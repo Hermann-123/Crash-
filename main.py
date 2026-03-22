@@ -1,165 +1,140 @@
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import requests
+import logging
 import os
-from flask import Flask
 import threading
+from flask import Flask
 
 # ==========================================
-# 1. TES IDENTIFIANTS PERSONNELS
+# 1. LA BOÎTE NOIRE (LOGGING)
 # ==========================================
-# Ton Token Telegram (Garde ce fichier privé !)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("boite_noire.log", encoding='utf-8'), # Fichier de sauvegarde
+        logging.StreamHandler() # Affichage dans la console Render
+    ]
+)
+logging.info("La boîte noire est activée. Démarrage du système.")
+
+# ==========================================
+# 2. TES IDENTIFIANTS SECRETS
+# ==========================================
+# Ton Token Telegram 
 TOKEN = "7641013539:AAHidh_Hlpuv8jcSx8X-L5-_OVTebuUvyXw"
 bot = telebot.TeleBot(TOKEN)
 
-# Ton ID personnel (Le bot ignorera tous les autres utilisateurs)
+# Ta Clé API-Football
+API_KEY_FOOT = "Ab5a054667msh0a1ea9c796930c5p169b7fjsn0f250f6b6c19"
+
+# Ton ID Telegram VIP
 MON_ID = 5968288964 
 
-# Portefeuille virtuel
-user_data = {}
-
 # ==========================================
-# 2. MINI-SERVEUR WEB POUR RENDER 
+# 3. MINI-SERVEUR WEB POUR RENDER
 # ==========================================
 app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "Le serveur du Bot Sniper est en ligne et sécurisé !"
+    return "Le Bot Football est en ligne, API connectée et Boîte Noire active !"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
 # ==========================================
-# 3. VÉRIFICATION DE SÉCURITÉ VIP
+# 4. FONCTIONS DE SÉCURITÉ ET D'API
 # ==========================================
 def is_admin(chat_id):
-    """Vérifie si la personne qui parle au bot est bien toi."""
     return chat_id == MON_ID
 
+def recuperer_matchs(equipe_id):
+    """Interroge l'API de foot. Enregistre les crashs dans la boîte noire."""
+    url = "https://v3.football.api-sports.io/fixtures"
+    querystring = {"team": str(equipe_id), "last": "5"}
+    headers = {
+        "x-rapidapi-key": API_KEY_FOOT,
+        "x-rapidapi-host": "v3.football.api-sports.io"
+    }
+
+    try:
+        logging.info(f"Tentative de connexion à l'API pour l'équipe ID: {equipe_id}...")
+        response = requests.get(url, headers=headers, params=querystring)
+        response.raise_for_status() # Détecte si le serveur API est planté
+        
+        data = response.json()
+        logging.info("✅ Données récupérées avec succès depuis l'API.")
+        return data
+
+    except Exception as e:
+        # Le bot ne plante pas, il écrit l'erreur en silence.
+        logging.error(f"CRASH API LORS DE LA RECHERCHE DE L'ÉQUIPE {equipe_id} : {e}")
+        return None
+
 # ==========================================
-# 4. LE CŒUR DU BOT SNIPER
+# 5. L'INTERFACE TELEGRAM DU BOT
 # ==========================================
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     chat_id = message.chat.id
-    
-    # Blocage des intrus
     if not is_admin(chat_id):
-        bot.send_message(chat_id, "⛔ Accès refusé. Ce bot est privé et réservé à l'Administrateur.")
+        bot.send_message(chat_id, "⛔ Accès refusé.")
+        logging.warning(f"Tentative d'accès refusée pour l'ID inconnu : {chat_id}")
         return
         
-    # Initialisation du capital à 10 000 FCFA
-    if chat_id not in user_data:
-        user_data[chat_id] = {"bankroll": 10000}
-    
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("📊 Lancer une Analyse", callback_data="start_analysis"))
-    
     texte = (
-        f"Salut Sniper ! 🎯\n\n"
-        f"🔒 Authentification réussie. Accès VIP accordé.\n"
-        f"💰 **Capital actuel : {user_data[chat_id]['bankroll']} FCFA**\n\n"
-        f"Clique ci-dessous pour calculer la cible du prochain tir."
+        "⚽ **Bienvenue dans ton Centre d'Analyse Football !** ⚽\n\n"
+        "L'API est connectée. Le système est prêt à décortiquer les statistiques.\n\n"
+        "👉 Tape la commande /real pour tester la connexion et voir les 5 derniers matchs du Real Madrid."
     )
-    bot.send_message(chat_id, texte, reply_markup=markup, parse_mode="Markdown")
+    bot.send_message(chat_id, texte, parse_mode="Markdown")
 
-@bot.callback_query_handler(func=lambda call: call.data == "start_analysis")
-def ask_for_odds(call):
-    chat_id = call.message.chat.id
-    if not is_admin(chat_id):
-        return
-        
-    bot.answer_callback_query(call.id)
-    msg = bot.send_message(chat_id, "✈️ À quelle cote l'avion vient-il de se crasher ? (ex: 1.45)")
-    bot.register_next_step_handler(msg, process_odds)
-
-def process_odds(message):
+@bot.message_handler(commands=['real'])
+def test_real_madrid(message):
     chat_id = message.chat.id
     if not is_admin(chat_id):
         return
-        
-    try:
-        cote_precedente = float(message.text.replace(',', '.'))
-    except ValueError:
-        bot.send_message(chat_id, "❌ Erreur : Entre un nombre valide (ex: 1.45).")
-        return
 
-    bankroll = user_data[chat_id]["bankroll"]
-
-    # --- Stratégie Dynamique ---
-    if cote_precedente < 1.20:
-        cible_sniper = 1.45
-        pourcentage_mise = 0.05 
-        strategie = "Contre-attaque après un crash rapide."
-    elif 1.20 <= cote_precedente < 2.00:
-        cible_sniper = 1.30
-        pourcentage_mise = 0.02 
-        strategie = "Tir classique dans la zone de confort."
-    else:
-        cible_sniper = 1.15
-        pourcentage_mise = 0.01 
-        strategie = "Prudence maximale après un vol extrême."
-
-    # Calcul de la mise
-    mise_calculee = int(bankroll * pourcentage_mise)
-    if mise_calculee < 100:
-        mise_calculee = 100
-
-    user_data[chat_id]["mise_en_cours"] = mise_calculee
-    user_data[chat_id]["cible_en_cours"] = cible_sniper
-
-    texte_sniper = (
-        f"🎯 **ANALYSE TERMINÉE** 🎯\n\n"
-        f"🧠 Stratégie : {strategie}\n\n"
-        f"🔫 **ORDRE DE TIR :**\n"
-        f"👉 Retrait automatique à : **x{cible_sniper}**\n"
-        f"💵 Mise exacte à placer : **{mise_calculee} FCFA**\n\n"
-        f"✈️ *Envoie-moi la cote finale exacte pour le rapport de tir :*"
-    )
+    bot.send_message(chat_id, "⏳ Connexion à la base de données API-Sports en cours...")
     
-    msg = bot.send_message(chat_id, texte_sniper, parse_mode="Markdown")
-    bot.register_next_step_handler(msg, verify_shot)
+    # ID du Real Madrid = 541
+    data = recuperer_matchs(541)
 
-def verify_shot(message):
-    chat_id = message.chat.id
-    if not is_admin(chat_id):
+    if data is None:
+        bot.send_message(chat_id, "❌ Une erreur est survenue lors de la connexion à l'API. Vérifie la Boîte Noire.")
         return
         
-    try:
-        resultat_reel = float(message.text.replace(',', '.'))
-    except ValueError:
-        msg = bot.send_message(chat_id, "❌ Erreur de saisie. J'ai besoin du chiffre exact du crash (ex: 2.10) :")
-        bot.register_next_step_handler(msg, verify_shot)
+    if not data.get('response'):
+        bot.send_message(chat_id, "❌ L'API n'a renvoyé aucun match pour cette équipe.")
         return
 
-    cible_sniper = user_data[chat_id]["cible_en_cours"]
-    mise = user_data[chat_id]["mise_en_cours"]
-
-    # --- Mise à jour du Portefeuille ---
-    if resultat_reel >= cible_sniper:
-        gain_net = int((mise * cible_sniper) - mise)
-        user_data[chat_id]["bankroll"] += gain_net
-        reponse = f"✅ **CIBLE TOUCHÉE !**\nBénéfice net : +{gain_net} FCFA. Un tir parfait. 😎"
-    else:
-        user_data[chat_id]["bankroll"] -= mise
-        reponse = f"❌ **TIR MANQUÉ.**\nPerte : -{mise} FCFA. La discipline avant tout, on passe au suivant."
-
-    reponse += f"\n\n💰 **Nouveau Capital : {user_data[chat_id]['bankroll']} FCFA**"
-
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("📊 Préparer le prochain tir", callback_data="start_analysis"))
+    # Si tout va bien, on formate les résultats
+    reponse_texte = "📊 **Les 5 derniers scores exacts du Real Madrid :**\n\n"
     
-    bot.send_message(chat_id, reponse, reply_markup=markup, parse_mode="Markdown")
+    for match in data['response']:
+        equipe_dom = match['teams']['home']['name']
+        equipe_ext = match['teams']['away']['name']
+        buts_dom = match['goals']['home']
+        buts_ext = match['goals']['away']
+        
+        # Gestion des matchs non joués ou annulés (où les buts sont 'None')
+        if buts_dom is None or buts_ext is None:
+            score = "Match reporté/non joué"
+        else:
+            score = f"{buts_dom} - {buts_ext}"
+            
+        reponse_texte += f"🏟️ {equipe_dom} {score} {equipe_ext}\n"
+
+    bot.send_message(chat_id, reponse_texte, parse_mode="Markdown")
 
 # ==========================================
-# 5. LANCEMENT DU BOT
+# 6. LANCEMENT SIMULTANÉ
 # ==========================================
 if __name__ == "__main__":
-    # Lance le mini-serveur Web pour Render en arrière-plan
+    # N'oublie pas : requirements.txt doit contenir: pyTelegramBotAPI==4.14.0, Flask==3.0.2, requests==2.31.0
     threading.Thread(target=run_flask).start()
     
-    # Lance le bot Telegram
-    print("Le bot Sniper est armé, en ligne, et verrouillé sur ton ID !")
+    print("Le Bot Football est en ligne, sécurisé, et écoute sur Telegram !")
     bot.infinity_polling()
-    
