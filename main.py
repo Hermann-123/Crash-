@@ -12,8 +12,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("boite_noire.log", encoding='utf-8'), # Fichier de sauvegarde
-        logging.StreamHandler() # Affichage dans la console Render
+        logging.FileHandler("boite_noire.log", encoding='utf-8'),
+        logging.StreamHandler()
     ]
 )
 logging.info("La boîte noire est activée. Démarrage du système.")
@@ -21,14 +21,10 @@ logging.info("La boîte noire est activée. Démarrage du système.")
 # ==========================================
 # 2. TES IDENTIFIANTS SECRETS
 # ==========================================
-# Ton Token Telegram 
 TOKEN = "7641013539:AAHidh_Hlpuv8jcSx8X-L5-_OVTebuUvyXw"
 bot = telebot.TeleBot(TOKEN)
 
-# Ta Clé API-Football
 API_KEY_FOOT = "Ab5a054667msh0a1ea9c796930c5p169b7fjsn0f250f6b6c19"
-
-# Ton ID Telegram VIP
 MON_ID = 5968288964 
 
 # ==========================================
@@ -51,7 +47,7 @@ def is_admin(chat_id):
     return chat_id == MON_ID
 
 def recuperer_matchs(equipe_id):
-    """Interroge l'API de foot. Enregistre les crashs dans la boîte noire."""
+    """Interroge l'API de foot."""
     url = "https://v3.football.api-sports.io/fixtures"
     querystring = {"team": str(equipe_id), "last": "5"}
     headers = {
@@ -62,14 +58,13 @@ def recuperer_matchs(equipe_id):
     try:
         logging.info(f"Tentative de connexion à l'API pour l'équipe ID: {equipe_id}...")
         response = requests.get(url, headers=headers, params=querystring)
-        response.raise_for_status() # Détecte si le serveur API est planté
+        response.raise_for_status() 
         
         data = response.json()
         logging.info("✅ Données récupérées avec succès depuis l'API.")
         return data
 
     except Exception as e:
-        # Le bot ne plante pas, il écrit l'erreur en silence.
         logging.error(f"CRASH API LORS DE LA RECHERCHE DE L'ÉQUIPE {equipe_id} : {e}")
         return None
 
@@ -81,13 +76,12 @@ def send_welcome(message):
     chat_id = message.chat.id
     if not is_admin(chat_id):
         bot.send_message(chat_id, "⛔ Accès refusé.")
-        logging.warning(f"Tentative d'accès refusée pour l'ID inconnu : {chat_id}")
         return
         
     texte = (
         "⚽ **Bienvenue dans ton Centre d'Analyse Football !** ⚽\n\n"
         "L'API est connectée. Le système est prêt à décortiquer les statistiques.\n\n"
-        "👉 Tape la commande /real pour tester la connexion et voir les 5 derniers matchs du Real Madrid."
+        "👉 Tape la commande /real pour tester la connexion."
     )
     bot.send_message(chat_id, texte, parse_mode="Markdown")
 
@@ -99,18 +93,26 @@ def test_real_madrid(message):
 
     bot.send_message(chat_id, "⏳ Connexion à la base de données API-Sports en cours...")
     
-    # ID du Real Madrid = 541
+    # On lance la recherche
     data = recuperer_matchs(541)
 
+    # 1er filtre : Le crash technique total
     if data is None:
-        bot.send_message(chat_id, "❌ Une erreur est survenue lors de la connexion à l'API. Vérifie la Boîte Noire.")
+        bot.send_message(chat_id, "❌ Erreur critique de connexion. Vérifie la Boîte Noire.")
         return
         
+    # 2ème filtre : L'erreur d'abonnement RapidAPI (Le problème qu'on cherche)
+    if data.get('errors'):
+        erreur_api = data.get('errors')
+        bot.send_message(chat_id, f"⚠️ L'API refuse l'accès. Voici sa raison :\n\n`{erreur_api}`\n\n*(Copie-moi ce message !)*", parse_mode="Markdown")
+        return
+
+    # 3ème filtre : L'API marche mais ne trouve rien
     if not data.get('response'):
         bot.send_message(chat_id, "❌ L'API n'a renvoyé aucun match pour cette équipe.")
         return
 
-    # Si tout va bien, on formate les résultats
+    # Si tout va bien, on affiche les scores !
     reponse_texte = "📊 **Les 5 derniers scores exacts du Real Madrid :**\n\n"
     
     for match in data['response']:
@@ -119,9 +121,8 @@ def test_real_madrid(message):
         buts_dom = match['goals']['home']
         buts_ext = match['goals']['away']
         
-        # Gestion des matchs non joués ou annulés (où les buts sont 'None')
         if buts_dom is None or buts_ext is None:
-            score = "Match reporté/non joué"
+            score = "Match reporté"
         else:
             score = f"{buts_dom} - {buts_ext}"
             
@@ -133,8 +134,7 @@ def test_real_madrid(message):
 # 6. LANCEMENT SIMULTANÉ
 # ==========================================
 if __name__ == "__main__":
-    # N'oublie pas : requirements.txt doit contenir: pyTelegramBotAPI==4.14.0, Flask==3.0.2, requests==2.31.0
     threading.Thread(target=run_flask).start()
-    
-    print("Le Bot Football est en ligne, sécurisé, et écoute sur Telegram !")
+    print("Le Bot Football est en ligne et écoute sur Telegram !")
     bot.infinity_polling()
+    
