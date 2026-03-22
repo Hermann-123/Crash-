@@ -21,10 +21,14 @@ logging.info("La boîte noire est activée. Démarrage du système.")
 # ==========================================
 # 2. TES IDENTIFIANTS SECRETS
 # ==========================================
-TOKEN = "7641013539:AAHidh_Hlpuv8jcSx8X-L5-_OVTebuUvyXw"
+# Ton Token Telegram 
+TOKEN = "7641013539:AAEE4xxcGdzhOyHwoFwuHV7vnAbonsyMjyE"
 bot = telebot.TeleBot(TOKEN)
 
-API_KEY_FOOT = "Ab5a054667msh0a1ea9c796930c5p169b7fjsn0f250f6b6c19"
+# Ta NOUVELLE Clé API-Sports (Connexion Directe)
+API_KEY_FOOT = "a401855b9c55c032d2d63fac4c019306"
+
+# Ton ID Telegram VIP
 MON_ID = 5968288964 
 
 # ==========================================
@@ -34,35 +38,35 @@ app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "Le Bot Football est en ligne, API connectée et Boîte Noire active !"
+    return "Le Bot Football est en ligne avec la connexion API directe !"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
 # ==========================================
-# 4. FONCTIONS DE SÉCURITÉ ET D'API
+# 4. FONCTIONS DE SÉCURITÉ ET D'API DIRECTE
 # ==========================================
 def is_admin(chat_id):
     return chat_id == MON_ID
 
 def recuperer_matchs(equipe_id):
-    """Interroge l'API de foot via RapidAPI (Correction de l'adresse)."""
-    url = "https://api-football-v1.p.rapidapi.com/v3/fixtures"
+    """Interroge l'API de foot EN DIRECT (Sans RapidAPI)."""
+    url = "https://v3.football.api-sports.io/fixtures"
     querystring = {"team": str(equipe_id), "last": "5"}
     
+    # Header simplifié pour la connexion directe
     headers = {
-        "x-rapidapi-key": API_KEY_FOOT,
-        "x-rapidapi-host": "api-football-v1.p.rapidapi.com"
+        "x-apisports-key": API_KEY_FOOT
     }
 
     try:
-        logging.info(f"Tentative de connexion à RapidAPI pour l'équipe ID: {equipe_id}...")
+        logging.info(f"Tentative de connexion DIRECTE pour l'équipe ID: {equipe_id}...")
         response = requests.get(url, headers=headers, params=querystring)
         response.raise_for_status() 
         
         data = response.json()
-        logging.info("✅ Données récupérées avec succès depuis l'API.")
+        logging.info("✅ Données récupérées avec succès depuis l'API directe.")
         return data
 
     except Exception as e:
@@ -81,8 +85,8 @@ def send_welcome(message):
         
     texte = (
         "⚽ **Bienvenue dans ton Centre d'Analyse Football !** ⚽\n\n"
-        "L'API est connectée. Le système est prêt à décortiquer les statistiques.\n\n"
-        "👉 Tape la commande /real pour tester la connexion et voir les 5 derniers matchs du Real Madrid."
+        "La nouvelle API est connectée avec succès.\n\n"
+        "👉 Tape la commande /real pour lancer le test final sur le Real Madrid."
     )
     bot.send_message(chat_id, texte, parse_mode="Markdown")
 
@@ -94,26 +98,22 @@ def test_real_madrid(message):
 
     bot.send_message(chat_id, "⏳ Connexion à la base de données API-Sports en cours...")
     
-    # On lance la recherche pour le Real Madrid (ID 541)
+    # ID du Real Madrid = 541
     data = recuperer_matchs(541)
 
-    # 1er filtre : Le crash technique total
     if data is None:
         bot.send_message(chat_id, "❌ Erreur critique de connexion. Vérifie la Boîte Noire.")
         return
         
-    # 2ème filtre : L'erreur d'abonnement ou de clé
     if data.get('errors'):
         erreur_api = data.get('errors')
-        bot.send_message(chat_id, f"⚠️ L'API refuse l'accès. Voici sa raison :\n\n`{erreur_api}`\n\n*(Copie-moi ce message si ça bloque encore !)*", parse_mode="Markdown")
+        bot.send_message(chat_id, f"⚠️ L'API refuse l'accès. Voici sa raison :\n\n`{erreur_api}`", parse_mode="Markdown")
         return
 
-    # 3ème filtre : L'API marche mais ne trouve rien
     if not data.get('response'):
         bot.send_message(chat_id, "❌ L'API n'a renvoyé aucun match pour cette équipe.")
         return
 
-    # Si tout va bien, on affiche les scores !
     reponse_texte = "📊 **Les 5 derniers scores exacts du Real Madrid :**\n\n"
     
     for match in data['response']:
@@ -136,6 +136,6 @@ def test_real_madrid(message):
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
-    print("Le Bot Football est en ligne et écoute sur Telegram !")
+    print("Le Bot Football est en ligne avec la nouvelle clé API !")
     bot.infinity_polling()
-    
+        
