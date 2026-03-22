@@ -47,16 +47,17 @@ def is_admin(chat_id):
     return chat_id == MON_ID
 
 def recuperer_matchs(equipe_id):
-    """Interroge l'API de foot."""
-    url = "https://v3.football.api-sports.io/fixtures"
+    """Interroge l'API de foot via RapidAPI (Correction de l'adresse)."""
+    url = "https://api-football-v1.p.rapidapi.com/v3/fixtures"
     querystring = {"team": str(equipe_id), "last": "5"}
+    
     headers = {
         "x-rapidapi-key": API_KEY_FOOT,
-        "x-rapidapi-host": "v3.football.api-sports.io"
+        "x-rapidapi-host": "api-football-v1.p.rapidapi.com"
     }
 
     try:
-        logging.info(f"Tentative de connexion à l'API pour l'équipe ID: {equipe_id}...")
+        logging.info(f"Tentative de connexion à RapidAPI pour l'équipe ID: {equipe_id}...")
         response = requests.get(url, headers=headers, params=querystring)
         response.raise_for_status() 
         
@@ -81,7 +82,7 @@ def send_welcome(message):
     texte = (
         "⚽ **Bienvenue dans ton Centre d'Analyse Football !** ⚽\n\n"
         "L'API est connectée. Le système est prêt à décortiquer les statistiques.\n\n"
-        "👉 Tape la commande /real pour tester la connexion."
+        "👉 Tape la commande /real pour tester la connexion et voir les 5 derniers matchs du Real Madrid."
     )
     bot.send_message(chat_id, texte, parse_mode="Markdown")
 
@@ -93,7 +94,7 @@ def test_real_madrid(message):
 
     bot.send_message(chat_id, "⏳ Connexion à la base de données API-Sports en cours...")
     
-    # On lance la recherche
+    # On lance la recherche pour le Real Madrid (ID 541)
     data = recuperer_matchs(541)
 
     # 1er filtre : Le crash technique total
@@ -101,10 +102,10 @@ def test_real_madrid(message):
         bot.send_message(chat_id, "❌ Erreur critique de connexion. Vérifie la Boîte Noire.")
         return
         
-    # 2ème filtre : L'erreur d'abonnement RapidAPI (Le problème qu'on cherche)
+    # 2ème filtre : L'erreur d'abonnement ou de clé
     if data.get('errors'):
         erreur_api = data.get('errors')
-        bot.send_message(chat_id, f"⚠️ L'API refuse l'accès. Voici sa raison :\n\n`{erreur_api}`\n\n*(Copie-moi ce message !)*", parse_mode="Markdown")
+        bot.send_message(chat_id, f"⚠️ L'API refuse l'accès. Voici sa raison :\n\n`{erreur_api}`\n\n*(Copie-moi ce message si ça bloque encore !)*", parse_mode="Markdown")
         return
 
     # 3ème filtre : L'API marche mais ne trouve rien
@@ -122,7 +123,7 @@ def test_real_madrid(message):
         buts_ext = match['goals']['away']
         
         if buts_dom is None or buts_ext is None:
-            score = "Match reporté"
+            score = "Match reporté/non joué"
         else:
             score = f"{buts_dom} - {buts_ext}"
             
