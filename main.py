@@ -5,137 +5,81 @@ import os
 import threading
 from flask import Flask
 
-# ==========================================
-# 1. LA BOÎTE NOIRE (LOGGING)
-# ==========================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("boite_noire.log", encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logging.info("La boîte noire est activée. Démarrage du système.")
+# --- LOGGING (La boîte noire) ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
-# ==========================================
-# 2. TES IDENTIFIANTS SECRETS
-# ==========================================
-# Ton Token Telegram 
+# --- TES IDENTIFIANTS ---
 TOKEN = "7641013539:AAEE4xxcGdzhOyHwoFwuHV7vnAbonsyMjyE"
 bot = telebot.TeleBot(TOKEN)
 
-# Ta NOUVELLE Clé API-Sports (Connexion Directe)
-API_KEY_FOOT = "a401855b9c55c032d2d63fac4c019306"
+# Ta nouvelle clé Football-Data.org
+API_KEY_FOOT = "7d189cebfcc245dba669f86c41ebe1be"
 
 # Ton ID Telegram VIP
 MON_ID = 5968288964 
 
-# ==========================================
-# 3. MINI-SERVEUR WEB POUR RENDER
-# ==========================================
+# --- MINI-SERVEUR POUR RENDER ---
 app = Flask(__name__)
-
 @app.route('/')
-def index():
-    return "Le Bot Football est en ligne avec la connexion API directe !"
+def index(): return "Bot Foot Connecté avec Football-Data !"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# ==========================================
-# 4. FONCTIONS DE SÉCURITÉ ET D'API DIRECTE
-# ==========================================
-def is_admin(chat_id):
-    return chat_id == MON_ID
-
-def recuperer_matchs(equipe_id):
-    """Interroge l'API de foot EN DIRECT (Sans RapidAPI)."""
-    url = "https://v3.football.api-sports.io/fixtures"
-    querystring = {"team": str(equipe_id), "last": "5"}
-    
-    # Header simplifié pour la connexion directe
-    headers = {
-        "x-apisports-key": API_KEY_FOOT
-    }
+# --- FONCTION DE RÉCUPÉRATION DES MATCHS ---
+def recuperer_matchs_v2(equipe_id):
+    # On récupère les 5 derniers matchs TERMINÉS
+    url = f"https://api.football-data.org/v4/teams/{equipe_id}/matches?status=FINISHED&limit=5"
+    headers = {"X-Auth-Token": API_KEY_FOOT}
 
     try:
-        logging.info(f"Tentative de connexion DIRECTE pour l'équipe ID: {equipe_id}...")
-        response = requests.get(url, headers=headers, params=querystring)
-        response.raise_for_status() 
-        
+        response = requests.get(url, headers=headers)
         data = response.json()
-        logging.info("✅ Données récupérées avec succès depuis l'API directe.")
         return data
-
     except Exception as e:
-        logging.error(f"CRASH API LORS DE LA RECHERCHE DE L'ÉQUIPE {equipe_id} : {e}")
+        logging.error(f"Erreur API : {e}")
         return None
 
-# ==========================================
-# 5. L'INTERFACE TELEGRAM DU BOT
-# ==========================================
+# --- COMMANDES TELEGRAM ---
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    chat_id = message.chat.id
-    if not is_admin(chat_id):
-        bot.send_message(chat_id, "⛔ Accès refusé.")
-        return
-        
-    texte = (
-        "⚽ **Bienvenue dans ton Centre d'Analyse Football !** ⚽\n\n"
-        "La nouvelle API est connectée avec succès.\n\n"
-        "👉 Tape la commande /real pour lancer le test final sur le Real Madrid."
-    )
-    bot.send_message(chat_id, texte, parse_mode="Markdown")
+    if message.chat.id != MON_ID: return
+    texte = "⚽ **Système Opérationnel !** ⚽\n\nTa nouvelle clé est activée.\n👉 Tape /real pour tester."
+    bot.send_message(message.chat.id, texte, parse_mode="Markdown")
 
 @bot.message_handler(commands=['real'])
-def test_real_madrid(message):
-    chat_id = message.chat.id
-    if not is_admin(chat_id):
-        return
-
-    bot.send_message(chat_id, "⏳ Connexion à la base de données API-Sports en cours...")
+def test_real(message):
+    if message.chat.id != MON_ID: return
     
-    # ID du Real Madrid = 541
-    data = recuperer_matchs(541)
-
-    if data is None:
-        bot.send_message(chat_id, "❌ Erreur critique de connexion. Vérifie la Boîte Noire.")
-        return
-        
-    if data.get('errors'):
-        erreur_api = data.get('errors')
-        bot.send_message(chat_id, f"⚠️ L'API refuse l'accès. Voici sa raison :\n\n`{erreur_api}`", parse_mode="Markdown")
-        return
-
-    if not data.get('response'):
-        bot.send_message(chat_id, "❌ L'API n'a renvoyé aucun match pour cette équipe.")
-        return
-
-    reponse_texte = "📊 **Les 5 derniers scores exacts du Real Madrid :**\n\n"
+    bot.send_message(message.chat.id, "⏳ Analyse des derniers résultats du Real Madrid...")
     
-    for match in data['response']:
-        equipe_dom = match['teams']['home']['name']
-        equipe_ext = match['teams']['away']['name']
-        buts_dom = match['goals']['home']
-        buts_ext = match['goals']['away']
+    # Sur ce site, l'ID du Real Madrid est 86
+    data = recuperer_matchs_v2(86)
+
+    if not data or 'matches' not in data:
+        bot.send_message(message.chat.id, "❌ Erreur de connexion à l'API.")
+        return
+
+    if len(data['matches']) == 0:
+        bot.send_message(message.chat.id, "⚠️ Aucun match récent trouvé.")
+        return
+
+    reponse = "📊 **Derniers scores du Real Madrid :**\n\n"
+    
+    for match in data['matches']:
+        equipe_dom = match['homeTeam']['shortName']
+        equipe_ext = match['awayTeam']['shortName']
+        score_dom = match['score']['fullTime']['home']
+        score_ext = match['score']['fullTime']['away']
         
-        if buts_dom is None or buts_ext is None:
-            score = "Match reporté/non joué"
-        else:
-            score = f"{buts_dom} - {buts_ext}"
-            
-        reponse_texte += f"🏟️ {equipe_dom} {score} {equipe_ext}\n"
+        reponse += f"🏟️ {equipe_dom}  **{score_dom} - {score_ext}** {equipe_ext}\n"
 
-    bot.send_message(chat_id, reponse_texte, parse_mode="Markdown")
+    bot.send_message(message.chat.id, reponse, parse_mode="Markdown")
 
-# ==========================================
-# 6. LANCEMENT SIMULTANÉ
-# ==========================================
+# --- LANCEMENT ---
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
-    print("Le Bot Football est en ligne avec la nouvelle clé API !")
+    print("Le Bot est en ligne !")
     bot.infinity_polling()
         
