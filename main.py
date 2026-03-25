@@ -20,7 +20,7 @@ except ImportError:
     pass
 
 # --- CONFIGURATION DE LA CLÉ TOKEN ---
-TELEGRAM_TOKEN = "8722705761:AAEkcsR63EKptvU9RZ8YTdfRunvvb9ybwuk"
+TELEGRAM_TOKEN = "8722705761:AAFOd2g-GGcWA-7CSs_hcG2DYBhlY1S2XBA"
 
 # 🛑🛑🛑 REMPLACE CECI PAR TON VRAI LIEN RENDER 🛑🛑🛑
 WEBAPP_URL = "https://crash-prime.onrender.com" 
