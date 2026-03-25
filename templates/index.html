@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Terminal Prime VIP</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        body { background-color: #0b0e17; color: #ffffff; font-family: sans-serif; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; height: 100vh; }
+        .header { text-align: center; margin-bottom: 40px; margin-top: 20px; }
+        .header h1 { font-size: 26px; margin: 0; letter-spacing: 2px; color: #00f0ff; text-shadow: 0 0 15px rgba(0, 240, 255, 0.4); }
+        .header p { color: #6a7c92; font-size: 14px; margin-top: 5px; }
+        .card { background-color: #131826; border-radius: 25px; padding: 25px; width: 100%; max-width: 340px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6); border: 1px solid #202738; text-align: center; }
+        .input-label { color: #6a7c92; font-size: 12px; font-weight: bold; margin-bottom: 10px; display: block; text-transform: uppercase; text-align: left; }
+        .selector { width: 100%; padding: 16px; background-color: #0b0e17; color: white; border: 1px solid #202738; border-radius: 12px; font-size: 16px; margin-bottom: 35px; outline: none; text-align: center; box-sizing: border-box; }
+        .btn-scan { background: linear-gradient(135deg, #0052ff, #00f0ff); color: white; border: none; padding: 18px 30px; font-size: 18px; font-weight: bold; border-radius: 50px; width: 100%; cursor: pointer; box-shadow: 0 6px 20px rgba(0, 240, 255, 0.3); transition: all 0.2s ease; }
+        .btn-scan:active { transform: scale(0.96); }
+        #loader-area { display: none; flex-direction: column; align-items: center; justify-content: center; margin-top: 20px; }
+        .spinner { width: 60px; height: 60px; border: 5px solid rgba(0, 240, 255, 0.1); border-top: 5px solid #00f0ff; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 15px; box-shadow: 0 0 15px rgba(0, 240, 255, 0.5); }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        #progress-text { font-size: 32px; font-weight: bold; color: #ffffff; margin: 0; text-shadow: 0 0 10px rgba(255, 255, 255, 0.3); }
+        #status-text { color: #00f0ff; font-size: 14px; margin-top: 5px; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0% { opacity: 0.6; } 50% { opacity: 1; } 100% { opacity: 0.6; } }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>TERMINAL PRIME</h1>
+        <p>Intelligence Mathématique</p>
+    </div>
+
+    <div class="card">
+        <div id="input-area">
+            <label class="input-label">Sélecteur de Cible</label>
+            <select class="selector" id="devise">
+                <option value="EURUSD">🇪🇺 EUR / USD</option>
+                <option value="USDJPY">🇯🇵 USD / JPY</option>
+                <option value="AUDJPY">🇦🇺 AUD / JPY</option>
+                <option value="USDCAD">🇨🇦 USD / CAD</option>
+                <option value="CHFJPY">🇨🇭 CHF / JPY</option>
+                <option value="AUDCAD">🇦🇺 AUD / CAD</option>
+            </select>
+            <button class="btn-scan" onclick="lancerAnalyse()">📡 Lancer l'Analyse</button>
+        </div>
+
+        <div id="loader-area">
+            <div class="spinner"></div>
+            <p id="progress-text">0%</p>
+            <p id="status-text">Connexion au flux du marché...</p>
+        </div>
+    </div>
+
+    <script>
+        // Initialisation de Telegram
+        let tg = window.Telegram.WebApp;
+        tg.expand(); // Ouvre l'application en grand écran sur le téléphone
+
+        function lancerAnalyse() {
+            document.getElementById('input-area').style.display = 'none';
+            document.getElementById('loader-area').style.display = 'flex';
+
+            let progress = 0;
+            const progressText = document.getElementById('progress-text');
+            const statusText = document.getElementById('status-text');
+            const deviseChoisie = document.getElementById('devise').value;
+
+            const interval = setInterval(() => {
+                progress += Math.floor(Math.random() * 5) + 1;
+                
+                if (progress >= 100) {
+                    progress = 100;
+                    clearInterval(interval);
+                    
+                    // Fin du chargement : On envoie la devise au bot et on ferme l'App !
+                    setTimeout(() => {
+                        tg.sendData(deviseChoisie); // Envoie ex: "EURUSD" au bot Python
+                        tg.close(); // Ferme la Mini App automatiquement
+                    }, 800);
+                }
+
+                progressText.innerText = progress + '%';
+
+                if (progress > 30 && progress < 60) {
+                    statusText.innerText = "Calcul des Bandes de Bollinger...";
+                } else if (progress >= 60 && progress < 90) {
+                    statusText.innerText = "Recherche de Price Action...";
+                } else if (progress >= 90) {
+                    statusText.innerText = "Transmission sécurisée au bot...";
+                }
+            }, 100); 
+        }
+    </script>
+</body>
+</html>
