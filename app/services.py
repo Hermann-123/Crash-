@@ -122,98 +122,111 @@ class TicketFactory:
         portfolio = defaultdict(list)
         pool = []
         
+        logger.info(f"⚖️ LE JUGE SUPRÊME EXAMINE {len(evaluated_matches)} MATCHS...")
+        
         for match, sim, ai in evaluated_matches:
             if not ai.is_approved: continue
             
             p_home, p_draw, p_away = sim.proba_home, sim.proba_draw, sim.proba_away
             base_confidence = max(p_home, p_draw, p_away) 
             
-            # Décodage du Cerveau 2 (IA JSON)
+            # Nettoyage supplémentaire pour éviter les bugs de JSON
+            clean_json = ai.justification.replace("```json", "").replace("```", "").strip()
+            
             try:
-                ai_data = json.loads(ai.justification)
+                ai_data = json.loads(clean_json)
                 ai_profile = ai_data.get("profil", "INCERTAIN").upper()
                 ai_text = ai_data.get("analyse", "Aucune analyse disponible.")
             except:
+                logger.warning(f"❌ Rejet (JSON cassé) : {match.home_team}")
                 continue 
                 
-            # 🛡️ FILTRE ANTI-PIÈGE BOOKMAKER : Cote max autorisée
-            MAX_SAFE_ODDS = 1.75
+            # 🛡️ FILTRE ASSOUPLI POUR LE TEST (On passe de 1.75 à 1.85 max)
+            MAX_SAFE_ODDS = 1.85
+            added_to_pool = False
             
-            # ⚖️ LE JUGE SUPRÊME : Distribution des paris selon le profil IA
-
             # Profil 1 : DÉSÉQUILIBRÉ
             if ai_profile == "DÉSÉQUILIBRÉ":
                 if p_home >= 55.0:
                     odds = max(1.35, round(100.0/p_home*0.92, 2))
                     if odds <= MAX_SAFE_ODDS:
                         pool.append({"match": match, "type": f"Victoire {match.home_team} (1)", "odds": odds, "proba": p_home, "ai": ai_text})
+                        added_to_pool = True
                 
                 if p_away >= 55.0:
                     odds = max(1.35, round(100.0/p_away*0.92, 2))
                     if odds <= MAX_SAFE_ODDS:
                         pool.append({"match": match, "type": f"Victoire {match.away_team} (2)", "odds": odds, "proba": p_away, "ai": ai_text})
+                        added_to_pool = True
 
             # Profil 2 : DÉFENSIF
             elif ai_profile == "DÉFENSIF":
                 if sim.proba_over_2_5 < 35.0:
                     odds = max(1.40, round(100.0/(100-sim.proba_over_2_5)*0.92, 2))
                     if odds <= MAX_SAFE_ODDS:
-                        pool.append({"match": match, "type": "Moins de 2,5 buts dans le match", "odds": odds, "proba": 100 - sim.proba_over_2_5, "ai": ai_text})
+                        pool.append({"match": match, "type": "Moins de 2,5 buts", "odds": odds, "proba": 100 - sim.proba_over_2_5, "ai": ai_text})
+                        added_to_pool = True
                 
                 if sim.proba_btts < 40.0:
                     odds = max(1.40, round(100.0/(100-sim.proba_btts)*0.92, 2))
                     if odds <= MAX_SAFE_ODDS:
-                        pool.append({"match": match, "type": "Les 2 équipes marquent (BTTS : Non)", "odds": odds, "proba": 100 - sim.proba_btts, "ai": ai_text})
+                        pool.append({"match": match, "type": "BTTS : Non", "odds": odds, "proba": 100 - sim.proba_btts, "ai": ai_text})
+                        added_to_pool = True
 
             # Profil 3 : OFFENSIF
             elif ai_profile == "OFFENSIF":
                 if sim.proba_over_1_5 >= 78.0:
-                    pool.append({"match": match, "type": "Plus de 1,5 buts dans le match", "odds": max(1.20, round(100.0/sim.proba_over_1_5*0.92, 2)), "proba": sim.proba_over_1_5, "ai": ai_text})
+                    pool.append({"match": match, "type": "Plus de 1,5 buts", "odds": max(1.20, round(100.0/sim.proba_over_1_5*0.92, 2)), "proba": sim.proba_over_1_5, "ai": ai_text})
+                    added_to_pool = True
                 
                 if sim.proba_over_2_5 >= 60.0:
-                    pool.append({"match": match, "type": "Plus de 2,5 buts dans le match", "odds": max(1.55, round(100.0/sim.proba_over_2_5*0.92, 2)), "proba": sim.proba_over_2_5, "ai": ai_text})
+                    pool.append({"match": match, "type": "Plus de 2,5 buts", "odds": max(1.55, round(100.0/sim.proba_over_2_5*0.92, 2)), "proba": sim.proba_over_2_5, "ai": ai_text})
+                    added_to_pool = True
                 
                 if sim.proba_btts >= 62.0:
-                    pool.append({"match": match, "type": "Les 2 équipes marquent (BTTS : Oui)", "odds": max(1.60, round(100.0/sim.proba_btts*0.92, 2)), "proba": sim.proba_btts, "ai": ai_text})
+                    pool.append({"match": match, "type": "BTTS : Oui", "odds": max(1.60, round(100.0/sim.proba_btts*0.92, 2)), "proba": sim.proba_btts, "ai": ai_text})
+                    added_to_pool = True
 
-            # Profil 4 : INCERTAIN / COUVERTURE
+            # Profil 4 : INCERTAIN (Couverture)
             elif ai_profile == "INCERTAIN":
                 if p_home + p_draw >= 82.0:
-                    pool.append({"match": match, "type": f"Double Chance (1X) : {match.home_team} ou Nul", "odds": max(1.15, round(100.0/(p_home+p_draw)*0.92, 2)), "proba": p_home+p_draw, "ai": ai_text})
+                    pool.append({"match": match, "type": f"Double Chance (1X)", "odds": max(1.15, round(100.0/(p_home+p_draw)*0.92, 2)), "proba": p_home+p_draw, "ai": ai_text})
+                    added_to_pool = True
                 if p_away + p_draw >= 82.0:
-                    pool.append({"match": match, "type": f"Double Chance (X2) : {match.away_team} ou Nul", "odds": max(1.15, round(100.0/(p_away+p_draw)*0.92, 2)), "proba": p_away+p_draw, "ai": ai_text})
+                    pool.append({"match": match, "type": f"Double Chance (X2)", "odds": max(1.15, round(100.0/(p_away+p_draw)*0.92, 2)), "proba": p_away+p_draw, "ai": ai_text})
+                    added_to_pool = True
 
+            if added_to_pool:
+                logger.info(f"✅ ACCEPTÉ : {match.home_team} [{ai_profile}]")
+            else:
+                logger.info(f"❌ REFUSÉ (Trop risqué ou Veto) : {match.home_team} [{ai_profile}]")
 
-        # 🚀 L'ALGORITHME D'ASSEMBLAGE DES TICKETS
+        logger.info(f"📊 RÉSULTAT DU FILTRE : {len(pool)} matchs ont survécu sur {len(evaluated_matches)}.")
+
         def get_best_combo(pool_list, min_odds, max_odds, min_items, max_items, min_proba_threshold=0.0):
             if not pool_list: return None
-            
             pool_list = sorted(pool_list, key=lambda x: x['proba'], reverse=True)
             valid_pool = [p for p in pool_list if p['proba'] >= min_proba_threshold]
-            
             for r in range(min_items, max_items + 1):
                 for combo in itertools.combinations(valid_pool[:25], r):
                     match_ids = [x['match'].match_id for x in combo]
                     if len(set(match_ids)) != len(match_ids): continue 
-                    
                     total_odds = 1.0
                     for x in combo: total_odds *= x['odds']
-                    
                     if min_odds <= total_odds <= max_odds:
                         return combo
             return None
 
-        # 🌟 Combiné du Jour (Sécurité Maximale)
-        combo_jour = get_best_combo(pool, 1.8, 3.5, 2, 4, min_proba_threshold=75.0)
+        # 🌟 Combiné du Jour (On abaisse la cote min de 1.8 à 1.5 pour faciliter la création)
+        combo_jour = get_best_combo(pool, 1.5, 3.5, 2, 4, min_proba_threshold=72.0)
         if combo_jour:
             portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo_jour, TicketCategory.ULTRA_SAFE, "🌟 COMBINÉ DU JOUR (SÉCURITÉ MAX)"))
+            logger.info("🎟️ TICKET GÉNÉRÉ : Combiné du Jour !")
 
-        # 💎 Combiné VIP (Rentabilité)
         combo_vip = get_best_combo(pool, 3.0, 5.5, 3, 5, min_proba_threshold=62.0)
         if combo_vip:
             portfolio[TicketCategory.VIP].append(self._format_combo(combo_vip, TicketCategory.VIP, "💎 COMBINÉ VIP (RENTABILITÉ)"))
 
-        # 🚀 Value Bet 
         combo_value = get_best_combo(pool, 6.0, 45.0, 4, 7, min_proba_threshold=0.0)
         if combo_value:
             cat_val = TicketCategory.VALUE_BET if hasattr(TicketCategory, 'VALUE_BET') else TicketCategory.VALUE
@@ -224,32 +237,22 @@ class TicketFactory:
     def _format_combo(self, combo, cat, title):
         total_odds = 1.0
         combo_proba_math = 1.0
-        
         bet_text = ""
         ai_text = "🧠 **Rapport IA par Consensus :**\n"
-        
         for i, c in enumerate(combo, 1):
             total_odds *= c['odds']
             combo_proba_math *= (c['proba'] / 100.0)
-            
             bet_text += f"*{i}️⃣ {c['match'].home_team} vs {c['match'].away_team}*\n👉 **{c['type']}**\n📊 Cote : {c['odds']} | 🎯 Confiance : {c['proba']:.1f}%\n\n"
             ai_text += f"✔️ **{c['match'].home_team} vs {c['match'].away_team}** :\n{c['ai']}\n\n"
-            
+        
         total_odds = round(total_odds, 2)
         final_combo_proba = round(combo_proba_math * 100, 1)
-        
         bet_text += f"🔥 **FIABILITÉ GLOBALE DU COMBINÉ : {final_combo_proba}%**\n"
-        
         ids = sorted([c['match'].match_id for c in combo])
         unique_id = f"combo_{cat.name}_{'_'.join(ids)}"
         
         return GeneratedTicket(
-            category=cat, 
-            match_id=unique_id, 
-            sport=combo[0]['match'].sport, 
-            match_title=title, 
-            bet_type=bet_text.strip(), 
-            odds=total_odds, 
-            ai_confidence=final_combo_proba, 
-            ai_justification=ai_text.strip()
+            category=cat, match_id=unique_id, sport=combo[0]['match'].sport, 
+            match_title=title, bet_type=bet_text.strip(), odds=total_odds, 
+            ai_confidence=final_combo_proba, ai_justification=ai_text.strip()
         )
