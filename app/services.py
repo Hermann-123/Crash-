@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+import json
 import numpy as np
 from scipy.stats import poisson
 from typing import List, Tuple
@@ -52,25 +53,25 @@ class AIRiskManager:
     async def evaluate_match(self, match: MatchData, sim: SimulationResult) -> AIAuditReport:
         base_confidence = max(sim.proba_home, sim.proba_draw, sim.proba_away)
         
-        # Filtre initial : Rejet des matchs imprévisibles (< 45% de certitude)
         if base_confidence < 45.0:
-            return AIAuditReport(confidence_score=base_confidence, justification="VETO", is_approved=False)
+            return AIAuditReport(confidence_score=base_confidence, justification='{"profil": "VETO", "analyse": "Match trop incertain."}', is_approved=False)
 
         if not settings.GROQ_API_KEY:
-            return AIAuditReport(confidence_score=base_confidence, justification="Validé mathématiquement par l'algorithme.", is_approved=True)
+            return AIAuditReport(confidence_score=base_confidence, justification='{"profil": "INCERTAIN", "analyse": "Validation mathématique sans IA."}', is_approved=True)
 
-        # 🎯 PROMPT ULTRA-STRICT : Analyse tactique directe sans blabla ni nom de pari
+        # 🧠 CERVEAU 2 : Le Profiler Indépendant en format JSON
         prompt = f"""
-        Tu es un analyste sportif intransigeant. Analyse ce match : {match.home_team} vs {match.away_team}.
+        En tant que trader sportif expert, profile la physionomie tactique de ce match : {match.home_team} vs {match.away_team}.
         
-        Mission : Rédige UNE SEULE phrase percutante (maximum 3 lignes) sur la dynamique tactique du match (forces offensives, solidité défensive, ou probabilité de match fermé/ouvert).
-        
-        CONSIGNES STRICTES (Sinon tu seras désactivé) :
-        - NE NOMME JAMAIS de type de pari (interdiction d'écrire "victoire", "BTTS", "Under/Over").
-        - AUCUNE INTRODUCTION (ne dis pas "Voici le rapport" ou "Analyse du match").
-        - AUCUNE CONCLUSION ou parenthèse de rappel.
-        - Commence directement par ton analyse factuelle.
-        - Si tu détectes un piège (match amical, équipe bis), réponds UNIQUEMENT par le mot "VETO".
+        Mission : Renvoie UNIQUEMENT un objet JSON valide. Interdiction d'écrire du texte en dehors du JSON.
+        Le JSON doit contenir exactement deux clés :
+        1. "profil" : Choisis UN SEUL mot parmi : [OFFENSIF, DÉFENSIF, DÉSÉQUILIBRÉ, INCERTAIN, VETO].
+           - OFFENSIF : Défenses faibles, match à spectacle.
+           - DÉFENSIF : Match fermé, tactique, peu de buts prévus.
+           - DÉSÉQUILIBRÉ : Un grand favori qui va dominer.
+           - INCERTAIN : Équipes de même niveau, indécis.
+           - VETO : Piège de bookmaker, match amical, coupe sans enjeu.
+        2. "analyse" : UNE SEULE phrase percutante (max 30 mots) justifiant ce profil.
         """
         
         try:
@@ -82,10 +83,22 @@ class AIRiskManager:
                 )
                 if response.status_code == 200:
                     ans = response.json()['choices'][0]['message']['content'].strip()
-                    is_approved = not ans.upper().startswith("VETO")
+                    # Nettoyage au cas où l'IA mettrait des balises markdown
+                    if ans.startswith("```json"): ans = ans[7:]
+                    if ans.startswith("```"): ans = ans[3:]
+                    if ans.endswith("```"): ans = ans[:-3]
+                    ans = ans.strip()
+                    
+                    # Vérification de la validité du JSON
+                    json.loads(ans)
+                    
+                    is_approved = "VETO" not in ans.upper()
                     return AIAuditReport(confidence_score=round(base_confidence, 1), justification=ans, is_approved=is_approved)
-        except: pass
-        return AIAuditReport(confidence_score=base_confidence, justification="Indicateurs statistiques au vert, validation du modèle.", is_approved=True)
+        except Exception as e: 
+            logger.error(f"Erreur IA : {e}")
+            pass
+        
+        return AIAuditReport(confidence_score=base_confidence, justification='{"profil": "VETO", "analyse": "Échec de lecture IA."}', is_approved=False)
 
 class TicketFactory:
     def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, SimulationResult, AIAuditReport]]):
@@ -98,46 +111,63 @@ class TicketFactory:
             p_home, p_draw, p_away = sim.proba_home, sim.proba_draw, sim.proba_away
             base_confidence = max(p_home, p_draw, p_away) 
             
-            if p_home >= 55.0:
-                pool.append({"match": match, "type": f"Victoire {match.home_team} (1)", "odds": max(1.35, round(100.0/p_home*0.92, 2)), "proba": p_home, "ai": ai.justification})
-                if p_home >= 72.0:
-                    pool.append({"match": match, "type": f"Handicap -1 : {match.home_team}", "odds": max(1.65, round(100.0/(p_home-15)*0.92, 2)), "proba": p_home - 15, "ai": ai.justification})
-                    pool.append({"match": match, "type": f"Mi-Temps / Fin de match : {match.home_team} / {match.home_team}", "odds": max(1.85, round(100.0/(base_confidence-18)*0.92, 2)), "proba": base_confidence - 18, "ai": ai.justification})
-                if p_home >= 60.0 and sim.proba_over_1_5 >= 70.0:
-                    pool.append({"match": match, "type": f"Combo : {match.home_team} gagne ET Plus de 1.5 buts", "odds": max(1.50, round(100.0/(p_home-10)*0.92, 2)), "proba": p_home - 10, "ai": ai.justification})
-                if p_home >= 65.0 and sim.proba_btts < 40.0:
-                    pool.append({"match": match, "type": f"{match.home_team} gagne sans encaisser (Clean Sheet)", "odds": max(1.80, round(100.0/(p_home-15)*0.92, 2)), "proba": p_home - 15, "ai": ai.justification})
+            # Extraction du JSON de l'IA
+            try:
+                ai_data = json.loads(ai.justification)
+                ai_profile = ai_data.get("profil", "INCERTAIN").upper()
+                ai_text = ai_data.get("analyse", "Aucune analyse disponible.")
+            except:
+                continue # Si le JSON est cassé, on rejette le match
+                
+            # 🛡️ FILTRE BOOKMAKER : Cote max autorisée pour les paris "Sécurité"
+            MAX_SAFE_ODDS = 1.75
+            
+            # ⚖️ LE JUGE SUPRÊME : Croisement des Mathématiques et du Profil IA
 
-            if p_away >= 55.0:
-                pool.append({"match": match, "type": f"Victoire {match.away_team} (2)", "odds": max(1.35, round(100.0/p_away*0.92, 2)), "proba": p_away, "ai": ai.justification})
-                if p_away >= 72.0:
-                    pool.append({"match": match, "type": f"Handicap -1 : {match.away_team}", "odds": max(1.65, round(100.0/(p_away-15)*0.92, 2)), "proba": p_away - 15, "ai": ai.justification})
-                    pool.append({"match": match, "type": f"Mi-Temps / Fin de match : {match.away_team} / {match.away_team}", "odds": max(1.85, round(100.0/(base_confidence-18)*0.92, 2)), "proba": base_confidence - 18, "ai": ai.justification})
-                if p_away >= 60.0 and sim.proba_over_1_5 >= 70.0:
-                    pool.append({"match": match, "type": f"Combo : {match.away_team} gagne ET Plus de 1.5 buts", "odds": max(1.50, round(100.0/(p_away-10)*0.92, 2)), "proba": p_away - 10, "ai": ai.justification})
+            # 1. MATCHS DÉSÉQUILIBRÉS (Domination attendue par l'IA)
+            if ai_profile == "DÉSÉQUILIBRÉ":
+                if p_home >= 55.0:
+                    odds = max(1.35, round(100.0/p_home*0.92, 2))
+                    if odds <= MAX_SAFE_ODDS:
+                        pool.append({"match": match, "type": f"Victoire {match.home_team} (1)", "odds": odds, "proba": p_home, "ai": ai_text})
+                
+                if p_away >= 55.0:
+                    odds = max(1.35, round(100.0/p_away*0.92, 2))
+                    if odds <= MAX_SAFE_ODDS:
+                        pool.append({"match": match, "type": f"Victoire {match.away_team} (2)", "odds": odds, "proba": p_away, "ai": ai_text})
 
-            if p_home + p_draw >= 82.0:
-                pool.append({"match": match, "type": f"Double Chance (1X) : {match.home_team} ou Nul", "odds": max(1.15, round(100.0/(p_home+p_draw)*0.92, 2)), "proba": p_home+p_draw, "ai": ai.justification})
-            if p_away + p_draw >= 82.0:
-                pool.append({"match": match, "type": f"Double Chance (X2) : {match.away_team} ou Nul", "odds": max(1.15, round(100.0/(p_away+p_draw)*0.92, 2)), "proba": p_away+p_draw, "ai": ai.justification})
+            # 2. MATCHS DÉFENSIFS (Fermé, peu de buts attendus)
+            elif ai_profile == "DÉFENSIF":
+                if sim.proba_over_2_5 < 35.0:
+                    odds = max(1.40, round(100.0/(100-sim.proba_over_2_5)*0.92, 2))
+                    if odds <= MAX_SAFE_ODDS:
+                        pool.append({"match": match, "type": "Moins de 2,5 buts dans le match", "odds": odds, "proba": 100 - sim.proba_over_2_5, "ai": ai_text})
+                
+                if sim.proba_btts < 40.0:
+                    odds = max(1.40, round(100.0/(100-sim.proba_btts)*0.92, 2))
+                    if odds <= MAX_SAFE_ODDS:
+                        pool.append({"match": match, "type": "Les 2 équipes marquent (BTTS : Non)", "odds": odds, "proba": 100 - sim.proba_btts, "ai": ai_text})
 
-            if sim.proba_over_1_5 >= 78.0:
-                pool.append({"match": match, "type": "Plus de 1,5 buts dans le match", "odds": max(1.20, round(100.0/sim.proba_over_1_5*0.92, 2)), "proba": sim.proba_over_1_5, "ai": ai.justification})
-            if sim.proba_over_2_5 >= 60.0:
-                pool.append({"match": match, "type": "Plus de 2,5 buts dans le match", "odds": max(1.55, round(100.0/sim.proba_over_2_5*0.92, 2)), "proba": sim.proba_over_2_5, "ai": ai.justification})
-            if sim.proba_over_2_5 < 35.0:
-                pool.append({"match": match, "type": "Moins de 2,5 buts dans le match", "odds": max(1.55, round(100.0/(100-sim.proba_over_2_5)*0.92, 2)), "proba": 100 - sim.proba_over_2_5, "ai": ai.justification})
+            # 3. MATCHS OFFENSIFS (Spectacle, buts des deux côtés)
+            elif ai_profile == "OFFENSIF":
+                if sim.proba_over_1_5 >= 78.0:
+                    pool.append({"match": match, "type": "Plus de 1,5 buts dans le match", "odds": max(1.20, round(100.0/sim.proba_over_1_5*0.92, 2)), "proba": sim.proba_over_1_5, "ai": ai_text})
+                
+                if sim.proba_over_2_5 >= 60.0:
+                    pool.append({"match": match, "type": "Plus de 2,5 buts dans le match", "odds": max(1.55, round(100.0/sim.proba_over_2_5*0.92, 2)), "proba": sim.proba_over_2_5, "ai": ai_text})
+                
+                if sim.proba_btts >= 62.0:
+                    pool.append({"match": match, "type": "Les 2 équipes marquent (BTTS : Oui)", "odds": max(1.60, round(100.0/sim.proba_btts*0.92, 2)), "proba": sim.proba_btts, "ai": ai_text})
 
-            if sim.proba_btts >= 62.0:
-                pool.append({"match": match, "type": "Les 2 équipes marquent (BTTS : Oui)", "odds": max(1.65, round(100.0/sim.proba_btts*0.92, 2)), "proba": sim.proba_btts, "ai": ai.justification})
-                if sim.proba_over_2_5 >= 65.0:
-                    pool.append({"match": match, "type": "Combo : Les 2 marquent ET Plus de 2.5 buts", "odds": max(1.90, round(100.0/(sim.proba_btts-10)*0.92, 2)), "proba": sim.proba_btts - 10, "ai": ai.justification})
-            elif sim.proba_btts < 40.0:
-                pool.append({"match": match, "type": "Les 2 équipes marquent (BTTS : Non)", "odds": max(1.60, round(100.0/(100-sim.proba_btts)*0.92, 2)), "proba": 100 - sim.proba_btts, "ai": ai.justification})
+            # 4. MATCHS INCERTAINS / PIÈGES (Sécurité maximale via Double Chance)
+            elif ai_profile == "INCERTAIN":
+                if p_home + p_draw >= 82.0:
+                    pool.append({"match": match, "type": f"Double Chance (1X) : {match.home_team} ou Nul", "odds": max(1.15, round(100.0/(p_home+p_draw)*0.92, 2)), "proba": p_home+p_draw, "ai": f"Match piège, mais {match.home_team} devrait éviter la défaite à domicile."})
+                if p_away + p_draw >= 82.0:
+                    pool.append({"match": match, "type": f"Double Chance (X2) : {match.away_team} ou Nul", "odds": max(1.15, round(100.0/(p_away+p_draw)*0.92, 2)), "proba": p_away+p_draw, "ai": f"Match indécis, couverture sur {match.away_team}."})
 
-            if base_confidence >= 70.0:
-                pool.append({"match": match, "type": f"Score Exact Probable : {sim.most_likely_score}", "odds": 7.00, "proba": 15.0, "ai": ai.justification})
 
+        # 🚀 L'ALGORITHME D'ASSEMBLAGE DES TICKETS
         def get_best_combo(pool_list, min_odds, max_odds, min_items, max_items, min_proba_threshold=0.0):
             if not pool_list: return None
             
@@ -156,15 +186,18 @@ class TicketFactory:
                         return combo
             return None
 
-        combo_jour = get_best_combo(pool, 2.2, 3.5, 2, 4, min_proba_threshold=75.0)
+        # 🌟 Combiné du Jour (Sécurité Maximale : Exige 75% de réussite minimum)
+        combo_jour = get_best_combo(pool, 1.8, 3.5, 2, 4, min_proba_threshold=75.0)
         if combo_jour:
             portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo_jour, TicketCategory.ULTRA_SAFE, "🌟 COMBINÉ DU JOUR (SÉCURITÉ MAX)"))
 
+        # 💎 Combiné VIP (Très haute rentabilité : Exige 62% de réussite minimum)
         combo_vip = get_best_combo(pool, 3.0, 5.5, 3, 5, min_proba_threshold=62.0)
         if combo_vip:
             portfolio[TicketCategory.VIP].append(self._format_combo(combo_vip, TicketCategory.VIP, "💎 COMBINÉ VIP (RENTABILITÉ)"))
 
-        combo_value = get_best_combo(pool, 8.0, 45.0, 4, 7, min_proba_threshold=0.0)
+        # 🚀 Value Bet (Toutes les opportunités)
+        combo_value = get_best_combo(pool, 6.0, 45.0, 4, 7, min_proba_threshold=0.0)
         if combo_value:
             cat_val = TicketCategory.VALUE_BET if hasattr(TicketCategory, 'VALUE_BET') else TicketCategory.VALUE
             portfolio[cat_val].append(self._format_combo(combo_value, cat_val, "🚀 VALUE BET (GROSSE COTE)"))
@@ -176,7 +209,7 @@ class TicketFactory:
         combo_proba_math = 1.0
         
         bet_text = ""
-        ai_text = "🧠 **Rapport IA Détaillé :**\n"
+        ai_text = "🧠 **Rapport IA par Consensus :**\n"
         
         for i, c in enumerate(combo, 1):
             total_odds *= c['odds']
