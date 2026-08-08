@@ -5,7 +5,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("WallStreet_OS")
 
 class Settings:
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "8000472746:AAHWGq5dv_XGM9XRpCEVesPd0DdrIC5_IK0")
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "8000472746:AAFtFQ8O_gjmKiAC072fn5xvx0Jsf0cK5s0")
     ADMIN_ID: int = int(os.getenv("ADMIN_ID", "5968288964"))
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     
