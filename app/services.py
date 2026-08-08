@@ -1,3 +1,5 @@
+
+
 import asyncio
 import httpx
 import json
@@ -35,46 +37,38 @@ class DixonColesEngine:
         score_x, score_y = np.unravel_index(best_idx, matrix.shape)
 
         p_btts = float(np.sum(matrix[1:, 1:])) * 100
-        p_o05 = float(np.sum([matrix[i, j] for i in range(self.max_goals) for j in range(self.max_goals) if i + j > 0])) * 100
         p_o15 = float(np.sum([matrix[i, j] for i in range(self.max_goals) for j in range(self.max_goals) if i + j > 1])) * 100
         p_o25 = float(np.sum([matrix[i, j] for i in range(self.max_goals) for j in range(self.max_goals) if i + j > 2])) * 100
-        p_o35 = float(np.sum([matrix[i, j] for i in range(self.max_goals) for j in range(self.max_goals) if i + j > 3])) * 100
-        p_o45 = float(np.sum([matrix[i, j] for i in range(self.max_goals) for j in range(self.max_goals) if i + j > 4])) * 100
 
         est_corners = round(8.5 + (lambda_x + mu_y) * 1.5, 1)
 
         return SimulationResult(
             match_id=match.match_id, proba_home=p_home, proba_draw=p_draw, proba_away=p_away, 
             most_likely_score=f"{score_x}-{score_y}", proba_btts=p_btts, 
-            proba_over_1_5=p_o15, proba_over_2_5=p_o25, proba_over_3_5=p_o35, estimated_corners=est_corners
+            proba_over_1_5=p_o15, proba_over_2_5=p_o25, estimated_corners=est_corners
         )
 
 class AIRiskManager:
     async def evaluate_match(self, match: MatchData, sim: SimulationResult) -> AIAuditReport:
         base_confidence = max(sim.proba_home, sim.proba_draw, sim.proba_away)
         
-        # Filtre initial strict
         if base_confidence < 45.0:
             return AIAuditReport(confidence_score=base_confidence, justification='{"profil": "VETO", "analyse": "Match trop incertain."}', is_approved=False)
 
         if not settings.GROQ_API_KEY:
             return AIAuditReport(confidence_score=base_confidence, justification='{"profil": "INCERTAIN", "analyse": "Validation mathématique sans IA."}', is_approved=True)
 
+        # 🧠 PROMPT OPTIMISÉ : L'IA reçoit maintenant les stats pour être factuelle
         prompt = f"""
         En tant que trader sportif expert, profile la physionomie tactique de ce match : {match.home_team} vs {match.away_team}.
         
-        Mission : Renvoie UNIQUEMENT un objet JSON valide. Interdiction d'écrire du texte en dehors du JSON.
-        Le JSON doit contenir exactement deux clés :
-        1. "profil" : Choisis UN SEUL mot parmi : [OFFENSIF, DÉFENSIF, DÉSÉQUILIBRÉ, INCERTAIN, VETO].
-           - OFFENSIF : Défenses faibles, match à spectacle.
-           - DÉFENSIF : Match fermé, tactique, peu de buts prévus.
-           - DÉSÉQUILIBRÉ : Un grand favori qui va dominer.
-           - INCERTAIN : Équipes de même niveau, indécis.
-           - VETO : Piège de bookmaker, match amical, coupe sans enjeu.
-        2. "analyse" : UNE SEULE phrase percutante (max 30 mots) justifiant ce profil.
+        DONNÉES ALGO : Victoire 1: {round(sim.proba_home,1)}%, Victoire 2: {round(sim.proba_away,1)}%, Over 2.5: {round(sim.proba_over_2_5,1)}%, BTTS: {round(sim.proba_btts,1)}%.
+        
+        Mission : Renvoie UNIQUEMENT un objet JSON.
+        Clés : "profil" ([OFFENSIF, DÉFENSIF, DÉSÉQUILIBRÉ, INCERTAIN, VETO]) et "analyse".
+        Dans "analyse", cite impérativement une stat parmi celles fournies pour justifier ton profil.
         """
         
-        # ⏱️ LE GOUTTE-À-GOUTTE : Pause de 5 secondes exigée pour éviter tout crash de Groq
         await asyncio.sleep(5.0)
         
         try:
@@ -86,173 +80,65 @@ class AIRiskManager:
                 )
                 if response.status_code == 200:
                     ans = response.json()['choices'][0]['message']['content'].strip()
-                    # Nettoyage JSON
-                    if ans.startswith("```json"): ans = ans[7:]
-                    if ans.startswith("```"): ans = ans[3:]
-                    if ans.endswith("```"): ans = ans[:-3]
-                    ans = ans.strip()
-                    
-                    json.loads(ans) # Vérification de la structure JSON
-                    
-                    is_approved = "VETO" not in ans.upper()
-                    return AIAuditReport(confidence_score=round(base_confidence, 1), justification=ans, is_approved=is_approved)
-        except Exception as e: 
-            logger.error(f"Erreur IA : {e}")
-            pass
+                    if "```json" in ans: ans = ans.split("```json")[1].split("```")[0]
+                    elif "```" in ans: ans = ans.split("```")[1].split("```")[0]
+                    json.loads(ans)
+                    return AIAuditReport(confidence_score=round(base_confidence, 1), justification=ans, is_approved="VETO" not in ans.upper())
+        except: pass
         
-        # 🚨 MODE DE SURVIE : Le Moteur Mathématique prend le relais si Groq bloque
-        fallback_profile = "INCERTAIN"
-        if sim.proba_btts < 40.0 or sim.proba_over_2_5 < 35.0:
-            fallback_profile = "DÉFENSIF"
-        elif sim.proba_btts >= 62.0 or sim.proba_over_2_5 >= 60.0:
-            fallback_profile = "OFFENSIF"
-        elif base_confidence >= 55.0:
-            fallback_profile = "DÉSÉQUILIBRÉ"
-            
-        survie_json = f'{{"profil": "{fallback_profile}", "analyse": "Analyse mathématique d\'urgence."}}'
-        
-        return AIAuditReport(
-            confidence_score=base_confidence, 
-            justification=survie_json, 
-            is_approved=True
-        )
+        # Mode de survie
+        survie = f'{{"profil": "INCERTAIN", "analyse": "Confirmation statistique : {round(base_confidence,1)}% de probabilité mathématique."}}'
+        return AIAuditReport(confidence_score=base_confidence, justification=survie, is_approved=True)
 
 class TicketFactory:
     def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, SimulationResult, AIAuditReport]]):
         portfolio = defaultdict(list)
         pool = []
         
-        logger.info(f"⚖️ LE JUGE SUPRÊME EXAMINE {len(evaluated_matches)} MATCHS...")
-        
         for match, sim, ai in evaluated_matches:
             if not ai.is_approved: continue
-            
-            p_home, p_draw, p_away = sim.proba_home, sim.proba_draw, sim.proba_away
-            base_confidence = max(p_home, p_draw, p_away) 
-            
-            # Nettoyage supplémentaire pour éviter les bugs de JSON
-            clean_json = ai.justification.replace("```json", "").replace("```", "").strip()
-            
             try:
-                ai_data = json.loads(clean_json)
-                ai_profile = ai_data.get("profil", "INCERTAIN").upper()
-                ai_text = ai_data.get("analyse", "Aucune analyse disponible.")
-            except:
-                logger.warning(f"❌ Rejet (JSON cassé) : {match.home_team}")
-                continue 
+                ai_data = json.loads(ai.justification)
+                ai_profile, ai_text = ai_data.get("profil", "INCERTAIN").upper(), ai_data.get("analyse", "")
+            except: continue
                 
-            # 🛡️ FILTRE ASSOUPLI POUR LE TEST (On passe de 1.75 à 1.85 max)
-            MAX_SAFE_ODDS = 1.85
-            added_to_pool = False
+            MAX_SAFE_ODDS = 1.85 # Limite de sécurité individuelle
             
-            # Profil 1 : DÉSÉQUILIBRÉ
             if ai_profile == "DÉSÉQUILIBRÉ":
-                if p_home >= 55.0:
-                    odds = max(1.35, round(100.0/p_home*0.92, 2))
-                    if odds <= MAX_SAFE_ODDS:
-                        pool.append({"match": match, "type": f"Victoire {match.home_team} (1)", "odds": odds, "proba": p_home, "ai": ai_text})
-                        added_to_pool = True
-                
-                if p_away >= 55.0:
-                    odds = max(1.35, round(100.0/p_away*0.92, 2))
-                    if odds <= MAX_SAFE_ODDS:
-                        pool.append({"match": match, "type": f"Victoire {match.away_team} (2)", "odds": odds, "proba": p_away, "ai": ai_text})
-                        added_to_pool = True
+                if p := (sim.proba_home if sim.proba_home >= 55.0 else sim.proba_away if sim.proba_away >= 55.0 else 0):
+                    odds = max(1.35, round(100.0/p*0.92, 2))
+                    if odds <= MAX_SAFE_ODDS: pool.append({"match": match, "type": f"Victoire", "odds": odds, "proba": p, "ai": ai_text})
 
-            # Profil 2 : DÉFENSIF
             elif ai_profile == "DÉFENSIF":
-                if sim.proba_over_2_5 < 35.0:
-                    odds = max(1.40, round(100.0/(100-sim.proba_over_2_5)*0.92, 2))
-                    if odds <= MAX_SAFE_ODDS:
-                        pool.append({"match": match, "type": "Moins de 2,5 buts", "odds": odds, "proba": 100 - sim.proba_over_2_5, "ai": ai_text})
-                        added_to_pool = True
-                
-                if sim.proba_btts < 40.0:
-                    odds = max(1.40, round(100.0/(100-sim.proba_btts)*0.92, 2))
-                    if odds <= MAX_SAFE_ODDS:
-                        pool.append({"match": match, "type": "BTTS : Non", "odds": odds, "proba": 100 - sim.proba_btts, "ai": ai_text})
-                        added_to_pool = True
+                if sim.proba_over_2_5 < 35.0 and (odds := max(1.40, round(100.0/(100-sim.proba_over_2_5)*0.92, 2))) <= MAX_SAFE_ODDS:
+                    pool.append({"match": match, "type": "Moins de 2,5 buts", "odds": odds, "proba": 100 - sim.proba_over_2_5, "ai": ai_text})
+                elif sim.proba_btts < 40.0 and (odds := max(1.40, round(100.0/(100-sim.proba_btts)*0.92, 2))) <= MAX_SAFE_ODDS:
+                    pool.append({"match": match, "type": "BTTS : Non", "odds": odds, "proba": 100 - sim.proba_btts, "ai": ai_text})
 
-            # Profil 3 : OFFENSIF
             elif ai_profile == "OFFENSIF":
-                if sim.proba_over_1_5 >= 78.0:
-                    pool.append({"match": match, "type": "Plus de 1,5 buts", "odds": max(1.20, round(100.0/sim.proba_over_1_5*0.92, 2)), "proba": sim.proba_over_1_5, "ai": ai_text})
-                    added_to_pool = True
-                
                 if sim.proba_over_2_5 >= 60.0:
                     pool.append({"match": match, "type": "Plus de 2,5 buts", "odds": max(1.55, round(100.0/sim.proba_over_2_5*0.92, 2)), "proba": sim.proba_over_2_5, "ai": ai_text})
-                    added_to_pool = True
-                
-                if sim.proba_btts >= 62.0:
+                elif sim.proba_btts >= 62.0:
                     pool.append({"match": match, "type": "BTTS : Oui", "odds": max(1.60, round(100.0/sim.proba_btts*0.92, 2)), "proba": sim.proba_btts, "ai": ai_text})
-                    added_to_pool = True
 
-            # Profil 4 : INCERTAIN (Couverture)
-            elif ai_profile == "INCERTAIN":
-                if p_home + p_draw >= 82.0:
-                    pool.append({"match": match, "type": f"Double Chance (1X)", "odds": max(1.15, round(100.0/(p_home+p_draw)*0.92, 2)), "proba": p_home+p_draw, "ai": ai_text})
-                    added_to_pool = True
-                if p_away + p_draw >= 82.0:
-                    pool.append({"match": match, "type": f"Double Chance (X2)", "odds": max(1.15, round(100.0/(p_away+p_draw)*0.92, 2)), "proba": p_away+p_draw, "ai": ai_text})
-                    added_to_pool = True
-
-            if added_to_pool:
-                logger.info(f"✅ ACCEPTÉ : {match.home_team} [{ai_profile}]")
-            else:
-                logger.info(f"❌ REFUSÉ (Trop risqué ou Veto) : {match.home_team} [{ai_profile}]")
-
-        logger.info(f"📊 RÉSULTAT DU FILTRE : {len(pool)} matchs ont survécu sur {len(evaluated_matches)}.")
-
-        def get_best_combo(pool_list, min_odds, max_odds, min_items, max_items, min_proba_threshold=0.0):
-            if not pool_list: return None
-            pool_list = sorted(pool_list, key=lambda x: x['proba'], reverse=True)
-            valid_pool = [p for p in pool_list if p['proba'] >= min_proba_threshold]
+        # 🚀 ASSEMBLAGE AVEC FILTRE DE RENTABILITÉ (Cote totale >= 2.0)
+        def get_best_combo(pool_list, min_odds, max_odds, min_items, max_items, min_proba_threshold):
+            pool_list = sorted([p for p in pool_list if p['proba'] >= min_proba_threshold], key=lambda x: x['proba'], reverse=True)
             for r in range(min_items, max_items + 1):
-                for combo in itertools.combinations(valid_pool[:25], r):
-                    match_ids = [x['match'].match_id for x in combo]
-                    if len(set(match_ids)) != len(match_ids): continue 
+                for combo in itertools.combinations(pool_list[:25], r):
                     total_odds = 1.0
                     for x in combo: total_odds *= x['odds']
-                    if min_odds <= total_odds <= max_odds:
-                        return combo
+                    if min_odds <= total_odds <= max_odds: return combo
             return None
 
-        # 🌟 Combiné du Jour (On abaisse la cote min de 1.8 à 1.5 pour faciliter la création)
-        combo_jour = get_best_combo(pool, 1.5, 3.5, 2, 4, min_proba_threshold=72.0)
-        if combo_jour:
-            portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo_jour, TicketCategory.ULTRA_SAFE, "🌟 COMBINÉ DU JOUR (SÉCURITÉ MAX)"))
-            logger.info("🎟️ TICKET GÉNÉRÉ : Combiné du Jour !")
-
-        combo_vip = get_best_combo(pool, 3.0, 5.5, 3, 5, min_proba_threshold=62.0)
-        if combo_vip:
-            portfolio[TicketCategory.VIP].append(self._format_combo(combo_vip, TicketCategory.VIP, "💎 COMBINÉ VIP (RENTABILITÉ)"))
-
-        combo_value = get_best_combo(pool, 6.0, 45.0, 4, 7, min_proba_threshold=0.0)
-        if combo_value:
-            cat_val = TicketCategory.VALUE_BET if hasattr(TicketCategory, 'VALUE_BET') else TicketCategory.VALUE
-            portfolio[cat_val].append(self._format_combo(combo_value, cat_val, "🚀 VALUE BET (GROSSE COTE)"))
-
+        if combo := get_best_combo(pool, 2.0, 4.0, 2, 4, 72.0):
+            portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo, TicketCategory.ULTRA_SAFE, "🌟 COMBINÉ DU JOUR (BÉNÉFICE MAX)"))
+            
         return dict(portfolio)
 
     def _format_combo(self, combo, cat, title):
-        total_odds = 1.0
-        combo_proba_math = 1.0
-        bet_text = ""
-        ai_text = "🧠 **Rapport IA par Consensus :**\n"
-        for i, c in enumerate(combo, 1):
-            total_odds *= c['odds']
-            combo_proba_math *= (c['proba'] / 100.0)
-            bet_text += f"*{i}️⃣ {c['match'].home_team} vs {c['match'].away_team}*\n👉 **{c['type']}**\n📊 Cote : {c['odds']} | 🎯 Confiance : {c['proba']:.1f}%\n\n"
-            ai_text += f"✔️ **{c['match'].home_team} vs {c['match'].away_team}** :\n{c['ai']}\n\n"
-        
-        total_odds = round(total_odds, 2)
-        final_combo_proba = round(combo_proba_math * 100, 1)
-        bet_text += f"🔥 **FIABILITÉ GLOBALE DU COMBINÉ : {final_combo_proba}%**\n"
-        ids = sorted([c['match'].match_id for c in combo])
-        unique_id = f"combo_{cat.name}_{'_'.join(ids)}"
-        
-        return GeneratedTicket(
-            category=cat, match_id=unique_id, sport=combo[0]['match'].sport, 
-            match_title=title, bet_type=bet_text.strip(), odds=total_odds, 
-            ai_confidence=final_combo_proba, ai_justification=ai_text.strip()
-        )
+        total_odds = round(np.prod([c['odds'] for c in combo]), 2)
+        final_proba = round(np.prod([c['proba']/100 for c in combo]) * 100, 1)
+        bet_text = "\n".join([f"*{i}️⃣ {c['match'].home_team} vs {c['match'].away_team}*\n👉 **{c['type']}** (Cote: {c['odds']})" for i, c in enumerate(combo, 1)])
+        ai_text = "\n".join([f"✔️ {c['match'].home_team} : {c['ai']}" for c in combo])
+        return GeneratedTicket(category=cat, match_id="final", sport=SportType.SOCCER, match_title=title, bet_type=bet_text, odds=total_odds, ai_confidence=final_proba, ai_justification=ai_text)
