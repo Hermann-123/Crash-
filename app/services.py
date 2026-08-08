@@ -53,13 +53,13 @@ class AIRiskManager:
     async def evaluate_match(self, match: MatchData, sim: SimulationResult) -> AIAuditReport:
         base_confidence = max(sim.proba_home, sim.proba_draw, sim.proba_away)
         
+        # Filtre initial strict
         if base_confidence < 45.0:
             return AIAuditReport(confidence_score=base_confidence, justification='{"profil": "VETO", "analyse": "Match trop incertain."}', is_approved=False)
 
         if not settings.GROQ_API_KEY:
             return AIAuditReport(confidence_score=base_confidence, justification='{"profil": "INCERTAIN", "analyse": "Validation mathématique sans IA."}', is_approved=True)
 
-        # 🧠 CERVEAU 2 : Le Profiler Indépendant en format JSON
         prompt = f"""
         En tant que trader sportif expert, profile la physionomie tactique de ce match : {match.home_team} vs {match.away_team}.
         
@@ -74,6 +74,9 @@ class AIRiskManager:
         2. "analyse" : UNE SEULE phrase percutante (max 30 mots) justifiant ce profil.
         """
         
+        # ⏱️ LE GOUTTE-À-GOUTTE : Pause de 5 secondes exigée pour éviter tout crash de Groq
+        await asyncio.sleep(5.0)
+        
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -83,14 +86,13 @@ class AIRiskManager:
                 )
                 if response.status_code == 200:
                     ans = response.json()['choices'][0]['message']['content'].strip()
-                    # Nettoyage au cas où l'IA mettrait des balises markdown
+                    # Nettoyage JSON
                     if ans.startswith("```json"): ans = ans[7:]
                     if ans.startswith("```"): ans = ans[3:]
                     if ans.endswith("```"): ans = ans[:-3]
                     ans = ans.strip()
                     
-                    # Vérification de la validité du JSON
-                    json.loads(ans)
+                    json.loads(ans) # Vérification de la structure JSON
                     
                     is_approved = "VETO" not in ans.upper()
                     return AIAuditReport(confidence_score=round(base_confidence, 1), justification=ans, is_approved=is_approved)
@@ -98,7 +100,22 @@ class AIRiskManager:
             logger.error(f"Erreur IA : {e}")
             pass
         
-        return AIAuditReport(confidence_score=base_confidence, justification='{"profil": "VETO", "analyse": "Échec de lecture IA."}', is_approved=False)
+        # 🚨 MODE DE SURVIE : Le Moteur Mathématique prend le relais si Groq bloque
+        fallback_profile = "INCERTAIN"
+        if sim.proba_btts < 40.0 or sim.proba_over_2_5 < 35.0:
+            fallback_profile = "DÉFENSIF"
+        elif sim.proba_btts >= 62.0 or sim.proba_over_2_5 >= 60.0:
+            fallback_profile = "OFFENSIF"
+        elif base_confidence >= 55.0:
+            fallback_profile = "DÉSÉQUILIBRÉ"
+            
+        survie_json = f'{{"profil": "{fallback_profile}", "analyse": "Analyse mathématique d\'urgence."}}'
+        
+        return AIAuditReport(
+            confidence_score=base_confidence, 
+            justification=survie_json, 
+            is_approved=True
+        )
 
 class TicketFactory:
     def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, SimulationResult, AIAuditReport]]):
@@ -111,20 +128,20 @@ class TicketFactory:
             p_home, p_draw, p_away = sim.proba_home, sim.proba_draw, sim.proba_away
             base_confidence = max(p_home, p_draw, p_away) 
             
-            # Extraction du JSON de l'IA
+            # Décodage du Cerveau 2 (IA JSON)
             try:
                 ai_data = json.loads(ai.justification)
                 ai_profile = ai_data.get("profil", "INCERTAIN").upper()
                 ai_text = ai_data.get("analyse", "Aucune analyse disponible.")
             except:
-                continue # Si le JSON est cassé, on rejette le match
+                continue 
                 
-            # 🛡️ FILTRE BOOKMAKER : Cote max autorisée pour les paris "Sécurité"
+            # 🛡️ FILTRE ANTI-PIÈGE BOOKMAKER : Cote max autorisée
             MAX_SAFE_ODDS = 1.75
             
-            # ⚖️ LE JUGE SUPRÊME : Croisement des Mathématiques et du Profil IA
+            # ⚖️ LE JUGE SUPRÊME : Distribution des paris selon le profil IA
 
-            # 1. MATCHS DÉSÉQUILIBRÉS (Domination attendue par l'IA)
+            # Profil 1 : DÉSÉQUILIBRÉ
             if ai_profile == "DÉSÉQUILIBRÉ":
                 if p_home >= 55.0:
                     odds = max(1.35, round(100.0/p_home*0.92, 2))
@@ -136,7 +153,7 @@ class TicketFactory:
                     if odds <= MAX_SAFE_ODDS:
                         pool.append({"match": match, "type": f"Victoire {match.away_team} (2)", "odds": odds, "proba": p_away, "ai": ai_text})
 
-            # 2. MATCHS DÉFENSIFS (Fermé, peu de buts attendus)
+            # Profil 2 : DÉFENSIF
             elif ai_profile == "DÉFENSIF":
                 if sim.proba_over_2_5 < 35.0:
                     odds = max(1.40, round(100.0/(100-sim.proba_over_2_5)*0.92, 2))
@@ -148,7 +165,7 @@ class TicketFactory:
                     if odds <= MAX_SAFE_ODDS:
                         pool.append({"match": match, "type": "Les 2 équipes marquent (BTTS : Non)", "odds": odds, "proba": 100 - sim.proba_btts, "ai": ai_text})
 
-            # 3. MATCHS OFFENSIFS (Spectacle, buts des deux côtés)
+            # Profil 3 : OFFENSIF
             elif ai_profile == "OFFENSIF":
                 if sim.proba_over_1_5 >= 78.0:
                     pool.append({"match": match, "type": "Plus de 1,5 buts dans le match", "odds": max(1.20, round(100.0/sim.proba_over_1_5*0.92, 2)), "proba": sim.proba_over_1_5, "ai": ai_text})
@@ -159,12 +176,12 @@ class TicketFactory:
                 if sim.proba_btts >= 62.0:
                     pool.append({"match": match, "type": "Les 2 équipes marquent (BTTS : Oui)", "odds": max(1.60, round(100.0/sim.proba_btts*0.92, 2)), "proba": sim.proba_btts, "ai": ai_text})
 
-            # 4. MATCHS INCERTAINS / PIÈGES (Sécurité maximale via Double Chance)
+            # Profil 4 : INCERTAIN / COUVERTURE
             elif ai_profile == "INCERTAIN":
                 if p_home + p_draw >= 82.0:
-                    pool.append({"match": match, "type": f"Double Chance (1X) : {match.home_team} ou Nul", "odds": max(1.15, round(100.0/(p_home+p_draw)*0.92, 2)), "proba": p_home+p_draw, "ai": f"Match piège, mais {match.home_team} devrait éviter la défaite à domicile."})
+                    pool.append({"match": match, "type": f"Double Chance (1X) : {match.home_team} ou Nul", "odds": max(1.15, round(100.0/(p_home+p_draw)*0.92, 2)), "proba": p_home+p_draw, "ai": ai_text})
                 if p_away + p_draw >= 82.0:
-                    pool.append({"match": match, "type": f"Double Chance (X2) : {match.away_team} ou Nul", "odds": max(1.15, round(100.0/(p_away+p_draw)*0.92, 2)), "proba": p_away+p_draw, "ai": f"Match indécis, couverture sur {match.away_team}."})
+                    pool.append({"match": match, "type": f"Double Chance (X2) : {match.away_team} ou Nul", "odds": max(1.15, round(100.0/(p_away+p_draw)*0.92, 2)), "proba": p_away+p_draw, "ai": ai_text})
 
 
         # 🚀 L'ALGORITHME D'ASSEMBLAGE DES TICKETS
@@ -186,17 +203,17 @@ class TicketFactory:
                         return combo
             return None
 
-        # 🌟 Combiné du Jour (Sécurité Maximale : Exige 75% de réussite minimum)
+        # 🌟 Combiné du Jour (Sécurité Maximale)
         combo_jour = get_best_combo(pool, 1.8, 3.5, 2, 4, min_proba_threshold=75.0)
         if combo_jour:
             portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo_jour, TicketCategory.ULTRA_SAFE, "🌟 COMBINÉ DU JOUR (SÉCURITÉ MAX)"))
 
-        # 💎 Combiné VIP (Très haute rentabilité : Exige 62% de réussite minimum)
+        # 💎 Combiné VIP (Rentabilité)
         combo_vip = get_best_combo(pool, 3.0, 5.5, 3, 5, min_proba_threshold=62.0)
         if combo_vip:
             portfolio[TicketCategory.VIP].append(self._format_combo(combo_vip, TicketCategory.VIP, "💎 COMBINÉ VIP (RENTABILITÉ)"))
 
-        # 🚀 Value Bet (Toutes les opportunités)
+        # 🚀 Value Bet 
         combo_value = get_best_combo(pool, 6.0, 45.0, 4, 7, min_proba_threshold=0.0)
         if combo_value:
             cat_val = TicketCategory.VALUE_BET if hasattr(TicketCategory, 'VALUE_BET') else TicketCategory.VALUE
