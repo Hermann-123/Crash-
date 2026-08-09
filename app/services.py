@@ -3,14 +3,15 @@ import httpx
 import json
 import numpy as np
 from scipy.stats import poisson
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 from datetime import datetime
 from collections import defaultdict
 import itertools
 
-from app.models import MatchData, SimulationResult, AIAuditReport, GeneratedTicket, TicketCategory, SportType
+from app.models import MatchData, SimulationResult, MarketCandidate, AIValidationResult, GeneratedTicket, TicketCategory, SportType
 from app.core import settings, logger
 
+# ⚙️ 1. LE MOTEUR MATHÉMATIQUE (DIXON-COLES)
 class DixonColesEngine:
     def __init__(self, rho: float = -0.15, home_advantage: float = 1.15):
         self.rho = rho
@@ -47,122 +48,166 @@ class DixonColesEngine:
             proba_over_1_5=p_o15, proba_over_2_5=p_o25, proba_over_3_5=p_o35, estimated_corners=est_corners
         )
 
-class AIRiskManager:
-    async def evaluate_match(self, match: MatchData, sim: SimulationResult) -> AIAuditReport:
-        base_confidence = max(sim.proba_home, sim.proba_draw, sim.proba_away)
+# 📊 2. LE GÉNÉRATEUR ET FILTRE DE MARCHÉS (EDGE QUANTITATIF)
+class MarketEngine:
+    def generate_and_filter(self, match: MatchData, sim: SimulationResult, bookmaker_odds: Dict[str, float]) -> List[MarketCandidate]:
+        candidates = []
         
-        if base_confidence < 45.0:
-            return AIAuditReport(confidence_score=base_confidence, justification='{"profil": "VETO", "analyse": "Match trop incertain."}', is_approved=False)
+        # --- 1X2 (Victoires simples) ---
+        if "1" in bookmaker_odds:
+            candidates.append(self._build_candidate("1X2", f"Victoire {match.home_team}", sim.proba_home, bookmaker_odds["1"]))
+        if "2" in bookmaker_odds:
+            candidates.append(self._build_candidate("1X2", f"Victoire {match.away_team}", sim.proba_away, bookmaker_odds["2"]))
+            
+        # --- BUTS (Over/Under) ---
+        if "O1.5" in bookmaker_odds:
+            candidates.append(self._build_candidate("OVER_UNDER", "Plus de 1,5 buts", sim.proba_over_1_5, bookmaker_odds["O1.5"]))
+        if "O2.5" in bookmaker_odds:
+            candidates.append(self._build_candidate("OVER_UNDER", "Plus de 2,5 buts", sim.proba_over_2_5, bookmaker_odds["O2.5"]))
+        if "U2.5" in bookmaker_odds:
+            candidates.append(self._build_candidate("OVER_UNDER", "Moins de 2,5 buts", 100 - sim.proba_over_2_5, bookmaker_odds["U2.5"]))
+        if "U3.5" in bookmaker_odds:
+            candidates.append(self._build_candidate("OVER_UNDER", "Moins de 3,5 buts", 100 - sim.proba_over_3_5, bookmaker_odds["U3.5"]))
 
-        if not settings.GROQ_API_KEY:
-            return AIAuditReport(confidence_score=base_confidence, justification='{"profil": "INCERTAIN", "analyse": "Validation mathématique sans IA."}', is_approved=True)
+        # --- BTTS (Les 2 marquent) ---
+        if "BTTS_Y" in bookmaker_odds:
+            candidates.append(self._build_candidate("BTTS", "BTTS : Oui", sim.proba_btts, bookmaker_odds["BTTS_Y"]))
+        if "BTTS_N" in bookmaker_odds:
+            candidates.append(self._build_candidate("BTTS", "BTTS : Non", 100 - sim.proba_btts, bookmaker_odds["BTTS_N"]))
 
-        proba_u35 = 100 - sim.proba_over_3_5
+        # 🛡️ LE FILTRE INITIAL : On ne garde que les paris avec probabilité > 52% et cote intéressante
+        valid_markets = [c for c in candidates if c.probability >= 52.0 and c.real_odds >= 1.25]
         
-        # 🧠 PROMPT "BÉTON ARMÉ" : Tolérance zéro pour le risque offensif
+        # On trie par probabilité décroissante et on envoie uniquement le TOP 4 à l'IA
+        valid_markets.sort(key=lambda x: x.probability, reverse=True)
+        return valid_markets[:4]
+
+    def _build_candidate(self, m_type: str, selection: str, proba: float, real_odds: float) -> MarketCandidate:
+        implied_proba = (1.0 / real_odds) * 100 if real_odds > 0 else 0
+        edge = proba - implied_proba
+        return MarketCandidate(market_type=m_type, selection=selection, probability=proba, real_odds=real_odds, implied_probability=implied_proba, edge=edge)
+
+# 🧠 3. L'ANALYSTE IA (VALIDATION FINALE)
+class AIValidator:
+    def __init__(self):
+        # ⚡ CONCURRENCE : Permet à 3 requêtes Groq de tourner simultanément (Plus de sleep bloquant !)
+        self.semaphore = asyncio.Semaphore(3) 
+
+    async def evaluate_markets(self, match: MatchData, top_markets: List[MarketCandidate]) -> AIValidationResult:
+        if not top_markets:
+            return AIValidationResult(decision="VETO", reason="Aucun marché mathématiquement viable.")
+
+        market_text = "\n".join([f"- '{m.selection}' | Proba math: {round(m.probability, 1)}% | Cote: {m.real_odds}" for m in top_markets])
+
         prompt = f"""
-        En tant que trader sportif ultra-conservateur, profile la physionomie de ce match : {match.home_team} vs {match.away_team}.
+        Tu es le module d'analyse finale d'un Quant Fund sportif.
+        Analyse tactiquement ce match : {match.home_team} vs {match.away_team}.
         
-        DONNÉES ALGO : Victoire 1: {round(sim.proba_home,1)}%, Victoire 2: {round(sim.proba_away,1)}%, Moins de 3.5 buts: {round(proba_u35,1)}%.
+        Le moteur mathématique a présélectionné ces marchés viables avec leurs vraies cotes bookmaker :
+        {market_text}
         
-        Mission : Renvoie UNIQUEMENT un objet JSON valide.
-        Clés : "profil" ([DÉFENSIF, DÉSÉQUILIBRÉ, INCERTAIN, VETO]) et "analyse".
-        - DÉFENSIF : Match fermé (Moins de 3.5 buts assuré).
-        - DÉSÉQUILIBRÉ : Un favori écrasant.
-        - INCERTAIN : Équipes de force similaire, on privilégiera la double chance.
-        - VETO : Match amical, match à spectacle, ou forte volatilité. Ne prends AUCUN risque offensif.
-        Dans "analyse", cite impérativement la statistique algo qui justifie ton choix (ex: "Avec 82% de chances de moins de 3.5 buts...").
+        Mission :
+        1. Compare les marchés proposés.
+        2. Identifie LE SEUL pari qui présente la sécurité maximale par rapport à sa cote.
+        3. Si le match te semble trop piège, tu dois rejeter (VETO).
+        
+        Renvoie UNIQUEMENT un JSON avec 3 clés :
+        {{
+            "decision": "APPROVED" ou "VETO",
+            "primary_market_selection": "Recopie EXACTEMENT le texte du pari que tu as choisi parmi la liste",
+            "reason": "Analyse tactique et statistique (max 30 mots) justifiant ce choix."
+        }}
         """
         
-        await asyncio.sleep(5.0)
-        
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"},
-                    json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}]}, timeout=10.0
-                )
-                if response.status_code == 200:
-                    ans = response.json()['choices'][0]['message']['content'].strip()
-                    if "```json" in ans: ans = ans.split("```json")[1].split("```")[0]
-                    elif "```" in ans: ans = ans.split("```")[1].split("```")[0]
-                    json.loads(ans)
-                    return AIAuditReport(confidence_score=round(base_confidence, 1), justification=ans, is_approved="VETO" not in ans.upper())
-        except: pass
-        
-        # Mode de survie strict
-        survie = f'{{"profil": "INCERTAIN", "analyse": "Confirmation mathématique d\'urgence : {round(base_confidence,1)}% de fiabilité stat."}}'
-        return AIAuditReport(confidence_score=base_confidence, justification=survie, is_approved=True)
+        async with self.semaphore:
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"},
+                        json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}]}, timeout=12.0
+                    )
+                    if response.status_code == 200:
+                        ans = response.json()['choices'][0]['message']['content'].strip()
+                        if "```json" in ans: ans = ans.split("```json")[1].split("```")[0]
+                        elif "```" in ans: ans = ans.split("```")[1].split("```")[0]
+                        data = json.loads(ans)
+                        
+                        if data.get("decision") == "APPROVED":
+                            chosen_sel = data.get("primary_market_selection", "").strip()
+                            chosen_market = next((m for m in top_markets if m.selection == chosen_sel), None)
+                            
+                            if chosen_market:
+                                return AIValidationResult(decision="APPROVED", primary_market=chosen_market, reason=data.get("reason", ""))
+                        
+                        return AIValidationResult(decision="VETO", reason=data.get("reason", "Jugé trop risqué par l'IA."))
+            except Exception as e:
+                logger.error(f"Erreur IA sur {match.home_team}: {e}")
+                
+        # MODE DE SURVIE : Si l'IA crash, on valide le meilleur pari mathématique (le premier de la liste)
+        if top_markets:
+            return AIValidationResult(decision="APPROVED", primary_market=top_markets[0], reason="Validation mathématique d'urgence (Erreur IA).")
+        return AIValidationResult(decision="VETO", reason="Échec de l'IA et aucun marché de secours.")
 
+# 🚀 4. L'USINE À TICKETS (RÈGLES DE GESTION DE CAPITAL)
 class TicketFactory:
-    def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, SimulationResult, AIAuditReport]]):
+    def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, AIValidationResult]]):
         portfolio = defaultdict(list)
         pool = []
         
-        for match, sim, ai in evaluated_matches:
-            if not ai.is_approved: continue
-            try:
-                ai_data = json.loads(ai.justification)
-                ai_profile, ai_text = ai_data.get("profil", "INCERTAIN").upper(), ai_data.get("analyse", "")
-            except: continue
-                
-            MAX_SAFE_ODDS = 1.65 # Limite stricte individuelle, on ne veut que des probas massives
-            
-            # 1. VICTOIRE ÉCRASANTE (> 65%)
-            if ai_profile == "DÉSÉQUILIBRÉ":
-                if p := (sim.proba_home if sim.proba_home >= 65.0 else sim.proba_away if sim.proba_away >= 65.0 else 0):
-                    odds = max(1.15, round(100.0/p*0.92, 2))
-                    team = match.home_team if sim.proba_home >= 65.0 else match.away_team
-                    if odds <= MAX_SAFE_ODDS: 
-                        pool.append({"match": match, "type": f"Victoire {team}", "odds": odds, "proba": p, "ai": ai_text})
+        # On ne conserve QUE les paris ayant passé le filtre IA ("APPROVED")
+        for match, ai_res in evaluated_matches:
+            if ai_res.decision == "APPROVED" and ai_res.primary_market:
+                pool.append({
+                    "match": match, 
+                    "type": ai_res.primary_market.selection, 
+                    "odds": ai_res.primary_market.real_odds, 
+                    "proba": ai_res.primary_market.probability, 
+                    "ai": ai_res.reason
+                })
 
-            # 2. VERROU DÉFENSIF LARGE (Moins de 3.5 buts)
-            elif ai_profile == "DÉFENSIF":
-                proba_u35 = 100 - sim.proba_over_3_5
-                if proba_u35 >= 75.0:
-                    odds = max(1.15, round(100.0/proba_u35*0.92, 2))
-                    if odds <= MAX_SAFE_ODDS: 
-                        pool.append({"match": match, "type": "Moins de 3,5 buts", "odds": odds, "proba": proba_u35, "ai": ai_text})
-
-            # 3. DOUBLE CHANCE BÉTON (1X ou X2)
-            elif ai_profile == "INCERTAIN":
-                if sim.proba_home + sim.proba_draw >= 82.0:
-                    odds = max(1.10, round(100.0/(sim.proba_home+sim.proba_draw)*0.92, 2))
-                    if odds <= MAX_SAFE_ODDS: 
-                        pool.append({"match": match, "type": f"Double Chance (1X)", "odds": odds, "proba": sim.proba_home+sim.proba_draw, "ai": ai_text})
-                elif sim.proba_away + sim.proba_draw >= 82.0:
-                    odds = max(1.10, round(100.0/(sim.proba_away+sim.proba_draw)*0.92, 2))
-                    if odds <= MAX_SAFE_ODDS: 
-                        pool.append({"match": match, "type": f"Double Chance (X2)", "odds": odds, "proba": sim.proba_away+sim.proba_draw, "ai": ai_text})
-
-        # 🚀 ASSEMBLAGE DES COMBINÉS SÉCURISÉS (Objectif cote >= 2.0)
-        def get_best_combo(pool_list, min_odds, max_odds, min_items, max_items, min_proba_threshold):
-            pool_list = sorted([p for p in pool_list if p['proba'] >= min_proba_threshold], key=lambda x: x['proba'], reverse=True)
+        # 🧩 L'ASSEMBLAGE EXACT (Algorithme de Combinaison)
+        def get_best_combo(pool_list, min_odds, max_odds, min_items, max_items):
+            # On privilégie toujours les probabilités les plus élevées
+            pool_list = sorted(pool_list, key=lambda x: x['proba'], reverse=True)
             for r in range(min_items, max_items + 1):
-                # Limite l'itération aux 20 meilleurs matchs pour la rapidité
+                # Analyse les combinaisons parmi les 20 meilleurs matchs de la journée
                 for combo in itertools.combinations(pool_list[:20], r):
+                    match_ids = [x['match'].match_id for x in combo]
+                    if len(set(match_ids)) != len(match_ids): continue 
+                    
                     total_odds = 1.0
                     for x in combo: total_odds *= x['odds']
-                    if min_odds <= total_odds <= max_odds: return combo
+                    
+                    if min_odds <= round(total_odds, 2) <= max_odds: 
+                        return combo
             return None
 
-        # 🌟 Combiné du Jour : Cote de 2.0 à 3.5 max, avec les matchs les plus fiables
-        if combo_jour := get_best_combo(pool, 2.0, 3.5, 2, 4, 75.0):
-            portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo_jour, TicketCategory.ULTRA_SAFE, "🌟 COMBINÉ DU JOUR (BÉTON ARMÉ)"))
+        # 🌟 COMBINÉ DU JOUR : Exactement 2 Matchs / Cote stricte entre 2.2 et 3.5
+        if combo_jour := get_best_combo(pool, 2.2, 3.5, 2, 2):
+            portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo_jour, TicketCategory.ULTRA_SAFE, "🌟 COMBINÉ DU JOUR (2 MATCHS BÉTON)"))
             
-        if combo_vip := get_best_combo(pool, 3.0, 5.0, 3, 5, 70.0):
-            portfolio[TicketCategory.VIP].append(self._format_combo(combo_vip, TicketCategory.VIP, "💎 COMBINÉ VIP (SÉCURITÉ ÉTENDUE)"))
-            
-        if combo_value := get_best_combo(pool, 5.0, 15.0, 4, 7, 65.0):
-            cat_val = TicketCategory.VALUE_BET if hasattr(TicketCategory, 'VALUE_BET') else TicketCategory.VALUE
-            portfolio[cat_val].append(self._format_combo(combo_value, cat_val, "🚀 VALUE BET (CONSERVATEUR)"))
+        # 💎 COMBINÉ VIP : 3 à 4 Matchs / Cote entre 3.0 et 5.0
+        if combo_vip := get_best_combo(pool, 3.0, 5.0, 3, 4):
+            portfolio[TicketCategory.VIP].append(self._format_combo(combo_vip, TicketCategory.VIP, "💎 COMBINÉ VIP"))
             
         return dict(portfolio)
 
     def _format_combo(self, combo, cat, title):
         total_odds = round(np.prod([c['odds'] for c in combo]), 2)
+        # Probabilité mathématique globale du ticket combiné
         final_proba = round(np.prod([c['proba']/100 for c in combo]) * 100, 1)
-        bet_text = "\n".join([f"*{i}️⃣ {c['match'].home_team} vs {c['match'].away_team}*\n👉 **{c['type']}**\n📊 Cote : {c['odds']} | 🎯 Confiance : {c['proba']:.1f}%\n" for i, c in enumerate(combo, 1)])
-        ai_text = "\n".join([f"✔️ **{c['match'].home_team}** : {c['ai']}" for c in combo])
-        return GeneratedTicket(category=cat, match_id="final", sport=SportType.SOCCER, match_title=title, bet_type=bet_text, odds=total_odds, ai_confidence=final_proba, ai_justification=ai_text)
+        
+        bet_text = "\n".join([f"*{i}️⃣ {c['match'].home_team} vs {c['match'].away_team}*\n👉 **{c['type']}**\n📊 Cote Bookmaker : {c['odds']} | 🎯 Proba Algo : {c['proba']:.1f}%\n" for i, c in enumerate(combo, 1)])
+        ai_text = "\n".join([f"✔️ **{c['match'].home_team}** :\n{c['ai']}\n" for c in combo])
+        
+        return GeneratedTicket(
+            category=cat, 
+            match_id="final", 
+            sport=SportType.SOCCER, 
+            match_title=title, 
+            bet_type=bet_text.strip(), 
+            odds=total_odds, 
+            ai_confidence=final_proba, 
+            ai_justification=ai_text.strip()
+        )
