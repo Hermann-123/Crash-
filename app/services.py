@@ -48,7 +48,7 @@ class DixonColesEngine:
             proba_over_1_5=p_o15, proba_over_2_5=p_o25, proba_over_3_5=p_o35, estimated_corners=est_corners
         )
 
-# 📊 2. LE GÉNÉRATEUR ET FILTRE (Règle stricte : >= 81%)
+# 📊 2. LE GÉNÉRATEUR ET FILTRE (DYNAMIQUE)
 class MarketEngine:
     def generate_and_filter(self, match: MatchData, sim: SimulationResult, bookmaker_odds: Dict[str, float]) -> List[MarketCandidate]:
         candidates = []
@@ -58,27 +58,17 @@ class MarketEngine:
         if "O1.5" in bookmaker_odds: candidates.append(self._build_candidate("OVER_UNDER", "Plus de 1,5 buts", sim.proba_over_1_5, bookmaker_odds["O1.5"]))
         if "O2.5" in bookmaker_odds: candidates.append(self._build_candidate("OVER_UNDER", "Plus de 2,5 buts", sim.proba_over_2_5, bookmaker_odds["O2.5"]))
         if "U2.5" in bookmaker_odds: candidates.append(self._build_candidate("OVER_UNDER", "Moins de 2,5 buts", 100 - sim.proba_over_2_5, bookmaker_odds["U2.5"]))
-        if "U3.5" in bookmaker_odds: candidates.append(self._build_candidate("OVER_UNDER", "Moins de 3,5 buts", 100 - sim.proba_over_3_5, bookmaker_odds["U3.5"]))
+        
+        # 🚨 SUPPRESSION DU "U3.5" : On l'a retiré du code pour éviter le spam !
+        
         if "BTTS_Y" in bookmaker_odds: candidates.append(self._build_candidate("BTTS", "BTTS : Oui", sim.proba_btts, bookmaker_odds["BTTS_Y"]))
         if "BTTS_N" in bookmaker_odds: candidates.append(self._build_candidate("BTTS", "BTTS : Non", 100 - sim.proba_btts, bookmaker_odds["BTTS_N"]))
 
         # 🛡️ FILTRE 81%
         valid_markets = [c for c in candidates if c.probability >= 81.0 and 1.15 <= c.real_odds <= 1.90]
-        
-        # 🛑 ANTI-SATURATION
-        has_under = False
-        diverse_markets = []
         valid_markets.sort(key=lambda x: x.probability, reverse=True)
-        
-        for m in valid_markets:
-            if "Moins" in m.selection:
-                if not has_under:
-                    diverse_markets.append(m)
-                    has_under = True
-            else:
-                diverse_markets.append(m)
                 
-        return diverse_markets[:4]
+        return valid_markets[:4]
 
     def _build_candidate(self, m_type: str, selection: str, proba: float, real_odds: float) -> MarketCandidate:
         return MarketCandidate(market_type=m_type, selection=selection, probability=proba, real_odds=real_odds, 
@@ -89,50 +79,51 @@ class MarketEngine:
 class AIValidator:
     def __init__(self):
         self.semaphore = asyncio.Semaphore(1) 
-        # URL pure pour éviter les bugs de liens markdown
         self.api_url = "https://api.groq.com/openai/v1/chat/completions"
 
-    # Fonction ultra-robuste pour lire le JSON même si l'IA bavarde
     def _extract_json(self, text: str) -> dict:
         try:
             start = text.find('{')
             end = text.rfind('}')
-            if start != -1 and end != -1:
-                return json.loads(text[start:end+1])
+            if start != -1 and end != -1: return json.loads(text[start:end+1])
             return {}
-        except:
-            return {}
+        except: return {}
 
     async def evaluate_markets(self, match: MatchData, top_markets: List[MarketCandidate]) -> AIValidationResult:
         if not top_markets: return AIValidationResult(decision="VETO", reason="Aucun marché n'atteint les 81%.")
 
         market_text = "\n".join([f"- '{m.selection}' (Proba: {round(m.probability, 1)}%, Cote: {m.real_odds})" for m in top_markets])
 
+        # 🧠 CERVEAU 1 (Obligation de privilégier les vrais paris)
         prompt_c1 = f"""
-        Tu es le CERVEAU 1 (Analyste). Match: {match.home_team} vs {match.away_team}.
+        Tu es le CERVEAU 1. Match: {match.home_team} vs {match.away_team}.
         Voici les marchés à plus de 81% de fiabilité :
         {market_text}
-        Choisis LE MEILLEUR pari. Renvoie UNIQUEMENT un JSON strict : {{"decision": "APPROVED", "pari": "Recopie le texte du pari", "raison": "..."}}
+        
+        RÈGLE D'OR : Privilégie TOUJOURS une "Victoire", un pari "Plus de buts" ou "BTTS : Oui" s'ils sont dans la liste. Ne choisis un pari "Moins de buts" que si c'est l'unique choix possible.
+        
+        Choisis LE MEILLEUR pari. Renvoie UNIQUEMENT un JSON strict : {{"decision": "APPROVED", "pari": "Recopie le texte exact", "raison": "..."}}
         """
         
         async with self.semaphore:
             await asyncio.sleep(1.2)
             try:
                 async with httpx.AsyncClient() as client:
-                    # CERVEAU 1
                     res1 = await client.post(self.api_url, headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"}, json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt_c1}]}, timeout=10.0)
                     if res1.status_code == 200:
                         ans1 = res1.json()['choices'][0]['message']['content']
                         data1 = self._extract_json(ans1)
                         chosen_sel = data1.get("pari", "")
                         
-                        # CERVEAU 2
+                        # 🧠 CERVEAU 2 (Recadré pour ne plus demander les actualités)
                         if data1.get("decision") == "APPROVED" and chosen_sel:
                             prompt_c2 = f"""
-                            Tu es le CERVEAU 2 (Juge des Risques). 
-                            Le Cerveau 1 propose de parier sur '{chosen_sel}' pour le match {match.home_team} vs {match.away_team}.
-                            Ta mission : Chercher le piège. Si tu penses que ce pari est 100% béton, réponds APPROVED. Si tu as le moindre doute, réponds VETO.
-                            Renvoie UNIQUEMENT un JSON strict : {{"decision": "APPROVED" ou "VETO", "raison": "Ton avis strict"}}
+                            Tu es le CERVEAU 2 (Juge des Risques). Le Cerveau 1 propose '{chosen_sel}' pour {match.home_team} vs {match.away_team}.
+                            
+                            RÈGLE ABSOLUE : Tu n'as pas besoin de connaître l'actualité ou les blessures de ces équipes. Juge UNIQUEMENT sur la pure logique tactique de cette confrontation.
+                            Si la logique globale te semble solide, réponds APPROVED. Si tu détectes une aberration, réponds VETO.
+                            
+                            Renvoie UNIQUEMENT un JSON strict : {{"decision": "APPROVED" ou "VETO", "raison": "Ton avis tactique (max 15 mots)"}}
                             """
                             await asyncio.sleep(1.2)
                             res2 = await client.post(self.api_url, headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"}, json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt_c2}]}, timeout=10.0)
@@ -144,41 +135,47 @@ class AIValidator:
                                 if data2.get("decision") == "APPROVED":
                                     chosen_market = next((m for m in top_markets if m.selection == chosen_sel), None)
                                     if chosen_market:
-                                        return AIValidationResult(decision="APPROVED", primary_market=chosen_market, reason=f"Double Validation IA : {data2.get('raison')}")
+                                        return AIValidationResult(decision="APPROVED", primary_market=chosen_market, reason=f"{data2.get('raison')}")
                                 
-                                return AIValidationResult(decision="VETO", reason=f"VETO Cerveau 2 : {data2.get('raison', 'Risque détecté.')}")
-            except Exception as e: 
-                logger.error(f"Erreur Double IA sur {match.home_team}: {e}")
+                                return AIValidationResult(decision="VETO", reason=f"VETO C2: {data2.get('raison', 'Risque détecté.')}")
+            except Exception as e: logger.error(f"Erreur IA : {e}")
                 
-        return AIValidationResult(decision="VETO", reason="Échec technique de la Double Vérification IA.")
+        return AIValidationResult(decision="VETO", reason="Erreur de vérification IA.")
 
 # 🚀 4. L'USINE À TICKETS
 class TicketFactory:
-    def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, AIValidationResult]]):
+        def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, AIValidationResult]]):
         portfolio = defaultdict(list)
+        # On ne garde que les paris ayant un "Edge" positif (Value) ou une très haute probabilité
         pool = []
         
         for match, ai_res in evaluated_matches:
             if ai_res.decision == "APPROVED" and ai_res.primary_market:
-                pool.append({"match": match, "type": ai_res.primary_market.selection, "odds": ai_res.primary_market.real_odds, "proba": ai_res.primary_market.probability, "ai": ai_res.reason})
+                # 🛡️ FILTRE DE VALEUR PROFESSIONNEL
+                # On exige un Edge > 2% (Mathématiquement, c'est ce qui bat le bookmaker sur le long terme)
+                if ai_res.primary_market.edge > 2.0:
+                    pool.append({
+                        "match": match, 
+                        "type": ai_res.primary_market.selection, 
+                        "odds": ai_res.primary_market.real_odds, 
+                        "proba": ai_res.primary_market.probability, 
+                        "ai": ai_res.reason
+                    })
 
-        def get_best_combo(pool_list, min_odds, max_odds, min_items, max_items):
-            pool_list = sorted(pool_list, key=lambda x: x['proba'], reverse=True)
-            for r in range(min_items, max_items + 1):
-                for combo in itertools.combinations(pool_list[:20], r):
-                    match_ids = [x['match'].match_id for x in combo]
-                    if len(set(match_ids)) != len(match_ids): continue 
-                    
-                    total_odds = 1.0
-                    for x in combo: total_odds *= x['odds']
-                    
-                    if min_odds <= round(total_odds, 2) <= max_odds: return combo
+        # 🚀 ASSEMBLEUR : 2 matchs, cote entre 2.2 et 3.5
+        # Cette fois, on trie par "Edge" (Value) plutôt que par probabilité pure
+        def get_best_value_combo(pool_list, min_odds, max_odds):
+            pool_list = sorted(pool_list, key=lambda x: x['edge'], reverse=True)
+            for combo in itertools.combinations(pool_list[:10], 2): # Le top 10 des meilleures valeurs
+                total_odds = combo[0]['odds'] * combo[1]['odds']
+                if min_odds <= round(total_odds, 2) <= max_odds: return combo
             return None
 
-        if combo_jour := get_best_combo(pool, 2.2, 3.5, 2, 2):
-            portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo_jour, TicketCategory.ULTRA_SAFE, "🌟 COMBINÉ DU JOUR (DOUBLE IA - 81%+)"))
+        if combo := get_best_value_combo(pool, 2.2, 3.5):
+            portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo, TicketCategory.ULTRA_SAFE, "📈 COMBINÉ VALUE BET (APPROCHE PRO)"))
             
         return dict(portfolio)
+
 
     def _format_combo(self, combo, cat, title):
         total_odds = round(np.prod([c['odds'] for c in combo]), 2)
