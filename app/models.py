@@ -41,6 +41,22 @@ class AIAuditReport(BaseModel):
     justification: str
     is_approved: bool
 
+# --- 🚀 AJOUTS POUR LE NOUVEAU MOTEUR QUANTITATIF ---
+class MarketCandidate(BaseModel):
+    market_type: str        
+    selection: str          
+    probability: float      
+    real_odds: float        
+    implied_probability: float 
+    edge: float             
+    confidence: float = 0.0 
+
+class AIValidationResult(BaseModel):
+    decision: str           
+    primary_market: Optional[MarketCandidate] = None
+    reason: str             
+# ----------------------------------------------------
+
 class GeneratedTicket(BaseModel):
     category: TicketCategory
     match_id: str
