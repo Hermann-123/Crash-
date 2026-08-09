@@ -25,7 +25,8 @@ API_KEY_ODDS = "55a670c7b44c3dcc3c9750e9f5c51da1"
 
 async def fetch_real_odds_matches() -> list:
     # 🚨 MODIFICATION CRUCIALE : Ajout de 'totals' et 'btts' dans l'URL
-    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={API_KEY_ODDS}&regions=eu&markets=h2h,totals,btts"
+        url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={API_KEY_ODDS}&regions=eu&markets=h2h,totals"
+    
     matches_and_odds = []
     today_str = datetime.now().strftime("%Y-%m-%d")
     
