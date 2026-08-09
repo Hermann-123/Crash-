@@ -136,8 +136,8 @@ class MarketAnalyzer:
         add_candidate("1X2", f"Victoire {match.away_team}", sim.proba_away, 10, "2")
         add_candidate("OVER_UNDER", "Plus de 1,5 buts", sim.proba_over_1_5, 7, "O1.5")
         add_candidate("OVER_UNDER", "Plus de 2,5 buts", sim.proba_over_2_5, 8, "O2.5")
-        add_candidate("OVER_UNDER", "Moins de 2,5 buts", 100 - sim.proba_over_2_5, 7, "U2.5")
-        add_candidate("OVER_UNDER", "Moins de 3,5 buts", 100 - sim.proba_over_3_5, 6, "U3.5")
+        #add_candidate("OVER_UNDER", "Moins de 2,5 buts", 100 - sim.proba_over_2_5, 7, "U2.5")
+        #add_candidate("OVER_UNDER", "Moins de 3,5 buts", 100 - sim.proba_over_3_5, 6, "U3.5")
         add_candidate("BTTS", "BTTS Oui", sim.proba_btts, 8, "BTTS_Y")
         add_candidate("BTTS", "BTTS Non", 100 - sim.proba_btts, 6, "BTTS_N")
 
