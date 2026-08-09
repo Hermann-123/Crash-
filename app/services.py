@@ -144,38 +144,31 @@ class AIValidator:
 
 # 🚀 4. L'USINE À TICKETS
 class TicketFactory:
-        def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, AIValidationResult]]):
+    def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, AIValidationResult]]):
         portfolio = defaultdict(list)
-        # On ne garde que les paris ayant un "Edge" positif (Value) ou une très haute probabilité
         pool = []
         
         for match, ai_res in evaluated_matches:
             if ai_res.decision == "APPROVED" and ai_res.primary_market:
-                # 🛡️ FILTRE DE VALEUR PROFESSIONNEL
-                # On exige un Edge > 2% (Mathématiquement, c'est ce qui bat le bookmaker sur le long terme)
-                if ai_res.primary_market.edge > 2.0:
-                    pool.append({
-                        "match": match, 
-                        "type": ai_res.primary_market.selection, 
-                        "odds": ai_res.primary_market.real_odds, 
-                        "proba": ai_res.primary_market.probability, 
-                        "ai": ai_res.reason
-                    })
+                pool.append({"match": match, "type": ai_res.primary_market.selection, "odds": ai_res.primary_market.real_odds, "proba": ai_res.primary_market.probability, "ai": ai_res.reason})
 
-        # 🚀 ASSEMBLEUR : 2 matchs, cote entre 2.2 et 3.5
-        # Cette fois, on trie par "Edge" (Value) plutôt que par probabilité pure
-        def get_best_value_combo(pool_list, min_odds, max_odds):
-            pool_list = sorted(pool_list, key=lambda x: x['edge'], reverse=True)
-            for combo in itertools.combinations(pool_list[:10], 2): # Le top 10 des meilleures valeurs
-                total_odds = combo[0]['odds'] * combo[1]['odds']
-                if min_odds <= round(total_odds, 2) <= max_odds: return combo
+        def get_best_combo(pool_list, min_odds, max_odds, min_items, max_items):
+            pool_list = sorted(pool_list, key=lambda x: x['proba'], reverse=True)
+            for r in range(min_items, max_items + 1):
+                for combo in itertools.combinations(pool_list[:20], r):
+                    match_ids = [x['match'].match_id for x in combo]
+                    if len(set(match_ids)) != len(match_ids): continue 
+                    
+                    total_odds = 1.0
+                    for x in combo: total_odds *= x['odds']
+                    
+                    if min_odds <= round(total_odds, 2) <= max_odds: return combo
             return None
 
-        if combo := get_best_value_combo(pool, 2.2, 3.5):
-            portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo, TicketCategory.ULTRA_SAFE, "📈 COMBINÉ VALUE BET (APPROCHE PRO)"))
+        if combo_jour := get_best_combo(pool, 2.2, 3.5, 2, 2):
+            portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo_jour, TicketCategory.ULTRA_SAFE, "🌟 COMBINÉ DU JOUR (DOUBLE IA - 81%+)"))
             
         return dict(portfolio)
-
 
     def _format_combo(self, combo, cat, title):
         total_odds = round(np.prod([c['odds'] for c in combo]), 2)
