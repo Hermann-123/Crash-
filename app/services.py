@@ -1,183 +1,267 @@
+# app/services.py
+#
+# WALLSTREET OS - PROFESSIONAL ANALYSIS ENGINE (QUANT FUND V4)
+# ------------------------------------------------------------
 import asyncio
-import httpx
 import json
+import itertools
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
+
+import httpx
 import numpy as np
 from scipy.stats import poisson
-from typing import List, Tuple, Dict
-from datetime import datetime
-from collections import defaultdict
-import itertools
 
-from app.models import MatchData, SimulationResult, MarketCandidate, AIValidationResult, GeneratedTicket, TicketCategory, SportType
+from app.models import MatchData, SimulationResult, AIAuditReport, GeneratedTicket, TicketCategory, SportType
 from app.core import settings, logger
 
-# ⚙️ 1. LE MOTEUR MATHÉMATIQUE
+# ============================================================
+# CONFIGURATION DU MOTEUR
+# ============================================================
+MIN_MARKET_SCORE = 52.0  # Plus bas pour laisser l'Edge s'exprimer
+MAX_MATCHES_PER_CATEGORY = 2 # Objectif Hermann : Exactement 2 matchs
+AI_TIMEOUT = 12.0
+
+@dataclass
+class MarketCandidate:
+    match: MatchData
+    market: str
+    selection: str
+    probability: float
+    odds: Optional[float]
+    mathematical_score: float
+    explanation: str
+    edge: float
+    priority: int = 0
+
+def clamp(value: float, minimum: float = 0.0, maximum: float = 100.0) -> float:
+    return max(minimum, min(maximum, float(value)))
+
+def safe_probability(value: float) -> float:
+    return round(clamp(value), 2)
+
+def normalize_market_name(name: str) -> str:
+    return name.lower().replace(" ", "_").replace(".", "_").replace(",", "_")
+
+# ============================================================
+# 1. MOTEUR DIXON-COLES
+# ============================================================
 class DixonColesEngine:
-    def __init__(self, rho: float = -0.15, home_advantage: float = 1.15):
+    def __init__(self, rho: float = -0.15, home_advantage: float = 1.15, max_goals: int = 8):
         self.rho = rho
         self.home_advantage = home_advantage
-        self.max_goals = 6
+        self.max_goals = max_goals
+
+    def _tau(self, x: int, y: int, lambda_x: float, mu_y: float) -> float:
+        if x == 0 and y == 0: return 1.0 - lambda_x * mu_y * self.rho
+        if x == 0 and y == 1: return 1.0 + lambda_x * self.rho
+        if x == 1 and y == 0: return 1.0 + mu_y * self.rho
+        if x == 1 and y == 1: return 1.0 - self.rho
+        return 1.0
+
+    def _expected_goals(self, match: MatchData) -> Tuple[float, float]:
+        home_odds = max(match.home_odds, 1.01)
+        away_odds = max(match.away_odds, 1.01)
+        lambda_home = ((1.0 / home_odds) * 1.8 * self.home_advantage)
+        lambda_away = ((1.0 / away_odds) * 1.8)
+        return (max(lambda_home, 0.05), max(lambda_away, 0.05))
 
     def simulate(self, match: MatchData) -> SimulationResult:
-        lambda_x = (1.0 / match.home_odds) * 1.8 * self.home_advantage
-        mu_y = (1.0 / match.away_odds) * 1.8
-        matrix = np.zeros((self.max_goals, self.max_goals))
+        lambda_home, lambda_away = self._expected_goals(match)
+        matrix = np.zeros((self.max_goals, self.max_goals), dtype=float)
+
+        for home_goals in range(self.max_goals):
+            for away_goals in range(self.max_goals):
+                base_probability = poisson.pmf(home_goals, lambda_home) * poisson.pmf(away_goals, lambda_away)
+                correction = self._tau(home_goals, away_goals, lambda_home, lambda_away)
+                matrix[home_goals, away_goals] = max(base_probability * correction, 0.0)
+
+        total = matrix.sum()
+        if total <= 0: matrix[:] = 1.0 / matrix.size
+        else: matrix /= total
+
+        p_home = np.tril(matrix, -1).sum() * 100
+        p_draw = np.diag(matrix).sum() * 100
+        p_away = np.triu(matrix, 1).sum() * 100
+
+        p_btts_yes = matrix[1:, 1:].sum() * 100
+        
+        p_over_1_5 = 0.0
+        p_over_2_5 = 0.0
+        p_over_3_5 = 0.0
 
         for i in range(self.max_goals):
             for j in range(self.max_goals):
-                matrix[i, j] = poisson.pmf(i, lambda_x) * poisson.pmf(j, mu_y)
+                goals = i + j
+                prob = matrix[i, j]
+                if goals > 1: p_over_1_5 += prob * 100
+                if goals > 2: p_over_2_5 += prob * 100
+                if goals > 3: p_over_3_5 += prob * 100
+
+        best_index = np.argmax(matrix)
+        score_home, score_away = np.unravel_index(best_index, matrix.shape)
         
-        matrix /= np.sum(matrix)
-        p_home = float(np.sum(np.tril(matrix, -1))) * 100
-        p_draw = float(np.sum(np.diag(matrix))) * 100
-        p_away = float(np.sum(np.triu(matrix, 1))) * 100
-
-        best_idx = np.argmax(matrix)
-        score_x, score_y = np.unravel_index(best_idx, matrix.shape)
-
-        p_btts = float(np.sum(matrix[1:, 1:])) * 100
-        p_o15 = float(np.sum([matrix[i, j] for i in range(self.max_goals) for j in range(self.max_goals) if i + j > 1])) * 100
-        p_o25 = float(np.sum([matrix[i, j] for i in range(self.max_goals) for j in range(self.max_goals) if i + j > 2])) * 100
-        p_o35 = float(np.sum([matrix[i, j] for i in range(self.max_goals) for j in range(self.max_goals) if i + j > 3])) * 100
-
-        est_corners = round(8.5 + (lambda_x + mu_y) * 1.5, 1)
+        est_corners = round(8.5 + (lambda_home + lambda_away) * 1.5, 1)
 
         return SimulationResult(
-            match_id=match.match_id, proba_home=p_home, proba_draw=p_draw, proba_away=p_away, 
-            most_likely_score=f"{score_x}-{score_y}", proba_btts=p_btts, 
-            proba_over_1_5=p_o15, proba_over_2_5=p_o25, proba_over_3_5=p_o35, estimated_corners=est_corners
+            match_id=match.match_id, proba_home=safe_probability(p_home), proba_draw=safe_probability(p_draw),
+            proba_away=safe_probability(p_away), most_likely_score=f"{score_home}-{score_away}",
+            proba_btts=safe_probability(p_btts_yes), proba_over_1_5=safe_probability(p_over_1_5),
+            proba_over_2_5=safe_probability(p_over_2_5), proba_over_3_5=safe_probability(p_over_3_5), estimated_corners=est_corners
         )
 
-# 📊 2. LE GÉNÉRATEUR ET FILTRE (DYNAMIQUE)
-class MarketEngine:
-    def generate_and_filter(self, match: MatchData, sim: SimulationResult, bookmaker_odds: Dict[str, float]) -> List[MarketCandidate]:
+# ============================================================
+# 2. GENERATEUR DE MARCHES (VRAIES COTES ET EDGE)
+# ============================================================
+class MarketAnalyzer:
+    def generate_candidates(self, match: MatchData, sim: SimulationResult, bookmaker_odds: Dict[str, float]) -> List[MarketCandidate]:
         candidates = []
         
-        if "1" in bookmaker_odds: candidates.append(self._build_candidate("1X2", f"Victoire {match.home_team}", sim.proba_home, bookmaker_odds["1"]))
-        if "2" in bookmaker_odds: candidates.append(self._build_candidate("1X2", f"Victoire {match.away_team}", sim.proba_away, bookmaker_odds["2"]))
-        if "O1.5" in bookmaker_odds: candidates.append(self._build_candidate("OVER_UNDER", "Plus de 1,5 buts", sim.proba_over_1_5, bookmaker_odds["O1.5"]))
-        if "O2.5" in bookmaker_odds: candidates.append(self._build_candidate("OVER_UNDER", "Plus de 2,5 buts", sim.proba_over_2_5, bookmaker_odds["O2.5"]))
-        if "U2.5" in bookmaker_odds: candidates.append(self._build_candidate("OVER_UNDER", "Moins de 2,5 buts", 100 - sim.proba_over_2_5, bookmaker_odds["U2.5"]))
-        
-        # 🚨 SUPPRESSION DU "U3.5" : On l'a retiré du code pour éviter le spam !
-        
-        if "BTTS_Y" in bookmaker_odds: candidates.append(self._build_candidate("BTTS", "BTTS : Oui", sim.proba_btts, bookmaker_odds["BTTS_Y"]))
-        if "BTTS_N" in bookmaker_odds: candidates.append(self._build_candidate("BTTS", "BTTS : Non", 100 - sim.proba_btts, bookmaker_odds["BTTS_N"]))
+        # Helper pour injecter la vraie cote et calculer l'Edge
+        def add_candidate(m_type, selection, proba, priority, odds_key):
+            real_odds = bookmaker_odds.get(odds_key)
+            if real_odds:
+                implied = (1.0 / real_odds) * 100
+                edge = proba - implied
+                # On ne garde que si l'Edge est positif et la cote réaliste
+                if edge > 0 and 1.25 <= real_odds <= 2.20:
+                    candidates.append(MarketCandidate(
+                        match=match, market=m_type, selection=selection, probability=proba,
+                        odds=real_odds, mathematical_score=proba, 
+                        explanation=f"Proba:{proba:.1f}% | Cote:{real_odds} | Edge:{edge:.1f}%", edge=edge, priority=priority
+                    ))
 
-        # 🛡️ FILTRE 81%
-        valid_markets = [c for c in candidates if c.probability >= 81.0 and 1.15 <= c.real_odds <= 1.90]
-        valid_markets.sort(key=lambda x: x.probability, reverse=True)
-                
-        return valid_markets[:4]
+        add_candidate("1X2", f"Victoire {match.home_team}", sim.proba_home, 10, "1")
+        add_candidate("1X2", f"Victoire {match.away_team}", sim.proba_away, 10, "2")
+        add_candidate("OVER_UNDER", "Plus de 1,5 buts", sim.proba_over_1_5, 7, "O1.5")
+        add_candidate("OVER_UNDER", "Plus de 2,5 buts", sim.proba_over_2_5, 8, "O2.5")
+        add_candidate("OVER_UNDER", "Moins de 2,5 buts", 100 - sim.proba_over_2_5, 7, "U2.5")
+        add_candidate("OVER_UNDER", "Moins de 3,5 buts", 100 - sim.proba_over_3_5, 6, "U3.5")
+        add_candidate("BTTS", "BTTS Oui", sim.proba_btts, 8, "BTTS_Y")
+        add_candidate("BTTS", "BTTS Non", 100 - sim.proba_btts, 6, "BTTS_N")
 
-    def _build_candidate(self, m_type: str, selection: str, proba: float, real_odds: float) -> MarketCandidate:
-        return MarketCandidate(market_type=m_type, selection=selection, probability=proba, real_odds=real_odds, 
-                               implied_probability=(1.0 / real_odds) * 100 if real_odds > 0 else 0, 
-                               edge=proba - ((1.0 / real_odds) * 100 if real_odds > 0 else 0))
+        return candidates
 
-# 🧠🧠 3. L'ANALYSTE À DOUBLE CERVEAU
-class AIValidator:
+# ============================================================
+# 3. IA - SECOND AVIS (Juge de l'Edge)
+# ============================================================
+class AIRiskManager:
     def __init__(self):
-        self.semaphore = asyncio.Semaphore(1) 
-        self.api_url = "https://api.groq.com/openai/v1/chat/completions"
+        self.semaphore = asyncio.Semaphore(2)
 
     def _extract_json(self, text: str) -> dict:
         try:
-            start = text.find('{')
-            end = text.rfind('}')
-            if start != -1 and end != -1: return json.loads(text[start:end+1])
-            return {}
+            s = text.find('{')
+            e = text.rfind('}')
+            return json.loads(text[s:e+1]) if s != -1 and e != -1 else {}
         except: return {}
 
-    async def evaluate_markets(self, match: MatchData, top_markets: List[MarketCandidate]) -> AIValidationResult:
-        if not top_markets: return AIValidationResult(decision="VETO", reason="Aucun marché n'atteint les 81%.")
+    async def evaluate_match(self, match: MatchData, sim: SimulationResult, candidates: List[MarketCandidate]) -> AIAuditReport:
+        valid = [c for c in candidates if c.mathematical_score >= MIN_MARKET_SCORE]
+        if not valid: return AIAuditReport(confidence_score=0.0, justification="VETO: Pas de Value Bet.", is_approved=False)
 
-        market_text = "\n".join([f"- '{m.selection}' (Proba: {round(m.probability, 1)}%, Cote: {m.real_odds})" for m in top_markets])
+        valid.sort(key=lambda x: (x.edge, x.priority), reverse=True)
+        top_candidates = valid[:5]
+        
+        market_context = [{"selection": c.selection, "probability": c.probability, "odds": c.odds, "edge": round(c.edge,1)} for c in top_candidates]
 
-        # 🧠 CERVEAU 1 (Obligation de privilégier les vrais paris)
-        prompt_c1 = f"""
-        Tu es le CERVEAU 1. Match: {match.home_team} vs {match.away_team}.
-        Voici les marchés à plus de 81% de fiabilité :
-        {market_text}
+        prompt = f"""
+        Tu es le gestionnaire des risques d'un Quant Fund sportif. Match : {match.home_team} vs {match.away_team}.
+        Voici les SEULES opportunités "Value Bet" (avec un edge positif par rapport au bookmaker) :
+        {json.dumps(market_context, ensure_ascii=False, indent=2)}
         
-        RÈGLE D'OR : Privilégie TOUJOURS une "Victoire", un pari "Plus de buts" ou "BTTS : Oui" s'ils sont dans la liste. Ne choisis un pari "Moins de buts" que si c'est l'unique choix possible.
+        Mission :
+        1. Choisis le marché qui offre le meilleur équilibre entre Sécurité (probabilité) et Rentabilité (Edge).
+        2. Recopie EXACTEMENT le texte de la sélection.
         
-        Choisis LE MEILLEUR pari. Renvoie UNIQUEMENT un JSON strict : {{"decision": "APPROVED", "pari": "Recopie le texte exact", "raison": "..."}}
+        Réponds UNIQUEMENT via ce JSON : {{"decision": "ACCEPT", "selection": "texte", "reason": "Justification (max 15 mots)"}}
         """
-        
+
         async with self.semaphore:
             await asyncio.sleep(1.2)
             try:
                 async with httpx.AsyncClient() as client:
-                    res1 = await client.post(self.api_url, headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"}, json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt_c1}]}, timeout=10.0)
-                    if res1.status_code == 200:
-                        ans1 = res1.json()['choices'][0]['message']['content']
-                        data1 = self._extract_json(ans1)
-                        chosen_sel = data1.get("pari", "")
+                    resp = await client.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"}, json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}]}, timeout=AI_TIMEOUT)
+                    if resp.status_code == 200:
+                        data = self._extract_json(resp.json()['choices'][0]['message']['content'])
                         
-                        # 🧠 CERVEAU 2 (Recadré pour ne plus demander les actualités)
-                        if data1.get("decision") == "APPROVED" and chosen_sel:
-                            prompt_c2 = f"""
-                            Tu es le CERVEAU 2 (Juge des Risques). Le Cerveau 1 propose '{chosen_sel}' pour {match.home_team} vs {match.away_team}.
-                            
-                            RÈGLE ABSOLUE : Tu n'as pas besoin de connaître l'actualité ou les blessures de ces équipes. Juge UNIQUEMENT sur la pure logique tactique de cette confrontation.
-                            Si la logique globale te semble solide, réponds APPROVED. Si tu détectes une aberration, réponds VETO.
-                            
-                            Renvoie UNIQUEMENT un JSON strict : {{"decision": "APPROVED" ou "VETO", "raison": "Ton avis tactique (max 15 mots)"}}
-                            """
-                            await asyncio.sleep(1.2)
-                            res2 = await client.post(self.api_url, headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"}, json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt_c2}]}, timeout=10.0)
-                            
-                            if res2.status_code == 200:
-                                ans2 = res2.json()['choices'][0]['message']['content']
-                                data2 = self._extract_json(ans2)
-                                
-                                if data2.get("decision") == "APPROVED":
-                                    chosen_market = next((m for m in top_markets if m.selection == chosen_sel), None)
-                                    if chosen_market:
-                                        return AIValidationResult(decision="APPROVED", primary_market=chosen_market, reason=f"{data2.get('raison')}")
-                                
-                                return AIValidationResult(decision="VETO", reason=f"VETO C2: {data2.get('raison', 'Risque détecté.')}")
-            except Exception as e: logger.error(f"Erreur IA : {e}")
+                        if data.get("decision") == "ACCEPT":
+                            sel = data.get("selection", "")
+                            chosen = next((c for c in top_candidates if c.selection == sel), None)
+                            if chosen:
+                                return AIAuditReport(confidence_score=chosen.probability, justification=json.dumps({"market": chosen.market, "selection": chosen.selection, "reason": data.get("reason"), "odds": chosen.odds}), is_approved=True)
+                        return AIAuditReport(confidence_score=0, justification="VETO IA", is_approved=False)
+            except Exception as exc:
+                logger.error(f"Erreur AI : {exc}")
                 
-        return AIValidationResult(decision="VETO", reason="Erreur de vérification IA.")
+        # Fallback ultra-sécurisé
+        best = top_candidates[0]
+        return AIAuditReport(confidence_score=best.probability, justification=json.dumps({"market": best.market, "selection": best.selection, "reason": "Sélection par Edge max (Erreur IA).", "odds": best.odds}), is_approved=True)
 
-# 🚀 4. L'USINE À TICKETS
+# ============================================================
+# 4. FABRIQUE DE TICKETS (L'Assembleur 100 000 FCFA)
+# ============================================================
 class TicketFactory:
-    def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, AIValidationResult]]):
+    def build_portfolio(self, evaluated_matches: List[Tuple[MatchData, SimulationResult, AIAuditReport]]):
         portfolio = defaultdict(list)
-        pool = []
-        
-        for match, ai_res in evaluated_matches:
-            if ai_res.decision == "APPROVED" and ai_res.primary_market:
-                pool.append({"match": match, "type": ai_res.primary_market.selection, "odds": ai_res.primary_market.real_odds, "proba": ai_res.primary_market.probability, "ai": ai_res.reason})
+        selected = []
 
-        def get_best_combo(pool_list, min_odds, max_odds, min_items, max_items):
-            pool_list = sorted(pool_list, key=lambda x: x['proba'], reverse=True)
-            for r in range(min_items, max_items + 1):
-                for combo in itertools.combinations(pool_list[:20], r):
-                    match_ids = [x['match'].match_id for x in combo]
-                    if len(set(match_ids)) != len(match_ids): continue 
-                    
-                    total_odds = 1.0
-                    for x in combo: total_odds *= x['odds']
-                    
-                    if min_odds <= round(total_odds, 2) <= max_odds: return combo
-            return None
+        for match, sim, ai in evaluated_matches:
+            if not ai.is_approved: continue
+            try:
+                data = json.loads(ai.justification)
+                selected.append({
+                    "match": match, "selection": data["selection"], 
+                    "odds": float(data.get("odds", 0.0)), "confidence": ai.confidence_score, "ai_reason": data["reason"]
+                })
+            except: continue
 
-        if combo_jour := get_best_combo(pool, 2.2, 3.5, 2, 2):
-            portfolio[TicketCategory.ULTRA_SAFE].append(self._format_combo(combo_jour, TicketCategory.ULTRA_SAFE, "🌟 COMBINÉ DU JOUR (DOUBLE IA - 81%+)"))
-            
+        selected.sort(key=lambda x: x["confidence"], reverse=True)
+
+        # 🚀 ASSEMBLEUR : Exactement 2 matchs, Cote 2.2 à 3.5
+        for combo in itertools.combinations(selected[:15], 2):
+            total_odds = combo[0]["odds"] * combo[1]["odds"]
+            if 2.2 <= round(total_odds, 2) <= 3.5:
+                # Création du ticket parfait
+                bet_text = ""
+                ai_text = ""
+                for i, item in enumerate(combo, 1):
+                    bet_text += f"*{i}️⃣ {item['match'].home_team} vs {item['match'].away_team}*\n👉 **{item['selection']}**\n📊 Cote : {item['odds']} | 🎯 Proba : {item['confidence']:.1f}%\n\n"
+                    ai_text += f"✔️ **{item['match'].home_team}** : {item['ai_reason']}\n\n"
+                
+                final_proba = round((combo[0]["confidence"]/100) * (combo[1]["confidence"]/100) * 100, 1)
+                
+                ticket = GeneratedTicket(
+                    category=TicketCategory.ULTRA_SAFE, match_id="final_quant_combo", sport=SportType.SOCCER,
+                    match_title="🌟 COMBINÉ VALUE BET (APPROCHE PRO)", bet_type=bet_text.strip(), odds=round(total_odds, 2),
+                    ai_confidence=final_proba, ai_justification=ai_text.strip()
+                )
+                portfolio[TicketCategory.ULTRA_SAFE].append(ticket)
+                break # On s'arrête au premier combo parfait généré
+
         return dict(portfolio)
 
-    def _format_combo(self, combo, cat, title):
-        total_odds = round(np.prod([c['odds'] for c in combo]), 2)
-        final_proba = round(np.prod([c['proba']/100 for c in combo]) * 100, 1)
-        
-        bet_text = "\n".join([f"*{i}️⃣ {c['match'].home_team} vs {c['match'].away_team}*\n👉 **{c['type']}**\n📊 Cote : {c['odds']} | 🎯 Proba Algo : {c['proba']:.1f}%\n" for i, c in enumerate(combo, 1)])
-        ai_text = "\n".join([f"✔️ **{c['match'].home_team}** :\n{c['ai']}\n" for c in combo])
-        
-        return GeneratedTicket(
-            category=cat, match_id="final", sport=SportType.SOCCER, match_title=title, 
-            bet_type=bet_text.strip(), odds=total_odds, ai_confidence=final_proba, ai_justification=ai_text.strip()
-        )
+# ============================================================
+# 5. PIPELINE GLOBAL (Utilisé par main.py)
+# ============================================================
+class AnalysisPipeline:
+    def __init__(self):
+        self.math_engine = DixonColesEngine()
+        self.market_analyzer = MarketAnalyzer()
+        self.ai_manager = AIRiskManager()
+        self.ticket_factory = TicketFactory()
+
+    async def analyze_match(self, match: MatchData, bookmaker_odds: Dict[str, float]):
+        simulation = self.math_engine.simulate(match)
+        candidates = self.market_analyzer.generate_candidates(match, simulation, bookmaker_odds)
+        ai_report = await self.ai_manager.evaluate_match(match, simulation, candidates)
+        return (match, simulation, ai_report)
+
+    async def build_daily_portfolio(self, matches_and_odds: List[Tuple[MatchData, Dict[str, float]]]):
+        # On utilise asyncio.gather pour traiter plusieurs matchs très rapidement !
+        tasks = [self.analyze_match(m, odds) for m, odds in matches_and_odds]
+        evaluated = await asyncio.gather(*tasks)
+        return self.ticket_factory.build_portfolio(evaluated)
+
+pipeline = AnalysisPipeline()
