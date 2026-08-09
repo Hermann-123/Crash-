@@ -62,10 +62,10 @@ class MarketEngine:
         if "BTTS_Y" in bookmaker_odds: candidates.append(self._build_candidate("BTTS", "BTTS : Oui", sim.proba_btts, bookmaker_odds["BTTS_Y"]))
         if "BTTS_N" in bookmaker_odds: candidates.append(self._build_candidate("BTTS", "BTTS : Non", 100 - sim.proba_btts, bookmaker_odds["BTTS_N"]))
 
-        # 🛡️ FILTRE 81% : On ne garde QUE les paris à 81% ou plus (Cotes entre 1.15 et 1.90 max pour la sécurité)
+        # 🛡️ FILTRE 81%
         valid_markets = [c for c in candidates if c.probability >= 81.0 and 1.15 <= c.real_odds <= 1.90]
         
-        # 🛑 ANTI-SATURATION : On limite à UN SEUL marché "Moins de buts" pour laisser la place aux Victoires/BTTS
+        # 🛑 ANTI-SATURATION
         has_under = False
         diverse_markets = []
         valid_markets.sort(key=lambda x: x.probability, reverse=True)
@@ -89,56 +89,68 @@ class MarketEngine:
 class AIValidator:
     def __init__(self):
         self.semaphore = asyncio.Semaphore(1) 
+        # URL pure pour éviter les bugs de liens markdown
+        self.api_url = "https://api.groq.com/openai/v1/chat/completions"
+
+    # Fonction ultra-robuste pour lire le JSON même si l'IA bavarde
+    def _extract_json(self, text: str) -> dict:
+        try:
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1:
+                return json.loads(text[start:end+1])
+            return {}
+        except:
+            return {}
 
     async def evaluate_markets(self, match: MatchData, top_markets: List[MarketCandidate]) -> AIValidationResult:
         if not top_markets: return AIValidationResult(decision="VETO", reason="Aucun marché n'atteint les 81%.")
 
         market_text = "\n".join([f"- '{m.selection}' (Proba: {round(m.probability, 1)}%, Cote: {m.real_odds})" for m in top_markets])
 
-        # 🧠 CERVEAU 1 : L'Analyste Quantitatif (Choisit le pari)
         prompt_c1 = f"""
         Tu es le CERVEAU 1 (Analyste). Match: {match.home_team} vs {match.away_team}.
         Voici les marchés à plus de 81% de fiabilité :
         {market_text}
-        Choisis LE MEILLEUR pari. Renvoie un JSON: {{"decision": "APPROVED", "pari": "Recopie le texte du pari", "raison": "..."}}
+        Choisis LE MEILLEUR pari. Renvoie UNIQUEMENT un JSON strict : {{"decision": "APPROVED", "pari": "Recopie le texte du pari", "raison": "..."}}
         """
         
         async with self.semaphore:
-            await asyncio.sleep(1.2) # Sécurité anti-ban API
+            await asyncio.sleep(1.2)
             try:
                 async with httpx.AsyncClient() as client:
-                    res1 = await client.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"}, json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt_c1}]}, timeout=10.0)
+                    # CERVEAU 1
+                    res1 = await client.post(self.api_url, headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"}, json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt_c1}]}, timeout=10.0)
                     if res1.status_code == 200:
-                        ans1 = res1.json()['choices'][0]['message']['content'].strip()
-                        if "```json" in ans1: ans1 = ans1.split("```json")[1].split("```")[0]
-                        data1 = json.loads(ans1)
+                        ans1 = res1.json()['choices'][0]['message']['content']
+                        data1 = self._extract_json(ans1)
                         chosen_sel = data1.get("pari", "")
                         
-                        # 🧠 CERVEAU 2 : Le Juge (Valide ou Détruit le pari)
-                        if data1.get("decision") == "APPROVED":
+                        # CERVEAU 2
+                        if data1.get("decision") == "APPROVED" and chosen_sel:
                             prompt_c2 = f"""
                             Tu es le CERVEAU 2 (Juge des Risques). 
                             Le Cerveau 1 propose de parier sur '{chosen_sel}' pour le match {match.home_team} vs {match.away_team}.
                             Ta mission : Chercher le piège. Si tu penses que ce pari est 100% béton, réponds APPROVED. Si tu as le moindre doute, réponds VETO.
-                            Renvoie un JSON: {{"decision": "APPROVED" ou "VETO", "raison": "Ton avis strict"}}
+                            Renvoie UNIQUEMENT un JSON strict : {{"decision": "APPROVED" ou "VETO", "raison": "Ton avis strict"}}
                             """
                             await asyncio.sleep(1.2)
-                            res2 = await client.post("[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)", headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"}, json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt_c2}]}, timeout=10.0)
+                            res2 = await client.post(self.api_url, headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"}, json={"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt_c2}]}, timeout=10.0)
                             
                             if res2.status_code == 200:
-                                ans2 = res2.json()['choices'][0]['message']['content'].strip()
-                                if "```json" in ans2: ans2 = ans2.split("```json")[1].split("```")[0]
-                                data2 = json.loads(ans2)
+                                ans2 = res2.json()['choices'][0]['message']['content']
+                                data2 = self._extract_json(ans2)
                                 
                                 if data2.get("decision") == "APPROVED":
                                     chosen_market = next((m for m in top_markets if m.selection == chosen_sel), None)
                                     if chosen_market:
-                                        return AIValidationResult(decision="APPROVED", primary_market=chosen_market, reason=f"Double Validation : {data2.get('raison')}")
+                                        return AIValidationResult(decision="APPROVED", primary_market=chosen_market, reason=f"Double Validation IA : {data2.get('raison')}")
                                 
-                                return AIValidationResult(decision="VETO", reason=f"VETO du Cerveau 2 : {data2.get('raison')}")
-            except Exception as e: logger.error(f"Erreur Double IA : {e}")
+                                return AIValidationResult(decision="VETO", reason=f"VETO Cerveau 2 : {data2.get('raison', 'Risque détecté.')}")
+            except Exception as e: 
+                logger.error(f"Erreur Double IA sur {match.home_team}: {e}")
                 
-        return AIValidationResult(decision="VETO", reason="Échec de la Double Vérification IA.")
+        return AIValidationResult(decision="VETO", reason="Échec technique de la Double Vérification IA.")
 
 # 🚀 4. L'USINE À TICKETS
 class TicketFactory:
