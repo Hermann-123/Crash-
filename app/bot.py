@@ -71,17 +71,8 @@ async def fetch_tickets_by_text(message: Message):
     response += f"{t.bet_type}\n\n"
     response += f"📈 **COTE TOTALE : {t.odds}**\n\n"
     response += f"{t.ai_justification}\n"
-    
-    # 🛡️ BOUCLIER ANTI-CRASH 1 : On coupe le texte si l'IA a été trop bavarde
-    if len(response) > 4000:
-        response = response[:4000] + "\n\n⚠️ [Suite du rapport tronquée par Telegram (limite de 4096 caractères)]"
-
-    try:
-        # On essaie d'envoyer le message avec le beau formatage (Gras/Italique)
-        await message.answer(response, parse_mode="Markdown")
-    except Exception:
-        # 🛡️ BOUCLIER ANTI-CRASH 2 : Si l'IA a cassé le Markdown, on force l'envoi en texte brut
-        await message.answer(response)
+        
+    await message.answer(response, parse_mode="Markdown")
 
 @router.message(F.text == "📊 Analyse Manuelle")
 async def ask_manual(message: Message, state: FSMContext):
