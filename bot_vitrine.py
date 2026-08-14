@@ -7,7 +7,7 @@ from aiogram.types import Message
 
 # 🔑 TES CLÉS (À remplacer pour le test)
 TELEGRAM_TOKEN = "8000472746:AAGt50VAqUof8tPIGgQ96jF2MzK7gxpkMbE"
-GROQ_API_KEY = "TA_CLE_GROQ"
+GROQ_API_KEY = "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"
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
