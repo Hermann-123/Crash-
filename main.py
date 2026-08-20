@@ -1,17 +1,13 @@
 import os
-import sys
 import datetime
 import random
 import time
 import string
 import json
-import pandas as pd
-import ta
-import requests
 import telebot
 import websocket
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from flask import Flask
+from fastapi import FastAPI
 from threading import Thread, Timer
 
 # ==========================================
@@ -38,23 +34,19 @@ class PO_Simple:
         
     def connect(self):
         try:
-            self.ws.connect("wss://ws.pocketoption.com/socket.io/?EIO=3&transport=websocket", timeout=5)
+            # Nouvelle adresse officielle des serveurs Pocket Option (po.market)
+            self.ws.connect("wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket", timeout=5)
             # Authentification de session
             auth_packet = json.dumps({"ssid": self.ssid})
+            self.ws.send(f'40') # Initialisation protocole EIO=4
+            time.sleep(1)
             self.ws.send(f'42["auth",{auth_packet}]')
             self.connected = True
             print("✅ Connecté au serveur PO via WebSocket !")
         except Exception as e:
             print(f"❌ Erreur connexion WebSocket : {e}")
 
-    def get_realtime_price(self, asset):
-        # Simulation de récupération du prix via WebSocket pour l'exemple
-        return None
-
-print("🔄 Initialisation du connecteur Pocket Option OTC...")
 api_po = PO_Simple("c8p9d7a50kfnr50oqevscpprdi")
-# On lance la connexion dans un thread pour ne pas bloquer le bot
-Thread(target=api_po.connect, daemon=True).start()
 
 # ==========================================
 # VARIABLES D'ÉTAT ET ROUTAGE
@@ -63,13 +55,10 @@ user_prefs = {}
 mode_trading = {} 
 trades_en_cours = {}
 utilisateurs_actifs = set()
-derniere_alerte_auto = {}
-cooldown_actifs = {} 
 niveaux_martingale = {} 
 
 utilisateurs_autorises = {ADMIN_ID: "LIFETIME"}
 cles_generees = {}
-stats_journee = {'ITM': 0, 'OTM': 0, 'details': []}
 
 OTC_PAIRS = [
     "EURUSD_otc", "GBPUSD_otc", "AUDUSD_otc", "NZDUSD_otc",
@@ -78,21 +67,21 @@ OTC_PAIRS = [
 ]
 
 # ==========================================
-# SERVEUR WEB (KEEP ALIVE RENDER)
+# SERVEUR WEB COMPATIBLE RENDER (FASTAPI)
 # ==========================================
-app = Flask(__name__)
+app = FastAPI()
 
-@app.route('/')
+@app.get('/')
 def home():
-    return "Terminal Prime VIP : Édition V18.1 POCKET OPTION (Direct WS)"
+    return {"status": "Terminal Prime VIP : Édition V18.2 POCKET OPTION (Direct WS - En Ligne)"}
 
-def run():
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
+# Lancement automatique du Bot et du WebSocket au démarrage de l'app
+@app.on_event("startup")
+def startup_event():
+    print("🔄 Initialisation des moteurs (Bot + Pocket Option)...")
+    Thread(target=api_po.connect, daemon=True).start()
+    Thread(target=bot.infinity_polling, daemon=True).start()
+    print("⬛ BOÎTE NOIRE : Édition V18.2 Démarrée avec succès.")
 
 # ==========================================
 # SYSTÈME DE GESTION DES ACCÈS VIP
@@ -142,7 +131,7 @@ def bienvenue(message):
     utilisateurs_actifs.add(user_id)
     niveaux_martingale[user_id] = niveaux_martingale.get(user_id, 0)
     mode_trading[user_id] = mode_trading.get(user_id, "STANDARD")
-    texte = "🏴‍☠️ **TERMINAL PRIME - V18.1 POCKET OPTION 🛑** 🔥\n\n📡 **Connexion directe WS établie**."
+    texte = "🏴‍☠️ **TERMINAL PRIME - V18.2 POCKET OPTION 🛑** 🔥\n\n📡 **Connexion directe WS établie**."
     bot.send_message(message.chat.id, texte, reply_markup=obtenir_clavier(user_id), parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "⏰ HEURES DE TRADING")
@@ -157,8 +146,3 @@ def devises(message):
     boutons = [InlineKeyboardButton(paire.replace("_otc", " OTC"), callback_data=f"set_{paire}") for paire in OTC_PAIRS]
     markup.add(*boutons)
     bot.send_message(message.chat.id, "Sélectionne ta cible OTC :", reply_markup=markup)
-
-if __name__ == "__main__":
-    keep_alive()
-    print("⬛ BOÎTE NOIRE : Édition V18.1 Démarrée.", flush=True)
-    bot.infinity_polling()
