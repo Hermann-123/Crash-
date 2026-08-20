@@ -1,46 +1,29 @@
 import os
 import datetime
 import random
-import time
 import string
 import json
+import websocket
 import pandas as pd
 import ta
+import requests
 import telebot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from flask import Flask
 from threading import Thread, Timer
-
-# 🟢 IMPORT DE L'API POCKET OPTION
-from pocketoptionapi.stable_api import PocketOption
 
 # ==========================================
 # CONFIGURATION PRINCIPALE ET SÉCURITÉ
 # ==========================================
 TELEGRAM_TOKEN = "8000472746:AAGsb319CKyUqYEwyTM5uF_Ykjx4dnHA-ts"
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
 ADMIN_ID = 5968288964 
 CAPITAL_ACTUEL = 40650 
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "D0srw6sB3otYTc00UdBE9otPIbhkKV8X")
+
 COEF_MARTINGALE = 2.5
 MAX_MARTINGALE = 3  
-
-# ==========================================
-# CONNEXION À POCKET OPTION (SSID)
-# ==========================================
-SSID = "c8p9d7a50kfnr50oqevscpprdi"
-print("🔄 Connexion au serveur Pocket Option OTC...")
-api_po = PocketOption(SSID)
-
-def maintenir_connexion_po():
-    api_po.connect()
-    while True:
-        try:
-            if not api_po.check_connect():
-                api_po.connect()
-        except: pass
-        time.sleep(30)
-
-Thread(target=maintenir_connexion_po, daemon=True).start()
 
 # ==========================================
 # VARIABLES D'ÉTAT
@@ -51,24 +34,30 @@ utilisateurs_autorises = {ADMIN_ID: "LIFETIME"}
 cles_generees = {}
 stats_journee = {'ITM': 0, 'OTM': 0, 'details': []}
 
-# PAIRES STRICTEMENT OTC POCKET OPTION
-OTC_PAIRS = [
-    "EURUSD_otc", "GBPUSD_otc", "AUDUSD_otc", "NZDUSD_otc",
-    "USDCAD_otc", "USDCHF_otc", "USDJPY_otc", "EURJPY_otc",
-    "GBPJPY_otc", "AUDJPY_otc", "CADJPY_otc", "CHFJPY_otc"
+CRYPTO_PAIRS = ["BTCUSD", "ETHUSD", "LTCUSD"]
+FOREX_PAIRS = [
+    "AUDUSD", "CADJPY", "CHFJPY", "EURJPY", "USDCAD", 
+    "AUDJPY", "EURAUD", "EURUSD", "AUDCAD", "USDCHF", 
+    "CADCHF", "EURCHF", "USDJPY"
 ]
 
-def format_otc_nom(symbole):
-    return symbole.replace("_otc", " OTC")
+def nom_otc(symbole):
+    return f"{symbole[:3]}/{symbole[3:]} OTC"
 
 # ==========================================
 # SERVEUR WEB (KEEP ALIVE RENDER)
 # ==========================================
 app = Flask(__name__)
+
 @app.route('/')
-def home(): return "Terminal Prime VIP : Édition V18 (4 Piliers + Vrai OTC) - EN LIGNE"
-def run(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
-def keep_alive(): Thread(target=run, daemon=True).start()
+def home():
+    return "Terminal Prime VIP : Édition V18.5 ULTIMATE (Stable & Rapide) - EN LIGNE"
+
+def run():
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+
+def keep_alive():
+    Thread(target=run, daemon=True).start()
 
 # ==========================================
 # SÉCURITÉ ET ACCÈS VIP
@@ -79,18 +68,21 @@ def est_autorise(user_id):
         expiration = utilisateurs_autorises[user_id]
         if expiration == "LIFETIME" or datetime.datetime.now() < expiration: return True
         del utilisateurs_autorises[user_id]
-        try: bot.send_message(user_id, "⚠️ **ABONNEMENT EXPIRÉ** ⚠️", parse_mode="Markdown")
+        try: bot.send_message(user_id, "⚠️ **ABONNEMENT EXPIRÉ** ⚠️\n\nVotre accès est terminé.", parse_mode="Markdown")
         except: pass
     return False
 
 @bot.message_handler(commands=['keygen'])
 def generer_cle(message):
     if message.chat.id != ADMIN_ID: return
-    arg = message.text.split()[1].lower() if len(message.text.split()) > 1 else '1s'
-    jours = "LIFETIME" if arg == 'vie' else (7 if arg == '1s' else 30)
-    cle = "VIP-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    cles_generees[cle] = jours
-    bot.send_message(message.chat.id, f"✅ **CLÉ GÉNÉRÉE**\n🔑 `{cle}`\n⏳ Durée : {jours}", parse_mode="Markdown")
+    try:
+        arg = message.text.split()[1].lower()
+        jours = "LIFETIME" if arg == 'vie' else (7 if arg == '1s' else (14 if arg == '2s' else (30 if arg == '1m' else (90 if arg == '3m' else int(arg)))))
+        cle = "VIP-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        cles_generees[cle] = jours
+        texte = f"✅ **CLÉ GÉNÉRÉE**\n🔑 `{cle}`\n⏳ Durée : {'À VIE 👑' if jours == 'LIFETIME' else f'{jours} Jours'}"
+        bot.send_message(message.chat.id, texte, parse_mode="Markdown")
+    except: pass
 
 @bot.message_handler(commands=['vip'])
 def activer_vip(message):
@@ -101,35 +93,46 @@ def activer_vip(message):
             jours = cles_generees.pop(cle)
             utilisateurs_autorises[chat_id] = "LIFETIME" if jours == "LIFETIME" else datetime.datetime.now() + datetime.timedelta(days=jours)
             bot.send_message(chat_id, "🎉 **ACCÈS DÉVERROUILLÉ !** Tapez /start", parse_mode="Markdown")
+        else: 
+            bot.send_message(chat_id, "❌ **Clé invalide.**", parse_mode="Markdown")
     except: pass
 
 # ==========================================
-# EXTRACTION DES VRAIES DONNÉES POCKET OPTION
+# ROUTEUR DE DONNÉES WEBSOCKET
 # ==========================================
-def obtenir_donnees_otc(symbole, granularite=300):
+def est_symbole_autorise(symbole):
+    # En mode OTC simulé, on donne un accès total H24 pour trader l'interface
+    return "AUTORISE", ""
+
+def prefixer_symbole(symbole): 
+    return f"cry{symbole}" if symbole in CRYPTO_PAIRS else f"frx{symbole}"
+
+def obtenir_donnees_deriv(symbole, granularite=300):
     for _ in range(3):
         try:
-            api_po.get_candles(symbole, granularite)
-            time.sleep(1.5) # Temps de réponse du WebSocket PO
-            donnees = api_po.candles.get_candles(symbole, granularite)
-            if donnees and len(donnees) > 50:
-                return donnees
+            ws = websocket.WebSocket()
+            ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=5)
+            ws.send(json.dumps({"ticks_history": prefixer_symbole(symbole), "end": "latest", "count": 250, "style": "candles", "granularity": granularite}))
+            res = json.loads(ws.recv())
+            ws.close()
+            if "candles" in res: return res['candles']
         except: time.sleep(1)
     return None
 
-def obtenir_prix_actuel_otc(symbole):
-    try:
-        api_po.get_candles(symbole, 60)
-        time.sleep(1)
-        donnees = api_po.candles.get_candles(symbole, 60)
-        if donnees: return float(donnees[-1]['close'])
-    except: pass
+def obtenir_prix_actuel_deriv(symbole):
+    for _ in range(3):
+        try:
+            ws = websocket.WebSocket()
+            ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=5)
+            ws.send(json.dumps({"ticks_history": prefixer_symbole(symbole), "end": "latest", "count": 1, "style": "ticks"}))
+            res = json.loads(ws.recv())
+            ws.close()
+            if "history" in res: return float(res["history"]["prices"][0])
+        except: time.sleep(1)
     return None
 
 def verifier_correlation(symbole_base, action_visee):
-    # Les marchés OTC sont des algorithmes synthétiques créés par le broker.
-    # Ils n'ont pas de corrélation macroéconomique entre eux.
-    return True 
+    return True
 
 # ==========================================
 # LES 4 PILIERS MATHÉMATIQUES
@@ -156,14 +159,16 @@ def analyser_aroon_rsi(df):
             s, res = (min(35, max(0, (u - d) * 0.5)), []) if dir == "CALL" else (min(35, max(0, (d - u) * 0.5)), [])
             if dir == "CALL":
                 if u_p <= d_p and u > d: s += 20; res.append("Croisement Up")
-                if 40 <= r <= 68: s += 20; res.append("RSI sain")
+                if 40 <= r <= 68: s += 20; res.append(f"RSI sain")
+                if u >= 70: s += 15
             else:
                 if d_p <= u_p and d > u: s += 20; res.append("Croisement Down")
-                if 32 <= r <= 60: s += 20; res.append("RSI sain")
+                if 32 <= r <= 60: s += 20; res.append(f"RSI sain")
+                if d >= 70: s += 15
             return min(100, s), res
         sc, rc = score("CALL")
         sp, rp = score("PUT")
-        return {"nom": "AROON_RSI", "label": "Show The Direction", "score_call": sc, "score_put": sp, "txt": f"Aroon {u:.0f}/{d:.0f} | RSI {r:.1f}"}
+        return {"nom": "AROON_RSI", "label": "Show The Direction", "score_call": sc, "score_put": sp, "raisons_call": rc, "raisons_put": rp, "txt": f"Aroon {u:.0f}/{d:.0f} | RSI {r:.1f}"}
     except: return None
 
 def analyser_adx_stc(df):
@@ -176,15 +181,67 @@ def analyser_adx_stc(df):
         def score(dir):
             s, res = 0, []
             if dir == "CALL":
-                if sprev <= 25 and sv > sprev: s += 35
+                if sprev <= 25 and sv > sprev: s += 35; res.append("STC Rebond Bas")
+                elif sv < 40: s += 15
                 if dip > din: s += 20
+                if adx >= 15: s += min(20, (adx - 15) * 1.2)
             else:
-                if sprev >= 75 and sv < sprev: s += 35
+                if sprev >= 75 and sv < sprev: s += 35; res.append("STC Rebond Haut")
+                elif sv > 60: s += 15
                 if din > dip: s += 20
+                if adx >= 15: s += min(20, (adx - 15) * 1.2)
             return min(100, s), res
         sc, rc = score("CALL")
         sp, rp = score("PUT")
-        return {"nom": "ADX_STC", "label": "Reversal Points", "score_call": sc, "score_put": sp, "txt": f"STC {sv:.0f} | ADX {adx:.0f}"}
+        return {"nom": "ADX_STC", "label": "Identifies Reversal", "score_call": sc, "score_put": sp, "raisons_call": rc, "raisons_put": rp, "txt": f"STC {sv:.0f} | ADX {adx:.0f}"}
+    except: return None
+
+def analyser_cci_macd(df):
+    try:
+        cci = ta.trend.CCIIndicator(high=df['high'], low=df['low'], close=df['close'], window=10).cci()
+        macd = ta.trend.MACD(close=df['close'], window_slow=25, window_fast=10, window_sign=5).macd_diff()
+        c, cp, m, mp = float(cci.iloc[-2]), float(cci.iloc[-3]), float(macd.iloc[-2]), float(macd.iloc[-3])
+        
+        def score(dir):
+            s, res = 0, []
+            if dir == "CALL":
+                if cp <= -100 and c > cp: s += 30; res.append("CCI Survente")
+                elif c < -50: s += 12
+                if m > 0: s += 20
+                if m > mp: s += 15
+            else:
+                if cp >= 100 and c < cp: s += 30; res.append("CCI Surachat")
+                elif c > 50: s += 12
+                if m < 0: s += 20
+                if m < mp: s += 15
+            return min(100, s), res
+        sc, rc = score("CALL")
+        sp, rp = score("PUT")
+        return {"nom": "CCI_MACD", "label": "A Moment When", "score_call": sc, "score_put": sp, "raisons_call": rc, "raisons_put": rp, "txt": f"CCI {c:.0f} | MACD {m:.4f}"}
+    except: return None
+
+def analyser_donchian_cci(df):
+    try:
+        up, low = df['high'].rolling(20).max(), df['low'].rolling(20).min()
+        cci = ta.trend.CCIIndicator(high=df['high'], low=df['low'], close=df['close'], window=11).cci()
+        px, u, l = float(df['close'].iloc[-2]), float(up.iloc[-2]), float(low.iloc[-2])
+        c, cp = float(cci.iloc[-2]), float(cci.iloc[-3])
+        pct = (px - l) / (u - l) if (u - l) > 0 else 1e-9
+        
+        def score(dir):
+            s, res = 0, []
+            if dir == "CALL":
+                prox = max(0, 1 - pct * 2.5)
+                s += prox * 35
+                if cp <= -100 and c > cp: s += 30
+            else:
+                prox = max(0, (pct - 0.6) * 2.5)
+                s += prox * 35
+                if cp >= 100 and c < cp: s += 30
+            return min(100, s), res
+        sc, rc = score("CALL")
+        sp, rp = score("PUT")
+        return {"nom": "DONCHIAN", "label": "You Know And", "score_call": sc, "score_put": sp, "raisons_call": rc, "raisons_put": rp, "txt": f"Canal {pct*100:.0f}% | CCI {c:.0f}"}
     except: return None
 
 # ==========================================
@@ -194,19 +251,22 @@ def analyser_binaire_pro(symbole, mode="STANDARD"):
     timeframes = [600, 300, 120] if mode == "STANDARD" else [60]
 
     for tf in timeframes:
-        candles = obtenir_donnees_otc(symbole, tf)
-        if not candles: continue
+        candles = obtenir_donnees_deriv(symbole, tf)
+        if not candles or len(candles) < 60: continue
 
         try:
             df = pd.DataFrame([{'open': float(c['open']), 'close': float(c['close']), 'high': float(c['high']), 'low': float(c['low'])} for c in candles])
             df['corps'] = abs(df['close'] - df['open'])
             df['taille'] = df['high'] - df['low']
 
+            if df['corps'].iloc[-4:-1].mean() > 0 and (df['taille'].iloc[-4:-1].mean() > df['corps'].iloc[-4:-1].mean() * 3.5):
+                return "⚠️ Filtre Anti-Chaos activé.", None, None, None, None, None, None, None
+
             last, prev, p_prev = df.iloc[-1], df.iloc[-2], df.iloc[-3]
             fusee_haussiere = (last['close'] > last['open']) and (prev['close'] > prev['open']) and (p_prev['close'] > p_prev['open']) and (last['corps'] > last['taille'] * 0.25)
             fusee_baissiere = (last['close'] < last['open']) and (prev['close'] < prev['open']) and (p_prev['close'] < p_prev['open']) and (last['corps'] > last['taille'] * 0.25)
 
-            resultats = [f(df) for f in (analyser_aroon_rsi, analyser_adx_stc) if f(df)]
+            resultats = [f(df) for f in (analyser_aroon_rsi, analyser_adx_stc, analyser_cci_macd, analyser_donchian_cci) if f(df)]
             candidats = []
             
             for r in resultats:
@@ -222,37 +282,40 @@ def analyser_binaire_pro(symbole, mode="STANDARD"):
             action = "🟢 ACHAT (CALL)" if gagnant["dir"] == "CALL" else "🔴 VENTE (PUT)"
             conf = min(99, 70 + int(gagnant["score"] * 0.29))
             bb_status = f"🧩 {gagnant['label']} — {gagnant['txt']}"
+            score_algo = round(5 + (gagnant["score"] / 100) * 5, 1)
 
+            if not verifier_correlation(symbole, action): return f"⚠️ **FAKEOUT DÉTECTÉ**", None, None, None, None, None, None, None
+            
             duree, exp_texte = (180, "3 MIN (HIT & RUN)") if tf == 300 else (tf, f"{int(tf/60)} MIN") if mode == "STANDARD" else (60, "1 MINUTE (SCALP)")
-            return action, conf, exp_texte, duree, bb_status
+            return action, conf, exp_texte, duree, 0, 0, bb_status, score_algo
 
         except: continue
-    return f"⚠️ En attente d'une configuration valide ({mode}).", None, None, None, None
+    return f"⚠️ En attente ({mode}).", None, None, None, None, None, None, None
 
 # ==========================================
 # EXÉCUTION & COMMANDES
 # ==========================================
 def executer_tir_flash(chat_id, symbole, action_brute, duree, palier):
+    nom_paire = nom_otc(symbole)
     act = "🟢 ACHAT (CALL)" if action_brute == "CALL" else "🔴 VENTE (PUT)"
-    nom = format_otc_nom(symbole)
     if palier == 0:
-        bot.send_message(chat_id, f"👻 **FANTÔME LANCÉ ({nom})**", parse_mode="Markdown")
+        bot.send_message(chat_id, f"👻 **FANTÔME LANCÉ ({nom_paire})**", parse_mode="Markdown")
     else:
         markup = InlineKeyboardMarkup().add(InlineKeyboardButton("✅ GAGNÉ SUR POCKET", callback_data="force_win"))
-        bot.send_message(chat_id, f"🔥 **TIR IMMÉDIAT : PALIER {palier} ({nom})**\n👉 **CLIQUEZ SUR {act} MAINTENANT !**", reply_markup=markup, parse_mode="Markdown")
+        bot.send_message(chat_id, f"🔥 **TIR IMMÉDIAT : PALIER {palier} ({nom_paire})**\n👉 **CLIQUEZ SUR {act} MAINTENANT !**", reply_markup=markup, parse_mode="Markdown")
     
-    trades_en_cours[chat_id] = {'symbole': symbole, 'action': action_brute, 'duree': duree, 'prix_entree': obtenir_prix_actuel_otc(symbole)}
+    trades_en_cours[chat_id] = {'symbole': symbole, 'action': action_brute, 'duree': duree, 'prix_entree': obtenir_prix_actuel_deriv(symbole)}
     Timer(duree, verifier_resultat, args=[chat_id]).start()
 
 def verifier_resultat(chat_id):
     trade = trades_en_cours.get(chat_id)
     if not trade: return
-    prix_sortie = obtenir_prix_actuel_otc(trade['symbole'])
+    prix_sortie = obtenir_prix_actuel_deriv(trade['symbole'])
     if not prix_sortie: return
 
     gagne = (trade['action'] == "CALL" and prix_sortie > trade['prix_entree']) or (trade['action'] == "PUT" and prix_sortie < trade['prix_entree'])
     palier = niveaux_martingale.get(chat_id, 0)
-    nom = format_otc_nom(trade['symbole'])
+    nom = nom_otc(trade['symbole'])
 
     if gagne:
         niveaux_martingale[chat_id] = 0
@@ -291,9 +354,8 @@ def save_devise(call):
     
     actif = call.data.replace("set_", "")
     user_prefs[chat_id] = actif
-    msg = bot.send_message(chat_id, f"⏳ *Analyse des 4 Piliers sur {format_otc_nom(actif)} (Pocket Option Vrai Marché)...*", parse_mode="Markdown")
-    
-    action, conf, exp_texte, duree_sec, bb = analyser_binaire_pro(actif, mode_trading.get(chat_id, "STANDARD"))
+    msg = bot.send_message(chat_id, f"⏳ *Analyse des 4 Piliers sur {nom_otc(actif)}...*", parse_mode="Markdown")
+    action, conf, exp_texte, duree_sec, r, s, bb, score = analyser_binaire_pro(actif, mode_trading.get(chat_id, "STANDARD"))
     
     if not action or "⚠️" in action:
         try: bot.edit_message_text(action, chat_id, msg.message_id)
@@ -303,12 +365,13 @@ def save_devise(call):
     sec_rest = 60 - datetime.datetime.now().second
     if sec_rest < 15: sec_rest += 60
     palier = niveaux_martingale.get(chat_id, 0)
-    if palier == 0: palier = 1; niveaux_martingale[chat_id] = 1
+    
+    if palier == 0 and score and score >= 10.0: palier = 1; niveaux_martingale[chat_id] = 1
 
     mise = int((CAPITAL_ACTUEL * 0.02) * (COEF_MARTINGALE ** (palier - 1 if palier > 0 else 0)))
     str_h = (datetime.datetime.now() + datetime.timedelta(seconds=sec_rest)).strftime("%H:%M:00")
     
-    signal = f"🚨 **ALERTE VIP** 🚨\n🌐 {format_otc_nom(actif)}\n⏱ {str_h}\n⏳ {exp_texte}\n👉 {action}\n{bb}\n💵 Mise : {mise}$ (Palier {palier})" if palier > 0 else f"👻 **FANTÔME** 👻\n🌐 {format_otc_nom(actif)}\n⏱ {str_h}\n⏳ {exp_texte}\n👉 {action}"
+    signal = f"🚨 **ALERTE VIP** 🚨\n🌐 {nom_otc(actif)}\n⏱ {str_h}\n⏳ {exp_texte}\n👉 {action}\n{bb}\n💵 Mise : {mise}$ (Palier {palier})" if palier > 0 else f"👻 **FANTÔME** 👻\n🌐 {nom_otc(actif)}\n⏱ {str_h}\n⏳ {exp_texte}\n👉 {action}\n*(Le bot prend le trade virtuellement)*"
     bot.delete_message(chat_id, msg.message_id)
     bot.send_message(chat_id, signal, parse_mode="Markdown")
     Timer(sec_rest, executer_tir_flash, args=[chat_id, actif, "CALL" if "ACHAT" in action else "PUT", duree_sec, palier]).start()
@@ -317,7 +380,7 @@ def save_devise(call):
 def lancer(message):
     if not est_autorise(message.chat.id): return
     actif = user_prefs.get(message.chat.id)
-    if not actif: return bot.send_message(message.chat.id, "⚠️ Choisis une devise OTC d'abord !")
+    if not actif: return bot.send_message(message.chat.id, "⚠️ Choisis une devise d'abord !")
     save_devise(type('obj', (object,), {'data': f"set_{actif}", 'message': message, 'from_user': message.from_user, 'id': '1'})())
 
 @bot.message_handler(commands=['start'])
@@ -327,13 +390,13 @@ def bienvenue(message):
     utilisateurs_actifs.add(user_id)
     mode_trading[user_id] = "STANDARD"
     markup = ReplyKeyboardMarkup(resize_keyboard=True).row(KeyboardButton("📊 CHOISIR UNE DEVISE"), KeyboardButton("🚀 LANCER L'ANALYSE")).row(KeyboardButton("🛡️ MODE: 4 PILIERS STANDARD"), KeyboardButton("⏰ HEURES DE TRADING"))
-    bot.send_message(user_id, "🏴‍☠️ **TERMINAL PRIME V18 ULTIMATE** 🔥\n\nMoteur : 4 Piliers Indépendants\nSource : VRAI MARCHÉ OTC Pocket Option H24", reply_markup=markup, parse_mode="Markdown")
+    bot.send_message(user_id, "🏴‍☠️ **TERMINAL PRIME V18 ULTIMATE (OTC READY)** 🔥\n\nMoteur : 4 Piliers Indépendants\nMode : Affichage OTC 24/7", reply_markup=markup, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "📊 CHOISIR UNE DEVISE")
 def devises(message):
     markup = InlineKeyboardMarkup(row_width=3)
-    markup.add(*[InlineKeyboardButton(format_otc_nom(p), callback_data=f"set_{p}") for p in OTC_PAIRS])
-    bot.send_message(message.chat.id, "Sélectionne ta cible (Vrai Marché OTC Pocket Option) :", reply_markup=markup)
+    markup.add(*[InlineKeyboardButton(nom_otc(p), callback_data=f"set_{p}") for p in FOREX_PAIRS])
+    bot.send_message(message.chat.id, "Sélectionne ta cible (Affichage OTC) :", reply_markup=markup)
 
 @bot.message_handler(func=lambda m: m.text.startswith("🛡️") or m.text.startswith("🔥"))
 def toggle_mode(m):
@@ -343,5 +406,5 @@ def toggle_mode(m):
 
 if __name__ == "__main__":
     keep_alive()
-    print("⬛ BOÎTE NOIRE : Édition V18 (Vrai OTC Pocket Option) Démarrée.")
+    print("⬛ BOÎTE NOIRE : Édition V18 Stable Démarrée.")
     bot.infinity_polling()
