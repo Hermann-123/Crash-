@@ -13,7 +13,7 @@ threading.Thread(target=run, daemon=True).start()
 
 # 2. NOTRE TEST DE CONNEXION BRUTE (AVEC RECONNEXION AUTO)
 # ⚠️ REMPLACE CECI PAR TON NOUVEAU SSID TOUT FRAIS :
-SSID = "AH-VOTVks02jTJaXO" 
+SSID = "c8p9d7a50kfnr50oqevscpprdi" 
 
 def on_message(ws, message):
     if message == "2":
