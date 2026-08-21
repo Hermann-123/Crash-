@@ -2088,6 +2088,68 @@ def test_groq_reel(message):
                               f"Le bot basculerait en mode dégradé sur un vrai signal.",
                          parse_mode="Markdown")
 
+@bot.message_handler(commands=['testderiv'])
+def test_deriv_reel(message):
+    """
+    ✅ Diagnostic honnête pour DERIV_API_TOKEN : ne révèle jamais le token
+    en entier (seulement sa longueur + 2 premiers/2 derniers caractères,
+    pour vérifier qu'il n'est pas vide/tronqué/mal collé), et fait un VRAI
+    appel réseau à l'API Deriv pour rapporter exactement ce qui se passe.
+    """
+    uid = message.chat.id
+    if not est_autorise(uid): return
+
+    if not DERIV_API_TOKEN:
+        return bot.send_message(uid,
+            "❌ *DERIV_API_TOKEN absente*\n"
+            "Aucune variable d'environnement DERIV_API_TOKEN configurée sur Render.",
+            parse_mode="Markdown")
+
+    longueur = len(DERIV_API_TOKEN)
+    apercu = f"{DERIV_API_TOKEN[:2]}...{DERIV_API_TOKEN[-2:]}" if longueur >= 6 else "(trop court)"
+    a_espace = DERIV_API_TOKEN != DERIV_API_TOKEN.strip()
+
+    espace_msg = "⚠️ OUI — c'est probablement le bug" if a_espace else "✅ Non"
+
+    bot.send_message(uid,
+        f"🔬 *DIAGNOSTIC DERIV_API_TOKEN*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Longueur : {longueur} caractères\n"
+        f"Aperçu : `{apercu}`\n"
+        f"Espace/retour à la ligne détecté : {espace_msg}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔄 Appel réel en cours vers l'API Deriv...", parse_mode="Markdown")
+
+    try:
+        ws = websocket.create_connection(DERIV_WS_URL, timeout=10)
+        ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
+        resp = json.loads(ws.recv())
+        ws.close()
+
+        if resp.get("error"):
+            bot.send_message(uid,
+                f"❌ *AUTHORIZE REFUSÉ PAR DERIV*\n"
+                f"Message exact : `{resp['error'].get('message')}`\n"
+                f"Code erreur : `{resp['error'].get('code')}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👉 Si le token semble correct (longueur normale, pas d'espace), "
+                f"régénère-le une nouvelle fois et copie-le en un seul geste "
+                f"dès qu'il s'affiche en clair.",
+                parse_mode="Markdown")
+        else:
+            info = resp.get("authorize", {})
+            bot.send_message(uid,
+                f"✅ *CONNEXION DERIV RÉUSSIE*\n"
+                f"Compte : `{info.get('loginid')}`\n"
+                f"Devise : {info.get('currency')}\n"
+                f"Type : {'Réel' if not info.get('is_virtual') else 'Démo (virtuel)'}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👉 Le token fonctionne. Tu peux activer l'auto-trading via /menu.",
+                parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(uid, f"❌ *Erreur réseau* : `{type(e).__name__}: {e}`",
+                         parse_mode="Markdown")
+
 @bot.message_handler(commands=['iastats'])
 def ia_stats(message):
     uid = message.chat.id
