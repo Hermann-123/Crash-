@@ -2,6 +2,7 @@ pyTelegramBotAPI
 requests
 pandas
 ta
+websocket-client
 websockets
 flask
 metaapi-cloud-sdk
