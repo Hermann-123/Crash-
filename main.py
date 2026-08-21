@@ -61,7 +61,7 @@ def convertir_symbole_mt5(symbole_bot):
 # CONFIGURATION METAAPI (EXÉCUTION MT5 RÉELLE)
 # ==========================================
 
-METAAPI_TOKEN = "ea6deb68-7513-49bd-9669-5d162ca1e4eb", "").strip()
+METAAPI_TOKEN = os.environ.get("ea6deb68-7513-49bd-9669-5d162ca1e4eb", "").strip()
 METAAPI_ACCOUNT_ID = os.environ.get("41080337", "").strip()
 metaapi_instance = MetaApi(token=METAAPI_TOKEN) if METAAPI_TOKEN else None
 
