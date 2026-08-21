@@ -61,8 +61,8 @@ def convertir_symbole_mt5(symbole_bot):
 # CONFIGURATION METAAPI (EXÉCUTION MT5 RÉELLE)
 # ==========================================
 
-METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN", "").strip()
-METAAPI_ACCOUNT_ID = os.environ.get("METAAPI_ACCOUNT_ID", "").strip()
+METAAPI_TOKEN = os.environ.get("4b6c631b-ce28-4aae-ab2d-fc8de9c64db5", "").strip()
+METAAPI_ACCOUNT_ID = os.environ.get("41080337", "").strip()
 metaapi_instance = MetaApi(token=METAAPI_TOKEN) if METAAPI_TOKEN else None
 
 async def passer_ordre_mt5_reel(symbole_bot, action, volume_lots, sl, tp):
