@@ -41,7 +41,8 @@ CAPITAL_ACTUEL = 40650
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "D0srw6sB3otYTc00UdBE9otPIbhkKV8X")
 
 # ==========================================
-# CONFIGURATION METAAPI (EXÉCUTION MT5 RÉELLE)
+
+        return res# CONFIGURATION METAAPI (EXÉCUTION MT5 RÉELLE)
 # ==========================================
 METAAPI_TOKEN = os.environ.get("4b6c631b-ce28-4aae-ab2d-fc8de9c64db5", "").strip()
 METAAPI_ACCOUNT_ID = os.environ.get("41080337", "").strip()
@@ -88,7 +89,6 @@ def executer_ordre_mt5_sync(symbole, action, volume_lots, sl, tp):
         asyncio.set_event_loop(loop)
         res = loop.run_until_complete(passer_ordre_mt5_reel(symbole, action, volume_lots, sl, tp))
         loop.close()
-        return res
     except Exception as e:
         print(f"[MetaApi Sync] {e}", flush=True)
         return None
@@ -834,7 +834,7 @@ def scanner_marche_auto():
     while True:
         try:
             time.sleep(15)
-            libres = [u for u in utilisateurs_actifs if ADMIN_ID == u] # Priorité admin ou utilisateurs autorisés
+            libres = [u for u in utilisateurs_actifs if est_autorise(u)]
             if not libres: continue
 
             resultats = []
@@ -852,7 +852,6 @@ def scanner_marche_auto():
 
                     entry_direction = "BUY" if "BUY" in res["action"] else "SELL"
                     
-                    # --- OUVERTURE AUTOMATIQUE DU TRADE EN LOCAL ET SUR MT5 ---
                     trade_id, sizing = ouvrir_trade(
                         uid=uid, symbole=paire, direction=entry_direction, entry_price=px,
                         sl=res["sl"], tp1=res["tp1"], tp_final=res["tp"],
@@ -860,13 +859,11 @@ def scanner_marche_auto():
                         label=res["label"], strategie_nom_ia=res.get("strategie_nom_ia", "TREND")
                     )
 
-                    # Calcul du lot réel (Minimum 0.01 lot sur MT5)
                     calcul_lots = round(max(0.01, sizing['lot_factor']), 2)
 
-                    # Envoi direct de l'ordre réel sur MetaTrader 5 via MetaApi en arrière-plan
+                    # Envoi direct avec la fonction corrigée
                     Thread(target=executer_ordre_mt5_sync, args=(paire, res["action"], calcul_lots, res["sl"], res["tp"]), daemon=True).start()
 
-                    # Notification Telegram (Mode Full Auto sans clic requis)
                     msg = (
                         f"🤖 *TRADE FULL AUTO EXÉCUTÉ SUR MT5 !*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -883,6 +880,7 @@ def scanner_marche_auto():
                         pass
         except Exception as e:
             print(f"[Scanner Full Auto] {e}", flush=True)
+
 
 # ==========================================
 # MONITORING DES TRADES ACTIFS
