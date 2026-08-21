@@ -1,19 +1,25 @@
 """
 ╔════════════════════════════════════════════════════════════════════════════╗
-║   TERMINAL PRIME V55 — GROQ + EXÉCUTION RÉELLE METAAPI + PANNEAU CONTRÔLE   ║
+║   TERMINAL PRIME V55 — GROQ + EXÉCUTION RÉELLE DERIV + PANNEAU CONTRÔLE     ║
 ║                                                                            ║
-║  ⚙️ NOUVEAU DANS CETTE VERSION FUSIONNÉE :                                ║
-║   • Connexion MetaApi (bridge cloud vers ton compte MT5, sans PC)         ║
+║  ⚙️ NOUVEAU DANS CETTE VERSION :                                          ║
+║   • Exécution réelle via l'API Deriv (gratuite, pas de MT5/VPS/MetaApi)   ║
 ║   • Panneau de contrôle Telegram (/menu) : auto-trading ON/OFF,           ║
-║     mode SOLO/MULTI, status live, stop d'urgence, réglage du lot          ║
+║     mode SOLO/MULTI, status live, stop d'urgence, réglage de la mise      ║
 ║   • Quand auto-trading est ON : le bot ouvre/ferme les trades TOUT SEUL   ║
-║     sur MT5 dès qu'un signal passe le calcul + Groq — comme l'EA vidéo.   ║
+║     sur ton compte Deriv dès qu'un signal passe le calcul + Groq.         ║
 ║   • Quand auto-trading est OFF (par défaut, sécurité) : comportement      ║
 ║     identique à avant — notifications + bouton "Copier" manuel.          ║
 ║                                                                            ║
-║  Variables d'environnement à ajouter sur Render :                        ║
-║     METAAPI_TOKEN       -> ton token API MetaApi.cloud                   ║
-║     METAAPI_ACCOUNT_ID  -> l'ID du compte MT5 déployé sur MetaApi         ║
+║  ⚠️ Trades exécutés via des contrats "Multiplicateurs" Deriv (CFD à       ║
+║  effet de levier avec SL/TP intégrés). Pas de fermeture partielle native  ║
+║  sur ce produit : la logique "TP1 85% + 15% final" est reproduite en     ║
+║  ouvrant DEUX contrats séparés à l'entrée (85% de la mise avec TP1,       ║
+║  15% avec le TP final) — chacun se ferme automatiquement côté Deriv.      ║
+║                                                                            ║
+║  Variable d'environnement à ajouter sur Render :                        ║
+║     DERIV_API_TOKEN  -> ton token API Deriv (gratuit, app.deriv.com →    ║
+║                         Paramètres → Sécurité et niveaux → API Token)    ║
 ║  (en plus de celles déjà utilisées : TELEGRAM_TOKEN régénéré, FMP_API_KEY,║
 ║   GROQ_API_KEY)                                                           ║
 ╚════════════════════════════════════════════════════════════════════════════╝
@@ -26,7 +32,6 @@ import time
 import string
 import json
 import math
-import asyncio
 import websocket
 import pandas as pd
 import ta
@@ -37,7 +42,6 @@ from flask import Flask
 from threading import Thread, Lock
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from metaapi_cloud_sdk import MetaApi
 
 # ==========================================
 # CONFIGURATION
@@ -49,8 +53,8 @@ ADMIN_ID = 5968288964
 CAPITAL_ACTUEL = 40650
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 
-METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN", "")
-METAAPI_ACCOUNT_ID = os.environ.get("METAAPI_ACCOUNT_ID", "")
+DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")   # app_id public par défaut, suffisant pour démarrer
 
 # ==========================================
 # RISK MANAGEMENT — CONFIGURATION GLOBALE
@@ -78,7 +82,8 @@ RISK_CONFIG = {
 CONTROL_STATE = {
     "auto_trading_active": False,   # démarre OFF par sécurité — à activer via le menu Telegram
     "mode": "SOLO",                 # SOLO = un seul trade actif à la fois (comme l'EA vidéo) | MULTI = plusieurs en parallèle
-    "volume_lot": 0.01,             # taille de lot réelle envoyée à MetaApi — reste petit en démo
+    "stake_usd": 1.0,                # mise en USD par trade sur Deriv — reste petit en démo/tests
+    "multiplier": 10,                # effet de levier du contrat Multiplicateur
     "stop_urgence_actif": False,
 }
 
@@ -152,7 +157,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Terminal Prime V55 — MetaApi Edition"
+    return "Terminal Prime V55 — Deriv Edition"
 
 def run():
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
@@ -161,88 +166,147 @@ def keep_alive():
     Thread(target=run, daemon=True).start()
 
 # ==========================================
-# ✅ NOUVEAU : PONT METAAPI (exécution réelle MT5, sans PC)
+# ✅ NOUVEAU : PONT DERIV (exécution réelle, gratuite, sans PC/VPS)
 # ==========================================
-# telebot est synchrone, le SDK MetaApi est asynchrone. On fait tourner une
-# boucle asyncio dédiée dans un thread permanent, et on lui soumet les
-# coroutines depuis le code synchrone existant.
+# Même style que le reste du bot (obtenir_donnees_deriv, etc.) : connexion
+# websocket synchrone ouverte à la demande, avec authorize + requête + lecture
+# de la réponse correspondante, puis fermeture. Pas d'asyncio nécessaire.
+#
+# Produit utilisé : "Multiplicateurs" Deriv (CFD à effet de levier avec
+# stop_loss/take_profit intégrés, exécutés automatiquement côté serveur
+# Deriv — pas besoin de surveiller nous-mêmes le déclenchement du SL/TP).
+#
+# ⚠️ Pas de fermeture partielle native sur ce produit : on ouvre DEUX
+# contrats séparés à l'entrée pour reproduire "TP1 85% + 15% final" :
+#   - contrat A : 85% de la mise, cible = TP1
+#   - contrat B : 15% de la mise, cible = TP final
+# Quand le contrat A se termine (gagné ou perdu), on ajuste le SL du
+# contrat B (breakeven) via contract_update.
 
-_metaapi_loop = asyncio.new_event_loop()
+DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
-def _demarrer_boucle_metaapi():
-    asyncio.set_event_loop(_metaapi_loop)
-    _metaapi_loop.run_forever()
+def _deriv_request(payload, timeout=10):
+    """
+    Ouvre une connexion, s'authentifie, envoie une requête, retourne la
+    première réponse dont le msg_type correspond à une clé de payload
+    (buy, sell, portfolio, proposal_open_contract, contract_update, ...).
+    Lève une exception explicite en cas d'erreur API ou de timeout.
+    """
+    if not DERIV_API_TOKEN:
+        raise RuntimeError("DERIV_API_TOKEN manquant (variable d'environnement Render).")
 
-Thread(target=_demarrer_boucle_metaapi, daemon=True).start()
+    cle_attendue = None
+    for k in ("buy", "sell", "portfolio", "proposal_open_contract",
+              "contract_update", "balance", "proposal"):
+        if k in payload:
+            cle_attendue = k
+            break
 
-def _executer_sync(coro, timeout=30):
-    future = asyncio.run_coroutine_threadsafe(coro, _metaapi_loop)
-    return future.result(timeout=timeout)
+    ws = None
+    try:
+        ws = websocket.create_connection(DERIV_WS_URL, timeout=timeout)
+        ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
+        auth_resp = json.loads(ws.recv())
+        if auth_resp.get("error"):
+            raise RuntimeError(f"Deriv authorize refusé : {auth_resp['error'].get('message')}")
 
-_metaapi_api = None
-_metaapi_connection = None
-_metaapi_lock = Lock()
+        ws.send(json.dumps(payload))
+        debut = time.time()
+        while time.time() - debut < timeout:
+            resp = json.loads(ws.recv())
+            if resp.get("error"):
+                raise RuntimeError(f"Deriv API erreur : {resp['error'].get('message')}")
+            if cle_attendue and cle_attendue in resp:
+                return resp
+            if resp.get("msg_type") == cle_attendue:
+                return resp
+        raise TimeoutError(f"Deriv: pas de réponse '{cle_attendue}' sous {timeout}s")
+    finally:
+        try:
+            if ws: ws.close()
+        except Exception:
+            pass
 
-async def _obtenir_connexion_metaapi():
-    global _metaapi_api, _metaapi_connection
-    if _metaapi_connection is not None:
-        return _metaapi_connection
-    if not METAAPI_TOKEN or not METAAPI_ACCOUNT_ID:
-        raise RuntimeError("METAAPI_TOKEN ou METAAPI_ACCOUNT_ID manquant (variables d'environnement Render).")
+def deriv_symbole(symbole_bot):
+    """Traduit le symbole interne du bot vers le symbole Deriv (réutilise prefixer_symbole)."""
+    return prefixer_symbole(symbole_bot)
 
-    _metaapi_api = MetaApi(METAAPI_TOKEN)
-    account = await _metaapi_api.metatrader_account_api.get_account(METAAPI_ACCOUNT_ID)
-    if account.state != "DEPLOYED":
-        await account.deploy()
-    await account.wait_connected()
+def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, sl=None, tp=None):
+    """
+    Ouvre un contrat Multiplicateur. direction: "BUY" -> MULTUP, "SELL" -> MULTDOWN.
+    stake : mise en USD. multiplier : effet de levier (ex 10, 20... selon l'actif).
+    sl/tp : niveaux de PRIX (pas de distance) — convertis en limit_order.
+    Retourne le contract_id.
+    """
+    sym = deriv_symbole(symbole)
+    contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
 
-    connection = account.get_rpc_connection()
-    await connection.connect()
-    await connection.wait_synchronized()
+    limit_order = {}
+    if sl is not None:
+        limit_order["stop_loss"] = round(float(sl), 5)
+    if tp is not None:
+        limit_order["take_profit"] = round(float(tp), 5)
 
-    _metaapi_connection = connection
-    return _metaapi_connection
+    payload = {
+        "buy": 1,
+        "price": round(stake, 2),
+        "parameters": {
+            "amount": round(stake, 2),
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": "USD",
+            "symbol": sym,
+            "multiplier": multiplier,
+        }
+    }
+    if limit_order:
+        payload["parameters"]["limit_order"] = limit_order
 
-def metaapi_connecter():
-    with _metaapi_lock:
-        return _executer_sync(_obtenir_connexion_metaapi(), timeout=60)
+    resp = _deriv_request(payload)
+    buy_info = resp.get("buy", {})
+    contract_id = buy_info.get("contract_id")
+    print(f"[Deriv] Contrat ouvert {sym} {contract_type} mise={stake} → contract_id={contract_id}", flush=True)
+    return contract_id
 
-def metaapi_placer_ordre(symbole, direction, volume, sl=None, tp=None, commentaire="TerminalPrime"):
-    async def _do():
-        conn = await _obtenir_connexion_metaapi()
-        if direction.upper() == "BUY":
-            return await conn.create_market_buy_order(
-                symbole, volume, stop_loss=sl, take_profit=tp,
-                options={"comment": commentaire[:26]})
-        else:
-            return await conn.create_market_sell_order(
-                symbole, volume, stop_loss=sl, take_profit=tp,
-                options={"comment": commentaire[:26]})
-    return _executer_sync(_do())
+def deriv_modifier_contrat(contract_id, sl=None, tp=None):
+    """Met à jour le SL/TP d'un contrat ouvert (ex: passage en breakeven)."""
+    limit_order = {}
+    if sl is not None:
+        limit_order["stop_loss"] = round(float(sl), 5)
+    if tp is not None:
+        limit_order["take_profit"] = round(float(tp), 5)
+    payload = {"contract_update": 1, "contract_id": contract_id,
+               "limit_order": limit_order}
+    return _deriv_request(payload)
 
-def metaapi_modifier_position(position_id, sl=None, tp=None):
-    async def _do():
-        conn = await _obtenir_connexion_metaapi()
-        return await conn.modify_position(position_id, stop_loss=sl, take_profit=tp)
-    return _executer_sync(_do())
+def deriv_fermer_contrat(contract_id):
+    """Ferme (vend) un contrat au marché immédiatement."""
+    payload = {"sell": contract_id, "price": 0}
+    return _deriv_request(payload)
 
-def metaapi_fermer_partiel(position_id, volume):
-    async def _do():
-        conn = await _obtenir_connexion_metaapi()
-        return await conn.close_position_partially(position_id, volume)
-    return _executer_sync(_do())
+def deriv_statut_contrat(contract_id):
+    """
+    Retourne l'état actuel d'un contrat : is_sold (0/1), profit, current_spot...
+    Utilisé par le monitoring pour détecter qu'un TP/SL a été exécuté
+    automatiquement côté Deriv (sans qu'on ait eu besoin de le déclencher).
+    """
+    payload = {"proposal_open_contract": 1, "contract_id": contract_id}
+    resp = _deriv_request(payload)
+    return resp.get("proposal_open_contract", {})
 
-def metaapi_fermer_position(position_id):
-    async def _do():
-        conn = await _obtenir_connexion_metaapi()
-        return await conn.close_position(position_id)
-    return _executer_sync(_do())
+def deriv_positions_ouvertes():
+    """Liste les contrats actuellement ouverts sur le compte."""
+    payload = {"portfolio": 1}
+    resp = _deriv_request(payload)
+    return resp.get("portfolio", {}).get("contracts", [])
 
-def metaapi_positions_ouvertes():
-    async def _do():
-        conn = await _obtenir_connexion_metaapi()
-        return await conn.get_positions()
-    return _executer_sync(_do())
+def deriv_connecter():
+    """Vérifie que le token fonctionne (appelée au démarrage / à l'activation)."""
+    payload = {"balance": 1}
+    resp = _deriv_request(payload)
+    solde = resp.get("balance", {})
+    print(f"[Deriv] Connecté — solde: {solde.get('balance')} {solde.get('currency')}", flush=True)
+    return solde
 
 def peut_ouvrir_automatiquement(symbole):
     """Respecte le mode SOLO/MULTI et le stop d'urgence avant toute ouverture auto."""
@@ -497,8 +561,8 @@ def enregistrer_resultat_trade(uid, pnl, win, pnl_pour_bilan=None):
 
 # ==========================================
 # OUVERTURE / FERMETURE DE TRADE
-# ✅ MODIFIÉ : appelle MetaApi pour une exécution RÉELLE quand un
-# metaapi_position_id est présent ou quand auto-trading est actif.
+# ✅ MODIFIÉ : appelle Deriv pour une exécution RÉELLE quand
+# executer_reel=True (auto-trading actif ou copie manuelle avec auto ON).
 # ==========================================
 
 def create_trade_id():
@@ -508,23 +572,30 @@ def ouvrir_trade(uid, symbole, direction, entry_price, sl, tp1, tp_final, strate
                  label="SIGNAL", strategie_nom_ia="?", ia_score=None, gemini_score=None,
                  contexte_marche=None, executer_reel=False):
     """
-    ✅ NOUVEAU paramètre executer_reel : si True, place un vrai ordre MT5
-    via MetaApi AVANT d'enregistrer le trade localement. Si l'ordre réel
-    échoue, le trade n'est PAS enregistré (on ne veut jamais suivre un
-    trade fantôme qui n'existe pas vraiment sur le compte).
+    ✅ NOUVEAU paramètre executer_reel : si True, ouvre 2 vrais contrats
+    Deriv (85% mise → TP1, 15% mise → TP final) AVANT d'enregistrer le
+    trade localement. Si l'ouverture réelle échoue, le trade n'est PAS
+    enregistré (on ne veut jamais suivre un trade fantôme).
     """
     trade_id = create_trade_id()
     sizing = calculer_position_size(CAPITAL_ACTUEL, RISK_CONFIG["risk_per_trade_pct"],
                                     entry_price, sl, symbole)
 
-    metaapi_position_id = None
+    deriv_contract_tp1 = None
+    deriv_contract_final = None
     if executer_reel:
-        resultat = metaapi_placer_ordre(
-            symbole, direction, CONTROL_STATE["volume_lot"], sl=sl, tp=tp_final,
-            commentaire=label
-        )
-        metaapi_position_id = resultat.get("positionId") or resultat.get("orderId")
-        print(f"[MetaApi] Ordre réel placé {symbole} {direction} → position {metaapi_position_id}", flush=True)
+        stake_total = CONTROL_STATE["stake_usd"]
+        multiplier = CONTROL_STATE["multiplier"]
+        stake_tp1 = round(stake_total * RISK_CONFIG["partial_tp_ratio"], 2)
+        stake_final = round(stake_total - stake_tp1, 2)
+
+        deriv_contract_tp1 = deriv_ouvrir_contrat(
+            symbole, direction, stake_tp1, multiplier, sl=sl, tp=tp1)
+        deriv_contract_final = deriv_ouvrir_contrat(
+            symbole, direction, stake_final, multiplier, sl=sl, tp=tp_final)
+        print(f"[Deriv] Trade réel ouvert {symbole} {direction} → "
+              f"contrat TP1={deriv_contract_tp1} (${stake_tp1}) / "
+              f"contrat FINAL={deriv_contract_final} (${stake_final})", flush=True)
 
     trades_actifs[uid] = {
         "trade_id": trade_id, "symbol": symbole,
@@ -544,7 +615,8 @@ def ouvrir_trade(uid, symbole, direction, entry_price, sl, tp1, tp_final, strate
         "breakeven_active": False,
         "trailing_active": False,
         "sizing": sizing,
-        "metaapi_position_id": metaapi_position_id,
+        "deriv_contract_tp1": deriv_contract_tp1,
+        "deriv_contract_final": deriv_contract_final,
         "reel": executer_reel,
     }
     print(f"[Trade Opened] {uid}: {trade_id} {symbole} {direction} @ {entry_price} "
@@ -559,12 +631,16 @@ def fermer_trade_complet(uid, exit_price, win):
         trade_id = trade["trade_id"]
 
         try:
-            # ✅ Fermeture réelle MetaApi si le trade a une position réelle
-            if trade.get("reel") and trade.get("metaapi_position_id"):
+            # ✅ Fermeture réelle Deriv : ferme le contrat "final" restant s'il
+            # est encore ouvert (le contrat TP1, lui, s'est déjà auto-fermé
+            # côté Deriv quand son propre TP/SL a été touché).
+            if trade.get("reel") and trade.get("deriv_contract_final"):
                 try:
-                    metaapi_fermer_position(trade["metaapi_position_id"])
+                    statut = deriv_statut_contrat(trade["deriv_contract_final"])
+                    if not statut.get("is_sold"):
+                        deriv_fermer_contrat(trade["deriv_contract_final"])
                 except Exception as e:
-                    print(f"[MetaApi] Erreur fermeture position {trade['metaapi_position_id']}: {e}", flush=True)
+                    print(f"[Deriv] Erreur fermeture contrat final {trade['deriv_contract_final']}: {e}", flush=True)
 
             risque_initial = trade["sizing"]["montant_risque"]
             portion_restante = (1 - RISK_CONFIG["partial_tp_ratio"]) if trade.get("partial_closed") else 1.0
@@ -651,13 +727,9 @@ def fermer_trade_partiel(uid, exit_price):
             gain_ratio = abs(exit_price - trade["entry_price"]) / trade["sizing"]["distance_sl"] if trade["sizing"]["distance_sl"] > 0 else 1
             pnl_partiel = risque_initial * gain_ratio * ratio
 
-            # ✅ Fermeture partielle réelle MetaApi (85% du volume) + SL → breakeven réel
-            if trade.get("reel") and trade.get("metaapi_position_id"):
-                try:
-                    volume_partiel = round(CONTROL_STATE["volume_lot"] * ratio, 2)
-                    metaapi_fermer_partiel(trade["metaapi_position_id"], volume_partiel)
-                except Exception as e:
-                    print(f"[MetaApi] Erreur fermeture partielle: {e}", flush=True)
+            # ✅ Avec Deriv, le contrat TP1 s'est déjà fermé automatiquement
+            # côté serveur (SL/TP intégrés au contrat) — rien à fermer ici.
+            # Il ne reste qu'à faire passer le contrat "final" en breakeven.
 
             trade["partial_closed"]   = True
             trade["partial_pnl"]      = pnl_partiel
@@ -670,11 +742,11 @@ def fermer_trade_partiel(uid, exit_price):
             else:
                 trade["sl"] = trade["entry_price"] - buffer
 
-            if trade.get("reel") and trade.get("metaapi_position_id"):
+            if trade.get("reel") and trade.get("deriv_contract_final"):
                 try:
-                    metaapi_modifier_position(trade["metaapi_position_id"], sl=trade["sl"])
+                    deriv_modifier_contrat(trade["deriv_contract_final"], sl=trade["sl"])
                 except Exception as e:
-                    print(f"[MetaApi] Erreur modification SL breakeven: {e}", flush=True)
+                    print(f"[Deriv] Erreur modification SL breakeven: {e}", flush=True)
 
             pnl_total[uid] = pnl_total.get(uid, 0) + pnl_partiel
             stats = init_daily_stats(uid)
@@ -711,11 +783,11 @@ def appliquer_trailing_stop(uid, prix_current):
             trade["trailing_active"] = True
 
     if nouveau_sl is not None:
-        if trade.get("reel") and trade.get("metaapi_position_id"):
+        if trade.get("reel") and trade.get("deriv_contract_final"):
             try:
-                metaapi_modifier_position(trade["metaapi_position_id"], sl=nouveau_sl)
+                deriv_modifier_contrat(trade["deriv_contract_final"], sl=nouveau_sl)
             except Exception as e:
-                print(f"[MetaApi] Erreur trailing stop: {e}", flush=True)
+                print(f"[Deriv] Erreur trailing stop: {e}", flush=True)
         return True
     return False
 
@@ -2275,7 +2347,7 @@ def scanner_marche_auto():
 
                     # ✅ NOUVEAU : EXÉCUTION 100% AUTOMATIQUE (comme l'EA vidéo)
                     # Si auto-trading est ON, on ouvre directement le trade réel
-                    # via MetaApi, sans passer par le bouton "Copier".
+                    # via Deriv, sans passer par le bouton "Copier".
                     if peut_ouvrir_automatiquement(paire):
                         try:
                             trade_id, sizing = ouvrir_trade(
@@ -2298,7 +2370,7 @@ def scanner_marche_auto():
                                 f"🛑 SL : {res['sl']:.5f}  🎯 TP : {res['tp']:.5f}\n"
                                 f"⚖️ R/R : {res['rr']}R · 🎖️ Confiance {res['confiance']}%\n"
                                 f"🤖 Score IA : {res.get('ia_score','?')}%\n"
-                                f"💵 Lot réel : {CONTROL_STATE['volume_lot']}\n"
+                                f"💵 Mise réelle : ${CONTROL_STATE['stake_usd']} x{CONTROL_STATE['multiplier']}\n"
                                 f"🆔 {trade_id}"
                             )
                             bot.send_message(uid, txt_auto, parse_mode="Markdown")
@@ -2647,22 +2719,22 @@ def toggle_auto_trading(message):
             "🛑 Stop d'urgence encore actif. Utilise '🛑 STOP D'URGENCE' pour le lever avant de relancer.",
             parse_mode="Markdown")
     CONTROL_STATE["auto_trading_active"] = not CONTROL_STATE["auto_trading_active"]
-    metaapi_ok = True
+    deriv_ok = True
     if CONTROL_STATE["auto_trading_active"]:
         try:
-            metaapi_connecter()
+            deriv_connecter()
         except Exception as e:
-            metaapi_ok = False
+            deriv_ok = False
             CONTROL_STATE["auto_trading_active"] = False
     etat = "🟢 ACTIVÉ" if CONTROL_STATE["auto_trading_active"] else "🔴 DÉSACTIVÉ"
     txt = (
         f"⚙️ *Auto-trading : {etat}*\n\n"
         f"{'Le bot ouvre/ferme les trades automatiquement sur les signaux validés (calcul + Groq), sans clic.' if CONTROL_STATE['auto_trading_active'] else 'Retour au mode notification + bouton Copier manuel.'}\n"
         f"Mode actuel : {CONTROL_STATE['mode']}\n"
-        f"Lot réel : {CONTROL_STATE['volume_lot']}"
+        f"Mise réelle : ${CONTROL_STATE['stake_usd']} x{CONTROL_STATE['multiplier']}"
     )
-    if not metaapi_ok:
-        txt += "\n\n⚠️ Connexion MetaApi échouée — vérifie METAAPI_TOKEN/METAAPI_ACCOUNT_ID sur Render."
+    if not deriv_ok:
+        txt += "\n\n⚠️ Connexion Deriv échouée — vérifie DERIV_API_TOKEN sur Render."
     bot.send_message(uid, txt, reply_markup=obtenir_clavier(uid), parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text and m.text.startswith("⚙️ MODE"))
@@ -2687,18 +2759,18 @@ def status_live(message):
     lignes.append(f"Stop d'urgence : {'🛑 ACTIF' if CONTROL_STATE['stop_urgence_actif'] else '✅ inactif'}")
     lignes.append("━━━━━━━━━━━━━━━━━━━━━━")
     try:
-        positions = metaapi_positions_ouvertes()
+        positions = deriv_positions_ouvertes()
         if not positions:
-            lignes.append("Aucune position ouverte sur MT5 actuellement.")
+            lignes.append("Aucun contrat ouvert sur Deriv actuellement.")
         else:
-            lignes.append(f"*{len(positions)} position(s) ouverte(s) sur MT5 :*")
+            lignes.append(f"*{len(positions)} contrat(s) ouvert(s) sur Deriv :*")
             for p in positions:
                 lignes.append(
-                    f"  {p.get('symbol')} {p.get('type')} | "
-                    f"Vol {p.get('volume')} | P&L {p.get('profit', 0):+.2f}$"
+                    f"  {p.get('symbol')} {p.get('contract_type')} | "
+                    f"Mise {p.get('buy_price')}$ | P&L {p.get('profit', 0):+.2f}$"
                 )
     except Exception as e:
-        lignes.append(f"⚠️ Impossible de récupérer les positions MetaApi : {e}")
+        lignes.append(f"⚠️ Impossible de récupérer les positions Deriv : {e}")
     bot.send_message(uid, "\n".join(lignes), parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "💰 RISQUE PAR TRADE")
@@ -2707,27 +2779,45 @@ def risque_menu(message):
     if uid != ADMIN_ID: return
     txt = (
         f"💰 *RISQUE PAR TRADE*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Lot réel actuel : {CONTROL_STATE['volume_lot']}\n"
+        f"Mise réelle actuelle : ${CONTROL_STATE['stake_usd']}\n"
+        f"Multiplicateur : x{CONTROL_STATE['multiplier']}\n"
         f"Risque % configuré : {RISK_CONFIG['risk_per_trade_pct']}%\n\n"
-        f"Pour changer le lot : /lot 0.01\n"
+        f"Pour changer la mise : /stake 1.0\n"
+        f"Pour changer le multiplicateur : /mult 10\n"
         f"Pour changer le risque % : /risk risk_per_trade_pct 1.0\n\n"
-        f"⚠️ Reste sur 0.01 tant que tu es en démo/tests."
+        f"⚠️ Reste petit tant que tu es en démo/tests."
     )
     bot.send_message(uid, txt, parse_mode="Markdown")
 
-@bot.message_handler(commands=['lot'])
-def changer_lot(message):
+@bot.message_handler(commands=['stake'])
+def changer_stake(message):
     uid = message.chat.id
     if uid != ADMIN_ID: return
     parts = message.text.strip().split()
     if len(parts) < 2:
-        return bot.send_message(uid, "Usage : /lot 0.01")
+        return bot.send_message(uid, "Usage : /stake 1.0")
     try:
         valeur = float(parts[1])
-        if valeur <= 0 or valeur > 1.0:
-            return bot.send_message(uid, "❌ Lot invalide (entre 0.01 et 1.0 recommandé).")
-        CONTROL_STATE["volume_lot"] = valeur
-        bot.send_message(uid, f"✅ Lot réel = {valeur}")
+        if valeur <= 0 or valeur > 1000:
+            return bot.send_message(uid, "❌ Mise invalide.")
+        CONTROL_STATE["stake_usd"] = valeur
+        bot.send_message(uid, f"✅ Mise réelle = ${valeur}")
+    except ValueError:
+        bot.send_message(uid, "❌ Valeur invalide.")
+
+@bot.message_handler(commands=['mult'])
+def changer_multiplicateur(message):
+    uid = message.chat.id
+    if uid != ADMIN_ID: return
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        return bot.send_message(uid, "Usage : /mult 10")
+    try:
+        valeur = int(parts[1])
+        if valeur <= 0 or valeur > 1000:
+            return bot.send_message(uid, "❌ Multiplicateur invalide.")
+        CONTROL_STATE["multiplier"] = valeur
+        bot.send_message(uid, f"✅ Multiplicateur = x{valeur}")
     except ValueError:
         bot.send_message(uid, "❌ Valeur invalide.")
 
@@ -2753,7 +2843,7 @@ def stop_urgence(message):
         )
         return bot.send_message(uid,
             "🛑 *STOP D'URGENCE*\n\nCeci va :\n"
-            "• Fermer TOUTES les positions ouvertes sur MT5\n"
+            "• Fermer TOUS les contrats ouverts sur Deriv\n"
             "• Désactiver l'auto-trading immédiatement\n\n"
             "Confirme :", reply_markup=markup, parse_mode="Markdown")
     else:
@@ -2770,10 +2860,10 @@ def confirmer_stop_urgence(call):
     CONTROL_STATE["stop_urgence_actif"] = True
     fermees, erreurs = 0, 0
     try:
-        positions = metaapi_positions_ouvertes()
+        positions = deriv_positions_ouvertes()
         for p in positions:
             try:
-                metaapi_fermer_position(p["id"])
+                deriv_fermer_contrat(p["contract_id"])
                 fermees += 1
             except Exception:
                 erreurs += 1
@@ -2810,7 +2900,7 @@ def bienvenue(message):
         t = trades_actifs[uid]
         trade_info = f"\n🟠 *TRADE ACTIF:* {t['symbol']} {t['direction']} @ {t['entry_price']}"
     bot.send_message(uid,
-        f"💼 *TERMINAL PRIME V55* — ANALYSTE IA + EXÉCUTION RÉELLE (MetaApi)\n"
+        f"💼 *TERMINAL PRIME V55* — ANALYSTE IA + EXÉCUTION RÉELLE (Deriv)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Auto-trading : {'🟢 ON' if CONTROL_STATE['auto_trading_active'] else '🔴 OFF (démarre toujours désactivé)'}\n"
         f"Mode : {CONTROL_STATE['mode']}\n"
@@ -2987,7 +3077,7 @@ def save_devise(call):
         f"💼 *{cache.get('label','SIGNAL')}* — {nom}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 BUY MARKET' if 'BUY' in cache['action'] else '🔴 SELL MARKET'}"
-        f"{' (RÉEL — MetaApi)' if executer_reel_manuel else ' (simulé)'}\n"
+        f"{' (RÉEL — Deriv)' if executer_reel_manuel else ' (simulé)'}\n"
         f"📊 Contexte : {cache.get('contexte','')}\n"
         f"🤖 Score IA validé : {cache.get('ia_score','?')}%\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3014,17 +3104,17 @@ def save_devise(call):
 
 if __name__ == "__main__":
     keep_alive()
-    # ✅ Connexion MetaApi tentée au démarrage (non bloquante si elle échoue —
+    # ✅ Connexion Deriv tentée au démarrage (non bloquante si elle échoue —
     # l'admin pourra réessayer via le bouton "AUTO-TRADING" dans /menu).
     try:
-        metaapi_connecter()
-        print("✅ MetaApi connecté au démarrage", flush=True)
+        deriv_connecter()
+        print("✅ Deriv connecté au démarrage", flush=True)
     except Exception as e:
-        print(f"⚠️ MetaApi non connecté au démarrage ({e}) — connexion réessayée à l'activation.", flush=True)
+        print(f"⚠️ Deriv non connecté au démarrage ({e}) — connexion réessayée à l'activation.", flush=True)
 
     Thread(target=scanner_marche_auto,            daemon=True).start()
     Thread(target=monitorer_trades_actifs,         daemon=True).start()
     Thread(target=envoyer_rapports_quotidiens_auto,daemon=True).start()
     Thread(target=watchdog_trades_bloques,         daemon=True).start()
-    print("💼 TERMINAL PRIME V55 — MetaApi Edition ACTIF", flush=True)
+    print("💼 TERMINAL PRIME V55 — Deriv Edition ACTIF", flush=True)
     bot.infinity_polling()
