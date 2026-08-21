@@ -34,7 +34,7 @@ from metaapi_cloud_sdk import MetaApi
 # CONFIGURATION GLOBALE
 # ==========================================
 
-TELEGRAM_TOKEN = "8000472746:AAGwm6ZXmFX1c7XRKsgk1WvSNEa_MJ05r1w"
+TELEGRAM_TOKEN = "8000472746:AAGNxTti2ED2k7WsODMpWpA2FKpeNKSGc2k"
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 ADMIN_ID = 5968288964
 CAPITAL_ACTUEL = 40650
@@ -61,7 +61,7 @@ def convertir_symbole_mt5(symbole_bot):
 # CONFIGURATION METAAPI (EXÉCUTION MT5 RÉELLE)
 # ==========================================
 
-METAAPI_TOKEN = os.environ.get("4b6c631b-ce28-4aae-ab2d-fc8de9c64db5", "").strip()
+METAAPI_TOKEN = "ea6deb68-7513-49bd-9669-5d162ca1e4eb", "").strip()
 METAAPI_ACCOUNT_ID = os.environ.get("41080337", "").strip()
 metaapi_instance = MetaApi(token=METAAPI_TOKEN) if METAAPI_TOKEN else None
 
