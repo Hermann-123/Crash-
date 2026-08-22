@@ -73,7 +73,7 @@ RISK_CONFIG = {
     "trailing_stop_distance_pct": 0.003,
     "max_trades_per_day": 8,
     "max_trade_age_hours": 12,
-    "signal_validity_seconds": 45,
+    "signal_validity_seconds": 20,   # ✅ V57: réduit (45→20) — un signal de scalping M1 périme vite
     "max_rr_degradation_pct": 40,
 }
 
@@ -1284,6 +1284,166 @@ def analyser_trend_pullback_confluence(symbole):
         print(f"[TrendPullback/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
         return None
 
+# ==========================================
+# ✅ V57 NEW: STRATÉGIE DE SCALPING MULTI-TIMEFRAME (M1 → M30)
+# ==========================================
+# Empilement inspiré d'une méthode Fibonacci "golden pocket" + structure de
+# session, adaptée à des timeframes courts pour du scalping réel (au lieu
+# du swing H1/M15 de la stratégie précédente) :
+#
+#   M30 : biais directionnel (EMA9 vs EMA21) — la tendance "macro" du scalp
+#   M15 : zone de retracement Fibonacci (38.2%-61.8%, "golden pocket") du
+#         dernier swing détecté — la zone de valeur où on cherche un retour
+#   M5  : le prix doit être ACTUELLEMENT dans cette zone (pas juste l'avoir
+#         traversée) — condition de timing
+#   M1  : bougie de confirmation (Pin Bar / Engulfing / Marubozu) dans le
+#         sens du biais — le déclencheur d'entrée précis
+#
+# Le second avis du moteur IA (H1/H4/multi-TF, contexte marché, détection
+# de faux signal) reste actif en aval, inchangé — il sert de filtre de
+# sécurité macro même sur un scalp court terme.
+
+def calculer_zone_fibonacci(df, lookback=20):
+    """
+    Détecte le dernier swing haut/bas sur la fenêtre récente et calcule la
+    zone de retracement Fibonacci 38.2%-61.8% ("golden pocket") de ce swing.
+    Retourne None si le swing est trop plat pour être exploitable.
+    """
+    try:
+        sub = df.iloc[-lookback:].reset_index(drop=True)
+        plus_haut = float(sub['high'].max())
+        plus_bas = float(sub['low'].min())
+        idx_haut = int(sub['high'].idxmax())
+        idx_bas = int(sub['low'].idxmin())
+
+        amplitude = plus_haut - plus_bas
+        if amplitude <= 0:
+            return None
+
+        if idx_haut > idx_bas:
+            # Le plus haut est venu APRÈS le plus bas → swing haussier →
+            # zone d'achat en retracement (discount zone)
+            direction_swing = "BULL"
+            zone_haut = plus_haut - (amplitude * 0.382)
+            zone_bas  = plus_haut - (amplitude * 0.618)
+        else:
+            direction_swing = "BEAR"
+            zone_bas  = plus_bas + (amplitude * 0.382)
+            zone_haut = plus_bas + (amplitude * 0.618)
+
+        return {
+            "bas": round(min(zone_bas, zone_haut), 5),
+            "haut": round(max(zone_bas, zone_haut), 5),
+            "direction_swing": direction_swing,
+            "amplitude": amplitude,
+        }
+    except Exception:
+        return None
+
+def analyser_scalping_multi_tf(symbole):
+    """
+    Stratégie unique de scalping M1→M30. Retourne un signal (même structure
+    que l'ancienne stratégie, pour rester compatible avec le moteur IA et
+    tout le reste du pipeline existant) ou None si aucune configuration
+    valide n'est détectée.
+    """
+    c30 = obtenir_donnees_deriv(symbole, 1800)
+    c15 = obtenir_donnees_deriv(symbole, 900)
+    c5  = obtenir_donnees_deriv(symbole, 300)
+    c1  = obtenir_donnees_deriv(symbole, 60)
+
+    if not all([c30, c15, c5, c1]) or len(c30) < 30 or len(c15) < 30 or len(c5) < 30 or len(c1) < 15:
+        print(f"[DEBUG-SCALP] {symbole} REJET: données insuffisantes "
+              f"(M30={len(c30) if c30 else 0}, M15={len(c15) if c15 else 0}, "
+              f"M5={len(c5) if c5 else 0}, M1={len(c1) if c1 else 0})", flush=True)
+        return None
+
+    try:
+        df30 = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
+                               "low":float(c["low"]),"close":float(c["close"])} for c in c30])
+        df15 = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
+                               "low":float(c["low"]),"close":float(c["close"])} for c in c15])
+        df5  = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
+                               "low":float(c["low"]),"close":float(c["close"])} for c in c5])
+        df1  = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
+                               "low":float(c["low"]),"close":float(c["close"])} for c in c1])
+
+        px = float(df1['close'].iloc[-1])
+
+        # ── 1. BIAIS DIRECTIONNEL M30 ──
+        ema9_30  = _ema(df30['close'], 9)
+        ema21_30 = _ema(df30['close'], 21)
+        direction = "BULL" if ema9_30.iloc[-2] > ema21_30.iloc[-2] else "BEAR"
+
+        # ── 2. ZONE FIBONACCI (GOLDEN POCKET) SUR M15 ──
+        zone = calculer_zone_fibonacci(df15, lookback=20)
+        if not zone or zone["direction_swing"] != direction:
+            print(f"[DEBUG-SCALP] {symbole} REJET: pas de zone Fibonacci "
+                  f"cohérente avec le biais M30 ({direction})", flush=True)
+            return None
+
+        # ── 3. LE PRIX EST-IL ACTUELLEMENT DANS LA ZONE (M5) ? ──
+        if not (zone["bas"] <= px <= zone["haut"]):
+            print(f"[DEBUG-SCALP] {symbole} REJET: prix {px} hors zone Fibo "
+                  f"[{zone['bas']}, {zone['haut']}]", flush=True)
+            return None
+
+        # ── 4. BOUGIE DE CONFIRMATION M1 ──
+        pattern, _ = detecter_chandeliers_pdf(df1)
+        patterns_valides_bull = ("PIN_BULL", "ENGULFING_BULL", "MARUBOZU_BULL")
+        patterns_valides_bear = ("PIN_BEAR", "ENGULFING_BEAR", "MARUBOZU_BEAR")
+        if (direction == "BULL" and pattern not in patterns_valides_bull) or \
+           (direction == "BEAR" and pattern not in patterns_valides_bear):
+            print(f"[DEBUG-SCALP] {symbole} REJET: aucune bougie de confirmation "
+                  f"M1 valide (direction={direction}, pattern détecté={pattern})", flush=True)
+            return None
+
+        # ── 5. RISQUE / CIBLE basés sur l'ATR M1 (mouvements courts, SL serré) ──
+        atr1 = calculer_atr(df1)
+        if atr1 <= 0:
+            return None
+
+        bougie1 = df1.iloc[-2]
+        if direction == "BULL":
+            signal_dir = "BUY"
+            sl = min(float(bougie1['low']) - atr1 * 0.2, px - atr1 * 1.0)
+            distance = px - sl
+            if distance <= 0:
+                return None
+            tp = px + distance * 1.5
+            tp1 = px + distance * 1.0
+        else:
+            signal_dir = "SELL"
+            sl = max(float(bougie1['high']) + atr1 * 0.2, px + atr1 * 1.0)
+            distance = sl - px
+            if distance <= 0:
+                return None
+            tp = px - distance * 1.5
+            tp1 = px - distance * 1.0
+
+        rr = abs(tp - px) / abs(px - sl) if abs(px - sl) > 0 else 0
+        if rr < 1.2:
+            print(f"[DEBUG-SCALP] {symbole} REJET: R/R {rr:.2f} < 1.2", flush=True)
+            return None
+
+        print(f"[DEBUG-SCALP] {symbole} ✅ SIGNAL ÉMIS — direction={direction} "
+              f"zone_fibo=[{zone['bas']},{zone['haut']}] pattern={pattern} rr={rr:.2f}", flush=True)
+
+        return {
+            "action": "🟢 ACHAT (BUY)" if signal_dir == "BUY" else "🔴 VENTE (SELL)",
+            "tendance": direction, "force": f"Biais M30 {direction}",
+            "msg": f"Scalping M1→M30 : pullback zone Fibo golden pocket + {pattern.replace('_',' ')}",
+            "sl": round(sl, 5), "tp1": round(tp1, 5), "tp": round(tp, 5),
+            "rr": round(rr, 2), "px": round(px, 5),
+            "strategie": 1, "confiance": 70,
+            "label": "SCALPING MULTI-TF (M1→M30)",
+            "zones_confluence": ["Fibonacci Golden Pocket M15"],
+            "order_block": None, "niveau_cle": None,
+        }
+    except Exception as e:
+        print(f"[Scalping/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        return None
+
 def detecter_contexte_pdf(symbole):
     cached = contexte_marche_cache.get(symbole)
     if cached and (time.time() - cached["ts"]) < 120:
@@ -1913,7 +2073,7 @@ def cerveau_pro_trader(symbole):
     signaux_valides = []
     print(f"[DEBUG] === Analyse {symbole} — début cycle ===", flush=True)
     for fn, nom_strategie, emoji_ctx in (
-        (analyser_trend_pullback_confluence, "TREND_PULLBACK", "📈 TREND PULLBACK & CONFLUENCE"),
+        (analyser_scalping_multi_tf, "SCALPING_MULTI_TF", "⚡ SCALPING MULTI-TF (M1→M30)"),
     ):
         try:
             signal_brut = fn(symbole)
@@ -2445,7 +2605,7 @@ def scanner_marche_auto():
     toutes_paires = ELITE_PAIRS_MT5
     while True:
         try:
-            time.sleep(15)
+            time.sleep(8)  # ✅ V57: cycle plus rapide (15→8s), adapté au scalping M1
             libres = [u for u in utilisateurs_actifs if est_autorise(u)]
             if not libres:
                 continue
