@@ -217,7 +217,26 @@ def backtester(symbole, nb_jours=60, seuil_ia_teste=None):
 
 
 if __name__ == "__main__":
-    symbole = sys.argv[1] if len(sys.argv) > 1 else "XAUUSD"
+    symboles_arg = sys.argv[1] if len(sys.argv) > 1 else "XAUUSD"
     nb_jours = int(sys.argv[2]) if len(sys.argv) > 2 else 60
     seuil = int(sys.argv[3]) if len(sys.argv) > 3 else None
-    backtester(symbole, nb_jours, seuil)
+
+    symboles = [s.strip().upper() for s in symboles_arg.split(",") if s.strip()]
+    tous_resultats = []
+
+    for sym in symboles:
+        res = backtester(sym, nb_jours, seuil)
+        if res:
+            tous_resultats.append(res)
+        time.sleep(1)  # petite pause entre deux symboles, courtoisie API
+
+    if len(symboles) > 1 and tous_resultats:
+        print(f"\n{'='*70}")
+        print(f"TABLEAU COMPARATIF — {nb_jours} jours (seuil IA={bot_core.IA_CONFIG['seuil_acceptation']}%)")
+        print(f"{'='*70}")
+        print(f"{'Symbole':<10} {'Trades':<8} {'Winrate':<10} {'R/R moy':<10} {'Espérance':<10}")
+        print(f"{'-'*70}")
+        for r in sorted(tous_resultats, key=lambda x: x['esperance'], reverse=True):
+            print(f"{r['symbole']:<10} {r['nb_trades']:<8} {r['winrate']:.1f}%{'':<5} "
+                  f"{r['rr_moyen']:.2f}{'':<6} {r['esperance']:+.2f}")
+        print(f"{'='*70}\n")
