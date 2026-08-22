@@ -253,7 +253,9 @@ def _deriv_obtenir_ws_url(force_refresh=False):
     if resp.status_code != 200:
         raise RuntimeError(f"Deriv OTP HTTP {resp.status_code}: {resp.text[:300]}")
     data = resp.json()
-    url = data.get("url") or data.get("websocket_url") or data.get("ws_url")
+    interieur = data.get("data", data)
+    url = (data.get("url") or data.get("websocket_url") or data.get("ws_url")
+           or interieur.get("url") or interieur.get("websocket_url") or interieur.get("ws_url"))
     if not url:
         raise RuntimeError(f"Deriv OTP: pas d'URL dans la réponse: {resp.text[:300]}")
     return url
