@@ -217,11 +217,21 @@ def backtester(symbole, nb_jours=60, seuil_ia_teste=None):
 
 
 if __name__ == "__main__":
+    # ✅ Marqueur de version — vérifie dans les logs Render que c'est bien
+    # CETTE version qui tourne (utile si Auto-Deploy est sur "Off" et qu'un
+    # ancien build tourne encore sans qu'on s'en rende compte).
+    print(f"\n{'#'*70}", flush=True)
+    print(f"# BACKTEST_STRATEGIE.PY — VERSION MULTI-SYMBOLES (avec tableau comparatif)", flush=True)
+    print(f"# Lancé le : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", flush=True)
+    print(f"# Arguments reçus : {sys.argv[1:]}", flush=True)
+    print(f"{'#'*70}\n", flush=True)
+
     symboles_arg = sys.argv[1] if len(sys.argv) > 1 else "XAUUSD"
     nb_jours = int(sys.argv[2]) if len(sys.argv) > 2 else 60
     seuil = int(sys.argv[3]) if len(sys.argv) > 3 else None
 
     symboles = [s.strip().upper() for s in symboles_arg.split(",") if s.strip()]
+    print(f"Symboles à tester ({len(symboles)}) : {symboles}", flush=True)
     tous_resultats = []
 
     for sym in symboles:
