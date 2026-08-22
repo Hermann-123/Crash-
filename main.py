@@ -112,27 +112,38 @@ def simuler_issue_trade(bougies_futures, direction, sl, tp, max_bougies=200):
 # BOUCLE DE BACKTEST
 # ==========================================
 
-def backtester(symbole, nb_jours=60, seuil_ia_teste=None):
+def backtester(symbole, nb_jours=20, seuil_ia_teste=None):
     """
-    Rejoue la stratégie bougie par bougie sur l'historique M15, en ne
-    donnant à chaque étape que les données disponibles JUSQU'À ce point
-    (pas de bougies futures visibles par la stratégie elle-même).
+    ✅ V57: rejoue la stratégie de SCALPING MULTI-TF (M1→M30) en avançant
+    bougie par bougie sur l'historique M5 (compromis entre fidélité et
+    temps de calcul — le M1 donnerait 5x plus d'itérations pour un gain de
+    précision marginal, vu que la zone de timing se vérifie déjà au M5).
+    À chaque pas, seules les données ANTÉRIEURES à cet instant sont
+    fournies aux fonctions du bot (aucune bougie future visible).
     """
-    print(f"\n{'='*70}\nBACKTEST {symbole} — {nb_jours} jours d'historique\n{'='*70}", flush=True)
+    print(f"\n{'='*70}\nBACKTEST SCALPING {symbole} — {nb_jours} jours d'historique\n{'='*70}", flush=True)
 
-    bougies_par_jour_m15 = 96
-    nb_m15 = min(nb_jours * bougies_par_jour_m15 + 200, 20000)
-    nb_h1 = min(nb_jours * 24 + 200, 20000)
+    print("Récupération de l'historique M1...", flush=True)
+    m1 = obtenir_historique_paginee(symbole, 60, min(nb_jours * 1440 + 300, 40000))
+    print(f"  → {len(m1)} bougies M1 récupérées", flush=True)
+
+    print("Récupération de l'historique M5...", flush=True)
+    m5 = obtenir_historique_paginee(symbole, 300, min(nb_jours * 288 + 300, 20000))
+    print(f"  → {len(m5)} bougies M5 récupérées", flush=True)
 
     print("Récupération de l'historique M15...", flush=True)
-    m15 = obtenir_historique_paginee(symbole, 900, nb_m15)
+    m15 = obtenir_historique_paginee(symbole, 900, min(nb_jours * 96 + 300, 20000))
     print(f"  → {len(m15)} bougies M15 récupérées", flush=True)
 
-    print("Récupération de l'historique H1...", flush=True)
-    h1 = obtenir_historique_paginee(symbole, 3600, nb_h1)
+    print("Récupération de l'historique M30...", flush=True)
+    m30 = obtenir_historique_paginee(symbole, 1800, min(nb_jours * 48 + 300, 20000))
+    print(f"  → {len(m30)} bougies M30 récupérées", flush=True)
+
+    print("Récupération de l'historique H1 (filtre macro du moteur IA)...", flush=True)
+    h1 = obtenir_historique_paginee(symbole, 3600, min(nb_jours * 24 + 300, 20000))
     print(f"  → {len(h1)} bougies H1 récupérées", flush=True)
 
-    if len(m15) < 100 or len(h1) < 100:
+    if any(len(x) < 100 for x in (m1, m5, m15, m30, h1)):
         print("❌ Pas assez de données récupérées pour un backtest fiable.", flush=True)
         return
 
@@ -140,54 +151,62 @@ def backtester(symbole, nb_jours=60, seuil_ia_teste=None):
         bot_core.IA_CONFIG["seuil_acceptation"] = seuil_ia_teste
 
     resultats = []
-    fenetre_min_m15, fenetre_min_h1 = 90, 90  # mêmes minimums que le bot en direct
+    fenetre_min = 40  # minimum de bougies connues requis sur chaque timeframe avant de tester
 
-    # On avance bougie par bougie sur le M15, en reconstituant à chaque pas
-    # uniquement la fenêtre H1 "connue" à cet instant (pas de futur visible).
-    for i in range(fenetre_min_m15, len(m15) - 1):
-        epoch_actuel = m15[i]["epoch"]
+    # On avance bougie par bougie sur le M5 (le timing de la stratégie se
+    # décide à cette résolution) — pour chaque pas, on reconstitue les
+    # fenêtres M1/M15/M30/H1 "connues" à cet instant précis.
+    for i in range(fenetre_min, len(m5) - 1):
+        epoch_actuel = m5[i]["epoch"]
 
-        # Fenêtre H1 correspondant à ce moment précis (aucune bougie H1 après epoch_actuel)
-        h1_connu = [c for c in h1 if c["epoch"] <= epoch_actuel]
-        if len(h1_connu) < fenetre_min_h1:
+        m1_connu  = [c for c in m1  if c["epoch"] <= epoch_actuel]
+        m15_connu = [c for c in m15 if c["epoch"] <= epoch_actuel]
+        m30_connu = [c for c in m30 if c["epoch"] <= epoch_actuel]
+        h1_connu  = [c for c in h1  if c["epoch"] <= epoch_actuel]
+        m5_connu  = m5[:i+1]
+
+        if any(len(x) < fenetre_min for x in (m1_connu, m15_connu, m30_connu, h1_connu)):
             continue
 
-        m15_connu = m15[:i+1]
-
-        # Monkey-patch temporaire : on force les fonctions de récupération
-        # de données du bot à retourner nos fenêtres historiques figées,
-        # au lieu d'aller chercher les données "temps réel" sur le réseau.
+        # Monkey-patch temporaire : force les fonctions du bot à utiliser
+        # nos fenêtres historiques figées au lieu du réseau temps réel.
+        # gran=14400 (H4) retourne None exprès → déclenche le repli normal
+        # du bot (agrégation H1×4) déjà codé dans obtenir_donnees_h4().
         original_fn = bot_core.obtenir_donnees_deriv
-        def _fake_obtenir_donnees(sym, gran, _m15=m15_connu, _h1=h1_connu):
-            if gran == 900:
-                return _m15[-250:]
-            if gran == 3600:
-                return _h1[-250:]
-            return original_fn(sym, gran)
+        def _fake_obtenir_donnees(sym, gran, _m1=m1_connu, _m5=m5_connu,
+                                  _m15=m15_connu, _m30=m30_connu, _h1=h1_connu):
+            if gran == 60:   return _m1[-250:]
+            if gran == 300:  return _m5[-250:]
+            if gran == 900:  return _m15[-250:]
+            if gran == 1800: return _m30[-250:]
+            if gran == 3600: return _h1[-250:]
+            return None
         bot_core.obtenir_donnees_deriv = _fake_obtenir_donnees
 
+        signal, verdict = None, None
         try:
-            signal = bot_core.analyser_trend_pullback_confluence(symbole)
+            signal = bot_core.analyser_scalping_multi_tf(symbole)
             if signal:
-                verdict = bot_core.moteur_ia_valider_signal(symbole, signal, "TREND_PULLBACK")
+                verdict = bot_core.moteur_ia_valider_signal(symbole, signal, "SCALPING_MULTI_TF")
         finally:
             bot_core.obtenir_donnees_deriv = original_fn  # toujours restaurer
 
-        if not signal or not verdict["accepte"]:
+        if not signal or not verdict or not verdict["accepte"]:
             continue
 
         direction = signal["tendance"]
         sl, tp = signal["sl"], signal["tp"]
-        futures = m15[i+1:]
-        issue, duree = simuler_issue_trade(futures, direction, sl, tp)
+        futures_m1 = [c for c in m1 if c["epoch"] > epoch_actuel]
+        issue, duree = simuler_issue_trade(futures_m1, direction, sl, tp, max_bougies=500)
 
         resultats.append({
             "epoch": epoch_actuel, "direction": direction,
             "score_ia": verdict["score"], "rr": signal["rr"],
-            "issue": issue, "duree_bougies": duree,
+            "issue": issue, "duree_minutes": duree,
         })
         print(f"  [{datetime.datetime.utcfromtimestamp(epoch_actuel)}] "
-              f"{direction} score={verdict['score']}% rr={signal['rr']} → {issue}", flush=True)
+              f"{direction} score={verdict['score']}% rr={signal['rr']} → {issue} "
+              f"({duree} min)", flush=True)
 
     # ── Résumé ──
     exploitables = [r for r in resultats if r["issue"] in ("WIN", "LOSS")]
@@ -198,17 +217,19 @@ def backtester(symbole, nb_jours=60, seuil_ia_teste=None):
     wins = [r for r in exploitables if r["issue"] == "WIN"]
     winrate = len(wins) / len(exploitables) * 100
     rr_moyen = sum(r["rr"] for r in exploitables) / len(exploitables)
+    duree_moyenne = sum(r["duree_minutes"] for r in exploitables) / len(exploitables)
 
     # Espérance simple : winrate% * RR - (1-winrate%) * 1 (risque = 1 unité par trade)
     esperance = (winrate/100 * rr_moyen) - ((1 - winrate/100) * 1)
 
     print(f"\n{'='*70}")
-    print(f"RÉSUMÉ — {symbole} sur {nb_jours} jours (seuil IA={bot_core.IA_CONFIG['seuil_acceptation']}%)")
+    print(f"RÉSUMÉ SCALPING — {symbole} sur {nb_jours} jours (seuil IA={bot_core.IA_CONFIG['seuil_acceptation']}%)")
     print(f"{'='*70}")
     print(f"Trades simulés (complets)  : {len(exploitables)}")
     print(f"Trades en cours (ignorés)  : {len(resultats) - len(exploitables)}")
     print(f"Winrate                    : {winrate:.1f}%")
     print(f"R/R moyen                  : {rr_moyen:.2f}")
+    print(f"Durée moyenne d'un trade   : {duree_moyenne:.0f} minutes")
     print(f"Espérance par trade (en R) : {esperance:+.2f}")
     print(f"{'='*70}\n")
 
@@ -221,13 +242,13 @@ if __name__ == "__main__":
     # CETTE version qui tourne (utile si Auto-Deploy est sur "Off" et qu'un
     # ancien build tourne encore sans qu'on s'en rende compte).
     print(f"\n{'#'*70}", flush=True)
-    print(f"# BACKTEST_STRATEGIE.PY — VERSION MULTI-SYMBOLES (avec tableau comparatif)", flush=True)
+    print(f"# BACKTEST_STRATEGIE.PY — SCALPING MULTI-TF (M1→M30) — multi-symboles", flush=True)
     print(f"# Lancé le : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", flush=True)
     print(f"# Arguments reçus : {sys.argv[1:]}", flush=True)
     print(f"{'#'*70}\n", flush=True)
 
     symboles_arg = sys.argv[1] if len(sys.argv) > 1 else "XAUUSD"
-    nb_jours = int(sys.argv[2]) if len(sys.argv) > 2 else 60
+    nb_jours = int(sys.argv[2]) if len(sys.argv) > 2 else 20
     seuil = int(sys.argv[3]) if len(sys.argv) > 3 else None
 
     symboles = [s.strip().upper() for s in symboles_arg.split(",") if s.strip()]
@@ -250,3 +271,4 @@ if __name__ == "__main__":
             print(f"{r['symbole']:<10} {r['nb_trades']:<8} {r['winrate']:.1f}%{'':<5} "
                   f"{r['rr_moyen']:.2f}{'':<6} {r['esperance']:+.2f}")
         print(f"{'='*70}\n")
+
