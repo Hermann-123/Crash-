@@ -54,7 +54,9 @@ CAPITAL_ACTUEL = 40650
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 
 DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")   # app_id public par défaut, suffisant pour démarrer
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "")   # ⚠️ App ID de la NOUVELLE API (ex: "32Oh8ivJRXsJrKUqVgYhR"), trouvé sur developers.deriv.com → Registered Apps
+DERIV_ACCOUNT_TYPE = os.environ.get("DERIV_ACCOUNT_TYPE", "demo")   # "demo" ou "real" — quel compte Options utiliser
+DERIV_LEGACY_APP_ID = os.environ.get("DERIV_LEGACY_APP_ID", "1089")  # app_id public legacy, utilisé UNIQUEMENT pour les données de marché (ticks/candles)
 
 # ==========================================
 # RISK MANAGEMENT — CONFIGURATION GLOBALE
@@ -183,18 +185,86 @@ def keep_alive():
 # Quand le contrat A se termine (gagné ou perdu), on ajuste le SL du
 # contrat B (breakeven) via contract_update.
 
-DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+DERIV_REST_BASE = "https://api.derivws.com"
 
-def _deriv_request(payload, timeout=10):
-    """
-    Ouvre une connexion, s'authentifie, envoie une requête, retourne la
-    première réponse dont le msg_type correspond à une clé de payload
-    (buy, sell, portfolio, proposal_open_contract, contract_update, ...).
-    Lève une exception explicite en cas d'erreur API ou de timeout.
-    """
-    if not DERIV_API_TOKEN:
-        raise RuntimeError("DERIV_API_TOKEN manquant (variable d'environnement Render).")
+def _deriv_headers():
+    return {
+        "Deriv-App-ID": DERIV_APP_ID,
+        "Authorization": f"Bearer {DERIV_API_TOKEN}",
+    }
 
+_deriv_account_id_cache = None
+_deriv_ws_cache = {"url": None, "obtained_at": 0}
+_deriv_lock = Lock()
+
+def deriv_get_account_id(force_refresh=False):
+    """
+    REST: liste les comptes Options du login (GET /trading/v1/options/accounts)
+    et choisit celui correspondant à DERIV_ACCOUNT_TYPE (demo/real).
+    Résultat mis en cache (le compte ne change pas en cours de route).
+    """
+    global _deriv_account_id_cache
+    if _deriv_account_id_cache and not force_refresh:
+        return _deriv_account_id_cache
+    if not DERIV_API_TOKEN or not DERIV_APP_ID:
+        raise RuntimeError("DERIV_API_TOKEN ou DERIV_APP_ID manquant (variables d'environnement Render).")
+
+    resp = requests.get(f"{DERIV_REST_BASE}/trading/v1/options/accounts",
+                        headers=_deriv_headers(), timeout=10)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Deriv get_accounts HTTP {resp.status_code}: {resp.text[:300]}")
+
+    data = resp.json()
+    comptes = data.get("accounts") or data.get("data") or (data if isinstance(data, list) else [])
+    if not comptes:
+        raise RuntimeError(f"Deriv: aucun compte Options trouvé — réponse brute: {resp.text[:300]}")
+
+    def est_demo(c):
+        return bool(c.get("is_virtual") or c.get("is_demo")
+                    or str(c.get("account_type", "")).lower() == "demo"
+                    or str(c.get("type", "")).lower() == "demo")
+
+    cible = None
+    for c in comptes:
+        if DERIV_ACCOUNT_TYPE == "demo" and est_demo(c):
+            cible = c; break
+        if DERIV_ACCOUNT_TYPE == "real" and not est_demo(c):
+            cible = c; break
+    if not cible:
+        cible = comptes[0]  # repli: le seul compte disponible
+
+    account_id = cible.get("account_id") or cible.get("accountId") or cible.get("id") or cible.get("loginid")
+    if not account_id:
+        raise RuntimeError(f"Deriv: impossible de trouver l'account_id dans: {cible}")
+
+    _deriv_account_id_cache = account_id
+    print(f"[Deriv] Compte Options sélectionné: {account_id}", flush=True)
+    return account_id
+
+def _deriv_obtenir_ws_url(force_refresh=False):
+    """
+    REST: demande un OTP (POST /trading/v1/options/accounts/{id}/otp) et
+    récupère l'URL WebSocket prête à l'emploi. L'OTP est de courte durée,
+    donc on en redemande un à chaque connexion (pas de cache long).
+    """
+    account_id = deriv_get_account_id(force_refresh=force_refresh)
+    resp = requests.post(f"{DERIV_REST_BASE}/trading/v1/options/accounts/{account_id}/otp",
+                        headers=_deriv_headers(), timeout=10)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Deriv OTP HTTP {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    url = data.get("url") or data.get("websocket_url") or data.get("ws_url")
+    if not url:
+        raise RuntimeError(f"Deriv OTP: pas d'URL dans la réponse: {resp.text[:300]}")
+    return url
+
+def _deriv_trading_request(payload, timeout=10, _retry=True):
+    """
+    Ouvre une connexion WebSocket fraîche (URL avec OTP intégré, obtenue
+    juste avant), envoie une requête de trading, retourne la réponse
+    correspondante. Redemande un nouvel OTP et retente une fois en cas
+    d'échec d'auth (OTP expiré entre-temps).
+    """
     cle_attendue = None
     for k in ("buy", "sell", "portfolio", "proposal_open_contract",
               "contract_update", "balance", "proposal"):
@@ -204,23 +274,24 @@ def _deriv_request(payload, timeout=10):
 
     ws = None
     try:
-        ws = websocket.create_connection(DERIV_WS_URL, timeout=timeout)
-        ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-        auth_resp = json.loads(ws.recv())
-        if auth_resp.get("error"):
-            raise RuntimeError(f"Deriv authorize refusé : {auth_resp['error'].get('message')}")
-
+        url = _deriv_obtenir_ws_url()
+        ws = websocket.create_connection(url, timeout=timeout,
+                                         header=[f"Deriv-App-ID: {DERIV_APP_ID}"])
         ws.send(json.dumps(payload))
         debut = time.time()
         while time.time() - debut < timeout:
             resp = json.loads(ws.recv())
             if resp.get("error"):
-                raise RuntimeError(f"Deriv API erreur : {resp['error'].get('message')}")
+                raise RuntimeError(f"Deriv API erreur: {resp['error'].get('message')}")
             if cle_attendue and cle_attendue in resp:
                 return resp
             if resp.get("msg_type") == cle_attendue:
                 return resp
         raise TimeoutError(f"Deriv: pas de réponse '{cle_attendue}' sous {timeout}s")
+    except Exception as e:
+        if _retry and any(m in str(e) for m in ("401", "Unauthorized", "OTP", "otp")):
+            return _deriv_trading_request(payload, timeout=timeout, _retry=False)
+        raise
     finally:
         try:
             if ws: ws.close()
@@ -262,7 +333,7 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, sl=None, tp=None
     if limit_order:
         payload["parameters"]["limit_order"] = limit_order
 
-    resp = _deriv_request(payload)
+    resp = _deriv_trading_request(payload)
     buy_info = resp.get("buy", {})
     contract_id = buy_info.get("contract_id")
     print(f"[Deriv] Contrat ouvert {sym} {contract_type} mise={stake} → contract_id={contract_id}", flush=True)
@@ -277,12 +348,12 @@ def deriv_modifier_contrat(contract_id, sl=None, tp=None):
         limit_order["take_profit"] = round(float(tp), 5)
     payload = {"contract_update": 1, "contract_id": contract_id,
                "limit_order": limit_order}
-    return _deriv_request(payload)
+    return _deriv_trading_request(payload)
 
 def deriv_fermer_contrat(contract_id):
     """Ferme (vend) un contrat au marché immédiatement."""
     payload = {"sell": contract_id, "price": 0}
-    return _deriv_request(payload)
+    return _deriv_trading_request(payload)
 
 def deriv_statut_contrat(contract_id):
     """
@@ -291,19 +362,19 @@ def deriv_statut_contrat(contract_id):
     automatiquement côté Deriv (sans qu'on ait eu besoin de le déclencher).
     """
     payload = {"proposal_open_contract": 1, "contract_id": contract_id}
-    resp = _deriv_request(payload)
+    resp = _deriv_trading_request(payload)
     return resp.get("proposal_open_contract", {})
 
 def deriv_positions_ouvertes():
     """Liste les contrats actuellement ouverts sur le compte."""
     payload = {"portfolio": 1}
-    resp = _deriv_request(payload)
+    resp = _deriv_trading_request(payload)
     return resp.get("portfolio", {}).get("contracts", [])
 
 def deriv_connecter():
-    """Vérifie que le token fonctionne (appelée au démarrage / à l'activation)."""
+    """Vérifie que le token/app_id fonctionnent (appelée au démarrage / à l'activation)."""
     payload = {"balance": 1}
-    resp = _deriv_request(payload)
+    resp = _deriv_trading_request(payload)
     solde = resp.get("balance", {})
     print(f"[Deriv] Connecté — solde: {solde.get('balance')} {solde.get('currency')}", flush=True)
     return solde
@@ -2091,10 +2162,9 @@ def test_groq_reel(message):
 @bot.message_handler(commands=['testderiv'])
 def test_deriv_reel(message):
     """
-    ✅ Diagnostic honnête pour DERIV_API_TOKEN : ne révèle jamais le token
-    en entier (seulement sa longueur + 2 premiers/2 derniers caractères,
-    pour vérifier qu'il n'est pas vide/tronqué/mal collé), et fait un VRAI
-    appel réseau à l'API Deriv pour rapporter exactement ce qui se passe.
+    ✅ Diagnostic honnête, étape par étape, pour la NOUVELLE API Deriv
+    (REST → OTP → WebSocket). Ne révèle jamais le token en entier, teste
+    chaque étape séparément pour localiser précisément où ça bloque.
     """
     uid = message.chat.id
     if not est_autorise(uid): return
@@ -2104,51 +2174,65 @@ def test_deriv_reel(message):
             "❌ *DERIV_API_TOKEN absente*\n"
             "Aucune variable d'environnement DERIV_API_TOKEN configurée sur Render.",
             parse_mode="Markdown")
+    if not DERIV_APP_ID:
+        return bot.send_message(uid,
+            "❌ *DERIV_APP_ID absente*\n"
+            "Il faut l'App ID trouvé sur developers.deriv.com → Registered Apps "
+            "(ex: 32Oh8ivJRXsJrKUqVgYhR), à mettre dans la variable DERIV_APP_ID sur Render.",
+            parse_mode="Markdown")
 
     longueur = len(DERIV_API_TOKEN)
-    apercu = f"{DERIV_API_TOKEN[:2]}...{DERIV_API_TOKEN[-2:]}" if longueur >= 6 else "(trop court)"
+    apercu = f"{DERIV_API_TOKEN[:3]}...{DERIV_API_TOKEN[-2:]}" if longueur >= 6 else "(trop court)"
     a_espace = DERIV_API_TOKEN != DERIV_API_TOKEN.strip()
-
     espace_msg = "⚠️ OUI — c'est probablement le bug" if a_espace else "✅ Non"
 
     bot.send_message(uid,
-        f"🔬 *DIAGNOSTIC DERIV_API_TOKEN*\n"
+        f"🔬 *DIAGNOSTIC DERIV — NOUVELLE API*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Longueur : {longueur} caractères\n"
-        f"Aperçu : `{apercu}`\n"
-        f"Espace/retour à la ligne détecté : {espace_msg}\n"
+        f"Token — longueur : {longueur} caractères\n"
+        f"Token — aperçu : `{apercu}`\n"
+        f"Token — espace parasite : {espace_msg}\n"
+        f"App ID : `{DERIV_APP_ID}`\n"
+        f"Type de compte visé : {DERIV_ACCOUNT_TYPE}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔄 Appel réel en cours vers l'API Deriv...", parse_mode="Markdown")
+        f"🔄 Étape 1/3 : récupération des comptes (REST)...", parse_mode="Markdown")
 
+    # Étape 1 : GET /trading/v1/options/accounts
     try:
-        ws = websocket.create_connection(DERIV_WS_URL, timeout=10)
-        ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-        resp = json.loads(ws.recv())
-        ws.close()
-
-        if resp.get("error"):
-            bot.send_message(uid,
-                f"❌ *AUTHORIZE REFUSÉ PAR DERIV*\n"
-                f"Message exact : `{resp['error'].get('message')}`\n"
-                f"Code erreur : `{resp['error'].get('code')}`\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👉 Si le token semble correct (longueur normale, pas d'espace), "
-                f"régénère-le une nouvelle fois et copie-le en un seul geste "
-                f"dès qu'il s'affiche en clair.",
-                parse_mode="Markdown")
-        else:
-            info = resp.get("authorize", {})
-            bot.send_message(uid,
-                f"✅ *CONNEXION DERIV RÉUSSIE*\n"
-                f"Compte : `{info.get('loginid')}`\n"
-                f"Devise : {info.get('currency')}\n"
-                f"Type : {'Réel' if not info.get('is_virtual') else 'Démo (virtuel)'}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👉 Le token fonctionne. Tu peux activer l'auto-trading via /menu.",
-                parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(uid, f"❌ *Erreur réseau* : `{type(e).__name__}: {e}`",
+        account_id = deriv_get_account_id(force_refresh=True)
+        bot.send_message(uid, f"✅ Étape 1/3 réussie — compte trouvé : `{account_id}`",
                          parse_mode="Markdown")
+    except Exception as e:
+        return bot.send_message(uid,
+            f"❌ *ÉTAPE 1/3 ÉCHOUÉE — récupération des comptes*\n"
+            f"`{e}`\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👉 Vérifie que DERIV_APP_ID correspond bien à l'App ID affiché sur "
+            f"developers.deriv.com → Registered Apps, et que le token n'a pas été "
+            f"révoqué depuis.",
+            parse_mode="Markdown")
+
+    # Étape 2 : POST .../otp
+    try:
+        ws_url = _deriv_obtenir_ws_url(force_refresh=True)
+        bot.send_message(uid, "✅ Étape 2/3 réussie — OTP obtenu, URL WebSocket générée.")
+    except Exception as e:
+        return bot.send_message(uid,
+            f"❌ *ÉTAPE 2/3 ÉCHOUÉE — génération de l'OTP*\n`{e}`",
+            parse_mode="Markdown")
+
+    # Étape 3 : connexion WS + requête balance
+    try:
+        solde = deriv_connecter()
+        bot.send_message(uid,
+            f"✅ *ÉTAPE 3/3 RÉUSSIE — CONNEXION COMPLÈTE*\n"
+            f"Solde : `{solde.get('balance')} {solde.get('currency')}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👉 Tout fonctionne. Tu peux activer l'auto-trading via /menu.",
+            parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(uid,
+            f"❌ *ÉTAPE 3/3 ÉCHOUÉE — connexion WebSocket*\n`{e}`",
+            parse_mode="Markdown")
 
 @bot.message_handler(commands=['iastats'])
 def ia_stats(message):
