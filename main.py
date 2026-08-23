@@ -175,6 +175,12 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5,
         finally:
             bot_core.obtenir_donnees_deriv = original_fn  # toujours restaurer
 
+        # ✅ Diagnostic : affiche le score IA de CHAQUE signal, accepté ou non
+        # (sans ça, un blocage silencieux au niveau IA est invisible dans les logs)
+        if signal and verdict:
+            statut = "✅ ACCEPTÉ" if verdict["accepte"] else "❌ rejeté"
+            print(f"    → score IA={verdict['score']}% (seuil={bot_core.IA_CONFIG['seuil_acceptation']}%) {statut}", flush=True)
+
         if not signal or not verdict or not verdict["accepte"]:
             continue
 
