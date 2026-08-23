@@ -1357,6 +1357,8 @@ def analyser_scalping_multi_tf(symbole, multiplicateur_tp=1.5, rr_min=1.2):
     c30 = obtenir_donnees_deriv(symbole, 1800)
     c15 = obtenir_donnees_deriv(symbole, 900)
 
+    print(f"[MARQUEUR-VERSION] V60-UNE-SEULE-CONDITION-MAJEURE actif", flush=True)
+
     if not c30 or not c15 or len(c30) < 30 or len(c15) < 40:
         print(f"[DEBUG-SCALP] {symbole} REJET: données insuffisantes "
               f"(M30={len(c30) if c30 else 0}, M15={len(c15) if c15 else 0})", flush=True)
@@ -1382,21 +1384,27 @@ def analyser_scalping_multi_tf(symbole, multiplicateur_tp=1.5, rr_min=1.2):
                   f"cohérente avec le biais M30 ({direction})", flush=True)
             return None
 
-        # ── 3. LE PRIX EST-IL ACTUELLEMENT DANS LA ZONE ? ──
-        if not (zone["bas"] <= px <= zone["haut"]):
-            print(f"[DEBUG-SCALP] {symbole} REJET: prix {px} hors zone Fibo "
-                  f"[{zone['bas']}, {zone['haut']}]", flush=True)
+        # ── 3. CONFIRMATION MAJEURE UNIQUE : le prix a touché la zone Fibo ──
+        # ✅ FIX V59: retour à UNE seule condition d'entrée décisive (biais +
+        # zone atteinte), comme demandé — plus de cumul de filtres qui se
+        # multiplient entre eux et ramènent la probabilité near-zéro. Le
+        # pattern de bougie n'est plus une porte bloquante : il reste
+        # affiché à titre indicatif dans le message si détecté.
+        recent_zone_touch = df15.iloc[-4:-1]  # 3 bougies avant celle en cours
+        touche_zone = any(
+            (zone["bas"] <= float(r['low']) <= zone["haut"]) or
+            (zone["bas"] <= float(r['high']) <= zone["haut"]) or
+            (float(r['low']) <= zone["bas"] and float(r['high']) >= zone["haut"])
+            for _, r in recent_zone_touch.iterrows()
+        )
+        if not touche_zone:
+            print(f"[DEBUG-SCALP] {symbole} REJET: prix n'a pas touché la zone Fibo "
+                  f"[{zone['bas']}, {zone['haut']}] sur les 3 dernières bougies", flush=True)
             return None
 
-        # ── 4. BOUGIE DE CONFIRMATION — SUR M15 (même échelle que la zone) ──
+        # Pattern détecté à titre indicatif seulement (n'est plus un filtre bloquant)
         pattern, _ = detecter_chandeliers_pdf(df15)
-        patterns_valides_bull = ("PIN_BULL", "ENGULFING_BULL", "MARUBOZU_BULL")
-        patterns_valides_bear = ("PIN_BEAR", "ENGULFING_BEAR", "MARUBOZU_BEAR")
-        if (direction == "BULL" and pattern not in patterns_valides_bull) or \
-           (direction == "BEAR" and pattern not in patterns_valides_bear):
-            print(f"[DEBUG-SCALP] {symbole} REJET: aucune bougie de confirmation "
-                  f"M15 valide (direction={direction}, pattern détecté={pattern})", flush=True)
-            return None
+
 
         # ── 5. RISQUE / CIBLE basés sur l'ATR M15 (même échelle que l'entrée) ──
         atr15 = calculer_atr(df15)
