@@ -3,7 +3,8 @@
 ║   TERMINAL PRIME V56 — PURE SCALPING M1 + EXÉCUTION RÉELLE DERIV           ║
 ║                                                                            ║
 ║  ⚙️ NOUVEAU DANS CETTE VERSION :                                          ║
-║   • Suppression totale de Groq (LLM) pour une exécution 100% mathématique  ║
+║   • Correction de l'erreur d'autorisation (est_autorise).                  ║
+║   • Suppression totale de l'IA/Groq pour une exécution 100% mathématique   ║
 ║     et une latence réduite au minimum.                                     ║
 ║   • Stratégie Pro Momentum Scalper (M1/M5) intégrée.                       ║
 ║   • Risk Management agressif (Trailing stop rapide, signaux de 10s).       ║
@@ -16,13 +17,11 @@ import random
 import time
 import string
 import json
-import math
 import websocket
 import pandas as pd
-import ta
 import requests
 import telebot
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 from flask import Flask
 from threading import Thread, Lock
 from enum import Enum
@@ -36,10 +35,9 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 ADMIN_ID = 5968288964
 CAPITAL_ACTUEL = 40650
-FMP_API_KEY = os.environ.get("FMP_API_KEY", "").strip()
 
 DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "").strip()
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "").strip()
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089").strip()
 DERIV_ACCOUNT_TYPE = os.environ.get("DERIV_ACCOUNT_TYPE", "demo")
 
 # ==========================================
@@ -58,7 +56,6 @@ RISK_CONFIG = {
     "max_trades_per_day": 15,            
     "max_trade_age_hours": 1,            
     "signal_validity_seconds": 10,       
-    "max_rr_degradation_pct": 25,
 }
 
 # ==========================================
@@ -73,17 +70,11 @@ CONTROL_STATE = {
     "stop_urgence_actif": False,
 }
 
-# ==========================================
-# ÉTATS DE TRADE
-# ==========================================
-
 class TradeState(Enum):
-    SIGNAL_SENT     = "SIGNAL_ENVOYÉ"
     TRADE_OPEN      = "TRADE_OUVERT"
     TRADE_PARTIAL   = "TP1_PARTIEL_BE"
     TRADE_WIN       = "GAGNÉ"
     TRADE_LOSS      = "PERDU"
-    CANCELLED       = "ANNULÉ"
 
 # ==========================================
 # LISTES DE PAIRES
@@ -91,49 +82,33 @@ class TradeState(Enum):
 
 VOLATILE_PAIRS  = ["V10","V25","V50","V75","V100"]
 COMMODITY_PAIRS = ["XAUUSD","XAGUSD"]
-FOREX_PAIRS     = ["AUDUSD","CADJPY","CHFJPY","EURJPY","USDCAD","AUDJPY",
-                   "EURAUD","EURUSD","AUDCAD","USDCHF","CADCHF","EURCHF",
-                   "USDJPY","GBPUSD"]
-
 ELITE_PAIRS_MT5 = VOLATILE_PAIRS + COMMODITY_PAIRS
-ALL_PAIRS       = VOLATILE_PAIRS + COMMODITY_PAIRS + FOREX_PAIRS
-
-NOMS_AFFICHAGE = {
-    "XAUUSD":"🥇 GOLD","XAGUSD":"🥈 ARGENT",
-    "V10":"🔥 V10","V25":"🔥 V25","V50":"🔥 V50",
-    "V75":"⚡ V75","V100":"💥 V100",
-}
 
 # ==========================================
 # VARIABLES D'ÉTAT GLOBALES
 # ==========================================
 
-user_prefs           = {}
 utilisateurs_actifs  = set()
 derniere_alerte_auto = {}
-signaux_cache        = {}
-
 utilisateurs_autorises = {ADMIN_ID: "LIFETIME"}
-cles_generees           = {}
-
-volatility_pairs_active = {
-    "V10": True, "V25": True, "V50": True, "V75": True, "V100": True,
-}
 
 trades_actifs     = {}
 trades_historique = {}
-prix_broker       = {}
-
 pnl_total  = {}
-win_count  = {}
-loss_count = {}
-
-contexte_marche_cache = {}
 daily_stats = {}
 lock_trade = Lock()
 
 # ==========================================
-# KEEP ALIVE
+# GESTION DES AUTORISATIONS
+# ==========================================
+
+def est_autorise(uid):
+    if uid == ADMIN_ID: 
+        return True
+    return uid in utilisateurs_autorises
+
+# ==========================================
+# KEEP ALIVE (FLASK)
 # ==========================================
 
 app = Flask(__name__)
@@ -149,18 +124,17 @@ def keep_alive():
     Thread(target=run, daemon=True).start()
 
 # ==========================================
-# PONT DERIV (exécution réelle)
+# PONT DERIV (Exécution réelle)
 # ==========================================
 
 DERIV_REST_BASE = "https://api.derivws.com"
+_deriv_account_id_cache = None
 
 def _deriv_headers():
     return {
         "Deriv-App-ID": DERIV_APP_ID,
         "Authorization": f"Bearer {DERIV_API_TOKEN}",
     }
-
-_deriv_account_id_cache = None
 
 def deriv_get_account_id(force_refresh=False):
     global _deriv_account_id_cache
@@ -169,79 +143,56 @@ def deriv_get_account_id(force_refresh=False):
     if not DERIV_API_TOKEN or not DERIV_APP_ID:
         raise RuntimeError("DERIV_API_TOKEN ou DERIV_APP_ID manquant.")
 
-    resp = requests.get(f"{DERIV_REST_BASE}/trading/v1/options/accounts",
-                        headers=_deriv_headers(), timeout=10)
+    resp = requests.get(f"{DERIV_REST_BASE}/trading/v1/options/accounts", headers=_deriv_headers(), timeout=10)
     if resp.status_code != 200:
-        raise RuntimeError(f"Deriv get_accounts HTTP {resp.status_code}: {resp.text[:300]}")
+        raise RuntimeError(f"Deriv get_accounts HTTP {resp.status_code}")
 
     data = resp.json()
     comptes = data.get("accounts") or data.get("data") or (data if isinstance(data, list) else [])
-    if not comptes:
-        raise RuntimeError("Deriv: aucun compte Options trouvé.")
-
-    def est_demo(c):
-        return bool(c.get("is_virtual") or c.get("is_demo")
-                    or str(c.get("account_type", "")).lower() == "demo"
-                    or str(c.get("type", "")).lower() == "demo")
-
+    
     cible = None
     for c in comptes:
-        if DERIV_ACCOUNT_TYPE == "demo" and est_demo(c):
+        est_demo = bool(c.get("is_virtual") or c.get("is_demo") or str(c.get("type", "")).lower() == "demo")
+        if DERIV_ACCOUNT_TYPE == "demo" and est_demo:
             cible = c; break
-        if DERIV_ACCOUNT_TYPE == "real" and not est_demo(c):
+        if DERIV_ACCOUNT_TYPE == "real" and not est_demo:
             cible = c; break
-    if not cible:
+    if not cible and comptes:
         cible = comptes[0]
 
-    account_id = cible.get("account_id") or cible.get("accountId") or cible.get("id") or cible.get("loginid")
-    _deriv_account_id_cache = account_id
-    print(f"[Deriv] Compte sélectionné: {account_id}", flush=True)
-    return account_id
+    _deriv_account_id_cache = cible.get("account_id") or cible.get("loginid")
+    return _deriv_account_id_cache
 
 def _deriv_obtenir_ws_url(force_refresh=False):
     account_id = deriv_get_account_id(force_refresh=force_refresh)
-    resp = requests.post(f"{DERIV_REST_BASE}/trading/v1/options/accounts/{account_id}/otp",
-                        headers=_deriv_headers(), timeout=10)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Deriv OTP HTTP {resp.status_code}")
+    resp = requests.post(f"{DERIV_REST_BASE}/trading/v1/options/accounts/{account_id}/otp", headers=_deriv_headers(), timeout=10)
     data = resp.json()
     interieur = data.get("data", data)
-    url = (data.get("url") or data.get("websocket_url") or interieur.get("url"))
-    return url
+    return (data.get("url") or data.get("websocket_url") or interieur.get("url"))
 
 def _deriv_trading_request(payload, timeout=10, _retry=True):
     cle_attendue = None
-    for k in ("buy", "sell", "portfolio", "proposal_open_contract",
-              "contract_update", "balance"):
+    for k in ("buy", "sell", "portfolio", "proposal_open_contract", "contract_update", "balance"):
         if k in payload:
-            cle_attendue = k
-            break
-
+            cle_attendue = k; break
     ws = None
     try:
         url = _deriv_obtenir_ws_url()
-        ws = websocket.create_connection(url, timeout=timeout,
-                                         header=[f"Deriv-App-ID: {DERIV_APP_ID}"])
+        ws = websocket.create_connection(url, timeout=timeout, header=[f"Deriv-App-ID: {DERIV_APP_ID}"])
         ws.send(json.dumps(payload))
         debut = time.time()
         while time.time() - debut < timeout:
             resp = json.loads(ws.recv())
-            if resp.get("error"):
-                raise RuntimeError(f"Deriv API erreur: {resp['error'].get('message')}")
-            if cle_attendue and cle_attendue in resp:
-                return resp
-            if resp.get("msg_type") == cle_attendue:
-                return resp
+            if resp.get("error"): raise RuntimeError(f"Deriv API erreur: {resp['error'].get('message')}")
+            if cle_attendue and cle_attendue in resp: return resp
+            if resp.get("msg_type") == cle_attendue: return resp
         raise TimeoutError(f"Deriv: pas de réponse sous {timeout}s")
     except Exception as e:
         if _retry and any(m in str(e) for m in ("401", "Unauthorized", "OTP")):
             return _deriv_trading_request(payload, timeout=timeout, _retry=False)
         raise
     finally:
-        try:
-            if ws: ws.close()
-        except Exception:
-            pass
+        if ws: ws.close()
 
 def deriv_symbole(symbole_bot):
     mapping = {"XAUUSD":"frxXAUUSD","XAGUSD":"frxXAGUSD"}
@@ -252,7 +203,6 @@ def deriv_symbole(symbole_bot):
 def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, sl=None, tp=None):
     sym = deriv_symbole(symbole)
     contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
-
     limit_order = {}
     if sl is not None: limit_order["stop_loss"] = round(float(sl), 5)
     if tp is not None: limit_order["take_profit"] = round(float(tp), 5)
@@ -265,11 +215,8 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, sl=None, tp=None
         }
     }
     if limit_order: payload["parameters"]["limit_order"] = limit_order
-
     resp = _deriv_trading_request(payload)
-    contract_id = resp.get("buy", {}).get("contract_id")
-    print(f"[Deriv] Contrat ouvert {sym} {contract_type} mise={stake} → ID={contract_id}", flush=True)
-    return contract_id
+    return resp.get("buy", {}).get("contract_id")
 
 def deriv_modifier_contrat(contract_id, sl=None, tp=None):
     limit_order = {}
@@ -290,9 +237,7 @@ def deriv_positions_ouvertes():
 
 def deriv_connecter():
     resp = _deriv_trading_request({"balance": 1})
-    solde = resp.get("balance", {})
-    print(f"[Deriv] Connecté — solde: {solde.get('balance')} {solde.get('currency')}", flush=True)
-    return solde
+    return resp.get("balance", {})
 
 def peut_ouvrir_automatiquement(symbole):
     if not CONTROL_STATE["auto_trading_active"]: return False
@@ -310,8 +255,7 @@ CANDLES_CACHE_TTL = 10
 
 def _obtenir_donnees_deriv_reseau(symbole_brut, granularite=300):
     sym = deriv_symbole(symbole_brut)
-    gran_valides = (60, 120, 180, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 86400)
-    gran_real = granularite if granularite in gran_valides else 14400
+    gran_real = granularite if granularite in (60, 300, 900, 3600) else 3600
     for _ in range(2):
         ws = None
         try:
@@ -323,8 +267,7 @@ def _obtenir_donnees_deriv_reseau(symbole_brut, granularite=300):
             if "candles" in res and "error" not in res:
                 return res["candles"]
         except:
-            try: ws.close()
-            except: pass
+            if ws: ws.close()
             time.sleep(0.2)
     return None
 
@@ -354,85 +297,45 @@ def obtenir_prix_broker_realtime(symbole):
             if "tick" in res:
                 return float(res["tick"]["quote"])
         except:
-            try: ws.close()
-            except: pass
+            if ws: ws.close()
             time.sleep(0.5)
     return None
 
-def valider_prix_avant_signal(symbole, prix_bot, tolerance=0.001):
+def valider_prix_avant_signal(symbole, prix_bot, tolerance=0.0015):
     prix_real = obtenir_prix_broker_realtime(symbole)
     if not prix_real: return False
     decalage = abs(prix_bot - prix_real) / prix_real
     return decalage <= tolerance
 
 # ==========================================
-# GESTION DU RISQUE
+# GESTION DU RISQUE ET DES TRADES
 # ==========================================
 
-def get_today_str(): return datetime.datetime.utcnow().strftime("%Y-%m-%d")
-
 def init_daily_stats(uid):
-    today = get_today_str()
+    today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
     if uid not in daily_stats or daily_stats[uid]["date"] != today:
         daily_stats[uid] = {
             "date": today, "pnl": 0.0, "trades": 0, "wins": 0, "losses": 0,
-            "consecutive_losses": 0, "paused_until": None,
-            "best_trade": 0.0, "worst_trade": 0.0,
+            "consecutive_losses": 0, "paused_until": None
         }
     return daily_stats[uid]
 
-def utilisateur_en_pause(uid):
-    stats = init_daily_stats(uid)
-    if stats["paused_until"] and time.time() < stats["paused_until"]:
-        return True, stats["paused_until"]
-    return False, None
-
-def daily_loss_limit_atteinte(uid):
-    stats = init_daily_stats(uid)
-    limite = -(CAPITAL_ACTUEL * RISK_CONFIG["daily_loss_limit_pct"] / 100.0)
-    return stats["pnl"] <= limite
-
 def utilisateur_peut_trader(uid):
     stats = init_daily_stats(uid)
-    if daily_loss_limit_atteinte(uid): return False, "🛑 Limite de perte journalière atteinte."
-    en_pause, _ = utilisateur_en_pause(uid)
-    if en_pause: return False, "⏸️ Pause anti-tilt active."
+    if stats["pnl"] <= -(CAPITAL_ACTUEL * RISK_CONFIG["daily_loss_limit_pct"] / 100.0): return False, "🛑 Limite de perte atteinte."
+    if stats["paused_until"] and time.time() < stats["paused_until"]: return False, "⏸️ Pause anti-tilt active."
     if stats["trades"] >= RISK_CONFIG["max_trades_per_day"]: return False, "🛑 Limite de trades/jour atteinte."
     return True, None
 
-def calculer_position_size(capital, risk_pct, prix_entree, prix_sl, symbole):
+def calculer_position_size(capital, risk_pct, prix_entree, prix_sl):
     montant_risque = capital * (risk_pct / 100.0)
     distance_sl = abs(prix_entree - prix_sl)
-    if distance_sl <= 0: return {"montant_risque": montant_risque, "lot_factor": 0, "distance_sl": 0}
-    return {"montant_risque": round(montant_risque, 2), "lot_factor": round(montant_risque / distance_sl, 4), "distance_sl": round(distance_sl, 5)}
+    if distance_sl <= 0: return {"montant_risque": montant_risque, "distance_sl": 0}
+    return {"montant_risque": round(montant_risque, 2), "distance_sl": round(distance_sl, 5)}
 
-def enregistrer_resultat_trade(uid, pnl, win, pnl_pour_bilan=None):
-    stats = init_daily_stats(uid)
-    stats["pnl"] += pnl
-    stats["trades"] += 1
-    valeur_bilan = pnl_pour_bilan if pnl_pour_bilan is not None else pnl
-    if win:
-        stats["wins"] += 1
-        stats["consecutive_losses"] = 0
-    else:
-        stats["losses"] += 1
-        stats["consecutive_losses"] += 1
-    stats["best_trade"] = max(stats["best_trade"], valeur_bilan)
-    stats["worst_trade"] = min(stats["worst_trade"], valeur_bilan)
-    if stats["consecutive_losses"] >= RISK_CONFIG["max_consecutive_losses"]:
-        stats["paused_until"] = time.time() + (RISK_CONFIG["pause_duration_minutes"] * 60)
-    return stats
-
-# ==========================================
-# EXÉCUTION DES TRADES
-# ==========================================
-
-def create_trade_id(): return "TRD-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
-
-def ouvrir_trade(uid, symbole, direction, entry_price, sl, tp1, tp_final, strategy, confiance,
-                 label="SIGNAL", strategie_nom_ia="?", ia_score=None, contexte_marche=None, executer_reel=False):
-    trade_id = create_trade_id()
-    sizing = calculer_position_size(CAPITAL_ACTUEL, RISK_CONFIG["risk_per_trade_pct"], entry_price, sl, symbole)
+def ouvrir_trade(uid, symbole, direction, entry_price, sl, tp1, tp_final, executer_reel=False):
+    trade_id = "TRD-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    sizing = calculer_position_size(CAPITAL_ACTUEL, RISK_CONFIG["risk_per_trade_pct"], entry_price, sl)
     deriv_contract_tp1, deriv_contract_final = None, None
 
     if executer_reel:
@@ -445,15 +348,12 @@ def ouvrir_trade(uid, symbole, direction, entry_price, sl, tp1, tp_final, strate
 
     trades_actifs[uid] = {
         "trade_id": trade_id, "symbol": symbole, "direction": direction, "entry_price": entry_price,
-        "sl": sl, "sl_original": sl, "tp1": tp1, "tp_final": tp_final,
-        "strategy": strategy, "confiance": confiance, "label": label,
-        "strategie_nom_ia": strategie_nom_ia, "ia_score": ia_score,
-        "state": TradeState.TRADE_OPEN, "timestamp_open": time.time(),
-        "partial_closed": False, "partial_pnl": 0.0, "breakeven_active": False, "trailing_active": False,
-        "sizing": sizing, "deriv_contract_tp1": deriv_contract_tp1, "deriv_contract_final": deriv_contract_final,
-        "reel": executer_reel,
+        "sl": sl, "tp1": tp1, "tp_final": tp_final, "state": TradeState.TRADE_OPEN,
+        "timestamp_open": time.time(), "partial_closed": False, "partial_pnl": 0.0,
+        "breakeven_active": False, "sizing": sizing, "deriv_contract_final": deriv_contract_final,
+        "reel": executer_reel
     }
-    return trade_id, sizing
+    return trade_id
 
 def fermer_trade_complet(uid, exit_price, win):
     with lock_trade:
@@ -461,13 +361,11 @@ def fermer_trade_complet(uid, exit_price, win):
         trade = trades_actifs[uid]
         try:
             if trade.get("reel") and trade.get("deriv_contract_final"):
-                try:
-                    statut = deriv_statut_contrat(trade["deriv_contract_final"])
-                    if not statut.get("is_sold"): deriv_fermer_contrat(trade["deriv_contract_final"])
+                try: deriv_fermer_contrat(trade["deriv_contract_final"])
                 except: pass
 
             risque_initial = trade["sizing"]["montant_risque"]
-            portion_restante = (1 - RISK_CONFIG["partial_tp_ratio"]) if trade.get("partial_closed") else 1.0
+            portion_restante = (1 - RISK_CONFIG["partial_tp_ratio"]) if trade["partial_closed"] else 1.0
             risque_portion = risque_initial * portion_restante
 
             if win:
@@ -477,20 +375,27 @@ def fermer_trade_complet(uid, exit_price, win):
                 pnl_final = -risque_portion
 
             pnl_trade_total = trade.get("partial_pnl", 0.0) + pnl_final
-            trade["state"] = TradeState.TRADE_WIN if win else TradeState.TRADE_LOSS
-            duration_seconds = time.time() - trade["timestamp_open"]
-
+            
             if uid not in trades_historique: trades_historique[uid] = []
             trades_historique[uid].append({
-                "trade_id": trade["trade_id"], "symbol": trade["symbol"], "direction": trade["direction"],
-                "entry": trade["entry_price"], "exit": exit_price, "pnl": pnl_trade_total, "win": win,
-                "timestamp": time.time(), "label": trade.get("label","")
+                "symbol": trade["symbol"], "direction": trade["direction"],
+                "pnl": pnl_trade_total, "win": win, "timestamp": time.time()
             })
 
             pnl_total[uid] = pnl_total.get(uid, 0) + pnl_final
-            enregistrer_resultat_trade(uid, pnl_final, win, pnl_pour_bilan=pnl_trade_total)
-            ia_enregistrer_resultat(trade["symbol"], trade.get("strategie_nom_ia", "?"), trade.get("ia_score", 0), "M1", win)
-            return {"trade_id": trade["trade_id"], "pnl": pnl_trade_total, "win": win, "duration": duration_seconds}
+            stats = init_daily_stats(uid)
+            stats["pnl"] += pnl_final
+            stats["trades"] += 1
+            if win:
+                stats["wins"] += 1
+                stats["consecutive_losses"] = 0
+            else:
+                stats["losses"] += 1
+                stats["consecutive_losses"] += 1
+                if stats["consecutive_losses"] >= RISK_CONFIG["max_consecutive_losses"]:
+                    stats["paused_until"] = time.time() + (RISK_CONFIG["pause_duration_minutes"] * 60)
+            
+            return {"trade_id": trade["trade_id"], "pnl": pnl_trade_total, "win": win}
         except: return None
         finally: trades_actifs.pop(uid, None)
 
@@ -543,7 +448,7 @@ def appliquer_trailing_stop(uid, prix_current):
     return False
 
 def utilisateur_a_trade_actif(uid):
-    return uid in trades_actifs and trades_actifs[uid]["state"] in (TradeState.TRADE_OPEN, TradeState.TRADE_PARTIAL)
+    return uid in trades_actifs
 
 # ==========================================
 # ANALYSE & STRATÉGIES M1 SCALPING
@@ -575,20 +480,14 @@ def detecter_chandeliers_pdf(df):
     except: return "NONE", 0
 
 def analyser_scalping_multi_tf(symbole):
-    """
-    🔥 STRATÉGIE PRO MOMENTUM SCALPER (M1 / M5)
-    Identifie la micro-tendance sur M5, et attend un micro-pullback 
-    sur les moyennes mobiles en M1 avec une bougie de rejet.
-    """
     c5  = obtenir_donnees_deriv(symbole, 300) 
     c1  = obtenir_donnees_deriv(symbole, 60)  
 
-    if not c5 or not c1 or len(c5) < 30 or len(c1) < 20:
-        return None
+    if not c5 or not c1 or len(c5) < 30 or len(c1) < 20: return None
 
     try:
-        df5  = pd.DataFrame(c5).astype(float)
-        df1  = pd.DataFrame(c1).astype(float)
+        df5  = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),"low":float(c["low"]),"close":float(c["close"])} for c in c5])
+        df1  = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),"low":float(c["low"]),"close":float(c["close"])} for c in c1])
         px = float(df1['close'].iloc[-1])
 
         # BIAIS M5
@@ -598,9 +497,7 @@ def analyser_scalping_multi_tf(symbole):
         # CONDITIONS M1
         ema21_1 = _ema(df1['close'], 21)
         distance_ema = abs(px - float(ema21_1.iloc[-2])) / px
-        
-        if distance_ema > 0.0015: 
-            return None
+        if distance_ema > 0.0015: return None
 
         # DECLENCHEUR
         pattern, _ = detecter_chandeliers_pdf(df1)
@@ -631,67 +528,11 @@ def analyser_scalping_multi_tf(symbole):
 
         return {
             "action": "🟢 ACHAT SCALP" if signal_dir == "BUY" else "🔴 VENTE SCALP",
-            "tendance": direction, "force": f"Impulsion M5 {direction}",
-            "msg": f"Scalping M1 : Rejet sur EMA21 + {pattern.replace('_',' ')}",
-            "sl": round(sl, 5), "tp1": round(tp1, 5), "tp": round(tp, 5),
-            "rr": round(rr, 2), "px": round(px, 5),
-            "strategie": 2, "confiance": 85,
-            "label": "PRO MOMENTUM SCALPER (M1)",
-            "zones_confluence": ["EMA21 M1 Rejection"],
-        }
-    except Exception as e:
-        print(f"[Analyse {symbole}] Erreur: {e}")
-        return None
-
-# ==========================================
-# VALIDATION DÉTERMINISTE (Moteur IA local)
-# ==========================================
-
-IA_CONFIG = {
-    "seuil_acceptation": 75,
-    "poids": {
-        "tendance_h1": 15, "ema_alignement": 20, "atr_volatilite": 20, "qualite_cassure": 45
-    }
-}
-
-ia_historique = []
-
-def moteur_ia_valider_signal(symbole, signal, strategie_nom):
-    # Validation ultra-rapide et mathématique uniquement
-    try:
-        score_base = signal.get("confiance", 50)
-        rr = signal.get("rr", 0)
-        
-        # Pénalisations / Bonus
-        if rr >= 2.0: score_base += 10
-        elif rr < 1.5: score_base -= 15
-        
-        score_final = max(0, min(100, score_base))
-        return {
-            "accepte": score_final >= IA_CONFIG["seuil_acceptation"], 
-            "score": score_final, 
-            "justification": ["Setup Momentum validé mathématiquement"]
+            "direction": signal_dir,
+            "sl": round(sl, 5), "tp1": round(tp1, 5), "tp": round(tp, 5), "px": round(px, 5)
         }
     except:
-        return {"accepte": False, "score": 0, "justification": []}
-
-def ia_enregistrer_resultat(symbol, strategie_nom, score, timeframe, win):
-    ia_historique.append({
-        "symbol": symbol, "strategie": strategie_nom, "score": score,
-        "timeframe": timeframe, "win": win, "ts": time.time()
-    })
-
-def cerveau_pro_trader(symbole):
-    signaux_valides = []
-    signal_brut = analyser_scalping_multi_tf(symbole)
-    if signal_brut:
-        verdict = moteur_ia_valider_signal(symbole, signal_brut, "SCALPING_MULTI_TF")
-        if verdict["accepte"]:
-            signal_brut["ia_score"] = verdict["score"]
-            signal_brut["ia_justification"] = verdict["justification"]
-            signal_brut["strategie_nom_ia"] = "SCALPING_MULTI_TF"
-            signaux_valides.append(signal_brut)
-    return signaux_valides
+        return None
 
 # ==========================================
 # PANNEAU DE CONTRÔLE ET COMMANDES TELEGRAM
@@ -701,14 +542,17 @@ def obtenir_clavier(uid):
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row(KeyboardButton("🟢 AUTO-TRADING: ON" if CONTROL_STATE["auto_trading_active"] else "🔴 AUTO-TRADING: OFF"))
     markup.row(KeyboardButton("📊 STATUS LIVE"), KeyboardButton(f"⚙️ MODE ({CONTROL_STATE['mode']})"))
-    markup.row(KeyboardButton("📊 CHOISIR UNE CIBLE"), KeyboardButton("🚀 LANCER L'ANALYSE"))
+    markup.row(KeyboardButton("📜 HISTORIQUE"), KeyboardButton("📊 RAPPORT DU JOUR"))
     markup.row(KeyboardButton("🛑 STOP D'URGENCE"))
     return markup
 
-@bot.message_handler(commands=['menu', 'controle'])
+@bot.message_handler(commands=['menu', 'controle', 'start'])
 def afficher_menu(message):
-    if est_autorise(message.chat.id):
-        bot.send_message(message.chat.id, "🎛️ *PANNEAU DE CONTRÔLE*", reply_markup=obtenir_clavier(message.chat.id), parse_mode="Markdown")
+    uid = message.chat.id
+    if est_autorise(uid):
+        utilisateurs_actifs.add(uid)
+        init_daily_stats(uid)
+        bot.send_message(uid, "🎛️ *PANNEAU DE CONTRÔLE - PURE SCALPING*", reply_markup=obtenir_clavier(uid), parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text and (m.text.startswith("🟢 AUTO-TRADING") or m.text.startswith("🔴 AUTO-TRADING")))
 def toggle_auto_trading(message):
@@ -718,29 +562,66 @@ def toggle_auto_trading(message):
     etat = "🟢 ACTIVÉ" if CONTROL_STATE["auto_trading_active"] else "🔴 DÉSACTIVÉ"
     bot.send_message(uid, f"⚙️ *Auto-trading : {etat}*", reply_markup=obtenir_clavier(uid), parse_mode="Markdown")
 
-@bot.message_handler(commands=['start'])
-def bienvenue(message):
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("⚙️ MODE"))
+def toggle_mode(message):
+    uid = message.chat.id
+    if uid != ADMIN_ID: return bot.send_message(uid, "❌ Réservé à l'admin.")
+    CONTROL_STATE["mode"] = "MULTI" if CONTROL_STATE["mode"] == "SOLO" else "SOLO"
+    bot.send_message(uid, f"⚙️ Mode : *{CONTROL_STATE['mode']}*", reply_markup=obtenir_clavier(uid), parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: m.text == "🛑 STOP D'URGENCE")
+def stop_urgence(message):
+    uid = message.chat.id
+    if uid != ADMIN_ID: return
+    CONTROL_STATE["auto_trading_active"] = False
+    CONTROL_STATE["stop_urgence_actif"] = not CONTROL_STATE["stop_urgence_actif"]
+    etat = "🛑 STOP D'URGENCE ACTIF (Trading bloqué)" if CONTROL_STATE["stop_urgence_actif"] else "✅ STOP D'URGENCE LEVÉ"
+    bot.send_message(uid, etat, reply_markup=obtenir_clavier(uid))
+
+@bot.message_handler(func=lambda m: m.text == "📊 STATUS LIVE")
+def status_live(message):
     uid = message.chat.id
     if not est_autorise(uid): return
-    utilisateurs_actifs.add(uid)
-    init_daily_stats(uid)
-    bot.send_message(uid, "💼 *TERMINAL PRIME V56 — PURE SCALPING*\nUtilise /menu pour accéder aux contrôles.", reply_markup=obtenir_clavier(uid), parse_mode="Markdown")
+    lignes = ["📊 *STATUS LIVE*\n━━━━━━━━━━━━━━━━━━━━━━"]
+    lignes.append(f"Auto-trading : {'🟢 ON' if CONTROL_STATE['auto_trading_active'] else '🔴 OFF'}")
+    lignes.append(f"Mode : {CONTROL_STATE['mode']}")
+    lignes.append(f"Stop d'urgence : {'🛑 ACTIF' if CONTROL_STATE['stop_urgence_actif'] else '✅ inactif'}")
+    try:
+        positions = deriv_positions_ouvertes()
+        if not positions:
+            lignes.append("Aucun contrat ouvert sur Deriv actuellement.")
+        else:
+            lignes.append(f"*{len(positions)} contrat(s) ouvert(s) :*")
+            for p in positions:
+                lignes.append(f"  {p.get('symbol')} {p.get('contract_type')} | Mise {p.get('buy_price')}$ | P&L {p.get('profit', 0):+.2f}$")
+    except Exception as e:
+        lignes.append(f"⚠️ Impossible de récupérer les positions : {e}")
+    bot.send_message(uid, "\n".join(lignes), parse_mode="Markdown")
 
-@bot.message_handler(commands=['iaconfig'])
-def gerer_ia_config(message):
-    if message.chat.id != ADMIN_ID: return
-    txt = (f"🤖 *PARAMÈTRES MOTEUR IA (Local)*\n"
-           f"Seuil d'acceptation : {IA_CONFIG['seuil_acceptation']}%\n"
-           f"Trades enregistrés : {len(ia_historique)}")
-    bot.send_message(message.chat.id, txt, parse_mode="Markdown")
+@bot.message_handler(func=lambda m: m.text == "📊 RAPPORT DU JOUR")
+def rapport_bouton(message):
+    uid = message.chat.id
+    if not est_autorise(uid): return
+    stats = init_daily_stats(uid)
+    txt = (f"📊 *RAPPORT DU JOUR*\n"
+           f"Trades exécutés : {stats['trades']}/{RISK_CONFIG['max_trades_per_day']}\n"
+           f"✅ Gagnés : {stats['wins']} | ❌ Perdus : {stats['losses']}\n"
+           f"💰 P&L : {stats['pnl']:+.2f} USD\n"
+           f"🏦 P&L total cumulé : {pnl_total.get(uid,0):+.2f} USD")
+    bot.send_message(uid, txt, parse_mode="Markdown")
 
-@bot.message_handler(commands=['iastats'])
-def ia_stats(message):
-    if message.chat.id != ADMIN_ID: return
-    wins = sum(1 for h in ia_historique if h["win"])
-    total = len(ia_historique)
-    wr = (wins / total * 100) if total else 0
-    bot.send_message(message.chat.id, f"📊 *Winrate Global* : {wr:.1f}% sur {total} trades", parse_mode="Markdown")
+@bot.message_handler(func=lambda m: m.text == "📜 HISTORIQUE")
+def historique_bouton(message):
+    uid = message.chat.id
+    if not est_autorise(uid): return
+    hist = trades_historique.get(uid, [])
+    if not hist: return bot.send_message(uid, "📭 Aucun trade dans l'historique.")
+    lignes = ["📜 *HISTORIQUE (10 derniers trades)*\n━━━━━━━━━━━━━━━━━━━━━━"]
+    for t in hist[-10:][::-1]:
+        emoji = "✅" if t["win"] else "❌"
+        date_str = datetime.datetime.fromtimestamp(t["timestamp"]).strftime("%d/%m %H:%M")
+        lignes.append(f"{emoji} {t['symbol']} {t['direction']} | {t['pnl']:+.2f}$ | {date_str}")
+    bot.send_message(uid, "\n".join(lignes), parse_mode="Markdown")
 
 # ==========================================
 # BOUCLE PRINCIPALE (SCAN & MONITOR)
@@ -749,45 +630,41 @@ def ia_stats(message):
 def scanner_marche_auto():
     while True:
         try:
-            time.sleep(5) # Scan hyper-rapide pour M1
+            time.sleep(5) 
             libres = [u for u in utilisateurs_actifs if est_autorise(u)]
             if not libres: continue
 
             resultats = []
             with ThreadPoolExecutor(max_workers=10) as executor:
-                futures = {executor.submit(cerveau_pro_trader, p): p for p in ELITE_PAIRS_MT5}
+                futures = {executor.submit(analyser_scalping_multi_tf, p): p for p in ELITE_PAIRS_MT5}
                 for future in as_completed(futures, timeout=10):
                     try:
                         paire = futures[future]
-                        signaux = future.result()
-                        for res in signaux:
+                        res = future.result()
+                        if res:
                             px = obtenir_prix_broker_realtime(paire)
                             if px and valider_prix_avant_signal(paire, px):
                                 resultats.append((paire, res, px))
                     except: pass
 
             for paire, res, px in resultats:
-                cle = f"{paire}_{res.get('strategie_nom_ia', 'PRO')}"
-                if cle in derniere_alerte_auto and (time.time() - derniere_alerte_auto[cle] < 60):
-                    continue # Évite le spam sur le même setup
+                cle = f"{paire}_SCALP"
+                if cle in derniere_alerte_auto and (time.time() - derniere_alerte_auto[cle] < 30):
+                    continue 
                 derniere_alerte_auto[cle] = time.time()
                 
                 for uid in libres:
                     if utilisateur_a_trade_actif(uid): continue
                     peut_trader, _ = utilisateur_peut_trader(uid)
                     if not peut_trader: continue
-
-                    entry_dir = "BUY" if "BUY" in res["action"] else "SELL"
                     
                     if peut_ouvrir_automatiquement(paire):
                         try:
-                            trade_id, sizing = ouvrir_trade(
-                                uid, paire, entry_dir, px, res["sl"], res["tp1"], res["tp"],
-                                res["strategie"], res["confiance"], res["label"],
-                                res.get("strategie_nom_ia"), res.get("ia_score"),
+                            trade_id = ouvrir_trade(
+                                uid, paire, res["direction"], px, res["sl"], res["tp1"], res["tp"],
                                 executer_reel=True
                             )
-                            bot.send_message(uid, f"⚡ *SCALP AUTO OUVERT* : {paire} {entry_dir} @ {px:.5f}", parse_mode="Markdown")
+                            bot.send_message(uid, f"⚡ *SCALP AUTO OUVERT* : {paire} {res['direction']} @ {px:.5f}", parse_mode="Markdown")
                         except Exception as e:
                             print(f"[Exec Auto] Erreur: {e}")
 
@@ -796,7 +673,7 @@ def scanner_marche_auto():
 def monitorer_trades_actifs():
     while True:
         try:
-            time.sleep(2) # Monitor ultra-réactif pour le scalping
+            time.sleep(2) 
             for uid in list(trades_actifs.keys()):
                 trade = trades_actifs[uid]
                 px = obtenir_prix_broker_realtime(trade["symbol"])
@@ -829,5 +706,5 @@ if __name__ == "__main__":
     keep_alive()
     Thread(target=scanner_marche_auto, daemon=True).start()
     Thread(target=monitorer_trades_actifs, daemon=True).start()
-    print("💼 TERMINAL PRIME V56 SCALPING DÉMARRÉ", flush=True)
+    print("💼 TERMINAL PRIME V56 PURE SCALPING DÉMARRÉ", flush=True)
     bot.infinity_polling()
