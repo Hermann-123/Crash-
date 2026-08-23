@@ -129,11 +129,15 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5,
     m30 = obtenir_historique_paginee(symbole, 1800, min(nb_jours * 48 + 300, 20000))
     print(f"  → {len(m30)} bougies M30 récupérées", flush=True)
 
+    print("Récupération de l'historique M5 (requis par le moteur IA)...", flush=True)
+    m5 = obtenir_historique_paginee(symbole, 300, min(nb_jours * 288 + 300, 20000))
+    print(f"  → {len(m5)} bougies M5 récupérées", flush=True)
+
     print("Récupération de l'historique H1 (filtre macro du moteur IA)...", flush=True)
     h1 = obtenir_historique_paginee(symbole, 3600, min(nb_jours * 24 + 300, 20000))
     print(f"  → {len(h1)} bougies H1 récupérées", flush=True)
 
-    if any(len(x) < 100 for x in (m15, m30, h1)):
+    if any(len(x) < 100 for x in (m15, m30, m5, h1)):
         print("❌ Pas assez de données récupérées pour un backtest fiable.", flush=True)
         return
 
@@ -144,25 +148,29 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5,
     fenetre_min = 40  # minimum de bougies connues requis sur chaque timeframe avant de tester
 
     # On avance bougie par bougie sur le M15 (l'entrée se décide à cette
-    # résolution maintenant) — pour chaque pas, fenêtres M30/H1 "connues".
+    # résolution maintenant) — pour chaque pas, fenêtres M30/M5/H1 "connues".
     for i in range(fenetre_min, len(m15) - 1):
         epoch_actuel = m15[i]["epoch"]
 
         m30_connu = [c for c in m30 if c["epoch"] <= epoch_actuel]
+        m5_connu  = [c for c in m5  if c["epoch"] <= epoch_actuel]
         h1_connu  = [c for c in h1  if c["epoch"] <= epoch_actuel]
         m15_connu = m15[:i+1]
 
-        if any(len(x) < fenetre_min for x in (m30_connu, h1_connu)):
+        if any(len(x) < fenetre_min for x in (m30_connu, m5_connu, h1_connu)):
             continue
 
-        # Monkey-patch temporaire : force les fonctions du bot à utiliser
-        # nos fenêtres historiques figées au lieu du réseau temps réel.
+        # ✅ FIX: le moteur IA (moteur_ia_valider_signal) a aussi besoin de
+        # données M5 (granularité 300) pour son propre calcul — sans ça il
+        # retourne systématiquement "Données insuffisantes" → score 0% →
+        # rejet automatique de TOUS les signaux, peu importe le seuil.
         # gran=14400 (H4) retourne None exprès → déclenche le repli normal
         # du bot (agrégation H1×4) déjà codé dans obtenir_donnees_h4().
         original_fn = bot_core.obtenir_donnees_deriv
-        def _fake_obtenir_donnees(sym, gran, _m15=m15_connu, _m30=m30_connu, _h1=h1_connu):
+        def _fake_obtenir_donnees(sym, gran, _m15=m15_connu, _m30=m30_connu, _m5=m5_connu, _h1=h1_connu):
             if gran == 900:  return _m15[-250:]
             if gran == 1800: return _m30[-250:]
+            if gran == 300:  return _m5[-250:]
             if gran == 3600: return _h1[-250:]
             return None
         bot_core.obtenir_donnees_deriv = _fake_obtenir_donnees
