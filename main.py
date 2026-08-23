@@ -112,7 +112,7 @@ def simuler_issue_trade(bougies_futures, direction, sl, tp, max_bougies=200):
 # BOUCLE DE BACKTEST
 # ==========================================
 
-def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5, rr_min=1.2):
+def backtester(symbole, nb_jours=20, seuil_ia_teste=None):
     """
     ✅ V58: rejoue la stratégie de SCALPING M15 (biais M30) en avançant
     bougie par bougie sur l'historique M15. Plus rapide que la version
@@ -177,9 +177,9 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5,
 
         signal, verdict = None, None
         try:
-            signal = bot_core.analyser_scalping_multi_tf(symbole, multiplicateur_tp=multiplicateur_tp, rr_min=rr_min)
+            signal = bot_core.analyser_order_block_engine(symbole)
             if signal:
-                verdict = bot_core.moteur_ia_valider_signal(symbole, signal, "SCALPING_MULTI_TF")
+                verdict = bot_core.moteur_ia_valider_signal(symbole, signal, "ORDER_BLOCK")
         finally:
             bot_core.obtenir_donnees_deriv = original_fn  # toujours restaurer
 
@@ -221,8 +221,8 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5,
     esperance = (winrate/100 * rr_moyen) - ((1 - winrate/100) * 1)
 
     print(f"\n{'='*70}")
-    print(f"RÉSUMÉ SCALPING — {symbole} sur {nb_jours} jours "
-          f"(seuil IA={bot_core.IA_CONFIG['seuil_acceptation']}%, R/R visé={multiplicateur_tp})")
+    print(f"RÉSUMÉ ORDER BLOCK — {symbole} sur {nb_jours} jours "
+          f"(seuil IA={bot_core.IA_CONFIG['seuil_acceptation']}%)")
     print(f"{'='*70}")
     print(f"Trades simulés (complets)  : {len(exploitables)}")
     print(f"Trades en cours (ignorés)  : {len(resultats) - len(exploitables)}")
@@ -232,7 +232,7 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5,
     print(f"Espérance par trade (en R) : {esperance:+.2f}")
     print(f"{'='*70}\n")
 
-    return {"symbole": symbole, "rr_vise": multiplicateur_tp, "nb_trades": len(exploitables),
+    return {"symbole": symbole, "nb_trades": len(exploitables),
             "winrate": winrate, "rr_moyen": rr_moyen, "esperance": esperance}
 
 
@@ -241,7 +241,7 @@ if __name__ == "__main__":
     # CETTE version qui tourne (utile si Auto-Deploy est sur "Off" et qu'un
     # ancien build tourne encore sans qu'on s'en rende compte).
     print(f"\n{'#'*70}", flush=True)
-    print(f"# BACKTEST_STRATEGIE.PY — SCALPING M15 (biais M30) — multi-symboles/multi-R:R", flush=True)
+    print(f"# BACKTEST_STRATEGIE.PY — ORDER BLOCK ENGINE — multi-symboles", flush=True)
     print(f"# Lancé le : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", flush=True)
     print(f"# Arguments reçus : {sys.argv[1:]}", flush=True)
     print(f"{'#'*70}\n", flush=True)
@@ -249,32 +249,26 @@ if __name__ == "__main__":
     symboles_arg = sys.argv[1] if len(sys.argv) > 1 else "XAUUSD"
     nb_jours = int(sys.argv[2]) if len(sys.argv) > 2 else 20
     seuil = int(sys.argv[3]) if len(sys.argv) > 3 else None
-    rr_arg = sys.argv[4] if len(sys.argv) > 4 else "1.5"
 
     symboles = [s.strip().upper() for s in symboles_arg.split(",") if s.strip()]
-    valeurs_rr = [float(x.strip()) for x in rr_arg.split(",") if x.strip()]
     print(f"Symboles à tester ({len(symboles)}) : {symboles}", flush=True)
-    print(f"Valeurs de R/R à tester ({len(valeurs_rr)}) : {valeurs_rr}", flush=True)
     tous_resultats = []
 
     for sym in symboles:
-        for rr_v in valeurs_rr:
-            res = backtester(sym, nb_jours, seuil, multiplicateur_tp=rr_v)
-            if res:
-                tous_resultats.append(res)
-            time.sleep(1)  # petite pause entre deux runs, courtoisie API
+        res = backtester(sym, nb_jours, seuil)
+        if res:
+            tous_resultats.append(res)
+        time.sleep(1)  # petite pause entre deux symboles, courtoisie API
 
     if len(tous_resultats) > 1:
         print(f"\n{'='*70}")
         print(f"TABLEAU COMPARATIF — {nb_jours} jours (seuil IA={bot_core.IA_CONFIG['seuil_acceptation']}%)")
         print(f"{'='*70}")
-        print(f"{'Symbole':<10} {'R/R visé':<10} {'Trades':<8} {'Winrate':<10} {'R/R moy':<10} {'Espérance':<10}")
+        print(f"{'Symbole':<10} {'Trades':<8} {'Winrate':<10} {'R/R moy':<10} {'Espérance':<10}")
         print(f"{'-'*70}")
         for r in sorted(tous_resultats, key=lambda x: x['esperance'], reverse=True):
-            print(f"{r['symbole']:<10} {r['rr_vise']:<10} {r['nb_trades']:<8} {r['winrate']:.1f}%{'':<5} "
+            print(f"{r['symbole']:<10} {r['nb_trades']:<8} {r['winrate']:.1f}%{'':<5} "
                   f"{r['rr_moyen']:.2f}{'':<6} {r['esperance']:+.2f}")
         print(f"{'='*70}\n")
-        print("⚠️ Choisis la meilleure combinaison ici, puis reteste-la SEULE sur une")
-        print("   période différente (autres jours) avant d'y faire confiance — un")
-        print("   résultat qui gagne sur plusieurs variantes testées ensemble peut")
-        print("   simplement avoir eu de la chance sur cette période précise.\n")
+        print("⚠️ Reteste la meilleure combinaison SEULE sur une période différente")
+        print("   avant d'y faire confiance.\n")
