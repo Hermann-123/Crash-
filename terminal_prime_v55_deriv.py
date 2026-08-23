@@ -1382,20 +1382,38 @@ def analyser_scalping_multi_tf(symbole, multiplicateur_tp=1.5, rr_min=1.2):
                   f"cohérente avec le biais M30 ({direction})", flush=True)
             return None
 
-        # ── 3. LE PRIX EST-IL ACTUELLEMENT DANS LA ZONE ? ──
-        if not (zone["bas"] <= px <= zone["haut"]):
-            print(f"[DEBUG-SCALP] {symbole} REJET: prix {px} hors zone Fibo "
-                  f"[{zone['bas']}, {zone['haut']}]", flush=True)
+        # ── 3. LE PRIX A-T-IL ÉTÉ DANS LA ZONE RÉCEMMENT (3 dernières bougies) ? ──
+        # ✅ FIX: on ne demande plus que le prix soit DANS la zone à l'instant
+        # exact du signal — un prix qui l'a touchée puis en est ressorti d'un
+        # tick reste un pullback valide. On regarde les 3 dernières bougies.
+        recent_zone_touch = df15.iloc[-4:-1]  # 3 bougies avant celle en cours
+        touche_zone = any(
+            (zone["bas"] <= float(r['low']) <= zone["haut"]) or
+            (zone["bas"] <= float(r['high']) <= zone["haut"]) or
+            (float(r['low']) <= zone["bas"] and float(r['high']) >= zone["haut"])
+            for _, r in recent_zone_touch.iterrows()
+        )
+        if not touche_zone:
+            print(f"[DEBUG-SCALP] {symbole} REJET: prix n'a pas touché la zone Fibo "
+                  f"[{zone['bas']}, {zone['haut']}] sur les 3 dernières bougies", flush=True)
             return None
 
-        # ── 4. BOUGIE DE CONFIRMATION — SUR M15 (même échelle que la zone) ──
-        pattern, _ = detecter_chandeliers_pdf(df15)
+        # ── 4. BOUGIE DE CONFIRMATION — sur l'une des 2 dernières bougies M15 ──
+        # ✅ FIX: pas forcément la toute dernière bougie exacte — le retournement
+        # peut se former 1 bougie après le pullback dans la zone.
+        pattern, pattern_idx_ok = "NONE", False
         patterns_valides_bull = ("PIN_BULL", "ENGULFING_BULL", "MARUBOZU_BULL")
         patterns_valides_bear = ("PIN_BEAR", "ENGULFING_BEAR", "MARUBOZU_BEAR")
-        if (direction == "BULL" and pattern not in patterns_valides_bull) or \
-           (direction == "BEAR" and pattern not in patterns_valides_bear):
+        for decalage in (0, 1):
+            sous_fenetre = df15.iloc[: len(df15) - decalage]
+            p, _ = detecter_chandeliers_pdf(sous_fenetre)
+            if (direction == "BULL" and p in patterns_valides_bull) or \
+               (direction == "BEAR" and p in patterns_valides_bear):
+                pattern, pattern_idx_ok = p, True
+                break
+        if not pattern_idx_ok:
             print(f"[DEBUG-SCALP] {symbole} REJET: aucune bougie de confirmation "
-                  f"M15 valide (direction={direction}, pattern détecté={pattern})", flush=True)
+                  f"M15 valide sur les 2 dernières bougies (direction={direction})", flush=True)
             return None
 
         # ── 5. RISQUE / CIBLE basés sur l'ATR M15 (même échelle que l'entrée) ──
