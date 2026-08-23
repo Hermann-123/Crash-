@@ -114,22 +114,12 @@ def simuler_issue_trade(bougies_futures, direction, sl, tp, max_bougies=200):
 
 def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5, rr_min=1.2):
     """
-    ✅ V57: rejoue la stratégie de SCALPING MULTI-TF (M1→M30) en avançant
-    bougie par bougie sur l'historique M5 (compromis entre fidélité et
-    temps de calcul — le M1 donnerait 5x plus d'itérations pour un gain de
-    précision marginal, vu que la zone de timing se vérifie déjà au M5).
-    À chaque pas, seules les données ANTÉRIEURES à cet instant sont
-    fournies aux fonctions du bot (aucune bougie future visible).
+    ✅ V58: rejoue la stratégie de SCALPING M15 (biais M30) en avançant
+    bougie par bougie sur l'historique M15. Plus rapide que la version
+    M1→M30 précédente (beaucoup moins de données à récupérer/traiter),
+    et cohérent avec le fait que l'entrée elle-même est maintenant M15.
     """
-    print(f"\n{'='*70}\nBACKTEST SCALPING {symbole} — {nb_jours} jours d'historique\n{'='*70}", flush=True)
-
-    print("Récupération de l'historique M1...", flush=True)
-    m1 = obtenir_historique_paginee(symbole, 60, min(nb_jours * 1440 + 300, 40000))
-    print(f"  → {len(m1)} bougies M1 récupérées", flush=True)
-
-    print("Récupération de l'historique M5...", flush=True)
-    m5 = obtenir_historique_paginee(symbole, 300, min(nb_jours * 288 + 300, 20000))
-    print(f"  → {len(m5)} bougies M5 récupérées", flush=True)
+    print(f"\n{'='*70}\nBACKTEST SCALPING M15 {symbole} — {nb_jours} jours d'historique\n{'='*70}", flush=True)
 
     print("Récupération de l'historique M15...", flush=True)
     m15 = obtenir_historique_paginee(symbole, 900, min(nb_jours * 96 + 300, 20000))
@@ -143,7 +133,7 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5,
     h1 = obtenir_historique_paginee(symbole, 3600, min(nb_jours * 24 + 300, 20000))
     print(f"  → {len(h1)} bougies H1 récupérées", flush=True)
 
-    if any(len(x) < 100 for x in (m1, m5, m15, m30, h1)):
+    if any(len(x) < 100 for x in (m15, m30, h1)):
         print("❌ Pas assez de données récupérées pour un backtest fiable.", flush=True)
         return
 
@@ -153,19 +143,16 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5,
     resultats = []
     fenetre_min = 40  # minimum de bougies connues requis sur chaque timeframe avant de tester
 
-    # On avance bougie par bougie sur le M5 (le timing de la stratégie se
-    # décide à cette résolution) — pour chaque pas, on reconstitue les
-    # fenêtres M1/M15/M30/H1 "connues" à cet instant précis.
-    for i in range(fenetre_min, len(m5) - 1):
-        epoch_actuel = m5[i]["epoch"]
+    # On avance bougie par bougie sur le M15 (l'entrée se décide à cette
+    # résolution maintenant) — pour chaque pas, fenêtres M30/H1 "connues".
+    for i in range(fenetre_min, len(m15) - 1):
+        epoch_actuel = m15[i]["epoch"]
 
-        m1_connu  = [c for c in m1  if c["epoch"] <= epoch_actuel]
-        m15_connu = [c for c in m15 if c["epoch"] <= epoch_actuel]
         m30_connu = [c for c in m30 if c["epoch"] <= epoch_actuel]
         h1_connu  = [c for c in h1  if c["epoch"] <= epoch_actuel]
-        m5_connu  = m5[:i+1]
+        m15_connu = m15[:i+1]
 
-        if any(len(x) < fenetre_min for x in (m1_connu, m15_connu, m30_connu, h1_connu)):
+        if any(len(x) < fenetre_min for x in (m30_connu, h1_connu)):
             continue
 
         # Monkey-patch temporaire : force les fonctions du bot à utiliser
@@ -173,10 +160,7 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5,
         # gran=14400 (H4) retourne None exprès → déclenche le repli normal
         # du bot (agrégation H1×4) déjà codé dans obtenir_donnees_h4().
         original_fn = bot_core.obtenir_donnees_deriv
-        def _fake_obtenir_donnees(sym, gran, _m1=m1_connu, _m5=m5_connu,
-                                  _m15=m15_connu, _m30=m30_connu, _h1=h1_connu):
-            if gran == 60:   return _m1[-250:]
-            if gran == 300:  return _m5[-250:]
+        def _fake_obtenir_donnees(sym, gran, _m15=m15_connu, _m30=m30_connu, _h1=h1_connu):
             if gran == 900:  return _m15[-250:]
             if gran == 1800: return _m30[-250:]
             if gran == 3600: return _h1[-250:]
@@ -196,17 +180,17 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, multiplicateur_tp=1.5,
 
         direction = signal["tendance"]
         sl, tp = signal["sl"], signal["tp"]
-        futures_m1 = [c for c in m1 if c["epoch"] > epoch_actuel]
-        issue, duree = simuler_issue_trade(futures_m1, direction, sl, tp, max_bougies=500)
+        futures_m15 = m15[i+1:]
+        issue, duree = simuler_issue_trade(futures_m15, direction, sl, tp, max_bougies=200)
 
         resultats.append({
             "epoch": epoch_actuel, "direction": direction,
             "score_ia": verdict["score"], "rr": signal["rr"],
-            "issue": issue, "duree_minutes": duree,
+            "issue": issue, "duree_minutes": duree * 15,
         })
         print(f"  [{datetime.datetime.utcfromtimestamp(epoch_actuel)}] "
               f"{direction} score={verdict['score']}% rr={signal['rr']} → {issue} "
-              f"({duree} min)", flush=True)
+              f"({duree * 15} min)", flush=True)
 
     # ── Résumé ──
     exploitables = [r for r in resultats if r["issue"] in ("WIN", "LOSS")]
@@ -243,7 +227,7 @@ if __name__ == "__main__":
     # CETTE version qui tourne (utile si Auto-Deploy est sur "Off" et qu'un
     # ancien build tourne encore sans qu'on s'en rende compte).
     print(f"\n{'#'*70}", flush=True)
-    print(f"# BACKTEST_STRATEGIE.PY — SCALPING MULTI-TF (M1→M30) — multi-symboles", flush=True)
+    print(f"# BACKTEST_STRATEGIE.PY — SCALPING M15 (biais M30) — multi-symboles/multi-R:R", flush=True)
     print(f"# Lancé le : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", flush=True)
     print(f"# Arguments reçus : {sys.argv[1:]}", flush=True)
     print(f"{'#'*70}\n", flush=True)
