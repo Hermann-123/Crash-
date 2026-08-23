@@ -1342,24 +1342,24 @@ def calculer_zone_fibonacci(df, lookback=20):
 
 def analyser_scalping_multi_tf(symbole, multiplicateur_tp=1.5, rr_min=1.2):
     """
-    Stratégie unique de scalping M1→M30. Retourne un signal (même structure
-    que l'ancienne stratégie, pour rester compatible avec le moteur IA et
-    tout le reste du pipeline existant) ou None si aucune configuration
-    valide n'est détectée.
+    ✅ V58: Entrée resserrée sur M15 UNIQUEMENT (biais macro M30 conservé).
+    Le backtest précédent montrait une espérance négative sur toutes les
+    valeurs de R/R testées — le vrai problème identifié n'était pas le
+    R/R, mais un décalage d'échelle : la zone et le biais se lisaient en
+    M15/M30, alors que le stop loss était calculé sur l'ATR M1 (bien plus
+    petit) — soufflé par du simple bruit intra-bougie sans rapport avec
+    la lecture de tendance M15/M30. Tout est maintenant aligné sur M15 :
+    biais M30, zone Fibonacci M15, confirmation M15, risque/cible sur
+    ATR M15. Moins de bruit, cohérence d'échelle du début à la fin.
 
-    ✅ multiplicateur_tp et rr_min sont réglables (backtest de plusieurs
-    R/R cibles sans dupliquer la fonction) — en usage normal (bot en
-    direct), ils gardent leurs valeurs par défaut, comportement inchangé.
+    ✅ multiplicateur_tp et rr_min restent réglables pour le backtest.
     """
     c30 = obtenir_donnees_deriv(symbole, 1800)
     c15 = obtenir_donnees_deriv(symbole, 900)
-    c5  = obtenir_donnees_deriv(symbole, 300)
-    c1  = obtenir_donnees_deriv(symbole, 60)
 
-    if not all([c30, c15, c5, c1]) or len(c30) < 30 or len(c15) < 30 or len(c5) < 30 or len(c1) < 15:
+    if not c30 or not c15 or len(c30) < 30 or len(c15) < 40:
         print(f"[DEBUG-SCALP] {symbole} REJET: données insuffisantes "
-              f"(M30={len(c30) if c30 else 0}, M15={len(c15) if c15 else 0}, "
-              f"M5={len(c5) if c5 else 0}, M1={len(c1) if c1 else 0})", flush=True)
+              f"(M30={len(c30) if c30 else 0}, M15={len(c15) if c15 else 0})", flush=True)
         return None
 
     try:
@@ -1367,12 +1367,8 @@ def analyser_scalping_multi_tf(symbole, multiplicateur_tp=1.5, rr_min=1.2):
                                "low":float(c["low"]),"close":float(c["close"])} for c in c30])
         df15 = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
                                "low":float(c["low"]),"close":float(c["close"])} for c in c15])
-        df5  = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
-                               "low":float(c["low"]),"close":float(c["close"])} for c in c5])
-        df1  = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
-                               "low":float(c["low"]),"close":float(c["close"])} for c in c1])
 
-        px = float(df1['close'].iloc[-1])
+        px = float(df15['close'].iloc[-1])
 
         # ── 1. BIAIS DIRECTIONNEL M30 ──
         ema9_30  = _ema(df30['close'], 9)
@@ -1386,31 +1382,31 @@ def analyser_scalping_multi_tf(symbole, multiplicateur_tp=1.5, rr_min=1.2):
                   f"cohérente avec le biais M30 ({direction})", flush=True)
             return None
 
-        # ── 3. LE PRIX EST-IL ACTUELLEMENT DANS LA ZONE (M5) ? ──
+        # ── 3. LE PRIX EST-IL ACTUELLEMENT DANS LA ZONE ? ──
         if not (zone["bas"] <= px <= zone["haut"]):
             print(f"[DEBUG-SCALP] {symbole} REJET: prix {px} hors zone Fibo "
                   f"[{zone['bas']}, {zone['haut']}]", flush=True)
             return None
 
-        # ── 4. BOUGIE DE CONFIRMATION M1 ──
-        pattern, _ = detecter_chandeliers_pdf(df1)
+        # ── 4. BOUGIE DE CONFIRMATION — SUR M15 (même échelle que la zone) ──
+        pattern, _ = detecter_chandeliers_pdf(df15)
         patterns_valides_bull = ("PIN_BULL", "ENGULFING_BULL", "MARUBOZU_BULL")
         patterns_valides_bear = ("PIN_BEAR", "ENGULFING_BEAR", "MARUBOZU_BEAR")
         if (direction == "BULL" and pattern not in patterns_valides_bull) or \
            (direction == "BEAR" and pattern not in patterns_valides_bear):
             print(f"[DEBUG-SCALP] {symbole} REJET: aucune bougie de confirmation "
-                  f"M1 valide (direction={direction}, pattern détecté={pattern})", flush=True)
+                  f"M15 valide (direction={direction}, pattern détecté={pattern})", flush=True)
             return None
 
-        # ── 5. RISQUE / CIBLE basés sur l'ATR M1 (mouvements courts, SL serré) ──
-        atr1 = calculer_atr(df1)
-        if atr1 <= 0:
+        # ── 5. RISQUE / CIBLE basés sur l'ATR M15 (même échelle que l'entrée) ──
+        atr15 = calculer_atr(df15)
+        if atr15 <= 0:
             return None
 
-        bougie1 = df1.iloc[-2]
+        bougie15 = df15.iloc[-2]
         if direction == "BULL":
             signal_dir = "BUY"
-            sl = min(float(bougie1['low']) - atr1 * 0.2, px - atr1 * 1.0)
+            sl = min(float(bougie15['low']) - atr15 * 0.15, px - atr15 * 1.0)
             distance = px - sl
             if distance <= 0:
                 return None
@@ -1418,7 +1414,7 @@ def analyser_scalping_multi_tf(symbole, multiplicateur_tp=1.5, rr_min=1.2):
             tp1 = px + distance * 1.0
         else:
             signal_dir = "SELL"
-            sl = max(float(bougie1['high']) + atr1 * 0.2, px + atr1 * 1.0)
+            sl = max(float(bougie15['high']) + atr15 * 0.15, px + atr15 * 1.0)
             distance = sl - px
             if distance <= 0:
                 return None
@@ -1436,11 +1432,11 @@ def analyser_scalping_multi_tf(symbole, multiplicateur_tp=1.5, rr_min=1.2):
         return {
             "action": "🟢 ACHAT (BUY)" if signal_dir == "BUY" else "🔴 VENTE (SELL)",
             "tendance": direction, "force": f"Biais M30 {direction}",
-            "msg": f"Scalping M1→M30 : pullback zone Fibo golden pocket + {pattern.replace('_',' ')}",
+            "msg": f"Scalping M15 (biais M30) : pullback zone Fibo golden pocket + {pattern.replace('_',' ')}",
             "sl": round(sl, 5), "tp1": round(tp1, 5), "tp": round(tp, 5),
             "rr": round(rr, 2), "px": round(px, 5),
             "strategie": 1, "confiance": 70,
-            "label": "SCALPING MULTI-TF (M1→M30)",
+            "label": "SCALPING M15 (biais M30)",
             "zones_confluence": ["Fibonacci Golden Pocket M15"],
             "order_block": None, "niveau_cle": None,
         }
