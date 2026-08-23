@@ -1452,6 +1452,295 @@ def analyser_scalping_multi_tf(symbole, multiplicateur_tp=1.5, rr_min=1.2):
         print(f"[Scalping/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
         return None
 
+# ==========================================
+# ✅ V61 : MOTEUR ORDER BLOCK — STRATÉGIE UNIQUE DE REMPLACEMENT
+# ==========================================
+# Suit strictement : STRUCTURE → BOS → DÉPLACEMENT → FVG → LIQUIDITÉ
+# INTERNE → ORDER BLOCK → RETOUR EN ZONE → CONFIRMATION → ENTRY → SL → TP
+#
+# Architecture multi-timeframe (configurable ci-dessous) :
+#   HTF (H1)  : contexte / tendance générale (filtre, pas un blocage strict)
+#   MTF (M30) : détection BOS / FVG / Liquidité interne / Order Block
+#   LTF (M15) : retour de prix + confirmation d'entrée optionnelle
+#
+# Toutes les valeurs importantes sont centralisées ici — rien en dur
+# ailleurs dans le moteur.
+
+ORDER_BLOCK_CONFIG = {
+    "ENABLED": True,
+    "BOS_REQUIRED": True,
+    "FVG_REQUIRED": True,
+    "LIQUIDITY_SWEEP_REQUIRED": True,
+    # ✅ Section 8 de la spec : une 4e règle est évoquée dans le TITRE de la
+    # vidéo ("Mes 4 règles") mais seules 3 règles sont réellement détaillées
+    # dans le contenu visible. On ne fabrique pas de 4e condition — elle
+    # reste désactivée et documentée comme non définie avec précision.
+    "FOURTH_CONFIRMATION_ENABLED": False,
+    "BOS_CONFIRMATION_MODE": "CLOSE",   # "CLOSE" ou "WICK"
+    "MAX_OB_TOUCHES": 1,                # au-delà, l'OB est considéré "mitigé"
+    "MIN_RR": 1.5,
+    "HTF_GRANULARITE": 3600,   # H1
+    "MTF_GRANULARITE": 1800,   # M30
+    "LTF_GRANULARITE": 900,    # M15
+}
+
+# Mémoire de fraîcheur des Order Blocks détectés (touch_count) — persiste
+# tant que le processus tourne, remise à zéro à chaque redéploiement.
+_ob_touch_cache = {}
+
+def _cle_ob(symbole, direction, ob):
+    return (symbole, direction, round(ob["bas"], 2), round(ob["haut"], 2))
+
+def detecter_bos(df, ordre_swing=3, mode="CLOSE"):
+    """
+    RÈGLE 1 — Tendance = BOS. Détecte si l'une des 2 dernières bougies
+    CLÔTURÉES (jamais la bougie en cours de formation, pour éviter tout
+    look-ahead) a cassé un swing high/low pertinent antérieur.
+    mode="CLOSE" exige une clôture au-delà du swing (pas une simple mèche) —
+    mode="WICK" accepte une mèche.
+    Retourne {direction, prix_swing_casse, idx_bos, idx_swing} ou None.
+    """
+    try:
+        sub = df.iloc[:-1].reset_index(drop=True)  # exclut la bougie en formation
+        n = len(sub)
+        if n < ordre_swing * 2 + 6:
+            return None
+
+        highs = sub['high'].values
+        lows = sub['low'].values
+        closes = sub['close'].values
+
+        limite = n - 2  # on ne considère les swings que AVANT les 2 dernières bougies
+        idx_highs = [i for i in range(ordre_swing, limite - ordre_swing)
+                     if highs[i] == highs[max(0, i-ordre_swing):i+ordre_swing+1].max()]
+        idx_lows = [i for i in range(ordre_swing, limite - ordre_swing)
+                    if lows[i] == lows[max(0, i-ordre_swing):i+ordre_swing+1].min()]
+        if not idx_highs or not idx_lows:
+            return None
+
+        swing_high_idx, swing_low_idx = idx_highs[-1], idx_lows[-1]
+        swing_high, swing_low = float(highs[swing_high_idx]), float(lows[swing_low_idx])
+
+        for i in range(n - 2, n):
+            ref_haut = closes[i] if mode == "CLOSE" else highs[i]
+            ref_bas  = closes[i] if mode == "CLOSE" else lows[i]
+            if ref_haut > swing_high:
+                return {"direction": "BULL", "prix_swing_casse": swing_high,
+                        "idx_bos": i, "idx_swing": swing_high_idx}
+            if ref_bas < swing_low:
+                return {"direction": "BEAR", "prix_swing_casse": swing_low,
+                        "idx_bos": i, "idx_swing": swing_low_idx}
+        return None
+    except Exception:
+        return None
+
+def detecter_fvg_dans_zone(df, idx_debut, idx_fin, direction):
+    """
+    RÈGLE 2 — FVG associé au mouvement impulsif ayant produit le BOS
+    (pas n'importe quel FVG du graphique). Cherche un gap 3-bougies entre
+    idx_debut (le swing cassé) et idx_fin (la bougie du BOS).
+    """
+    try:
+        meilleur = None
+        borne = min(idx_fin, len(df) - 1)
+        for i in range(max(idx_debut + 2, 2), borne + 1):
+            h1, l1 = float(df['high'].iloc[i-2]), float(df['low'].iloc[i-2])
+            h3, l3 = float(df['high'].iloc[i]), float(df['low'].iloc[i])
+            if direction == "BULL" and h1 < l3:
+                meilleur = {"type": "BULL", "haut": l3, "bas": h1, "idx": i}
+            elif direction == "BEAR" and l1 > h3:
+                meilleur = {"type": "BEAR", "haut": l1, "bas": h3, "idx": i}
+        return meilleur
+    except Exception:
+        return None
+
+def detecter_liquidity_sweep(df, idx_reference, direction, lookback=15):
+    """
+    RÈGLE 3 — Prise de liquidité interne avant le mouvement impulsif : un
+    niveau mineur pris (mèche au-delà) puis rejeté immédiatement dans le
+    sens du mouvement à venir. Une simple cassure ne suffit pas — il faut
+    le rejet (clôture qui revient au-delà du niveau).
+    """
+    try:
+        debut = max(0, idx_reference - lookback)
+        sub = df.iloc[debut: idx_reference + 1]
+        if len(sub) < 5:
+            return None
+        if direction == "BULL":
+            niveau = float(sub['low'].iloc[:-2].min())
+            derniere = sub.iloc[-1]
+            if float(derniere['low']) < niveau and float(derniere['close']) > niveau:
+                return {"type": "BULL", "niveau": niveau}
+        else:
+            niveau = float(sub['high'].iloc[:-2].max())
+            derniere = sub.iloc[-1]
+            if float(derniere['high']) > niveau and float(derniere['close']) < niveau:
+                return {"type": "BEAR", "niveau": niveau}
+        return None
+    except Exception:
+        return None
+
+def detecter_order_block_zone(df, idx_swing, direction):
+    """
+    Identifie la zone d'Order Block : la dernière bougie OPPOSÉE pertinente
+    juste avant le mouvement impulsif qui a cassé la structure. On ne
+    considère pas chaque bougie opposée — seulement celle qui précède
+    directement le déplacement (recherche bornée à 8 bougies en arrière).
+    """
+    try:
+        for i in range(idx_swing, max(idx_swing - 8, 0), -1):
+            o, c = float(df['open'].iloc[i]), float(df['close'].iloc[i])
+            if direction == "BULL" and c < o:
+                return {"haut": max(o, c, float(df['high'].iloc[i])),
+                        "bas": float(df['low'].iloc[i]), "idx": i}
+            if direction == "BEAR" and c > o:
+                return {"haut": float(df['high'].iloc[i]),
+                        "bas": min(o, c, float(df['low'].iloc[i])), "idx": i}
+        return None
+    except Exception:
+        return None
+
+def analyser_order_block_engine(symbole):
+    """
+    MOTEUR UNIQUE DE STRATÉGIE — Order Block.
+    STRUCTURE → BOS → DÉPLACEMENT → FVG → LIQUIDITÉ INTERNE → ORDER BLOCK
+    → RETOUR EN ZONE → CONFIRMATION (optionnelle) → ENTRY → SL → TP.
+
+    Ne fabrique jamais de signal si une condition centrale échoue : retourne
+    None (NO TRADE), jamais un signal dégradé pour "avoir quelque chose".
+    """
+    if not ORDER_BLOCK_CONFIG["ENABLED"]:
+        return None
+
+    c_htf = obtenir_donnees_deriv(symbole, ORDER_BLOCK_CONFIG["HTF_GRANULARITE"])
+    c_mtf = obtenir_donnees_deriv(symbole, ORDER_BLOCK_CONFIG["MTF_GRANULARITE"])
+    c_ltf = obtenir_donnees_deriv(symbole, ORDER_BLOCK_CONFIG["LTF_GRANULARITE"])
+
+    if not c_htf or not c_mtf or not c_ltf or len(c_htf) < 50 or len(c_mtf) < 50 or len(c_ltf) < 20:
+        print(f"[OB SCANNER] {symbole} REJECTED — REASON: insufficient data", flush=True)
+        return None
+
+    try:
+        df_htf = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
+                                 "low":float(c["low"]),"close":float(c["close"])} for c in c_htf])
+        df_mtf = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
+                                 "low":float(c["low"]),"close":float(c["close"])} for c in c_mtf])
+        df_ltf = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
+                                 "low":float(c["low"]),"close":float(c["close"])} for c in c_ltf])
+
+        px = float(df_ltf['close'].iloc[-1])
+
+        # ── RÈGLE 1 : TENDANCE = BOS (sur MTF) ──
+        bos = detecter_bos(df_mtf, mode=ORDER_BLOCK_CONFIG["BOS_CONFIRMATION_MODE"])
+        if ORDER_BLOCK_CONFIG["BOS_REQUIRED"] and not bos:
+            print(f"[OB SCANNER] {symbole} REJECTED — REASON: No BOS", flush=True)
+            return None
+        direction = bos["direction"]
+
+        ema20_htf = _ema(df_htf['close'], 20)
+        ema50_htf = _ema(df_htf['close'], 50)
+        tendance_htf = "BULL" if ema20_htf.iloc[-2] > ema50_htf.iloc[-2] else "BEAR"
+
+        # ── RÈGLE 2 : FVG associé au déplacement ──
+        fvg = detecter_fvg_dans_zone(df_mtf, bos["idx_swing"], bos["idx_bos"], direction)
+        if ORDER_BLOCK_CONFIG["FVG_REQUIRED"] and not fvg:
+            print(f"[OB SCANNER] {symbole} REJECTED — REASON: No FVG", flush=True)
+            return None
+
+        # ── RÈGLE 3 : PRISE DE LIQUIDITÉ INTERNE ──
+        liquidite = detecter_liquidity_sweep(df_mtf, bos["idx_swing"], direction)
+        if ORDER_BLOCK_CONFIG["LIQUIDITY_SWEEP_REQUIRED"] and not liquidite:
+            print(f"[OB SCANNER] {symbole} REJECTED — REASON: No liquidity sweep", flush=True)
+            return None
+
+        # ── IDENTIFICATION DE L'ORDER BLOCK ──
+        ob = detecter_order_block_zone(df_mtf, bos["idx_swing"], direction)
+        if not ob:
+            print(f"[OB SCANNER] {symbole} REJECTED — REASON: No valid OB candle", flush=True)
+            return None
+
+        # ── FRAÎCHEUR ──
+        cle = _cle_ob(symbole, direction, ob)
+        touches = _ob_touch_cache.get(cle, 0)
+        if touches >= ORDER_BLOCK_CONFIG["MAX_OB_TOUCHES"]:
+            print(f"[OB SCANNER] {symbole} REJECTED — REASON: OB already mitigated ({touches} touches)", flush=True)
+            return None
+
+        # ── RETOUR DU PRIX DANS L'OB (LTF) ──
+        if not (ob["bas"] <= px <= ob["haut"]):
+            print(f"[OB SCANNER] {symbole} REJECTED — REASON: price not back in OB "
+                  f"[{ob['bas']:.5f},{ob['haut']:.5f}], px={px}", flush=True)
+            return None
+
+        # ── CONFIRMATION D'ENTRÉE (module séparé, OPTIONNEL — n'est pas une
+        # des 3 règles centrales de la vidéo, affine seulement le score) ──
+        pattern, _ = detecter_chandeliers_pdf(df_ltf)
+        patterns_bull = ("PIN_BULL", "ENGULFING_BULL", "MARUBOZU_BULL")
+        patterns_bear = ("PIN_BEAR", "ENGULFING_BEAR", "MARUBOZU_BEAR")
+        confirmation_ok = (direction == "BULL" and pattern in patterns_bull) or \
+                           (direction == "BEAR" and pattern in patterns_bear)
+
+        # ── SL / TP STRUCTURELS ──
+        atr_mtf = calculer_atr(df_mtf)
+        marge = atr_mtf * 0.15 if atr_mtf > 0 else ob["haut"] * 0.001
+
+        if direction == "BULL":
+            signal_dir = "BUY"
+            sl = ob["bas"] - marge
+            distance = px - sl
+            if distance <= 0:
+                return None
+            niveaux = detecter_niveaux_cles(df_mtf)
+            cibles = [n for n in niveaux if n > px]
+            tp = min(cibles) if cibles else px + distance * 2.0
+            tp1 = px + distance * 1.0
+        else:
+            signal_dir = "SELL"
+            sl = ob["haut"] + marge
+            distance = sl - px
+            if distance <= 0:
+                return None
+            niveaux = detecter_niveaux_cles(df_mtf)
+            cibles = [n for n in niveaux if n < px]
+            tp = max(cibles) if cibles else px - distance * 2.0
+            tp1 = px - distance * 1.0
+
+        rr = abs(tp - px) / abs(px - sl) if abs(px - sl) > 0 else 0
+        if rr < ORDER_BLOCK_CONFIG["MIN_RR"]:
+            print(f"[OB SCANNER] {symbole} REJECTED — REASON: RR {rr:.2f} < {ORDER_BLOCK_CONFIG['MIN_RR']}", flush=True)
+            return None
+
+        # ── SCORE DE QUALITÉ (indépendant de l'IA — pas une probabilité garantie) ──
+        score = 25 + (20 if fvg else 0) + (20 if liquidite else 0) + \
+                (15 if confirmation_ok else 0) + (10 if touches == 0 else 0) + \
+                (10 if direction == tendance_htf else 0)
+        grade = "A+" if score >= 90 else "A" if score >= 75 else "B" if score >= 55 else "C"
+
+        _ob_touch_cache[cle] = touches + 1
+
+        print(f"[OB SCANNER] Symbol: {symbole} | BOS: YES | FVG: {'YES' if fvg else 'NO'} | "
+              f"LIQUIDITY SWEEP: {'YES' if liquidite else 'NO'} | OB: {direction} | "
+              f"FRESHNESS: {'HIGH' if touches==0 else 'USED'} | RR: {rr:.2f} | "
+              f"SCORE: {score} ({grade}) | STATUS: VALID", flush=True)
+
+        return {
+            "action": "🟢 ACHAT (BUY)" if signal_dir == "BUY" else "🔴 VENTE (SELL)",
+            "tendance": direction, "force": f"BOS {direction} confirmé (MTF)",
+            "msg": f"Order Block {direction} — BOS+FVG+Liquidité confirmés (grade {grade})",
+            "sl": round(sl, 5), "tp1": round(tp1, 5), "tp": round(tp, 5),
+            "rr": round(rr, 2), "px": round(px, 5),
+            "strategie": 1, "confiance": min(97, score),
+            "label": "ORDER BLOCK ENGINE",
+            "zones_confluence": [f"Order Block {direction}"],
+            "order_block": (ob["bas"], ob["haut"]), "niveau_cle": None,
+            "setup_score": score, "setup_grade": grade,
+            "bos_confirmed": True, "fvg_confirmed": bool(fvg),
+            "liquidity_sweep_confirmed": bool(liquidite),
+        }
+    except Exception as e:
+        print(f"[OrderBlock/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        return None
+
 def detecter_contexte_pdf(symbole):
     cached = contexte_marche_cache.get(symbole)
     if cached and (time.time() - cached["ts"]) < 120:
@@ -2081,7 +2370,7 @@ def cerveau_pro_trader(symbole):
     signaux_valides = []
     print(f"[DEBUG] === Analyse {symbole} — début cycle ===", flush=True)
     for fn, nom_strategie, emoji_ctx in (
-        (analyser_scalping_multi_tf, "SCALPING_MULTI_TF", "⚡ SCALPING MULTI-TF (M1→M30)"),
+        (analyser_order_block_engine, "ORDER_BLOCK", "🧱 ORDER BLOCK ENGINE"),
     ):
         try:
             signal_brut = fn(symbole)
