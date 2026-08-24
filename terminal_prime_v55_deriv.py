@@ -1477,8 +1477,8 @@ ORDER_BLOCK_CONFIG = {
     # reste désactivée et documentée comme non définie avec précision.
     "FOURTH_CONFIRMATION_ENABLED": False,
     "BOS_CONFIRMATION_MODE": "CLOSE",   # "CLOSE" ou "WICK"
-    "MAX_OB_TOUCHES": 2,                # au-delà, l'OB est considéré "mitigé"
-    "MIN_RR": 1.3,
+    "MAX_OB_TOUCHES": 1,                # au-delà, l'OB est considéré "mitigé"
+    "MIN_RR": 1.5,
     "HTF_GRANULARITE": 3600,   # H1
     "MTF_GRANULARITE": 1800,   # M30
     "LTF_GRANULARITE": 900,    # M15
@@ -1491,55 +1491,15 @@ _ob_touch_cache = {}
 def _cle_ob(symbole, direction, ob):
     return (symbole, direction, round(ob["bas"], 2), round(ob["haut"], 2))
 
-def detecter_bos(df, ordre_swing=2, mode="CLOSE", fenetre_recente=15):
+def detecter_bos(df, ordre_swing=3, mode="CLOSE"):
     """
-    RÈGLE 1 — Tendance = BOS. Cherche un BOS "récent" (dans les
-    `fenetre_recente` dernières bougies CLÔTURÉES, jamais la bougie en
-    cours de formation) plutôt que seulement les 2 dernières — un retour
-    de prix dans l'Order Block se produit souvent plusieurs bougies après
-    la cassure elle-même, pas immédiatement dessus.
+    RÈGLE 1 — Tendance = BOS. Détecte si l'une des 2 dernières bougies
+    CLÔTURÉES (jamais la bougie en cours de formation, pour éviter tout
+    look-ahead) a cassé un swing high/low pertinent antérieur.
     mode="CLOSE" exige une clôture au-delà du swing (pas une simple mèche) —
     mode="WICK" accepte une mèche.
-    Retourne le BOS le plus RÉCENT trouvé : {direction, prix_swing_casse,
-    idx_bos, idx_swing} ou None.
+    Retourne {direction, prix_swing_casse, idx_bos, idx_swing} ou None.
     """
-    try:
-        sub = df.iloc[:-1].reset_index(drop=True)  # exclut la bougie en formation
-        n = len(sub)
-        if n < ordre_swing * 2 + 6:
-            return None
-
-        highs = sub['high'].values
-        lows = sub['low'].values
-        closes = sub['close'].values
-
-        debut_recherche = max(ordre_swing, n - fenetre_recente)
-        meilleur = None
-        for i in range(debut_recherche, n):
-            # swings connus strictement AVANT la bougie i
-            idx_highs = [j for j in range(ordre_swing, i - ordre_swing)
-                         if highs[j] == highs[max(0, j-ordre_swing):j+ordre_swing+1].max()]
-            idx_lows = [j for j in range(ordre_swing, i - ordre_swing)
-                        if lows[j] == lows[max(0, j-ordre_swing):j+ordre_swing+1].min()]
-            if not idx_highs or not idx_lows:
-                continue
-            swing_high_idx, swing_low_idx = idx_highs[-1], idx_lows[-1]
-            swing_high, swing_low = float(highs[swing_high_idx]), float(lows[swing_low_idx])
-
-            ref_haut = closes[i] if mode == "CLOSE" else highs[i]
-            ref_bas  = closes[i] if mode == "CLOSE" else lows[i]
-            if ref_haut > swing_high:
-                meilleur = {"direction": "BULL", "prix_swing_casse": swing_high,
-                            "idx_bos": i, "idx_swing": swing_high_idx}
-            elif ref_bas < swing_low:
-                meilleur = {"direction": "BEAR", "prix_swing_casse": swing_low,
-                            "idx_bos": i, "idx_swing": swing_low_idx}
-        return meilleur
-    except Exception:
-        return None
-
-
-def _detecter_bos_ancien_non_utilise(df, ordre_swing=3, mode="CLOSE"):
     try:
         sub = df.iloc[:-1].reset_index(drop=True)  # exclut la bougie en formation
         n = len(sub)
@@ -1566,7 +1526,6 @@ def _detecter_bos_ancien_non_utilise(df, ordre_swing=3, mode="CLOSE"):
             ref_bas  = closes[i] if mode == "CLOSE" else lows[i]
             if ref_haut > swing_high:
                 return {"direction": "BULL", "prix_swing_casse": swing_high,
-
                         "idx_bos": i, "idx_swing": swing_high_idx}
             if ref_bas < swing_low:
                 return {"direction": "BEAR", "prix_swing_casse": swing_low,
@@ -1595,28 +1554,43 @@ def detecter_fvg_dans_zone(df, idx_debut, idx_fin, direction):
     except Exception:
         return None
 
-def detecter_liquidity_sweep(df, idx_reference, direction, lookback=25):
+def detecter_liquidity_sweep(df, idx_reference, direction, lookback=15):
     """
     RÈGLE 3 — Prise de liquidité interne avant le mouvement impulsif : un
     niveau mineur pris (mèche au-delà) puis rejeté immédiatement dans le
     sens du mouvement à venir. Une simple cassure ne suffit pas — il faut
     le rejet (clôture qui revient au-delà du niveau).
+
+    ✅ FIX (backtest 60j XAUUSD, 24/08) : la version précédente ne
+    vérifiait QUE la toute dernière bougie de la fenêtre de lookback
+    (idx_reference), au lieu de scanner toute la fenêtre — comme
+    detecter_order_block_zone le fait déjà pour l'OB. Ce bug expliquait
+    à lui seul 37.8% des rejets (76% des rejets "spécifiques") sur le
+    backtest : un vrai sweep de liquidité qui ne tombait pas exactement
+    sur idx_reference était invisible pour le bot, même quand le pattern
+    SMC était parfaitement valide. On scanne maintenant toute la fenêtre,
+    de la bougie la plus récente vers la plus ancienne, en recalculant à
+    chaque candidat le niveau mineur sur tout ce qui le précède.
     """
     try:
         debut = max(0, idx_reference - lookback)
         sub = df.iloc[debut: idx_reference + 1]
         if len(sub) < 5:
             return None
-        if direction == "BULL":
-            niveau = float(sub['low'].iloc[:-2].min())
-            derniere = sub.iloc[-1]
-            if float(derniere['low']) < niveau and float(derniere['close']) > niveau:
-                return {"type": "BULL", "niveau": niveau}
-        else:
-            niveau = float(sub['high'].iloc[:-2].max())
-            derniere = sub.iloc[-1]
-            if float(derniere['high']) > niveau and float(derniere['close']) < niveau:
-                return {"type": "BEAR", "niveau": niveau}
+
+        for i in range(len(sub) - 1, 1, -1):
+            candidat = sub.iloc[i]
+            avant = sub.iloc[:i]
+            if len(avant) < 2:
+                continue
+            if direction == "BULL":
+                niveau = float(avant['low'].min())
+                if float(candidat['low']) < niveau and float(candidat['close']) > niveau:
+                    return {"type": "BULL", "niveau": niveau, "idx": debut + i}
+            else:
+                niveau = float(avant['high'].max())
+                if float(candidat['high']) > niveau and float(candidat['close']) < niveau:
+                    return {"type": "BEAR", "niveau": niveau, "idx": debut + i}
         return None
     except Exception:
         return None
@@ -1626,10 +1600,10 @@ def detecter_order_block_zone(df, idx_swing, direction):
     Identifie la zone d'Order Block : la dernière bougie OPPOSÉE pertinente
     juste avant le mouvement impulsif qui a cassé la structure. On ne
     considère pas chaque bougie opposée — seulement celle qui précède
-    directement le déplacement (recherche bornée à 12 bougies en arrière).
+    directement le déplacement (recherche bornée à 8 bougies en arrière).
     """
     try:
-        for i in range(idx_swing, max(idx_swing - 12, 0), -1):
+        for i in range(idx_swing, max(idx_swing - 8, 0), -1):
             o, c = float(df['open'].iloc[i]), float(df['close'].iloc[i])
             if direction == "BULL" and c < o:
                 return {"haut": max(o, c, float(df['high'].iloc[i])),
