@@ -1477,8 +1477,8 @@ ORDER_BLOCK_CONFIG = {
     # reste désactivée et documentée comme non définie avec précision.
     "FOURTH_CONFIRMATION_ENABLED": False,
     "BOS_CONFIRMATION_MODE": "CLOSE",   # "CLOSE" ou "WICK"
-    "MAX_OB_TOUCHES": 1,                # au-delà, l'OB est considéré "mitigé"
-    "MIN_RR": 1.5,
+    "MAX_OB_TOUCHES": 2,                # au-delà, l'OB est considéré "mitigé"
+    "MIN_RR": 1.3,
     "HTF_GRANULARITE": 3600,   # H1
     "MTF_GRANULARITE": 1800,   # M30
     "LTF_GRANULARITE": 900,    # M15
@@ -1491,15 +1491,55 @@ _ob_touch_cache = {}
 def _cle_ob(symbole, direction, ob):
     return (symbole, direction, round(ob["bas"], 2), round(ob["haut"], 2))
 
-def detecter_bos(df, ordre_swing=3, mode="CLOSE"):
+def detecter_bos(df, ordre_swing=2, mode="CLOSE", fenetre_recente=15):
     """
-    RÈGLE 1 — Tendance = BOS. Détecte si l'une des 2 dernières bougies
-    CLÔTURÉES (jamais la bougie en cours de formation, pour éviter tout
-    look-ahead) a cassé un swing high/low pertinent antérieur.
+    RÈGLE 1 — Tendance = BOS. Cherche un BOS "récent" (dans les
+    `fenetre_recente` dernières bougies CLÔTURÉES, jamais la bougie en
+    cours de formation) plutôt que seulement les 2 dernières — un retour
+    de prix dans l'Order Block se produit souvent plusieurs bougies après
+    la cassure elle-même, pas immédiatement dessus.
     mode="CLOSE" exige une clôture au-delà du swing (pas une simple mèche) —
     mode="WICK" accepte une mèche.
-    Retourne {direction, prix_swing_casse, idx_bos, idx_swing} ou None.
+    Retourne le BOS le plus RÉCENT trouvé : {direction, prix_swing_casse,
+    idx_bos, idx_swing} ou None.
     """
+    try:
+        sub = df.iloc[:-1].reset_index(drop=True)  # exclut la bougie en formation
+        n = len(sub)
+        if n < ordre_swing * 2 + 6:
+            return None
+
+        highs = sub['high'].values
+        lows = sub['low'].values
+        closes = sub['close'].values
+
+        debut_recherche = max(ordre_swing, n - fenetre_recente)
+        meilleur = None
+        for i in range(debut_recherche, n):
+            # swings connus strictement AVANT la bougie i
+            idx_highs = [j for j in range(ordre_swing, i - ordre_swing)
+                         if highs[j] == highs[max(0, j-ordre_swing):j+ordre_swing+1].max()]
+            idx_lows = [j for j in range(ordre_swing, i - ordre_swing)
+                        if lows[j] == lows[max(0, j-ordre_swing):j+ordre_swing+1].min()]
+            if not idx_highs or not idx_lows:
+                continue
+            swing_high_idx, swing_low_idx = idx_highs[-1], idx_lows[-1]
+            swing_high, swing_low = float(highs[swing_high_idx]), float(lows[swing_low_idx])
+
+            ref_haut = closes[i] if mode == "CLOSE" else highs[i]
+            ref_bas  = closes[i] if mode == "CLOSE" else lows[i]
+            if ref_haut > swing_high:
+                meilleur = {"direction": "BULL", "prix_swing_casse": swing_high,
+                            "idx_bos": i, "idx_swing": swing_high_idx}
+            elif ref_bas < swing_low:
+                meilleur = {"direction": "BEAR", "prix_swing_casse": swing_low,
+                            "idx_bos": i, "idx_swing": swing_low_idx}
+        return meilleur
+    except Exception:
+        return None
+
+
+def _detecter_bos_ancien_non_utilise(df, ordre_swing=3, mode="CLOSE"):
     try:
         sub = df.iloc[:-1].reset_index(drop=True)  # exclut la bougie en formation
         n = len(sub)
@@ -1526,6 +1566,7 @@ def detecter_bos(df, ordre_swing=3, mode="CLOSE"):
             ref_bas  = closes[i] if mode == "CLOSE" else lows[i]
             if ref_haut > swing_high:
                 return {"direction": "BULL", "prix_swing_casse": swing_high,
+
                         "idx_bos": i, "idx_swing": swing_high_idx}
             if ref_bas < swing_low:
                 return {"direction": "BEAR", "prix_swing_casse": swing_low,
@@ -1554,43 +1595,28 @@ def detecter_fvg_dans_zone(df, idx_debut, idx_fin, direction):
     except Exception:
         return None
 
-def detecter_liquidity_sweep(df, idx_reference, direction, lookback=15):
+def detecter_liquidity_sweep(df, idx_reference, direction, lookback=25):
     """
     RÈGLE 3 — Prise de liquidité interne avant le mouvement impulsif : un
     niveau mineur pris (mèche au-delà) puis rejeté immédiatement dans le
     sens du mouvement à venir. Une simple cassure ne suffit pas — il faut
     le rejet (clôture qui revient au-delà du niveau).
-
-    ✅ FIX (backtest 60j XAUUSD, 24/08) : la version précédente ne
-    vérifiait QUE la toute dernière bougie de la fenêtre de lookback
-    (idx_reference), au lieu de scanner toute la fenêtre — comme
-    detecter_order_block_zone le fait déjà pour l'OB. Ce bug expliquait
-    à lui seul 37.8% des rejets (76% des rejets "spécifiques") sur le
-    backtest : un vrai sweep de liquidité qui ne tombait pas exactement
-    sur idx_reference était invisible pour le bot, même quand le pattern
-    SMC était parfaitement valide. On scanne maintenant toute la fenêtre,
-    de la bougie la plus récente vers la plus ancienne, en recalculant à
-    chaque candidat le niveau mineur sur tout ce qui le précède.
     """
     try:
         debut = max(0, idx_reference - lookback)
         sub = df.iloc[debut: idx_reference + 1]
         if len(sub) < 5:
             return None
-
-        for i in range(len(sub) - 1, 1, -1):
-            candidat = sub.iloc[i]
-            avant = sub.iloc[:i]
-            if len(avant) < 2:
-                continue
-            if direction == "BULL":
-                niveau = float(avant['low'].min())
-                if float(candidat['low']) < niveau and float(candidat['close']) > niveau:
-                    return {"type": "BULL", "niveau": niveau, "idx": debut + i}
-            else:
-                niveau = float(avant['high'].max())
-                if float(candidat['high']) > niveau and float(candidat['close']) < niveau:
-                    return {"type": "BEAR", "niveau": niveau, "idx": debut + i}
+        if direction == "BULL":
+            niveau = float(sub['low'].iloc[:-2].min())
+            derniere = sub.iloc[-1]
+            if float(derniere['low']) < niveau and float(derniere['close']) > niveau:
+                return {"type": "BULL", "niveau": niveau}
+        else:
+            niveau = float(sub['high'].iloc[:-2].max())
+            derniere = sub.iloc[-1]
+            if float(derniere['high']) > niveau and float(derniere['close']) < niveau:
+                return {"type": "BEAR", "niveau": niveau}
         return None
     except Exception:
         return None
@@ -1600,10 +1626,10 @@ def detecter_order_block_zone(df, idx_swing, direction):
     Identifie la zone d'Order Block : la dernière bougie OPPOSÉE pertinente
     juste avant le mouvement impulsif qui a cassé la structure. On ne
     considère pas chaque bougie opposée — seulement celle qui précède
-    directement le déplacement (recherche bornée à 8 bougies en arrière).
+    directement le déplacement (recherche bornée à 12 bougies en arrière).
     """
     try:
-        for i in range(idx_swing, max(idx_swing - 8, 0), -1):
+        for i in range(idx_swing, max(idx_swing - 12, 0), -1):
             o, c = float(df['open'].iloc[i]), float(df['close'].iloc[i])
             if direction == "BULL" and c < o:
                 return {"haut": max(o, c, float(df['high'].iloc[i])),
@@ -1754,6 +1780,185 @@ def analyser_order_block_engine(symbole):
         }
     except Exception as e:
         print(f"[OrderBlock/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        return None
+
+# ==========================================
+# ✅ V62 : DEUX STRATÉGIES ALTERNATIVES, PLUS HAUTE FRÉQUENCE
+# ==========================================
+# L'Order Block (3 conditions structurelles rares à aligner) produit très
+# peu de signaux sur Gold. Ces deux stratégies reposent sur des conditions
+# statistiques courantes (contact de bande, croisement de moyennes) —
+# mécaniquement plus fréquentes. À comparer par backtest avant de choisir
+# laquelle devient la stratégie unique du bot.
+
+BOLLINGER_CONFIG = {
+    "PERIODE": 20, "ECART_TYPE": 2.0,
+    "RSI_SURVENTE": 30, "RSI_SURACHAT": 70,
+    "MIN_RR": 1.0,
+    "GRANULARITE": 900,  # M15
+}
+
+def analyser_bollinger_rsi_reversion(symbole):
+    """
+    Stratégie 1 — Retour à la moyenne : le prix touche/dépasse la bande de
+    Bollinger extérieure (SMA20 ± 2 écarts-types) + RSI en zone extrême.
+    Cible = la bande médiane (SMA20), pas un swing structurel lointain —
+    plus fréquent par nature qu'une confluence à 3 conditions rares.
+    """
+    c15 = obtenir_donnees_deriv(symbole, BOLLINGER_CONFIG["GRANULARITE"])
+    if not c15 or len(c15) < 40:
+        return None
+    try:
+        df = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
+                             "low":float(c["low"]),"close":float(c["close"])} for c in c15])
+        periode = BOLLINGER_CONFIG["PERIODE"]
+        sma = df['close'].rolling(periode).mean()
+        std = df['close'].rolling(periode).std()
+        bande_haute = sma + BOLLINGER_CONFIG["ECART_TYPE"] * std
+        bande_basse = sma - BOLLINGER_CONFIG["ECART_TYPE"] * std
+
+        derniere = df.iloc[-2]  # bougie clôturée
+        px = float(derniere['close'])
+        milieu = float(sma.iloc[-2])
+        haut, bas = float(bande_haute.iloc[-2]), float(bande_basse.iloc[-2])
+        if pd.isna(milieu) or pd.isna(haut) or pd.isna(bas):
+            return None
+
+        try:
+            rsi_val = float(ta.momentum.RSIIndicator(close=df["close"], window=14).rsi().iloc[-2])
+        except Exception:
+            rsi_val = 50.0
+
+        direction = None
+        if float(derniere['low']) <= bas and rsi_val <= BOLLINGER_CONFIG["RSI_SURVENTE"]:
+            direction = "BULL"
+        elif float(derniere['high']) >= haut and rsi_val >= BOLLINGER_CONFIG["RSI_SURACHAT"]:
+            direction = "BEAR"
+        if not direction:
+            return None
+
+        pattern, _ = detecter_chandeliers_pdf(df)
+        bonus_pattern = 10 if (
+            (direction == "BULL" and pattern in ("PIN_BULL","ENGULFING_BULL","MARUBOZU_BULL")) or
+            (direction == "BEAR" and pattern in ("PIN_BEAR","ENGULFING_BEAR","MARUBOZU_BEAR"))
+        ) else 0
+
+        atr15 = calculer_atr(df)
+        marge = atr15 * 0.2 if atr15 > 0 else abs(haut - bas) * 0.05
+
+        if direction == "BULL":
+            signal_dir = "BUY"
+            sl = bas - marge
+            distance = px - sl
+            if distance <= 0: return None
+            tp = milieu
+            tp1 = px + distance * 0.6
+        else:
+            signal_dir = "SELL"
+            sl = haut + marge
+            distance = sl - px
+            if distance <= 0: return None
+            tp = milieu
+            tp1 = px - distance * 0.6
+
+        rr = abs(tp - px) / abs(px - sl) if abs(px - sl) > 0 else 0
+        if rr < BOLLINGER_CONFIG["MIN_RR"]:
+            return None
+
+        score = 60 + bonus_pattern + (15 if (rsi_val <= 20 or rsi_val >= 80) else 0)
+        print(f"[BOLLINGER] {symbole} ✅ SIGNAL — direction={direction} RSI={rsi_val:.1f} "
+              f"bande=[{bas:.5f},{haut:.5f}] rr={rr:.2f}", flush=True)
+
+        return {
+            "action": "🟢 ACHAT (BUY)" if signal_dir == "BUY" else "🔴 VENTE (SELL)",
+            "tendance": direction, "force": f"RSI {rsi_val:.1f}",
+            "msg": f"Bollinger + RSI : retour à la moyenne ({pattern.replace('_',' ')})",
+            "sl": round(sl,5), "tp1": round(tp1,5), "tp": round(tp,5),
+            "rr": round(rr,2), "px": round(px,5),
+            "strategie": 1, "confiance": min(95, score),
+            "label": "BOLLINGER + RSI (retour à la moyenne)",
+            "zones_confluence": ["Bande de Bollinger"],
+            "order_block": None, "niveau_cle": None,
+        }
+    except Exception as e:
+        print(f"[Bollinger/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        return None
+
+EMA_CROSS_CONFIG = {
+    "EMA_RAPIDE": 5, "EMA_LENTE": 20,
+    "MIN_RR": 1.5,
+    "GRANULARITE": 300,  # M5
+}
+
+def analyser_ema_cross(symbole):
+    """
+    Stratégie 2 — Croisement de moyennes mobiles (EMA5/EMA20 sur M5) : un
+    signal mécanique et fréquent, sans condition structurelle à aligner.
+    """
+    c5 = obtenir_donnees_deriv(symbole, EMA_CROSS_CONFIG["GRANULARITE"])
+    if not c5 or len(c5) < 40:
+        return None
+    try:
+        df = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
+                             "low":float(c["low"]),"close":float(c["close"])} for c in c5])
+        ema_rapide = _ema(df['close'], EMA_CROSS_CONFIG["EMA_RAPIDE"])
+        ema_lente  = _ema(df['close'], EMA_CROSS_CONFIG["EMA_LENTE"])
+
+        # Croisement sur la dernière bougie clôturée : rapide vs lente a
+        # changé de côté entre l'avant-dernière et la dernière bougie.
+        avant = ema_rapide.iloc[-3] - ema_lente.iloc[-3]
+        maintenant = ema_rapide.iloc[-2] - ema_lente.iloc[-2]
+        if pd.isna(avant) or pd.isna(maintenant):
+            return None
+
+        direction = None
+        if avant <= 0 and maintenant > 0:
+            direction = "BULL"
+        elif avant >= 0 and maintenant < 0:
+            direction = "BEAR"
+        if not direction:
+            return None
+
+        px = float(df['close'].iloc[-2])
+        atr5 = calculer_atr(df)
+        if atr5 <= 0:
+            return None
+
+        bougie = df.iloc[-2]
+        if direction == "BULL":
+            signal_dir = "BUY"
+            sl = min(float(bougie['low']) - atr5 * 0.3, px - atr5 * 1.2)
+            distance = px - sl
+            if distance <= 0: return None
+            tp = px + distance * 1.8
+            tp1 = px + distance * 1.0
+        else:
+            signal_dir = "SELL"
+            sl = max(float(bougie['high']) + atr5 * 0.3, px + atr5 * 1.2)
+            distance = sl - px
+            if distance <= 0: return None
+            tp = px - distance * 1.8
+            tp1 = px - distance * 1.0
+
+        rr = abs(tp - px) / abs(px - sl) if abs(px - sl) > 0 else 0
+        if rr < EMA_CROSS_CONFIG["MIN_RR"]:
+            return None
+
+        print(f"[EMA-CROSS] {symbole} ✅ SIGNAL — direction={direction} rr={rr:.2f}", flush=True)
+
+        return {
+            "action": "🟢 ACHAT (BUY)" if signal_dir == "BUY" else "🔴 VENTE (SELL)",
+            "tendance": direction, "force": f"Croisement EMA{EMA_CROSS_CONFIG['EMA_RAPIDE']}/{EMA_CROSS_CONFIG['EMA_LENTE']}",
+            "msg": f"Croisement EMA {direction}",
+            "sl": round(sl,5), "tp1": round(tp1,5), "tp": round(tp,5),
+            "rr": round(rr,2), "px": round(px,5),
+            "strategie": 1, "confiance": 65,
+            "label": "CROISEMENT EMA 5/20",
+            "zones_confluence": ["Croisement EMA"],
+            "order_block": None, "niveau_cle": None,
+        }
+    except Exception as e:
+        print(f"[EMACross/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
         return None
 
 def detecter_contexte_pdf(symbole):
