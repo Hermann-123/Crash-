@@ -1,31 +1,39 @@
 """
 ╔════════════════════════════════════════════════════════════════════════╗
-║  BACKTESTER — Terminal Prime V56                                        ║
+║  BACKTESTER — Terminal Prime V56 (+ DIAGNOSTIC DES REJETS)             ║
 ║                                                                          ║
-║  Rejoue la stratégie (analyser_trend_pullback_confluence + moteur IA    ║
-║  déterministe) sur plusieurs semaines de données historiques Deriv,     ║
-║  pour mesurer le VRAI winrate et R-multiple avant de régler les seuils  ║
-║  à l'aveugle.                                                           ║
+║  Rejoue la stratégie (analyser_order_block_engine + moteur IA          ║
+║  déterministe) sur plusieurs semaines de données historiques Deriv,    ║
+║  pour mesurer le VRAI winrate et R-multiple avant de régler les seuils ║
+║  à l'aveugle.                                                          ║
+║                                                                          ║
+║  ✅ AJOUT : compte automatiquement CHAQUE raison de rejet ("No BOS",   ║
+║  "No FVG", "score IA < seuil", etc.) et affiche un classement à la     ║
+║  fin. Objectif : savoir en un coup d'œil QUELLE porte bloque le plus,  ║
+║  au lieu de deviner ou de tout assouplir en même temps.                ║
 ║                                                                          ║
 ║  ⚠️ Le second avis Groq n'est PAS inclus dans ce backtest (il coûterait ║
-║  trop d'appels réseau sur des milliers de bougies). Les résultats ici   ║
-║  reflètent donc le calcul déterministe seul — un peu plus optimistes    ║
-║  que ce que donnerait le bot en direct avec Groq actif.                 ║
+║  trop d'appels réseau sur des milliers de bougies). Les résultats ici  ║
+║  reflètent donc le calcul déterministe seul — un peu plus optimistes   ║
+║  que ce que donnerait le bot en direct avec Groq actif.                ║
 ║                                                                          ║
 ║  USAGE (en local ou dans un One-Off Job Render) :                      ║
 ║      python backtest_strategie.py XAUUSD 60                            ║
 ║      (symbole, nombre de jours d'historique à tester)                  ║
 ║                                                                          ║
-║  Ce script IMPORTE le fichier principal du bot comme un module — donc   ║
-║  aucune duplication de la logique de stratégie. Placer ce fichier dans ║
-║  le même dossier que terminal_prime_v55_deriv.py sur GitHub.           ║
+║  Ce script IMPORTE le fichier principal du bot comme un module — donc  ║
+║  aucune duplication de la logique de stratégie. Placer ce fichier dans║
+║  le même dossier que terminal_prime_v55_deriv.py sur GitHub.          ║
 ╚════════════════════════════════════════════════════════════════════════╝
 """
 
 import sys
+import re
 import time
 import json
 import datetime
+import collections
+from contextlib import redirect_stdout
 import websocket
 import pandas as pd
 
@@ -189,7 +197,17 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None):
             statut = "✅ ACCEPTÉ" if verdict["accepte"] else "❌ rejeté"
             print(f"    → score IA={verdict['score']}% (seuil={bot_core.IA_CONFIG['seuil_acceptation']}%) {statut}", flush=True)
 
-        if not signal or not verdict or not verdict["accepte"]:
+        # ✅ AJOUT DIAGNOSTIC : trace la raison de sortie même quand aucun
+        # print "REASON:"/"REJET" n'a été émis plus haut dans la fonction
+        # (ex: signal brut = None sans log dédié, ou verdict IA rejeté).
+        if not signal:
+            print("[DIAG] REJET ENGINE: signal brut = None (voir logs [OB SCANNER] ci-dessus pour la raison exacte)", flush=True)
+            continue
+        if not verdict:
+            print("[DIAG] REJET IA: verdict manquant (exception dans moteur_ia_valider_signal)", flush=True)
+            continue
+        if not verdict["accepte"]:
+            print(f"[DIAG] REJET IA: score {verdict['score']}% < seuil {bot_core.IA_CONFIG['seuil_acceptation']}%", flush=True)
             continue
 
         direction = signal["tendance"]
@@ -236,12 +254,75 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None):
             "winrate": winrate, "rr_moyen": rr_moyen, "esperance": esperance}
 
 
+# ==========================================
+# ✅ WRAPPER DIAGNOSTIC — compte les raisons de rejet réelles
+# ==========================================
+
+class _CapteurRejets:
+    """
+    Flux stdout miroir : laisse passer chaque ligne vers la console normale
+    (donc rien ne change dans les logs Render que tu connais déjà) tout en
+    comptant, en parallèle, chaque raison de rejet rencontrée.
+    """
+    def __init__(self):
+        self.compteur = collections.Counter()
+        self._motifs = [
+            re.compile(r"REASON: (.+)"),                 # "[OB SCANNER] ... REASON: No BOS"
+            re.compile(r"REJET IA: (.+)"),                # rejets moteur IA (ajout ci-dessus)
+            re.compile(r"REJET ENGINE: (.+)"),            # signal brut = None
+        ]
+
+    def write(self, txt):
+        for ligne in txt.splitlines():
+            for motif in self._motifs:
+                m = motif.search(ligne)
+                if m:
+                    raison = m.group(1).strip()
+                    # normalise les raisons variables (score IA, etc.) pour
+                    # qu'elles se regroupent au lieu de compter 1x chacune
+                    raison = re.sub(r"\d+(\.\d+)?%", "N%", raison)
+                    raison = re.sub(r"\[.*?\]", "", raison).strip()
+                    self.compteur[raison] += 1
+                    break
+        sys.__stdout__.write(txt)
+
+    def flush(self):
+        sys.__stdout__.flush()
+
+
+def backtester_avec_diagnostic(symbole, nb_jours=20, seuil_ia_teste=None):
+    """
+    Enrobe backtester() sans toucher à sa logique : capture les logs de
+    rejet en parallèle de leur affichage normal, puis imprime un classement
+    des raisons les plus fréquentes à la fin. Sert à identifier QUELLE
+    porte (BOS / FVG / liquidity sweep / OB / score IA / etc.) bloque le
+    plus de signaux, pour ajuster celle-là en priorité plutôt qu'à l'aveugle.
+    """
+    capteur = _CapteurRejets()
+    with redirect_stdout(capteur):
+        res = backtester(symbole, nb_jours, seuil_ia_teste)
+
+    total = sum(capteur.compteur.values())
+    print(f"\n{'='*70}")
+    print(f"RÉPARTITION DES REJETS — {symbole} ({total} événements de rejet trackés)")
+    print(f"{'='*70}")
+    if total == 0:
+        print("Aucun rejet détecté dans les logs (ou format de log non reconnu).")
+    else:
+        for raison, n in capteur.compteur.most_common(15):
+            pct = (n / total * 100) if total else 0
+            print(f"{n:>6}x ({pct:4.1f}%)  {raison}")
+    print(f"{'='*70}\n")
+
+    return res
+
+
 if __name__ == "__main__":
     # ✅ Marqueur de version — vérifie dans les logs Render que c'est bien
     # CETTE version qui tourne (utile si Auto-Deploy est sur "Off" et qu'un
     # ancien build tourne encore sans qu'on s'en rende compte).
     print(f"\n{'#'*70}", flush=True)
-    print(f"# BACKTEST_STRATEGIE.PY — ORDER BLOCK ENGINE — multi-symboles", flush=True)
+    print(f"# BACKTEST_STRATEGIE.PY — ORDER BLOCK ENGINE — multi-symboles (+ diagnostic rejets)", flush=True)
     print(f"# Lancé le : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", flush=True)
     print(f"# Arguments reçus : {sys.argv[1:]}", flush=True)
     print(f"{'#'*70}\n", flush=True)
@@ -255,7 +336,7 @@ if __name__ == "__main__":
     tous_resultats = []
 
     for sym in symboles:
-        res = backtester(sym, nb_jours, seuil)
+        res = backtester_avec_diagnostic(sym, nb_jours, seuil)
         if res:
             tous_resultats.append(res)
         time.sleep(1)  # petite pause entre deux symboles, courtoisie API
