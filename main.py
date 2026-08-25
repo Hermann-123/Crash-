@@ -528,16 +528,26 @@ def obtenir_prix_broker_realtime(symbole):
         try:
             ws = websocket.WebSocket()
             ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=5)
-            ws.send(json.dumps({"ticks": sym}))
+            # ✅ FIX: l'abonnement live "ticks" est rejeté par Deriv pour ces
+            # symboles ("Symbol R_25 is invalid"), alors que "ticks_history"
+            # (même endpoint que celui déjà utilisé partout ailleurs dans le
+            # bot pour les bougies, et qui fonctionne de manière fiable)
+            # accepte parfaitement ces mêmes symboles. On demande donc juste
+            # le tout dernier tick via ticks_history au lieu d'un abonnement.
+            ws.send(json.dumps({
+                "ticks_history": sym, "end": "latest", "count": 1, "style": "ticks"
+            }))
             res = json.loads(ws.recv())
             ws.close()
-            if "tick" in res:
-                prix = float(res["tick"]["quote"])
+            historique = res.get("history", {})
+            prix_liste = historique.get("prices", [])
+            if prix_liste:
+                prix = float(prix_liste[-1])
                 prix_broker[symbole] = {"price": prix, "source": "Deriv",
                                         "timestamp": time.time()}
                 return prix
             else:
-                print(f"[Deriv Real-time {symbole}] réponse sans 'tick': {res}", flush=True)
+                print(f"[Deriv Real-time {symbole}] réponse sans 'history.prices': {res}", flush=True)
         except Exception as e:
             print(f"[Deriv Real-time {symbole}] tentative {tentative+1}/2 échouée: "
                   f"{type(e).__name__}: {e}", flush=True)
