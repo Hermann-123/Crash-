@@ -55,18 +55,29 @@ def obtenir_historique_paginee(symbole_bot, granularite, nb_bougies_cible, fin_e
     fin = fin_epoch if fin_epoch is not None else "latest"
 
     while len(toutes_bougies) < nb_bougies_cible:
-        ws = None
-        try:
-            ws = websocket.create_connection(
-                "wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=8)
-            ws.send(json.dumps({
-                "ticks_history": sym, "end": fin, "count": 5000,
-                "style": "candles", "granularity": granularite
-            }))
-            res = json.loads(ws.recv())
-            ws.close()
-        except Exception as e:
-            print(f"[Backtest] Erreur réseau récupération historique: {e}", flush=True)
+        res = None
+        for tentative in range(3):  # ✅ jusqu'à 3 essais en cas de timeout réseau
+            ws = None
+            try:
+                ws = websocket.create_connection(
+                    "wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=15)
+                ws.send(json.dumps({
+                    "ticks_history": sym, "end": fin, "count": 5000,
+                    "style": "candles", "granularity": granularite
+                }))
+                res = json.loads(ws.recv())
+                ws.close()
+                break  # succès, on sort de la boucle de tentatives
+            except Exception as e:
+                print(f"[Backtest] Tentative {tentative+1}/3 échouée: {e}", flush=True)
+                try:
+                    if ws: ws.close()
+                except Exception:
+                    pass
+                time.sleep(1.5)
+
+        if res is None:
+            print(f"[Backtest] Abandon après 3 tentatives — arrêt de la pagination.", flush=True)
             break
 
         if "error" in res or "candles" not in res:
