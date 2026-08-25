@@ -523,11 +523,11 @@ def obtenir_prix_broker_realtime(symbole):
         print(f"[FMP Real-time {symbole}] {e}", flush=True)
 
     sym = prefixer_symbole(symbole)
-    for _ in range(2):
+    for tentative in range(2):
         ws = None
         try:
             ws = websocket.WebSocket()
-            ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=3)
+            ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=5)
             ws.send(json.dumps({"ticks": sym}))
             res = json.loads(ws.recv())
             ws.close()
@@ -536,9 +536,13 @@ def obtenir_prix_broker_realtime(symbole):
                 prix_broker[symbole] = {"price": prix, "source": "Deriv",
                                         "timestamp": time.time()}
                 return prix
-        except:
+            else:
+                print(f"[Deriv Real-time {symbole}] réponse sans 'tick': {res}", flush=True)
+        except Exception as e:
+            print(f"[Deriv Real-time {symbole}] tentative {tentative+1}/2 échouée: "
+                  f"{type(e).__name__}: {e}", flush=True)
             try: ws.close()
-            except: pass
+            except Exception: pass
             time.sleep(0.5)
     return None
 
