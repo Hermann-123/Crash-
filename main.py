@@ -38,16 +38,21 @@ import terminal_prime_v55_deriv as bot_core
 # RÉCUPÉRATION D'HISTORIQUE PAGINÉ (au-delà des 250 dernières bougies)
 # ==========================================
 
-def obtenir_historique_paginee(symbole_bot, granularite, nb_bougies_cible):
+def obtenir_historique_paginee(symbole_bot, granularite, nb_bougies_cible, fin_epoch=None):
     """
     Récupère nb_bougies_cible bougies en remontant dans le temps par appels
     successifs (paramètre "end" de l'API Deriv ticks_history), jusqu'à
     5000 bougies par appel — bien au-delà de la fenêtre "temps réel" (250)
     utilisée par le bot en direct.
+
+    ✅ fin_epoch (optionnel) : point de fin de la fenêtre récupérée. Si None,
+    prend "latest" (les données les plus récentes). Sinon, remonte à partir
+    de cet epoch précis — permet de tester une période PASSÉE indépendante
+    (ex: il y a 90 jours) au lieu de toujours "les N derniers jours".
     """
     sym = bot_core.prefixer_symbole(symbole_bot)
     toutes_bougies = []
-    fin = "latest"
+    fin = fin_epoch if fin_epoch is not None else "latest"
 
     while len(toutes_bougies) < nb_bougies_cible:
         ws = None
@@ -112,29 +117,37 @@ def simuler_issue_trade(bougies_futures, direction, sl, tp, max_bougies=200):
 # BOUCLE DE BACKTEST
 # ==========================================
 
-def backtester(symbole, nb_jours=20, seuil_ia_teste=None, strategie="ob"):
+def backtester(symbole, nb_jours=20, seuil_ia_teste=None, strategie="ob", decalage_jours=0):
     """
-    ✅ V62: rejoue UNE des 3 stratégies disponibles (sélecteur `strategie`:
+    ✅ V63: rejoue UNE des 3 stratégies disponibles (sélecteur `strategie`:
     "ob" = Order Block, "bollinger" = Bollinger+RSI, "ema" = croisement EMA)
     en avançant bougie par bougie sur l'historique M15.
+
+    ✅ decalage_jours : décale la fenêtre testée dans le passé (ex: 90 =
+    teste la période qui se terminait il y a 90 jours, au lieu des N
+    derniers jours) — permet un vrai test HORS ÉCHANTILLON, sur une
+    période qui ne chevauche pas un test précédent.
     """
     noms_strategie = {"ob": "ORDER BLOCK", "bollinger": "BOLLINGER+RSI", "ema": "CROISEMENT EMA"}
-    print(f"\n{'='*70}\nBACKTEST {noms_strategie.get(strategie, strategie)} {symbole} — {nb_jours} jours d'historique\n{'='*70}", flush=True)
+    periode_txt = f"il y a {decalage_jours}-{decalage_jours+nb_jours} jours" if decalage_jours > 0 else f"les {nb_jours} derniers jours"
+    print(f"\n{'='*70}\nBACKTEST {noms_strategie.get(strategie, strategie)} {symbole} — {periode_txt}\n{'='*70}", flush=True)
+
+    fin_epoch = int(time.time()) - decalage_jours * 86400 if decalage_jours > 0 else None
 
     print("Récupération de l'historique M15...", flush=True)
-    m15 = obtenir_historique_paginee(symbole, 900, min(nb_jours * 96 + 300, 20000))
+    m15 = obtenir_historique_paginee(symbole, 900, min(nb_jours * 96 + 300, 20000), fin_epoch)
     print(f"  → {len(m15)} bougies M15 récupérées", flush=True)
 
     print("Récupération de l'historique M30...", flush=True)
-    m30 = obtenir_historique_paginee(symbole, 1800, min(nb_jours * 48 + 300, 20000))
+    m30 = obtenir_historique_paginee(symbole, 1800, min(nb_jours * 48 + 300, 20000), fin_epoch)
     print(f"  → {len(m30)} bougies M30 récupérées", flush=True)
 
     print("Récupération de l'historique M5 (requis par le moteur IA)...", flush=True)
-    m5 = obtenir_historique_paginee(symbole, 300, min(nb_jours * 288 + 300, 20000))
+    m5 = obtenir_historique_paginee(symbole, 300, min(nb_jours * 288 + 300, 20000), fin_epoch)
     print(f"  → {len(m5)} bougies M5 récupérées", flush=True)
 
     print("Récupération de l'historique H1 (filtre macro du moteur IA)...", flush=True)
-    h1 = obtenir_historique_paginee(symbole, 3600, min(nb_jours * 24 + 300, 20000))
+    h1 = obtenir_historique_paginee(symbole, 3600, min(nb_jours * 24 + 300, 20000), fin_epoch)
     print(f"  → {len(h1)} bougies H1 récupérées", flush=True)
 
     if any(len(x) < 100 for x in (m15, m30, m5, h1)):
@@ -229,7 +242,7 @@ def backtester(symbole, nb_jours=20, seuil_ia_teste=None, strategie="ob"):
     esperance = (winrate/100 * rr_moyen) - ((1 - winrate/100) * 1)
 
     print(f"\n{'='*70}")
-    print(f"RÉSUMÉ {noms_strategie.get(strategie, strategie)} — {symbole} sur {nb_jours} jours "
+    print(f"RÉSUMÉ {noms_strategie.get(strategie, strategie)} — {symbole} — {periode_txt} "
           f"(seuil IA={bot_core.IA_CONFIG['seuil_acceptation']}%)")
     print(f"{'='*70}")
     print(f"Trades simulés (complets)  : {len(exploitables)}")
@@ -249,7 +262,7 @@ if __name__ == "__main__":
     # CETTE version qui tourne (utile si Auto-Deploy est sur "Off" et qu'un
     # ancien build tourne encore sans qu'on s'en rende compte).
     print(f"\n{'#'*70}", flush=True)
-    print(f"# BACKTEST_STRATEGIE.PY — MULTI-STRATÉGIES (ob / bollinger / ema)", flush=True)
+    print(f"# BACKTEST_STRATEGIE.PY — MULTI-STRATÉGIES + PÉRIODE DÉCALABLE", flush=True)
     print(f"# Lancé le : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", flush=True)
     print(f"# Arguments reçus : {sys.argv[1:]}", flush=True)
     print(f"{'#'*70}\n", flush=True)
@@ -258,14 +271,16 @@ if __name__ == "__main__":
     nb_jours = int(sys.argv[2]) if len(sys.argv) > 2 else 20
     seuil = int(sys.argv[3]) if len(sys.argv) > 3 else None
     strategie_arg = sys.argv[4] if len(sys.argv) > 4 else "ob"  # "ob" | "bollinger" | "ema"
+    decalage_arg = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # jours de décalage dans le passé
 
     symboles = [s.strip().upper() for s in symboles_arg.split(",") if s.strip()]
     print(f"Symboles à tester ({len(symboles)}) : {symboles}", flush=True)
     print(f"Stratégie testée : {strategie_arg}", flush=True)
+    print(f"Décalage temporel : {decalage_arg} jours dans le passé", flush=True)
     tous_resultats = []
 
     for sym in symboles:
-        res = backtester(sym, nb_jours, seuil, strategie=strategie_arg)
+        res = backtester(sym, nb_jours, seuil, strategie=strategie_arg, decalage_jours=decalage_arg)
         if res:
             tous_resultats.append(res)
         time.sleep(1)  # petite pause entre deux symboles, courtoisie API
