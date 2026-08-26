@@ -291,7 +291,12 @@ def _deriv_trading_request(payload, timeout=10, _retry=True):
         while time.time() - debut < timeout:
             resp = json.loads(ws.recv())
             if resp.get("error"):
-                raise RuntimeError(f"Deriv API erreur: {resp['error'].get('message')}")
+                err = resp["error"]
+                details = err.get("details")
+                message_complet = err.get("message", "erreur inconnue")
+                if details:
+                    message_complet += f" — détails: {details}"
+                raise RuntimeError(f"Deriv API erreur: {message_complet}")
             if cle_attendue and cle_attendue in resp:
                 return resp
             if resp.get("msg_type") == cle_attendue:
@@ -311,21 +316,30 @@ def deriv_symbole(symbole_bot):
     """Traduit le symbole interne du bot vers le symbole Deriv (réutilise prefixer_symbole)."""
     return prefixer_symbole(symbole_bot)
 
-def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, sl=None, tp=None):
+def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price, sl=None, tp=None):
     """
     Ouvre un contrat Multiplicateur. direction: "BUY" -> MULTUP, "SELL" -> MULTDOWN.
     stake : mise en USD. multiplier : effet de levier (ex 10, 20... selon l'actif).
-    sl/tp : niveaux de PRIX (pas de distance) — convertis en limit_order.
-    Retourne le contract_id.
+
+    ✅ FIX: sur les Multiplicateurs Deriv, stop_loss/take_profit dans
+    limit_order sont des MONTANTS EN DOLLARS (perte/profit maximum), PAS
+    des niveaux de prix — confirmé par la doc officielle Deriv
+    ("When your loss reaches or exceeds this amount..."). sl/tp reçus ici
+    sont des niveaux de prix (comme calculés par la stratégie) ; on les
+    convertit ici en montant $ à partir du % de variation de prix, du
+    multiplicateur et de la mise, pour ne jamais envoyer un prix brut là
+    où Deriv attend un montant.
     """
     sym = deriv_symbole(symbole)
     contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
 
     limit_order = {}
-    if sl is not None:
-        limit_order["stop_loss"] = round(float(sl), 5)
-    if tp is not None:
-        limit_order["take_profit"] = round(float(tp), 5)
+    if sl is not None and entry_price:
+        pct_perte = abs(entry_price - float(sl)) / entry_price
+        limit_order["stop_loss"] = round(pct_perte * multiplier * stake, 2)
+    if tp is not None and entry_price:
+        pct_profit = abs(float(tp) - entry_price) / entry_price
+        limit_order["take_profit"] = round(pct_profit * multiplier * stake, 2)
 
     payload = {
         "buy": 1,
@@ -336,7 +350,7 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, sl=None, tp=None
             "contract_type": contract_type,
             "currency": "USD",
             "symbol": sym,
-            "multiplier": multiplier,
+            "multiplier": str(multiplier),
         }
     }
     if limit_order:
@@ -345,16 +359,23 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, sl=None, tp=None
     resp = _deriv_trading_request(payload)
     buy_info = resp.get("buy", {})
     contract_id = buy_info.get("contract_id")
-    print(f"[Deriv] Contrat ouvert {sym} {contract_type} mise={stake} → contract_id={contract_id}", flush=True)
+    print(f"[Deriv] Contrat ouvert {sym} {contract_type} mise={stake} limit_order={limit_order} "
+          f"→ contract_id={contract_id}", flush=True)
     return contract_id
 
-def deriv_modifier_contrat(contract_id, sl=None, tp=None):
-    """Met à jour le SL/TP d'un contrat ouvert (ex: passage en breakeven)."""
+def deriv_modifier_contrat(contract_id, entry_price, multiplier, stake, sl=None, tp=None):
+    """
+    Met à jour le SL/TP d'un contrat ouvert (ex: passage en breakeven).
+    ✅ FIX: même conversion prix → montant $ que deriv_ouvrir_contrat — sl/tp
+    reçus ici sont des niveaux de prix, convertis avant l'envoi à Deriv.
+    """
     limit_order = {}
-    if sl is not None:
-        limit_order["stop_loss"] = round(float(sl), 5)
-    if tp is not None:
-        limit_order["take_profit"] = round(float(tp), 5)
+    if sl is not None and entry_price:
+        pct_perte = abs(entry_price - float(sl)) / entry_price
+        limit_order["stop_loss"] = round(pct_perte * multiplier * stake, 2)
+    if tp is not None and entry_price:
+        pct_profit = abs(float(tp) - entry_price) / entry_price
+        limit_order["take_profit"] = round(pct_profit * multiplier * stake, 2)
     payload = {"contract_update": 1, "contract_id": contract_id,
                "limit_order": limit_order}
     return _deriv_trading_request(payload)
@@ -677,16 +698,17 @@ def ouvrir_trade(uid, symbole, direction, entry_price, sl, tp1, tp_final, strate
 
     deriv_contract_tp1 = None
     deriv_contract_final = None
+    stake_final = 0
+    multiplier = CONTROL_STATE["multiplier"]
     if executer_reel:
         stake_total = CONTROL_STATE["stake_usd"]
-        multiplier = CONTROL_STATE["multiplier"]
         stake_tp1 = round(stake_total * RISK_CONFIG["partial_tp_ratio"], 2)
         stake_final = round(stake_total - stake_tp1, 2)
 
         deriv_contract_tp1 = deriv_ouvrir_contrat(
-            symbole, direction, stake_tp1, multiplier, sl=sl, tp=tp1)
+            symbole, direction, stake_tp1, multiplier, entry_price, sl=sl, tp=tp1)
         deriv_contract_final = deriv_ouvrir_contrat(
-            symbole, direction, stake_final, multiplier, sl=sl, tp=tp_final)
+            symbole, direction, stake_final, multiplier, entry_price, sl=sl, tp=tp_final)
         print(f"[Deriv] Trade réel ouvert {symbole} {direction} → "
               f"contrat TP1={deriv_contract_tp1} (${stake_tp1}) / "
               f"contrat FINAL={deriv_contract_final} (${stake_final})", flush=True)
@@ -711,6 +733,8 @@ def ouvrir_trade(uid, symbole, direction, entry_price, sl, tp1, tp_final, strate
         "sizing": sizing,
         "deriv_contract_tp1": deriv_contract_tp1,
         "deriv_contract_final": deriv_contract_final,
+        "deriv_stake_final": stake_final,
+        "deriv_multiplier": multiplier,
         "reel": executer_reel,
     }
     print(f"[Trade Opened] {uid}: {trade_id} {symbole} {direction} @ {entry_price} "
@@ -838,7 +862,9 @@ def fermer_trade_partiel(uid, exit_price):
 
             if trade.get("reel") and trade.get("deriv_contract_final"):
                 try:
-                    deriv_modifier_contrat(trade["deriv_contract_final"], sl=trade["sl"])
+                    deriv_modifier_contrat(trade["deriv_contract_final"],
+                                           trade["entry_price"], trade["deriv_multiplier"],
+                                           trade["deriv_stake_final"], sl=trade["sl"])
                 except Exception as e:
                     print(f"[Deriv] Erreur modification SL breakeven: {e}", flush=True)
 
@@ -879,7 +905,9 @@ def appliquer_trailing_stop(uid, prix_current):
     if nouveau_sl is not None:
         if trade.get("reel") and trade.get("deriv_contract_final"):
             try:
-                deriv_modifier_contrat(trade["deriv_contract_final"], sl=nouveau_sl)
+                deriv_modifier_contrat(trade["deriv_contract_final"],
+                                       trade["entry_price"], trade["deriv_multiplier"],
+                                       trade["deriv_stake_final"], sl=nouveau_sl)
             except Exception as e:
                 print(f"[Deriv] Erreur trailing stop: {e}", flush=True)
         return True
