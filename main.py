@@ -321,14 +321,19 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price, sl=
     Ouvre un contrat Multiplicateur. direction: "BUY" -> MULTUP, "SELL" -> MULTDOWN.
     stake : mise en USD. multiplier : effet de levier (ex 10, 20... selon l'actif).
 
-    ✅ FIX: sur les Multiplicateurs Deriv, stop_loss/take_profit dans
-    limit_order sont des MONTANTS EN DOLLARS (perte/profit maximum), PAS
-    des niveaux de prix — confirmé par la doc officielle Deriv
-    ("When your loss reaches or exceeds this amount..."). sl/tp reçus ici
-    sont des niveaux de prix (comme calculés par la stratégie) ; on les
-    convertit ici en montant $ à partir du % de variation de prix, du
-    multiplicateur et de la mise, pour ne jamais envoyer un prix brut là
-    où Deriv attend un montant.
+    ✅ FIX (stop_loss/take_profit) : sur les Multiplicateurs Deriv, ces
+    valeurs dans limit_order sont des MONTANTS EN DOLLARS (perte/profit
+    maximum), PAS des niveaux de prix — confirmé par la doc officielle
+    Deriv. sl/tp reçus ici sont des niveaux de prix (calculés par la
+    stratégie) ; convertis ici en montant $ via le % de variation de prix,
+    le multiplicateur et la mise.
+
+    ✅ FIX (achat en 2 étapes) : l'achat direct avec "symbol" dans
+    "parameters" était rejeté ("Properties not allowed: symbol") sur
+    tous les actifs testés — le format attendu par cette API est le flux
+    standard Deriv en 2 étapes : demander une "proposal" (qui contient le
+    symbole et les détails du contrat) pour obtenir un proposal_id + prix,
+    puis "buy" en référençant ce proposal_id (sans "parameters").
     """
     sym = deriv_symbole(symbole)
     contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
@@ -341,23 +346,30 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price, sl=
         pct_profit = abs(float(tp) - entry_price) / entry_price
         limit_order["take_profit"] = round(pct_profit * multiplier * stake, 2)
 
-    payload = {
-        "buy": 1,
-        "price": round(stake, 2),
-        "parameters": {
-            "amount": round(stake, 2),
-            "basis": "stake",
-            "contract_type": contract_type,
-            "currency": "USD",
-            "symbol": sym,
-            "multiplier": str(multiplier),
-        }
+    # ── Étape 1 : proposition de prix (contient le symbole et les détails) ──
+    proposal_payload = {
+        "proposal": 1,
+        "amount": round(stake, 2),
+        "basis": "stake",
+        "contract_type": contract_type,
+        "currency": "USD",
+        "symbol": sym,
+        "multiplier": str(multiplier),
     }
     if limit_order:
-        payload["parameters"]["limit_order"] = limit_order
+        proposal_payload["limit_order"] = limit_order
 
-    resp = _deriv_trading_request(payload)
-    buy_info = resp.get("buy", {})
+    resp_prop = _deriv_trading_request(proposal_payload)
+    proposal = resp_prop.get("proposal", {})
+    proposal_id = proposal.get("id")
+    ask_price = proposal.get("ask_price")
+    if not proposal_id:
+        raise RuntimeError(f"Deriv proposal invalide (pas d'id retourné): {resp_prop}")
+
+    # ── Étape 2 : achat en référençant le proposal_id (pas de "parameters") ──
+    buy_payload = {"buy": proposal_id, "price": ask_price}
+    resp_buy = _deriv_trading_request(buy_payload)
+    buy_info = resp_buy.get("buy", {})
     contract_id = buy_info.get("contract_id")
     print(f"[Deriv] Contrat ouvert {sym} {contract_type} mise={stake} limit_order={limit_order} "
           f"→ contract_id={contract_id}", flush=True)
