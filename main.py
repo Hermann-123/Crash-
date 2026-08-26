@@ -334,6 +334,13 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price, sl=
     standard Deriv en 2 étapes : demander une "proposal" (qui contient le
     symbole et les détails du contrat) pour obtenir un proposal_id + prix,
     puis "buy" en référençant ce proposal_id (sans "parameters").
+
+    ✅ FIX (V56 — "Properties not allowed: symbol" persistant) : ce bot
+    utilise la NOUVELLE API Options de Deriv (flux REST /trading/v1/options
+    + OTP), pas l'ancienne API classique (wss://ws.derivws.com). Sur cette
+    nouvelle API, le champ a été renommé : "symbol" → "underlying_symbol"
+    (cf. developers.deriv.com/comparison/proposal/). Envoyer "symbol" est
+    rejeté par la validation de schéma avec exactement ce message d'erreur.
     """
     sym = deriv_symbole(symbole)
     contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
@@ -353,7 +360,7 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price, sl=
         "basis": "stake",
         "contract_type": contract_type,
         "currency": "USD",
-        "symbol": sym,
+        "underlying_symbol": sym,   # ✅ FIX V56: était "symbol": sym — renommé sur la nouvelle API Options
         "multiplier": str(multiplier),
     }
     if limit_order:
@@ -3931,7 +3938,7 @@ def save_devise(call):
 
     px  = obtenir_prix_broker_realtime(actif) or 0
     nom = NOMS_AFFICHAGE.get(actif, actif)
-    fmt = ".0f" if actif in VOLATILE_PAIRS else ".5f"
+    fmt = ".5f"  # ✅ FIX: ".0f" écrasait les décimales des indices Volatility (SL et entrée s'affichaient identiques)
     if px <= 0:
         return bot.send_message(uid,
             f"⚠️ Impossible de récupérer le prix actuel de {nom}. Réessaie dans un instant.",
