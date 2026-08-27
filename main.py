@@ -1,27 +1,6 @@
 """
 ╔════════════════════════════════════════════════════════════════════════════╗
 ║   TERMINAL PRIME V55 — GROQ + EXÉCUTION RÉELLE DERIV + PANNEAU CONTRÔLE     ║
-║                                                                            ║
-║  ⚙️ NOUVEAU DANS CETTE VERSION :                                          ║
-║   • Exécution réelle via l'API Deriv (gratuite, pas de MT5/VPS/MetaApi)   ║
-║   • Panneau de contrôle Telegram (/menu) : auto-trading ON/OFF,           ║
-║     mode SOLO/MULTI, status live, stop d'urgence, réglage de la mise      ║
-║   • Quand auto-trading est ON : le bot ouvre/ferme les trades TOUT SEUL   ║
-║     sur ton compte Deriv dès qu'un signal passe le calcul + Groq.         ║
-║   • Quand auto-trading est OFF (par défaut, sécurité) : comportement      ║
-║     identique à avant — notifications + bouton "Copier" manuel.          ║
-║                                                                            ║
-║  ⚠️ Trades exécutés via des contrats "Multiplicateurs" Deriv (CFD à       ║
-║  effet de levier avec SL/TP intégrés). Pas de fermeture partielle native  ║
-║  sur ce produit : la logique "TP1 85% + 15% final" est reproduite en     ║
-║  ouvrant DEUX contrats séparés à l'entrée (85% de la mise avec TP1,       ║
-║  15% avec le TP final) — chacun se ferme automatiquement côté Deriv.      ║
-║                                                                            ║
-║  Variable d'environnement à ajouter sur Render :                        ║
-║     DERIV_API_TOKEN  -> ton token API Deriv (gratuit, app.deriv.com →    ║
-║                         Paramètres → Sécurité et niveaux → API Token)    ║
-║  (en plus de celles déjà utilisées : TELEGRAM_TOKEN régénéré, FMP_API_KEY,║
-║   GROQ_API_KEY)                                                           ║
 ╚════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -32,6 +11,7 @@ import time
 import string
 import json
 import math
+import re
 import websocket
 import pandas as pd
 import ta
@@ -43,24 +23,16 @@ from threading import Thread, Lock
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")   # ⚠️ mets ton NOUVEAU token régénéré sur Render, jamais en dur ici
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 ADMIN_ID = 5968288964
 CAPITAL_ACTUEL = 40650
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 
 DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "")   # ⚠️ App ID de la NOUVELLE API (ex: "32Oh8ivJRXsJrKUqVgYhR"), trouvé sur developers.deriv.com → Registered Apps
-DERIV_ACCOUNT_TYPE = os.environ.get("DERIV_ACCOUNT_TYPE", "demo")   # "demo" ou "real" — quel compte Options utiliser
-DERIV_LEGACY_APP_ID = os.environ.get("DERIV_LEGACY_APP_ID", "1089")  # app_id public legacy, utilisé UNIQUEMENT pour les données de marché (ticks/candles)
-
-# ==========================================
-# RISK MANAGEMENT — CONFIGURATION GLOBALE
-# ==========================================
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "")
+DERIV_ACCOUNT_TYPE = os.environ.get("DERIV_ACCOUNT_TYPE", "demo")
+DERIV_LEGACY_APP_ID = os.environ.get("DERIV_LEGACY_APP_ID", "1089")
 
 RISK_CONFIG = {
     "risk_per_trade_pct": 1.0,
@@ -73,25 +45,17 @@ RISK_CONFIG = {
     "trailing_stop_distance_pct": 0.003,
     "max_trades_per_day": 8,
     "max_trade_age_hours": 12,
-    "signal_validity_seconds": 20,   # ✅ V57: réduit (45→20) — un signal de scalping M1 périme vite
+    "signal_validity_seconds": 20,
     "max_rr_degradation_pct": 40,
 }
 
-# ==========================================
-# ✅ NOUVEAU : ÉTAT DU PANNEAU DE CONTRÔLE
-# ==========================================
-
 CONTROL_STATE = {
-    "auto_trading_active": False,   # démarre OFF par sécurité — à activer via le menu Telegram
-    "mode": "SOLO",                 # SOLO = un seul trade actif à la fois (comme l'EA vidéo) | MULTI = plusieurs en parallèle
-    "stake_usd": 1.0,                # mise en USD par trade sur Deriv — reste petit en démo/tests
-    "multiplier": 10,                # effet de levier du contrat Multiplicateur
+    "auto_trading_active": False,
+    "mode": "SOLO",
+    "stake_usd": 1.0,
+    "multiplier": 10,
     "stop_urgence_actif": False,
 }
-
-# ==========================================
-# ÉTATS DE TRADE
-# ==========================================
 
 class TradeState(Enum):
     SIGNAL_SENT     = "SIGNAL_ENVOYÉ"
@@ -100,10 +64,6 @@ class TradeState(Enum):
     TRADE_WIN       = "GAGNÉ"
     TRADE_LOSS      = "PERDU"
     CANCELLED       = "ANNULÉ"
-
-# ==========================================
-# LISTES DE PAIRES
-# ==========================================
 
 VOLATILE_PAIRS  = ["V10","V25","V50","V75","V100"]
 COMMODITY_PAIRS = ["XAUUSD","XAGUSD"]
@@ -120,10 +80,6 @@ NOMS_AFFICHAGE = {
     "V75":"⚡ V75","V100":"💥 V100",
 }
 
-# ==========================================
-# VARIABLES D'ÉTAT GLOBALES
-# ==========================================
-
 user_prefs           = {}
 plateforme_trading   = {}
 utilisateurs_actifs  = set()
@@ -137,9 +93,6 @@ volatility_pairs_active = {
     "V10": True, "V25": True, "V50": True, "V75": True, "V100": True,
 }
 
-# ✅ V64 : Gold/Argent désactivés par défaut — le backtest EMA a montré une
-# espérance négative sur Gold, et l'Argent n'a pas encore été testé. Active
-# via /Commodities XAUUSD ON une fois testé si tu veux les réintégrer.
 commodity_pairs_active = {
     "XAUUSD": False, "XAGUSD": False,
 }
@@ -158,10 +111,6 @@ daily_stats = {}
 
 lock_trade = Lock()
 
-# ==========================================
-# KEEP ALIVE
-# ==========================================
-
 app = Flask(__name__)
 
 @app.route('/')
@@ -173,24 +122,6 @@ def run():
 
 def keep_alive():
     Thread(target=run, daemon=True).start()
-
-# ==========================================
-# ✅ NOUVEAU : PONT DERIV (exécution réelle, gratuite, sans PC/VPS)
-# ==========================================
-# Même style que le reste du bot (obtenir_donnees_deriv, etc.) : connexion
-# websocket synchrone ouverte à la demande, avec authorize + requête + lecture
-# de la réponse correspondante, puis fermeture. Pas d'asyncio nécessaire.
-#
-# Produit utilisé : "Multiplicateurs" Deriv (CFD à effet de levier avec
-# stop_loss/take_profit intégrés, exécutés automatiquement côté serveur
-# Deriv — pas besoin de surveiller nous-mêmes le déclenchement du SL/TP).
-#
-# ⚠️ Pas de fermeture partielle native sur ce produit : on ouvre DEUX
-# contrats séparés à l'entrée pour reproduire "TP1 85% + 15% final" :
-#   - contrat A : 85% de la mise, cible = TP1
-#   - contrat B : 15% de la mise, cible = TP final
-# Quand le contrat A se termine (gagné ou perdu), on ajuste le SL du
-# contrat B (breakeven) via contract_update.
 
 DERIV_REST_BASE = "https://api.derivws.com"
 
@@ -205,11 +136,6 @@ _deriv_ws_cache = {"url": None, "obtained_at": 0}
 _deriv_lock = Lock()
 
 def deriv_get_account_id(force_refresh=False):
-    """
-    REST: liste les comptes Options du login (GET /trading/v1/options/accounts)
-    et choisit celui correspondant à DERIV_ACCOUNT_TYPE (demo/real).
-    Résultat mis en cache (le compte ne change pas en cours de route).
-    """
     global _deriv_account_id_cache
     if _deriv_account_id_cache and not force_refresh:
         return _deriv_account_id_cache
@@ -238,7 +164,7 @@ def deriv_get_account_id(force_refresh=False):
         if DERIV_ACCOUNT_TYPE == "real" and not est_demo(c):
             cible = c; break
     if not cible:
-        cible = comptes[0]  # repli: le seul compte disponible
+        cible = comptes[0]
 
     account_id = cible.get("account_id") or cible.get("accountId") or cible.get("id") or cible.get("loginid")
     if not account_id:
@@ -249,11 +175,6 @@ def deriv_get_account_id(force_refresh=False):
     return account_id
 
 def _deriv_obtenir_ws_url(force_refresh=False):
-    """
-    REST: demande un OTP (POST /trading/v1/options/accounts/{id}/otp) et
-    récupère l'URL WebSocket prête à l'emploi. L'OTP est de courte durée,
-    donc on en redemande un à chaque connexion (pas de cache long).
-    """
     account_id = deriv_get_account_id(force_refresh=force_refresh)
     resp = requests.post(f"{DERIV_REST_BASE}/trading/v1/options/accounts/{account_id}/otp",
                         headers=_deriv_headers(), timeout=10)
@@ -268,12 +189,6 @@ def _deriv_obtenir_ws_url(force_refresh=False):
     return url
 
 def _deriv_trading_request(payload, timeout=10, _retry=True):
-    """
-    Ouvre une connexion WebSocket fraîche (URL avec OTP intégré, obtenue
-    juste avant), envoie une requête de trading, retourne la réponse
-    correspondante. Redemande un nouvel OTP et retente une fois en cas
-    d'échec d'auth (OTP expiré entre-temps).
-    """
     cle_attendue = None
     for k in ("buy", "sell", "portfolio", "proposal_open_contract",
               "contract_update", "balance", "proposal"):
@@ -291,12 +206,7 @@ def _deriv_trading_request(payload, timeout=10, _retry=True):
         while time.time() - debut < timeout:
             resp = json.loads(ws.recv())
             if resp.get("error"):
-                err = resp["error"]
-                details = err.get("details")
-                message_complet = err.get("message", "erreur inconnue")
-                if details:
-                    message_complet += f" — détails: {details}"
-                raise RuntimeError(f"Deriv API erreur: {message_complet}")
+                raise RuntimeError(f"Deriv API erreur: {resp['error'].get('message')}")
             if cle_attendue and cle_attendue in resp:
                 return resp
             if resp.get("msg_type") == cle_attendue:
@@ -313,115 +223,145 @@ def _deriv_trading_request(payload, timeout=10, _retry=True):
             pass
 
 def deriv_symbole(symbole_bot):
-    """Traduit le symbole interne du bot vers le symbole Deriv (réutilise prefixer_symbole)."""
     return prefixer_symbole(symbole_bot)
 
-def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price, sl=None, tp=None):
+def _parser_multiplicateurs_acceptes(message_erreur):
+    """
+    Extrait la liste de multiplicateurs valides d'un message d'erreur Deriv
+    du type "Multiplier is not in acceptable range. Accepts 80,200,400,600,800."
+    Retourne une liste triée d'entiers, ou None si le message ne correspond
+    pas à ce format.
+    """
+    m = re.search(r"Accepts\s+([\d,\s]+)", message_erreur)
+    if not m:
+        return None
+    try:
+        valeurs = sorted({int(x.strip()) for x in m.group(1).split(",") if x.strip()})
+        return valeurs or None
+    except ValueError:
+        return None
+
+MISE_MIN_DERIV_USD = 1.00
+
+def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price=None, sl=None, tp=None):
     """
     Ouvre un contrat Multiplicateur. direction: "BUY" -> MULTUP, "SELL" -> MULTDOWN.
-    stake : mise en USD. multiplier : effet de levier (ex 10, 20... selon l'actif).
+    stake : mise en USD. multiplier : effet de levier demandé (ex 10) —
+    peut être automatiquement corrigé si l'actif n'accepte pas cette valeur
+    (voir plus bas). Retourne (contract_id, multiplicateur_reellement_utilise).
 
-    ✅ FIX (stop_loss/take_profit) : sur les Multiplicateurs Deriv, ces
-    valeurs dans limit_order sont des MONTANTS EN DOLLARS (perte/profit
-    maximum), PAS des niveaux de prix — confirmé par la doc officielle
-    Deriv. sl/tp reçus ici sont des niveaux de prix (calculés par la
-    stratégie) ; convertis ici en montant $ via le % de variation de prix,
-    le multiplicateur et la mise.
+    ✅ FIX #1 : sur les contrats Multiplicateurs, l'API Deriv attend
+    stop_loss/take_profit comme des MONTANTS EN DOLLARS (perte/profit max
+    avant clôture auto), PAS des niveaux de prix absolus — confirmé par la
+    doc Deriv (limit_order.stop_loss/take_profit = montant $, cf.
+    community.deriv.com/t/take-profit-and-stop-loss-multipliers). On
+    convertit le niveau de prix en montant $ via : montant = mise ×
+    multiplicateur × (distance de prix / prix d'entrée).
 
-    ✅ FIX (achat en 2 étapes) : l'achat direct avec "symbol" dans
-    "parameters" était rejeté ("Properties not allowed: symbol") sur
-    tous les actifs testés — le format attendu par cette API est le flux
-    standard Deriv en 2 étapes : demander une "proposal" (qui contient le
-    symbole et les détails du contrat) pour obtenir un proposal_id + prix,
-    puis "buy" en référençant ce proposal_id (sans "parameters").
+    ✅ FIX #2 : chaque actif Deriv a sa PROPRE liste de multiplicateurs
+    valides (ex: V50 n'accepte que 80/200/400/600/800 — very différent
+    d'un forex ou d'un gold). Si le multiplicateur configuré globalement
+    (/mult) est refusé, on lit la liste des valeurs acceptées directement
+    dans le message d'erreur Deriv et on retente une fois avec la plus
+    petite (la plus conservatrice en termes de levier) — plutôt que
+    d'échouer silencieusement à chaque cycle.
 
-    ✅ FIX (V56 — "Properties not allowed: symbol" persistant) : ce bot
-    utilise la NOUVELLE API Options de Deriv (flux REST /trading/v1/options
-    + OTP), pas l'ancienne API classique (wss://ws.derivws.com). Sur cette
-    nouvelle API, le champ a été renommé : "symbol" → "underlying_symbol"
-    (cf. developers.deriv.com/comparison/proposal/). Envoyer "symbol" est
-    rejeté par la validation de schéma avec exactement ce message d'erreur.
+    ✅ FIX #3 : Deriv exige un minimum de $1.00 par contrat. Si la mise
+    demandée est sous ce seuil (ex: mise totale $1 découpée en 85%/15%,
+    donnant $0.85 et $0.15 — les deux invalides), on relève cette mise
+    précise au minimum de $1.00 plutôt que d'échouer. Cela peut dépenser
+    légèrement plus que la mise configurée sur les petites valeurs — c'est
+    documenté dans le message renvoyé à l'appelant.
     """
     sym = deriv_symbole(symbole)
     contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
 
-    limit_order = {}
-    if sl is not None and entry_price:
-        pct_perte = abs(entry_price - float(sl)) / entry_price
-        limit_order["stop_loss"] = round(pct_perte * multiplier * stake, 2)
-    if tp is not None and entry_price:
-        pct_profit = abs(float(tp) - entry_price) / entry_price
-        limit_order["take_profit"] = round(pct_profit * multiplier * stake, 2)
+    stake_ajuste = max(round(stake, 2), MISE_MIN_DERIV_USD)
 
-    # ── Étape 1 : proposition de prix (contient le symbole et les détails) ──
-    proposal_payload = {
-        "proposal": 1,
-        "amount": round(stake, 2),
-        "basis": "stake",
-        "contract_type": contract_type,
-        "currency": "USD",
-        "underlying_symbol": sym,   # ✅ FIX V56: était "symbol": sym — renommé sur la nouvelle API Options
-        "multiplier": str(multiplier),
-    }
-    if limit_order:
-        proposal_payload["limit_order"] = limit_order
+    def _construire_limit_order(mult):
+        limit_order = {}
+        if entry_price and float(entry_price) > 0:
+            if sl is not None:
+                distance_sl_pct = abs(float(entry_price) - float(sl)) / float(entry_price)
+                montant_sl = round(stake_ajuste * mult * distance_sl_pct, 2)
+                if montant_sl > 0:
+                    limit_order["stop_loss"] = montant_sl
+            if tp is not None:
+                distance_tp_pct = abs(float(tp) - float(entry_price)) / float(entry_price)
+                montant_tp = round(stake_ajuste * mult * distance_tp_pct, 2)
+                if montant_tp > 0:
+                    limit_order["take_profit"] = montant_tp
+        return limit_order
 
-    resp_prop = _deriv_trading_request(proposal_payload)
-    proposal = resp_prop.get("proposal", {})
-    proposal_id = proposal.get("id")
-    ask_price = proposal.get("ask_price")
-    if not proposal_id:
-        raise RuntimeError(f"Deriv proposal invalide (pas d'id retourné): {resp_prop}")
+    def _tenter(mult):
+        payload = {
+            "buy": 1,
+            "price": stake_ajuste,
+            "parameters": {
+                "amount": stake_ajuste,
+                "basis": "stake",
+                "contract_type": contract_type,
+                "currency": "USD",
+                "symbol": sym,
+                "multiplier": mult,
+            }
+        }
+        limit_order = _construire_limit_order(mult)
+        if limit_order:
+            payload["parameters"]["limit_order"] = limit_order
+        return _deriv_trading_request(payload), limit_order
 
-    # ── Étape 2 : achat en référençant le proposal_id (pas de "parameters") ──
-    buy_payload = {"buy": proposal_id, "price": ask_price}
-    resp_buy = _deriv_trading_request(buy_payload)
-    buy_info = resp_buy.get("buy", {})
+    try:
+        resp, limit_order = _tenter(multiplier)
+        multiplicateur_utilise = multiplier
+    except RuntimeError as e:
+        valeurs_ok = _parser_multiplicateurs_acceptes(str(e))
+        if not valeurs_ok:
+            raise
+        multiplicateur_utilise = min(valeurs_ok)
+        print(f"[Deriv] {sym}: multiplicateur x{multiplier} refusé — "
+              f"retenté avec x{multiplicateur_utilise} (valeurs acceptées par "
+              f"Deriv pour cet actif: {valeurs_ok})", flush=True)
+        resp, limit_order = _tenter(multiplicateur_utilise)
+
+    buy_info = resp.get("buy", {})
     contract_id = buy_info.get("contract_id")
-    print(f"[Deriv] Contrat ouvert {sym} {contract_type} mise={stake} limit_order={limit_order} "
+    print(f"[Deriv] Contrat ouvert {sym} {contract_type} mise={stake_ajuste} "
+          f"multiplicateur=x{multiplicateur_utilise} limit_order={limit_order} "
           f"→ contract_id={contract_id}", flush=True)
-    return contract_id
+    return contract_id, multiplicateur_utilise
 
-def deriv_modifier_contrat(contract_id, entry_price, multiplier, stake, sl=None, tp=None):
+def deriv_modifier_contrat(contract_id, sl=None, tp=None):
     """
     Met à jour le SL/TP d'un contrat ouvert (ex: passage en breakeven).
-    ✅ FIX: même conversion prix → montant $ que deriv_ouvrir_contrat — sl/tp
-    reçus ici sont des niveaux de prix, convertis avant l'envoi à Deriv.
+    ⚠️ Comme pour deriv_ouvrir_contrat, sl/tp ici doivent déjà être des
+    MONTANTS EN DOLLARS (pas des prix) — voir appliquer_trailing_stop et
+    fermer_trade_partiel, qui font maintenant cette conversion avant appel.
     """
     limit_order = {}
-    if sl is not None and entry_price:
-        pct_perte = abs(entry_price - float(sl)) / entry_price
-        limit_order["stop_loss"] = round(pct_perte * multiplier * stake, 2)
-    if tp is not None and entry_price:
-        pct_profit = abs(float(tp) - entry_price) / entry_price
-        limit_order["take_profit"] = round(pct_profit * multiplier * stake, 2)
+    if sl is not None:
+        limit_order["stop_loss"] = round(float(sl), 2)
+    if tp is not None:
+        limit_order["take_profit"] = round(float(tp), 2)
     payload = {"contract_update": 1, "contract_id": contract_id,
                "limit_order": limit_order}
     return _deriv_trading_request(payload)
 
 def deriv_fermer_contrat(contract_id):
-    """Ferme (vend) un contrat au marché immédiatement."""
     payload = {"sell": contract_id, "price": 0}
     return _deriv_trading_request(payload)
 
 def deriv_statut_contrat(contract_id):
-    """
-    Retourne l'état actuel d'un contrat : is_sold (0/1), profit, current_spot...
-    Utilisé par le monitoring pour détecter qu'un TP/SL a été exécuté
-    automatiquement côté Deriv (sans qu'on ait eu besoin de le déclencher).
-    """
     payload = {"proposal_open_contract": 1, "contract_id": contract_id}
     resp = _deriv_trading_request(payload)
     return resp.get("proposal_open_contract", {})
 
 def deriv_positions_ouvertes():
-    """Liste les contrats actuellement ouverts sur le compte."""
     payload = {"portfolio": 1}
     resp = _deriv_trading_request(payload)
     return resp.get("portfolio", {}).get("contracts", [])
 
 def deriv_connecter():
-    """Vérifie que le token/app_id fonctionnent (appelée au démarrage / à l'activation)."""
     payload = {"balance": 1}
     resp = _deriv_trading_request(payload)
     solde = resp.get("balance", {})
@@ -429,7 +369,6 @@ def deriv_connecter():
     return solde
 
 def peut_ouvrir_automatiquement(symbole):
-    """Respecte le mode SOLO/MULTI et le stop d'urgence avant toute ouverture auto."""
     if not CONTROL_STATE["auto_trading_active"]:
         return False
     if CONTROL_STATE["stop_urgence_actif"]:
@@ -437,10 +376,6 @@ def peut_ouvrir_automatiquement(symbole):
     if CONTROL_STATE["mode"] == "SOLO":
         return len(trades_actifs) == 0
     return symbole not in {t.get("symbol") for t in trades_actifs.values()}
-
-# ==========================================
-# UTILITAIRES PRIX (base V38)
-# ==========================================
 
 def prefixer_symbole(s):
     mapping = {"XAUUSD":"frxXAUUSD","XAGUSD":"frxXAGUSD"}
@@ -568,12 +503,6 @@ def obtenir_prix_broker_realtime(symbole):
         try:
             ws = websocket.WebSocket()
             ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089", timeout=5)
-            # ✅ FIX: l'abonnement live "ticks" est rejeté par Deriv pour ces
-            # symboles ("Symbol R_25 is invalid"), alors que "ticks_history"
-            # (même endpoint que celui déjà utilisé partout ailleurs dans le
-            # bot pour les bougies, et qui fonctionne de manière fiable)
-            # accepte parfaitement ces mêmes symboles. On demande donc juste
-            # le tout dernier tick via ticks_history au lieu d'un abonnement.
             ws.send(json.dumps({
                 "ticks_history": sym, "end": "latest", "count": 1, "style": "ticks"
             }))
@@ -606,10 +535,6 @@ def valider_prix_avant_signal(symbole, prix_bot, tolerance=0.001):
         print(f"[Validation {symbole}] ÉCART {decalage*100:.2f}% — REJETÉ", flush=True)
         return False
     return True
-
-# ==========================================
-# GESTION DU RISQUE PROFESSIONNELLE
-# ==========================================
 
 def get_today_str():
     return datetime.datetime.utcnow().strftime("%Y-%m-%d")
@@ -693,44 +618,39 @@ def enregistrer_resultat_trade(uid, pnl, win, pnl_pour_bilan=None):
         print(f"[Risk] {uid} EN PAUSE anti-tilt ({stats['consecutive_losses']} pertes consécutives)", flush=True)
     return stats
 
-# ==========================================
-# OUVERTURE / FERMETURE DE TRADE
-# ✅ MODIFIÉ : appelle Deriv pour une exécution RÉELLE quand
-# executer_reel=True (auto-trading actif ou copie manuelle avec auto ON).
-# ==========================================
-
 def create_trade_id():
     return "TRD-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
 def ouvrir_trade(uid, symbole, direction, entry_price, sl, tp1, tp_final, strategy, confiance,
                  label="SIGNAL", strategie_nom_ia="?", ia_score=None, gemini_score=None,
                  contexte_marche=None, executer_reel=False):
-    """
-    ✅ NOUVEAU paramètre executer_reel : si True, ouvre 2 vrais contrats
-    Deriv (85% mise → TP1, 15% mise → TP final) AVANT d'enregistrer le
-    trade localement. Si l'ouverture réelle échoue, le trade n'est PAS
-    enregistré (on ne veut jamais suivre un trade fantôme).
-    """
     trade_id = create_trade_id()
     sizing = calculer_position_size(CAPITAL_ACTUEL, RISK_CONFIG["risk_per_trade_pct"],
                                     entry_price, sl, symbole)
 
     deriv_contract_tp1 = None
     deriv_contract_final = None
-    stake_final = 0
-    multiplier = CONTROL_STATE["multiplier"]
+    multiplicateur_tp1_reel = None
+    multiplicateur_final_reel = None
     if executer_reel:
         stake_total = CONTROL_STATE["stake_usd"]
+        multiplier = CONTROL_STATE["multiplier"]
         stake_tp1 = round(stake_total * RISK_CONFIG["partial_tp_ratio"], 2)
         stake_final = round(stake_total - stake_tp1, 2)
 
-        deriv_contract_tp1 = deriv_ouvrir_contrat(
-            symbole, direction, stake_tp1, multiplier, entry_price, sl=sl, tp=tp1)
-        deriv_contract_final = deriv_ouvrir_contrat(
-            symbole, direction, stake_final, multiplier, entry_price, sl=sl, tp=tp_final)
+        # ✅ FIX : entry_price transmis pour que deriv_ouvrir_contrat convertisse
+        # sl/tp (niveaux de prix) en montants $ attendus par l'API Deriv.
+        # deriv_ouvrir_contrat retourne aussi le multiplicateur RÉELLEMENT
+        # utilisé (peut différer de `multiplier` si l'actif ne l'acceptait
+        # pas — voir _parser_multiplicateurs_acceptes) et relève lui-même
+        # toute mise sous le minimum $1.00 de Deriv.
+        deriv_contract_tp1, multiplicateur_tp1_reel = deriv_ouvrir_contrat(
+            symbole, direction, stake_tp1, multiplier, entry_price=entry_price, sl=sl, tp=tp1)
+        deriv_contract_final, multiplicateur_final_reel = deriv_ouvrir_contrat(
+            symbole, direction, stake_final, multiplier, entry_price=entry_price, sl=sl, tp=tp_final)
         print(f"[Deriv] Trade réel ouvert {symbole} {direction} → "
-              f"contrat TP1={deriv_contract_tp1} (${stake_tp1}) / "
-              f"contrat FINAL={deriv_contract_final} (${stake_final})", flush=True)
+              f"contrat TP1={deriv_contract_tp1} (${stake_tp1}, x{multiplicateur_tp1_reel}) / "
+              f"contrat FINAL={deriv_contract_final} (${stake_final}, x{multiplicateur_final_reel})", flush=True)
 
     trades_actifs[uid] = {
         "trade_id": trade_id, "symbol": symbole,
@@ -752,8 +672,7 @@ def ouvrir_trade(uid, symbole, direction, entry_price, sl, tp1, tp_final, strate
         "sizing": sizing,
         "deriv_contract_tp1": deriv_contract_tp1,
         "deriv_contract_final": deriv_contract_final,
-        "deriv_stake_final": stake_final,
-        "deriv_multiplier": multiplier,
+        "deriv_multiplier_final": multiplicateur_final_reel,
         "reel": executer_reel,
     }
     print(f"[Trade Opened] {uid}: {trade_id} {symbole} {direction} @ {entry_price} "
@@ -768,9 +687,6 @@ def fermer_trade_complet(uid, exit_price, win):
         trade_id = trade["trade_id"]
 
         try:
-            # ✅ Fermeture réelle Deriv : ferme le contrat "final" restant s'il
-            # est encore ouvert (le contrat TP1, lui, s'est déjà auto-fermé
-            # côté Deriv quand son propre TP/SL a été touché).
             if trade.get("reel") and trade.get("deriv_contract_final"):
                 try:
                     statut = deriv_statut_contrat(trade["deriv_contract_final"])
@@ -864,10 +780,6 @@ def fermer_trade_partiel(uid, exit_price):
             gain_ratio = abs(exit_price - trade["entry_price"]) / trade["sizing"]["distance_sl"] if trade["sizing"]["distance_sl"] > 0 else 1
             pnl_partiel = risque_initial * gain_ratio * ratio
 
-            # ✅ Avec Deriv, le contrat TP1 s'est déjà fermé automatiquement
-            # côté serveur (SL/TP intégrés au contrat) — rien à fermer ici.
-            # Il ne reste qu'à faire passer le contrat "final" en breakeven.
-
             trade["partial_closed"]   = True
             trade["partial_pnl"]      = pnl_partiel
             trade["breakeven_active"] = True
@@ -881,9 +793,11 @@ def fermer_trade_partiel(uid, exit_price):
 
             if trade.get("reel") and trade.get("deriv_contract_final"):
                 try:
-                    deriv_modifier_contrat(trade["deriv_contract_final"],
-                                           trade["entry_price"], trade["deriv_multiplier"],
-                                           trade["deriv_stake_final"], sl=trade["sl"])
+                    # ✅ FIX : breakeven ≈ perte nulle → on envoie un stop_loss
+                    # monétaire quasi nul (0.01$) plutôt que le prix absolu
+                    # de breakeven, pour rester cohérent avec l'unité $
+                    # attendue par contract_update sur les Multiplicateurs.
+                    deriv_modifier_contrat(trade["deriv_contract_final"], sl=0.01)
                 except Exception as e:
                     print(f"[Deriv] Erreur modification SL breakeven: {e}", flush=True)
 
@@ -924,9 +838,21 @@ def appliquer_trailing_stop(uid, prix_current):
     if nouveau_sl is not None:
         if trade.get("reel") and trade.get("deriv_contract_final"):
             try:
-                deriv_modifier_contrat(trade["deriv_contract_final"],
-                                       trade["entry_price"], trade["deriv_multiplier"],
-                                       trade["deriv_stake_final"], sl=nouveau_sl)
+                # ✅ FIX : convertit le nouveau niveau de trailing (prix) en
+                # montant $ avant l'appel à Deriv, comme pour l'ouverture.
+                entry = trade.get("entry_price")
+                montant_sl = None
+                if entry:
+                    # ✅ FIX : utilise le multiplicateur RÉELLEMENT appliqué par
+                    # Deriv sur ce contrat (peut différer de CONTROL_STATE si
+                    # l'actif l'a fait corriger à l'ouverture), sinon la valeur
+                    # configurée par défaut.
+                    multiplicateur_reel = trade.get("deriv_multiplier_final") or CONTROL_STATE["multiplier"]
+                    stake_final = max(round(CONTROL_STATE["stake_usd"] * (1 - RISK_CONFIG["partial_tp_ratio"]), 2),
+                                       MISE_MIN_DERIV_USD)
+                    distance_pct = abs(float(entry) - float(nouveau_sl)) / float(entry)
+                    montant_sl = round(max(stake_final * multiplicateur_reel * distance_pct, 0.01), 2)
+                deriv_modifier_contrat(trade["deriv_contract_final"], sl=montant_sl)
             except Exception as e:
                 print(f"[Deriv] Erreur trailing stop: {e}", flush=True)
         return True
@@ -936,10 +862,6 @@ def utilisateur_a_trade_actif(uid):
     return uid in trades_actifs and trades_actifs[uid]["state"] in (
         TradeState.TRADE_OPEN, TradeState.TRADE_PARTIAL
     )
-
-# ==========================================
-# WATCHDOG ANTI-BLOCAGE
-# ==========================================
 
 def watchdog_trades_bloques():
     while True:
@@ -982,10 +904,6 @@ def watchdog_trades_bloques():
                             pass
         except Exception as e:
             print(f"[Watchdog] {e}", flush=True)
-
-# ==========================================
-# SESSIONS / KILLZONES
-# ==========================================
 
 PAIRES_SESSION_ASIE    = ["AUDJPY","CADJPY","CHFJPY","USDJPY","EURJPY","AUDUSD","AUDCAD","XAUUSD","XAGUSD"]
 PAIRES_SESSION_LONDRES = ["EURUSD","GBPUSD","EURCHF","USDCHF","CADCHF","EURJPY","EURAUD","XAUUSD","XAGUSD"]
@@ -1038,10 +956,6 @@ def est_symbole_autorise(symbole):
     if symbole in paires_session:
         return "AUTORISE", ""
     return "HORS_SESSION", f"🔒 {symbole} inactif en {session}"
-
-# ==========================================
-# STRATÉGIE : TREND PULLBACK & CONFLUENCE
-# ==========================================
 
 def calculer_cpr_journalier(symbole):
     h1 = obtenir_donnees_deriv(symbole, 3600)
@@ -1172,799 +1086,29 @@ def detecter_order_blocks(df, lookback=40):
     except Exception:
         return [], []
 
-def analyser_trend_pullback_confluence(symbole):
-    c1h = obtenir_donnees_deriv(symbole, 3600)
-    c15 = obtenir_donnees_deriv(symbole, 900)
-    if not c1h or len(c1h) < 60 or not c15 or len(c15) < 30:
-        print(f"[DEBUG-TP] {symbole} REJET: données insuffisantes "
-              f"(c1h={len(c1h) if c1h else 0}, c15={len(c15) if c15 else 0})", flush=True)
-        return None
+def evaluer_structure_marche(df):
     try:
-        df1h = pd.DataFrame([{
-            "open": float(c["open"]), "high": float(c["high"]),
-            "low": float(c["low"]), "close": float(c["close"])
-        } for c in c1h])
-        df15 = pd.DataFrame([{
-            "open": float(c["open"]), "high": float(c["high"]),
-            "low": float(c["low"]), "close": float(c["close"])
-        } for c in c15])
-
-        px = float(df15['close'].iloc[-1])
-        score = 0.0
-
-        ema21_h1 = _ema(df1h['close'], 21)
-        ema55_h1 = _ema(df1h['close'], 55)
-        adx_h1   = calculer_adx(df1h)
-        tendance_bull = ema21_h1.iloc[-2] > ema55_h1.iloc[-2]
-        direction = "BULL" if tendance_bull else "BEAR"
-        score_tendance = min(20, max(0, (adx_h1 - 12) * 1.3))
-        score += score_tendance
-
-        structure_score = evaluer_structure_marche(df1h)
-        score_structure = min(15, max(0, (structure_score - 35) * 0.3))
-        score += score_structure
-
-        ema21_m15 = _ema(df15['close'], 21)
-        val_zone  = float(ema21_m15.iloc[-2])
-        distance_ema_pct = abs(px - val_zone) / px if px else 1
-        TOLERANCE_EMA = 0.010
-
-        obs_bull, obs_bear = detecter_order_blocks(df1h)
-        niveaux_cles = detecter_niveaux_cles(df1h)
-        TOLERANCE_NIVEAU = 0.004
-
-        zones_touchees = []
-        score_zone = 0.0
-
-        if distance_ema_pct <= TOLERANCE_EMA:
-            zones_touchees.append("EMA21 M15")
-            score_zone += max(5, 15 * (1 - distance_ema_pct / TOLERANCE_EMA))
-
-        ob_pertinent = None
-        obs_list = obs_bull if direction == "BULL" else obs_bear
-        for bottom, top in obs_list:
-            marge = (top - bottom) * 0.4
-            if (bottom - marge) <= px <= (top + marge):
-                zones_touchees.append(f"Order Block {'haussier' if direction=='BULL' else 'baissier'}")
-                ob_pertinent = (bottom, top)
-                score_zone += 15
-                break
-
-        niveau_pertinent = None
-        for niveau in niveaux_cles:
-            if abs(px - niveau) / px < TOLERANCE_NIVEAU:
-                zones_touchees.append("Support/Résistance clé")
-                niveau_pertinent = niveau
-                score_zone += 12
-                break
-
-        if not zones_touchees:
-            print(f"[DEBUG-TP] {symbole} REJET: aucune zone de pullback proche "
-                  f"(dist EMA21={distance_ema_pct*100:.2f}%, tolérance={TOLERANCE_EMA*100:.1f}%, "
-                  f"{len(obs_list)} OB détectés, {len(niveaux_cles)} niveaux clés détectés)", flush=True)
-            return None
-
-        score += min(25, score_zone)
-
-        try:
-            rsi_series = ta.momentum.RSIIndicator(close=df15["close"], window=14).rsi()
-            rsi_val = float(rsi_series.iloc[-2])
-        except Exception:
-            rsi_val = 50.0
-
-        score_rsi = 15 if 30 <= rsi_val <= 70 else (8 if 20 <= rsi_val <= 80 else 0)
-        score += score_rsi
-
-        macd_line, macd_signal, macd_hist = calculer_macd_signal(df15)
-        momentum_ok = (macd_hist > 0) if direction == "BULL" else (macd_hist < 0)
-        score_macd = 10 if momentum_ok else 0
-        score += score_macd
-
-        # ✅ V56 FIX: le pattern de secours "BOUGIE_DIRECTIONNELLE" acceptait
-        # n'importe quelle bougie allant dans le sens de la tendance (très
-        # fréquent, donc peu discriminant) avec un score non-nul. On exige
-        # maintenant un vrai pattern de retournement/continuation identifié
-        # (Pin Bar, Engulfing, Marubozu) — sinon le signal est rejeté ici,
-        # avant même d'atteindre le calcul IA. Moins de signaux bruts, mais
-        # chacun a un déclencheur d'entrée réellement justifié.
-        pattern, _ = detecter_chandeliers_pdf(df15)
-        patterns_valides_bull = ("PIN_BULL", "ENGULFING_BULL", "MARUBOZU_BULL")
-        patterns_valides_bear = ("PIN_BEAR", "ENGULFING_BEAR", "MARUBOZU_BEAR")
-        bougie_signal = df15.iloc[-2]
-
-        if (direction == "BULL" and pattern in patterns_valides_bull) or \
-           (direction == "BEAR" and pattern in patterns_valides_bear):
-            score_pattern = 20
-        else:
-            print(f"[DEBUG-TP] {symbole} REJET: aucun pattern de retournement/continuation "
-                  f"valide sur la bougie de signal (direction={direction}, pattern détecté={pattern})", flush=True)
-            return None
-
-        score += score_pattern
-
-        SEUIL_SCORE_CONFLUENCE = 45
-        if score < SEUIL_SCORE_CONFLUENCE:
-            print(f"[DEBUG-TP] {symbole} REJET: score confluence {score:.1f} < seuil {SEUIL_SCORE_CONFLUENCE} "
-                  f"(tendance={score_tendance:.1f} structure={score_structure:.1f} "
-                  f"zone={score_zone:.1f} rsi={score_rsi} macd={score_macd} pattern={score_pattern})", flush=True)
-            return None
-
-        atr15 = calculer_atr(df15)
-        if atr15 <= 0:
-            return None
-
-        cpr = calculer_cpr_journalier(symbole)
-
-        if direction == "BULL":
-            signal_dir = "BUY"
-            sl_structure = float(bougie_signal['low']) - (atr15 * 0.15)
-            sl_atr       = px - (atr15 * 1.2)
-            sl_candidats = [sl_structure, sl_atr]
-            if ob_pertinent:
-                sl_candidats.append(ob_pertinent[0] - (atr15 * 0.1))
-            sl = min(sl_candidats)
-            distance_risque = px - sl
-            if distance_risque <= 0:
-                return None
-            cible_objective = cpr["PDH"] if cpr and cpr["PDH"] > px else px + (distance_risque * 2.0)
-            tp_final = max(cible_objective, px + (distance_risque * 1.4))
-            tp1 = px + (distance_risque * 1.0)
-        else:
-            signal_dir = "SELL"
-            sl_structure = float(bougie_signal['high']) + (atr15 * 0.15)
-            sl_atr       = px + (atr15 * 1.2)
-            sl_candidats = [sl_structure, sl_atr]
-            if ob_pertinent:
-                sl_candidats.append(ob_pertinent[1] + (atr15 * 0.1))
-            sl = max(sl_candidats)
-            distance_risque = sl - px
-            if distance_risque <= 0:
-                return None
-            cible_objective = cpr["PDL"] if cpr and cpr["PDL"] < px else px - (distance_risque * 2.0)
-            tp_final = min(cible_objective, px - (distance_risque * 1.4))
-            tp1 = px - (distance_risque * 1.0)
-
-        risque = abs(px - sl)
-        rr = abs(tp_final - px) / risque if risque > 0 else 0
-        if rr < 1.4:
-            print(f"[DEBUG-TP] {symbole} REJET: R/R {rr:.2f} < 1.4 (score confluence "
-                  f"pourtant OK à {score:.1f})", flush=True)
-            return None
-
-        confiance = int(min(97, round(score)))
-        zones_txt = " + ".join(zones_touchees)
-
-        print(f"[DEBUG-TP] {symbole} ✅ SIGNAL ÉMIS — score={score:.1f} direction={direction} "
-              f"zones={zones_txt} pattern={pattern} rr={rr:.2f}", flush=True)
-
-        return {
-            "action": "🟢 ACHAT (BUY)" if signal_dir == "BUY" else "🔴 VENTE (SELL)",
-            "tendance": direction, "force": f"ADX {round(adx_h1,1)} · Structure {structure_score}%",
-            "msg": f"Pullback sur {zones_txt} + {pattern.replace('_',' ')} (score confluence {int(score)})",
-            "sl": round(sl,5), "tp1": round(tp1,5), "tp": round(tp_final,5),
-            "rr": round(rr,2), "px": round(px,5),
-            "strategie": 1, "confiance": confiance,
-            "label": "TREND PULLBACK & CONFLUENCE",
-            "rsi_value": round(rsi_val,1), "adx_value": round(adx_h1,1),
-            "zones_confluence": zones_touchees,
-            "order_block": ob_pertinent, "niveau_cle": niveau_pertinent,
-            "score_confluence_brut": round(score,1),
-        }
-    except Exception as e:
-        print(f"[TrendPullback/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
-        return None
-
-# ==========================================
-# ✅ V57 NEW: STRATÉGIE DE SCALPING MULTI-TIMEFRAME (M1 → M30)
-# ==========================================
-# Empilement inspiré d'une méthode Fibonacci "golden pocket" + structure de
-# session, adaptée à des timeframes courts pour du scalping réel (au lieu
-# du swing H1/M15 de la stratégie précédente) :
-#
-#   M30 : biais directionnel (EMA9 vs EMA21) — la tendance "macro" du scalp
-#   M15 : zone de retracement Fibonacci (38.2%-61.8%, "golden pocket") du
-#         dernier swing détecté — la zone de valeur où on cherche un retour
-#   M5  : le prix doit être ACTUELLEMENT dans cette zone (pas juste l'avoir
-#         traversée) — condition de timing
-#   M1  : bougie de confirmation (Pin Bar / Engulfing / Marubozu) dans le
-#         sens du biais — le déclencheur d'entrée précis
-#
-# Le second avis du moteur IA (H1/H4/multi-TF, contexte marché, détection
-# de faux signal) reste actif en aval, inchangé — il sert de filtre de
-# sécurité macro même sur un scalp court terme.
-
-def calculer_zone_fibonacci(df, lookback=20):
-    """
-    Détecte le dernier swing haut/bas sur la fenêtre récente et calcule la
-    zone de retracement Fibonacci 38.2%-61.8% ("golden pocket") de ce swing.
-    Retourne None si le swing est trop plat pour être exploitable.
-    """
-    try:
-        sub = df.iloc[-lookback:].reset_index(drop=True)
-        plus_haut = float(sub['high'].max())
-        plus_bas = float(sub['low'].min())
-        idx_haut = int(sub['high'].idxmax())
-        idx_bas = int(sub['low'].idxmin())
-
-        amplitude = plus_haut - plus_bas
-        if amplitude <= 0:
-            return None
-
-        if idx_haut > idx_bas:
-            # Le plus haut est venu APRÈS le plus bas → swing haussier →
-            # zone d'achat en retracement (discount zone)
-            direction_swing = "BULL"
-            zone_haut = plus_haut - (amplitude * 0.382)
-            zone_bas  = plus_haut - (amplitude * 0.618)
-        else:
-            direction_swing = "BEAR"
-            zone_bas  = plus_bas + (amplitude * 0.382)
-            zone_haut = plus_bas + (amplitude * 0.618)
-
-        return {
-            "bas": round(min(zone_bas, zone_haut), 5),
-            "haut": round(max(zone_bas, zone_haut), 5),
-            "direction_swing": direction_swing,
-            "amplitude": amplitude,
-        }
+        highs = df['high'].iloc[-20:].values
+        lows = df['low'].iloc[-20:].values
+        if len(highs) < 2 or len(lows) < 2:
+            return 50.0
+        hh = sum(1 for i in range(1, len(highs)) if highs[i] > highs[i-1])
+        hl = sum(1 for i in range(1, len(lows)) if lows[i] > lows[i-1])
+        lh = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i-1])
+        ll = sum(1 for i in range(1, len(lows)) if lows[i] < lows[i-1])
+        coherence_bull = (hh + hl) / (2 * (len(highs) - 1))
+        coherence_bear = (lh + ll) / (2 * (len(lows) - 1))
+        return round(max(coherence_bull, coherence_bear) * 100, 1)
     except Exception:
-        return None
-
-def analyser_scalping_multi_tf(symbole, multiplicateur_tp=1.5, rr_min=1.2):
-    """
-    ✅ V58: Entrée resserrée sur M15 UNIQUEMENT (biais macro M30 conservé).
-    Le backtest précédent montrait une espérance négative sur toutes les
-    valeurs de R/R testées — le vrai problème identifié n'était pas le
-    R/R, mais un décalage d'échelle : la zone et le biais se lisaient en
-    M15/M30, alors que le stop loss était calculé sur l'ATR M1 (bien plus
-    petit) — soufflé par du simple bruit intra-bougie sans rapport avec
-    la lecture de tendance M15/M30. Tout est maintenant aligné sur M15 :
-    biais M30, zone Fibonacci M15, confirmation M15, risque/cible sur
-    ATR M15. Moins de bruit, cohérence d'échelle du début à la fin.
-
-    ✅ multiplicateur_tp et rr_min restent réglables pour le backtest.
-    """
-    c30 = obtenir_donnees_deriv(symbole, 1800)
-    c15 = obtenir_donnees_deriv(symbole, 900)
-
-    print(f"[MARQUEUR-VERSION] V60-UNE-SEULE-CONDITION-MAJEURE actif", flush=True)
-
-    if not c30 or not c15 or len(c30) < 30 or len(c15) < 40:
-        print(f"[DEBUG-SCALP] {symbole} REJET: données insuffisantes "
-              f"(M30={len(c30) if c30 else 0}, M15={len(c15) if c15 else 0})", flush=True)
-        return None
-
-    try:
-        df30 = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
-                               "low":float(c["low"]),"close":float(c["close"])} for c in c30])
-        df15 = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
-                               "low":float(c["low"]),"close":float(c["close"])} for c in c15])
-
-        px = float(df15['close'].iloc[-1])
-
-        # ── 1. BIAIS DIRECTIONNEL M30 ──
-        ema9_30  = _ema(df30['close'], 9)
-        ema21_30 = _ema(df30['close'], 21)
-        direction = "BULL" if ema9_30.iloc[-2] > ema21_30.iloc[-2] else "BEAR"
-
-        # ── 2. ZONE FIBONACCI (GOLDEN POCKET) SUR M15 ──
-        zone = calculer_zone_fibonacci(df15, lookback=20)
-        if not zone or zone["direction_swing"] != direction:
-            print(f"[DEBUG-SCALP] {symbole} REJET: pas de zone Fibonacci "
-                  f"cohérente avec le biais M30 ({direction})", flush=True)
-            return None
-
-        # ── 3. CONFIRMATION MAJEURE UNIQUE : le prix a touché la zone Fibo ──
-        # ✅ FIX V59: retour à UNE seule condition d'entrée décisive (biais +
-        # zone atteinte), comme demandé — plus de cumul de filtres qui se
-        # multiplient entre eux et ramènent la probabilité near-zéro. Le
-        # pattern de bougie n'est plus une porte bloquante : il reste
-        # affiché à titre indicatif dans le message si détecté.
-        recent_zone_touch = df15.iloc[-4:-1]  # 3 bougies avant celle en cours
-        touche_zone = any(
-            (zone["bas"] <= float(r['low']) <= zone["haut"]) or
-            (zone["bas"] <= float(r['high']) <= zone["haut"]) or
-            (float(r['low']) <= zone["bas"] and float(r['high']) >= zone["haut"])
-            for _, r in recent_zone_touch.iterrows()
-        )
-        if not touche_zone:
-            print(f"[DEBUG-SCALP] {symbole} REJET: prix n'a pas touché la zone Fibo "
-                  f"[{zone['bas']}, {zone['haut']}] sur les 3 dernières bougies", flush=True)
-            return None
-
-        # Pattern détecté à titre indicatif seulement (n'est plus un filtre bloquant)
-        pattern, _ = detecter_chandeliers_pdf(df15)
-
-
-        # ── 5. RISQUE / CIBLE basés sur l'ATR M15 (même échelle que l'entrée) ──
-        atr15 = calculer_atr(df15)
-        if atr15 <= 0:
-            return None
-
-        bougie15 = df15.iloc[-2]
-        if direction == "BULL":
-            signal_dir = "BUY"
-            sl = min(float(bougie15['low']) - atr15 * 0.15, px - atr15 * 1.0)
-            distance = px - sl
-            if distance <= 0:
-                return None
-            tp = px + distance * multiplicateur_tp
-            tp1 = px + distance * 1.0
-        else:
-            signal_dir = "SELL"
-            sl = max(float(bougie15['high']) + atr15 * 0.15, px + atr15 * 1.0)
-            distance = sl - px
-            if distance <= 0:
-                return None
-            tp = px - distance * multiplicateur_tp
-            tp1 = px - distance * 1.0
-
-        rr = abs(tp - px) / abs(px - sl) if abs(px - sl) > 0 else 0
-        if rr < rr_min:
-            print(f"[DEBUG-SCALP] {symbole} REJET: R/R {rr:.2f} < {rr_min}", flush=True)
-            return None
-
-        print(f"[DEBUG-SCALP] {symbole} ✅ SIGNAL ÉMIS — direction={direction} "
-              f"zone_fibo=[{zone['bas']},{zone['haut']}] pattern={pattern} rr={rr:.2f}", flush=True)
-
-        return {
-            "action": "🟢 ACHAT (BUY)" if signal_dir == "BUY" else "🔴 VENTE (SELL)",
-            "tendance": direction, "force": f"Biais M30 {direction}",
-            "msg": f"Scalping M15 (biais M30) : pullback zone Fibo golden pocket + {pattern.replace('_',' ')}",
-            "sl": round(sl, 5), "tp1": round(tp1, 5), "tp": round(tp, 5),
-            "rr": round(rr, 2), "px": round(px, 5),
-            "strategie": 1, "confiance": 70,
-            "label": "SCALPING M15 (biais M30)",
-            "zones_confluence": ["Fibonacci Golden Pocket M15"],
-            "order_block": None, "niveau_cle": None,
-        }
-    except Exception as e:
-        print(f"[Scalping/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
-        return None
-
-# ==========================================
-# ✅ V61 : MOTEUR ORDER BLOCK — STRATÉGIE UNIQUE DE REMPLACEMENT
-# ==========================================
-# Suit strictement : STRUCTURE → BOS → DÉPLACEMENT → FVG → LIQUIDITÉ
-# INTERNE → ORDER BLOCK → RETOUR EN ZONE → CONFIRMATION → ENTRY → SL → TP
-#
-# Architecture multi-timeframe (configurable ci-dessous) :
-#   HTF (H1)  : contexte / tendance générale (filtre, pas un blocage strict)
-#   MTF (M30) : détection BOS / FVG / Liquidité interne / Order Block
-#   LTF (M15) : retour de prix + confirmation d'entrée optionnelle
-#
-# Toutes les valeurs importantes sont centralisées ici — rien en dur
-# ailleurs dans le moteur.
-
-ORDER_BLOCK_CONFIG = {
-    "ENABLED": True,
-    "BOS_REQUIRED": True,
-    "FVG_REQUIRED": True,
-    "LIQUIDITY_SWEEP_REQUIRED": True,
-    # ✅ Section 8 de la spec : une 4e règle est évoquée dans le TITRE de la
-    # vidéo ("Mes 4 règles") mais seules 3 règles sont réellement détaillées
-    # dans le contenu visible. On ne fabrique pas de 4e condition — elle
-    # reste désactivée et documentée comme non définie avec précision.
-    "FOURTH_CONFIRMATION_ENABLED": False,
-    "BOS_CONFIRMATION_MODE": "CLOSE",   # "CLOSE" ou "WICK"
-    "MAX_OB_TOUCHES": 2,                # au-delà, l'OB est considéré "mitigé"
-    "MIN_RR": 1.3,
-    "HTF_GRANULARITE": 3600,   # H1
-    "MTF_GRANULARITE": 1800,   # M30
-    "LTF_GRANULARITE": 900,    # M15
-}
-
-# Mémoire de fraîcheur des Order Blocks détectés (touch_count) — persiste
-# tant que le processus tourne, remise à zéro à chaque redéploiement.
-_ob_touch_cache = {}
-
-def _cle_ob(symbole, direction, ob):
-    return (symbole, direction, round(ob["bas"], 2), round(ob["haut"], 2))
-
-def detecter_bos(df, ordre_swing=2, mode="CLOSE", fenetre_recente=15):
-    """
-    RÈGLE 1 — Tendance = BOS. Cherche un BOS "récent" (dans les
-    `fenetre_recente` dernières bougies CLÔTURÉES, jamais la bougie en
-    cours de formation) plutôt que seulement les 2 dernières — un retour
-    de prix dans l'Order Block se produit souvent plusieurs bougies après
-    la cassure elle-même, pas immédiatement dessus.
-    mode="CLOSE" exige une clôture au-delà du swing (pas une simple mèche) —
-    mode="WICK" accepte une mèche.
-    Retourne le BOS le plus RÉCENT trouvé : {direction, prix_swing_casse,
-    idx_bos, idx_swing} ou None.
-    """
-    try:
-        sub = df.iloc[:-1].reset_index(drop=True)  # exclut la bougie en formation
-        n = len(sub)
-        if n < ordre_swing * 2 + 6:
-            return None
-
-        highs = sub['high'].values
-        lows = sub['low'].values
-        closes = sub['close'].values
-
-        debut_recherche = max(ordre_swing, n - fenetre_recente)
-        meilleur = None
-        for i in range(debut_recherche, n):
-            # swings connus strictement AVANT la bougie i
-            idx_highs = [j for j in range(ordre_swing, i - ordre_swing)
-                         if highs[j] == highs[max(0, j-ordre_swing):j+ordre_swing+1].max()]
-            idx_lows = [j for j in range(ordre_swing, i - ordre_swing)
-                        if lows[j] == lows[max(0, j-ordre_swing):j+ordre_swing+1].min()]
-            if not idx_highs or not idx_lows:
-                continue
-            swing_high_idx, swing_low_idx = idx_highs[-1], idx_lows[-1]
-            swing_high, swing_low = float(highs[swing_high_idx]), float(lows[swing_low_idx])
-
-            ref_haut = closes[i] if mode == "CLOSE" else highs[i]
-            ref_bas  = closes[i] if mode == "CLOSE" else lows[i]
-            if ref_haut > swing_high:
-                meilleur = {"direction": "BULL", "prix_swing_casse": swing_high,
-                            "idx_bos": i, "idx_swing": swing_high_idx}
-            elif ref_bas < swing_low:
-                meilleur = {"direction": "BEAR", "prix_swing_casse": swing_low,
-                            "idx_bos": i, "idx_swing": swing_low_idx}
-        return meilleur
-    except Exception:
-        return None
-
-
-def _detecter_bos_ancien_non_utilise(df, ordre_swing=3, mode="CLOSE"):
-    try:
-        sub = df.iloc[:-1].reset_index(drop=True)  # exclut la bougie en formation
-        n = len(sub)
-        if n < ordre_swing * 2 + 6:
-            return None
-
-        highs = sub['high'].values
-        lows = sub['low'].values
-        closes = sub['close'].values
-
-        limite = n - 2  # on ne considère les swings que AVANT les 2 dernières bougies
-        idx_highs = [i for i in range(ordre_swing, limite - ordre_swing)
-                     if highs[i] == highs[max(0, i-ordre_swing):i+ordre_swing+1].max()]
-        idx_lows = [i for i in range(ordre_swing, limite - ordre_swing)
-                    if lows[i] == lows[max(0, i-ordre_swing):i+ordre_swing+1].min()]
-        if not idx_highs or not idx_lows:
-            return None
-
-        swing_high_idx, swing_low_idx = idx_highs[-1], idx_lows[-1]
-        swing_high, swing_low = float(highs[swing_high_idx]), float(lows[swing_low_idx])
-
-        for i in range(n - 2, n):
-            ref_haut = closes[i] if mode == "CLOSE" else highs[i]
-            ref_bas  = closes[i] if mode == "CLOSE" else lows[i]
-            if ref_haut > swing_high:
-                return {"direction": "BULL", "prix_swing_casse": swing_high,
-
-                        "idx_bos": i, "idx_swing": swing_high_idx}
-            if ref_bas < swing_low:
-                return {"direction": "BEAR", "prix_swing_casse": swing_low,
-                        "idx_bos": i, "idx_swing": swing_low_idx}
-        return None
-    except Exception:
-        return None
-
-def detecter_fvg_dans_zone(df, idx_debut, idx_fin, direction):
-    """
-    RÈGLE 2 — FVG associé au mouvement impulsif ayant produit le BOS
-    (pas n'importe quel FVG du graphique). Cherche un gap 3-bougies entre
-    idx_debut (le swing cassé) et idx_fin (la bougie du BOS).
-    """
-    try:
-        meilleur = None
-        borne = min(idx_fin, len(df) - 1)
-        for i in range(max(idx_debut + 2, 2), borne + 1):
-            h1, l1 = float(df['high'].iloc[i-2]), float(df['low'].iloc[i-2])
-            h3, l3 = float(df['high'].iloc[i]), float(df['low'].iloc[i])
-            if direction == "BULL" and h1 < l3:
-                meilleur = {"type": "BULL", "haut": l3, "bas": h1, "idx": i}
-            elif direction == "BEAR" and l1 > h3:
-                meilleur = {"type": "BEAR", "haut": l1, "bas": h3, "idx": i}
-        return meilleur
-    except Exception:
-        return None
-
-def detecter_liquidity_sweep(df, idx_reference, direction, lookback=25):
-    """
-    RÈGLE 3 — Prise de liquidité interne avant le mouvement impulsif : un
-    niveau mineur pris (mèche au-delà) puis rejeté immédiatement dans le
-    sens du mouvement à venir. Une simple cassure ne suffit pas — il faut
-    le rejet (clôture qui revient au-delà du niveau).
-    """
-    try:
-        debut = max(0, idx_reference - lookback)
-        sub = df.iloc[debut: idx_reference + 1]
-        if len(sub) < 5:
-            return None
-        if direction == "BULL":
-            niveau = float(sub['low'].iloc[:-2].min())
-            derniere = sub.iloc[-1]
-            if float(derniere['low']) < niveau and float(derniere['close']) > niveau:
-                return {"type": "BULL", "niveau": niveau}
-        else:
-            niveau = float(sub['high'].iloc[:-2].max())
-            derniere = sub.iloc[-1]
-            if float(derniere['high']) > niveau and float(derniere['close']) < niveau:
-                return {"type": "BEAR", "niveau": niveau}
-        return None
-    except Exception:
-        return None
-
-def detecter_order_block_zone(df, idx_swing, direction):
-    """
-    Identifie la zone d'Order Block : la dernière bougie OPPOSÉE pertinente
-    juste avant le mouvement impulsif qui a cassé la structure. On ne
-    considère pas chaque bougie opposée — seulement celle qui précède
-    directement le déplacement (recherche bornée à 12 bougies en arrière).
-    """
-    try:
-        for i in range(idx_swing, max(idx_swing - 12, 0), -1):
-            o, c = float(df['open'].iloc[i]), float(df['close'].iloc[i])
-            if direction == "BULL" and c < o:
-                return {"haut": max(o, c, float(df['high'].iloc[i])),
-                        "bas": float(df['low'].iloc[i]), "idx": i}
-            if direction == "BEAR" and c > o:
-                return {"haut": float(df['high'].iloc[i]),
-                        "bas": min(o, c, float(df['low'].iloc[i])), "idx": i}
-        return None
-    except Exception:
-        return None
-
-def analyser_order_block_engine(symbole):
-    """
-    MOTEUR UNIQUE DE STRATÉGIE — Order Block.
-    STRUCTURE → BOS → DÉPLACEMENT → FVG → LIQUIDITÉ INTERNE → ORDER BLOCK
-    → RETOUR EN ZONE → CONFIRMATION (optionnelle) → ENTRY → SL → TP.
-
-    Ne fabrique jamais de signal si une condition centrale échoue : retourne
-    None (NO TRADE), jamais un signal dégradé pour "avoir quelque chose".
-    """
-    if not ORDER_BLOCK_CONFIG["ENABLED"]:
-        return None
-
-    c_htf = obtenir_donnees_deriv(symbole, ORDER_BLOCK_CONFIG["HTF_GRANULARITE"])
-    c_mtf = obtenir_donnees_deriv(symbole, ORDER_BLOCK_CONFIG["MTF_GRANULARITE"])
-    c_ltf = obtenir_donnees_deriv(symbole, ORDER_BLOCK_CONFIG["LTF_GRANULARITE"])
-
-    if not c_htf or not c_mtf or not c_ltf or len(c_htf) < 50 or len(c_mtf) < 50 or len(c_ltf) < 20:
-        print(f"[OB SCANNER] {symbole} REJECTED — REASON: insufficient data", flush=True)
-        return None
-
-    try:
-        df_htf = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
-                                 "low":float(c["low"]),"close":float(c["close"])} for c in c_htf])
-        df_mtf = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
-                                 "low":float(c["low"]),"close":float(c["close"])} for c in c_mtf])
-        df_ltf = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
-                                 "low":float(c["low"]),"close":float(c["close"])} for c in c_ltf])
-
-        px = float(df_ltf['close'].iloc[-1])
-
-        # ── RÈGLE 1 : TENDANCE = BOS (sur MTF) ──
-        bos = detecter_bos(df_mtf, mode=ORDER_BLOCK_CONFIG["BOS_CONFIRMATION_MODE"])
-        if ORDER_BLOCK_CONFIG["BOS_REQUIRED"] and not bos:
-            print(f"[OB SCANNER] {symbole} REJECTED — REASON: No BOS", flush=True)
-            return None
-        direction = bos["direction"]
-
-        ema20_htf = _ema(df_htf['close'], 20)
-        ema50_htf = _ema(df_htf['close'], 50)
-        tendance_htf = "BULL" if ema20_htf.iloc[-2] > ema50_htf.iloc[-2] else "BEAR"
-
-        # ── RÈGLE 2 : FVG associé au déplacement ──
-        fvg = detecter_fvg_dans_zone(df_mtf, bos["idx_swing"], bos["idx_bos"], direction)
-        if ORDER_BLOCK_CONFIG["FVG_REQUIRED"] and not fvg:
-            print(f"[OB SCANNER] {symbole} REJECTED — REASON: No FVG", flush=True)
-            return None
-
-        # ── RÈGLE 3 : PRISE DE LIQUIDITÉ INTERNE ──
-        liquidite = detecter_liquidity_sweep(df_mtf, bos["idx_swing"], direction)
-        if ORDER_BLOCK_CONFIG["LIQUIDITY_SWEEP_REQUIRED"] and not liquidite:
-            print(f"[OB SCANNER] {symbole} REJECTED — REASON: No liquidity sweep", flush=True)
-            return None
-
-        # ── IDENTIFICATION DE L'ORDER BLOCK ──
-        ob = detecter_order_block_zone(df_mtf, bos["idx_swing"], direction)
-        if not ob:
-            print(f"[OB SCANNER] {symbole} REJECTED — REASON: No valid OB candle", flush=True)
-            return None
-
-        # ── FRAÎCHEUR ──
-        cle = _cle_ob(symbole, direction, ob)
-        touches = _ob_touch_cache.get(cle, 0)
-        if touches >= ORDER_BLOCK_CONFIG["MAX_OB_TOUCHES"]:
-            print(f"[OB SCANNER] {symbole} REJECTED — REASON: OB already mitigated ({touches} touches)", flush=True)
-            return None
-
-        # ── RETOUR DU PRIX DANS L'OB (LTF) ──
-        if not (ob["bas"] <= px <= ob["haut"]):
-            print(f"[OB SCANNER] {symbole} REJECTED — REASON: price not back in OB "
-                  f"[{ob['bas']:.5f},{ob['haut']:.5f}], px={px}", flush=True)
-            return None
-
-        # ── CONFIRMATION D'ENTRÉE (module séparé, OPTIONNEL — n'est pas une
-        # des 3 règles centrales de la vidéo, affine seulement le score) ──
-        pattern, _ = detecter_chandeliers_pdf(df_ltf)
-        patterns_bull = ("PIN_BULL", "ENGULFING_BULL", "MARUBOZU_BULL")
-        patterns_bear = ("PIN_BEAR", "ENGULFING_BEAR", "MARUBOZU_BEAR")
-        confirmation_ok = (direction == "BULL" and pattern in patterns_bull) or \
-                           (direction == "BEAR" and pattern in patterns_bear)
-
-        # ── SL / TP STRUCTURELS ──
-        atr_mtf = calculer_atr(df_mtf)
-        marge = atr_mtf * 0.15 if atr_mtf > 0 else ob["haut"] * 0.001
-
-        if direction == "BULL":
-            signal_dir = "BUY"
-            sl = ob["bas"] - marge
-            distance = px - sl
-            if distance <= 0:
-                return None
-            niveaux = detecter_niveaux_cles(df_mtf)
-            cibles = [n for n in niveaux if n > px]
-            tp = min(cibles) if cibles else px + distance * 2.0
-            tp1 = px + distance * 1.0
-        else:
-            signal_dir = "SELL"
-            sl = ob["haut"] + marge
-            distance = sl - px
-            if distance <= 0:
-                return None
-            niveaux = detecter_niveaux_cles(df_mtf)
-            cibles = [n for n in niveaux if n < px]
-            tp = max(cibles) if cibles else px - distance * 2.0
-            tp1 = px - distance * 1.0
-
-        rr = abs(tp - px) / abs(px - sl) if abs(px - sl) > 0 else 0
-        if rr < ORDER_BLOCK_CONFIG["MIN_RR"]:
-            print(f"[OB SCANNER] {symbole} REJECTED — REASON: RR {rr:.2f} < {ORDER_BLOCK_CONFIG['MIN_RR']}", flush=True)
-            return None
-
-        # ── SCORE DE QUALITÉ (indépendant de l'IA — pas une probabilité garantie) ──
-        score = 25 + (20 if fvg else 0) + (20 if liquidite else 0) + \
-                (15 if confirmation_ok else 0) + (10 if touches == 0 else 0) + \
-                (10 if direction == tendance_htf else 0)
-        grade = "A+" if score >= 90 else "A" if score >= 75 else "B" if score >= 55 else "C"
-
-        _ob_touch_cache[cle] = touches + 1
-
-        print(f"[OB SCANNER] Symbol: {symbole} | BOS: YES | FVG: {'YES' if fvg else 'NO'} | "
-              f"LIQUIDITY SWEEP: {'YES' if liquidite else 'NO'} | OB: {direction} | "
-              f"FRESHNESS: {'HIGH' if touches==0 else 'USED'} | RR: {rr:.2f} | "
-              f"SCORE: {score} ({grade}) | STATUS: VALID", flush=True)
-
-        return {
-            "action": "🟢 ACHAT (BUY)" if signal_dir == "BUY" else "🔴 VENTE (SELL)",
-            "tendance": direction, "force": f"BOS {direction} confirmé (MTF)",
-            "msg": f"Order Block {direction} — BOS+FVG+Liquidité confirmés (grade {grade})",
-            "sl": round(sl, 5), "tp1": round(tp1, 5), "tp": round(tp, 5),
-            "rr": round(rr, 2), "px": round(px, 5),
-            "strategie": 1, "confiance": min(97, score),
-            "label": "ORDER BLOCK ENGINE",
-            "zones_confluence": [f"Order Block {direction}"],
-            "order_block": (ob["bas"], ob["haut"]), "niveau_cle": None,
-            "setup_score": score, "setup_grade": grade,
-            "bos_confirmed": True, "fvg_confirmed": bool(fvg),
-            "liquidity_sweep_confirmed": bool(liquidite),
-        }
-    except Exception as e:
-        print(f"[OrderBlock/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
-        return None
-
-# ==========================================
-# ✅ V62 : DEUX STRATÉGIES ALTERNATIVES, PLUS HAUTE FRÉQUENCE
-# ==========================================
-# L'Order Block (3 conditions structurelles rares à aligner) produit très
-# peu de signaux sur Gold. Ces deux stratégies reposent sur des conditions
-# statistiques courantes (contact de bande, croisement de moyennes) —
-# mécaniquement plus fréquentes. À comparer par backtest avant de choisir
-# laquelle devient la stratégie unique du bot.
-
-BOLLINGER_CONFIG = {
-    "PERIODE": 20, "ECART_TYPE": 2.0,
-    "RSI_SURVENTE": 30, "RSI_SURACHAT": 70,
-    "MIN_RR": 1.0,
-    "GRANULARITE": 900,  # M15
-}
-
-def analyser_bollinger_rsi_reversion(symbole):
-    """
-    Stratégie 1 — Retour à la moyenne : le prix touche/dépasse la bande de
-    Bollinger extérieure (SMA20 ± 2 écarts-types) + RSI en zone extrême.
-    Cible = la bande médiane (SMA20), pas un swing structurel lointain —
-    plus fréquent par nature qu'une confluence à 3 conditions rares.
-    """
-    c15 = obtenir_donnees_deriv(symbole, BOLLINGER_CONFIG["GRANULARITE"])
-    if not c15 or len(c15) < 40:
-        return None
-    try:
-        df = pd.DataFrame([{"open":float(c["open"]),"high":float(c["high"]),
-                             "low":float(c["low"]),"close":float(c["close"])} for c in c15])
-        periode = BOLLINGER_CONFIG["PERIODE"]
-        sma = df['close'].rolling(periode).mean()
-        std = df['close'].rolling(periode).std()
-        bande_haute = sma + BOLLINGER_CONFIG["ECART_TYPE"] * std
-        bande_basse = sma - BOLLINGER_CONFIG["ECART_TYPE"] * std
-
-        derniere = df.iloc[-2]  # bougie clôturée
-        px = float(derniere['close'])
-        milieu = float(sma.iloc[-2])
-        haut, bas = float(bande_haute.iloc[-2]), float(bande_basse.iloc[-2])
-        if pd.isna(milieu) or pd.isna(haut) or pd.isna(bas):
-            return None
-
-        try:
-            rsi_val = float(ta.momentum.RSIIndicator(close=df["close"], window=14).rsi().iloc[-2])
-        except Exception:
-            rsi_val = 50.0
-
-        direction = None
-        if float(derniere['low']) <= bas and rsi_val <= BOLLINGER_CONFIG["RSI_SURVENTE"]:
-            direction = "BULL"
-        elif float(derniere['high']) >= haut and rsi_val >= BOLLINGER_CONFIG["RSI_SURACHAT"]:
-            direction = "BEAR"
-        if not direction:
-            return None
-
-        pattern, _ = detecter_chandeliers_pdf(df)
-        bonus_pattern = 10 if (
-            (direction == "BULL" and pattern in ("PIN_BULL","ENGULFING_BULL","MARUBOZU_BULL")) or
-            (direction == "BEAR" and pattern in ("PIN_BEAR","ENGULFING_BEAR","MARUBOZU_BEAR"))
-        ) else 0
-
-        atr15 = calculer_atr(df)
-        marge = atr15 * 0.2 if atr15 > 0 else abs(haut - bas) * 0.05
-
-        if direction == "BULL":
-            signal_dir = "BUY"
-            sl = bas - marge
-            distance = px - sl
-            if distance <= 0: return None
-            tp = milieu
-            tp1 = px + distance * 0.6
-        else:
-            signal_dir = "SELL"
-            sl = haut + marge
-            distance = sl - px
-            if distance <= 0: return None
-            tp = milieu
-            tp1 = px - distance * 0.6
-
-        rr = abs(tp - px) / abs(px - sl) if abs(px - sl) > 0 else 0
-        if rr < BOLLINGER_CONFIG["MIN_RR"]:
-            return None
-
-        score = 60 + bonus_pattern + (15 if (rsi_val <= 20 or rsi_val >= 80) else 0)
-        print(f"[BOLLINGER] {symbole} ✅ SIGNAL — direction={direction} RSI={rsi_val:.1f} "
-              f"bande=[{bas:.5f},{haut:.5f}] rr={rr:.2f}", flush=True)
-
-        return {
-            "action": "🟢 ACHAT (BUY)" if signal_dir == "BUY" else "🔴 VENTE (SELL)",
-            "tendance": direction, "force": f"RSI {rsi_val:.1f}",
-            "msg": f"Bollinger + RSI : retour à la moyenne ({pattern.replace('_',' ')})",
-            "sl": round(sl,5), "tp1": round(tp1,5), "tp": round(tp,5),
-            "rr": round(rr,2), "px": round(px,5),
-            "strategie": 1, "confiance": min(95, score),
-            "label": "BOLLINGER + RSI (retour à la moyenne)",
-            "zones_confluence": ["Bande de Bollinger"],
-            "order_block": None, "niveau_cle": None,
-        }
-    except Exception as e:
-        print(f"[Bollinger/{symbole}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
-        return None
+        return 50.0
 
 EMA_CROSS_CONFIG = {
     "EMA_RAPIDE": 5, "EMA_LENTE": 20,
     "MIN_RR": 1.5,
-    "GRANULARITE": 300,  # M5
+    "GRANULARITE": 300,
 }
 
 def analyser_ema_cross(symbole):
-    """
-    Stratégie 2 — Croisement de moyennes mobiles (EMA5/EMA20 sur M5) : un
-    signal mécanique et fréquent, sans condition structurelle à aligner.
-    """
     c5 = obtenir_donnees_deriv(symbole, EMA_CROSS_CONFIG["GRANULARITE"])
     if not c5 or len(c5) < 40:
         return None
@@ -1974,8 +1118,6 @@ def analyser_ema_cross(symbole):
         ema_rapide = _ema(df['close'], EMA_CROSS_CONFIG["EMA_RAPIDE"])
         ema_lente  = _ema(df['close'], EMA_CROSS_CONFIG["EMA_LENTE"])
 
-        # Croisement sur la dernière bougie clôturée : rapide vs lente a
-        # changé de côté entre l'avant-dernière et la dernière bougie.
         avant = ema_rapide.iloc[-3] - ema_lente.iloc[-3]
         maintenant = ema_rapide.iloc[-2] - ema_lente.iloc[-2]
         if pd.isna(avant) or pd.isna(maintenant):
@@ -2045,12 +1187,8 @@ def detecter_contexte_pdf(symbole):
     contexte_marche_cache[symbole] = {"contexte": contexte, "ts": time.time()}
     return contexte
 
-# ==========================================
-# MOTEUR IA DE VALIDATION DES SIGNAUX
-# ==========================================
-
 IA_CONFIG = {
-    "seuil_acceptation": 78,
+    "seuil_acceptation": 55,
     "groq_active": True,
     "groq_seuil_veto": 32,
     "poids": {
@@ -2313,22 +1451,6 @@ def calculer_atr(df, period=14):
         return float(tr.rolling(period).mean().iloc[-2])
     except Exception:
         return 0.0
-
-def evaluer_structure_marche(df):
-    try:
-        highs = df['high'].iloc[-20:].values
-        lows = df['low'].iloc[-20:].values
-        if len(highs) < 2 or len(lows) < 2:
-            return 50.0
-        hh = sum(1 for i in range(1, len(highs)) if highs[i] > highs[i-1])
-        hl = sum(1 for i in range(1, len(lows)) if lows[i] > lows[i-1])
-        lh = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i-1])
-        ll = sum(1 for i in range(1, len(lows)) if lows[i] < lows[i-1])
-        coherence_bull = (hh + hl) / (2 * (len(highs) - 1))
-        coherence_bear = (lh + ll) / (2 * (len(lows) - 1))
-        return round(max(coherence_bull, coherence_bear) * 100, 1)
-    except Exception:
-        return 50.0
 
 def calculer_distance_support_resistance(df, px):
     try:
@@ -2652,10 +1774,6 @@ def stats_par_contexte_marche():
         groupes.setdefault(tendance, []).append(h)
     return {k: _winrate(v) for k, v in groupes.items()}
 
-# ==========================================
-# CERVEAU PRO TRADER
-# ==========================================
-
 def cerveau_pro_trader(symbole):
     signaux_valides = []
     print(f"[DEBUG] === Analyse {symbole} — début cycle ===", flush=True)
@@ -2716,10 +1834,6 @@ def cerveau_pro_trader(symbole):
         signal_brut["gestion_risque"]       = verdict.get("gestion_risque", {})
         signaux_valides.append(signal_brut)
     return signaux_valides
-
-# ==========================================
-# ✅ /Volatility GRANULAIRE
-# ==========================================
 
 @bot.message_handler(commands=['Volatility'])
 def gerer_volatility(message):
@@ -2787,10 +1901,6 @@ def gerer_commodities(message):
         return bot.send_message(message.chat.id, msg, parse_mode="Markdown")
     bot.send_message(message.chat.id, f"❌ Paire inconnue: {paire}\nValides: XAUUSD, XAGUSD, ALL")
 
-# ==========================================
-# /risk
-# ==========================================
-
 @bot.message_handler(commands=['risk'])
 def gerer_risque(message):
     if message.chat.id != ADMIN_ID:
@@ -2820,10 +1930,6 @@ def gerer_risque(message):
         except ValueError:
             return bot.send_message(message.chat.id, "❌ Valeur invalide.")
     bot.send_message(message.chat.id, "❌ Paramètre inconnu.")
-
-# ==========================================
-# /iaconfig
-# ==========================================
 
 @bot.message_handler(commands=['iaconfig'])
 def gerer_ia_config(message):
@@ -2943,11 +2049,6 @@ def test_groq_reel(message):
 
 @bot.message_handler(commands=['testderiv'])
 def test_deriv_reel(message):
-    """
-    ✅ Diagnostic honnête, étape par étape, pour la NOUVELLE API Deriv
-    (REST → OTP → WebSocket). Ne révèle jamais le token en entier, teste
-    chaque étape séparément pour localiser précisément où ça bloque.
-    """
     uid = message.chat.id
     if not est_autorise(uid): return
 
@@ -2979,7 +2080,6 @@ def test_deriv_reel(message):
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔄 Étape 1/3 : récupération des comptes (REST)...", parse_mode="Markdown")
 
-    # Étape 1 : GET /trading/v1/options/accounts
     try:
         account_id = deriv_get_account_id(force_refresh=True)
         bot.send_message(uid, f"✅ Étape 1/3 réussie — compte trouvé : `{account_id}`",
@@ -2993,7 +2093,6 @@ def test_deriv_reel(message):
             f"révoqué depuis.",
             parse_mode="Markdown")
 
-    # Étape 2 : POST .../otp
     try:
         ws_url = _deriv_obtenir_ws_url(force_refresh=True)
         bot.send_message(uid, "✅ Étape 2/3 réussie — OTP obtenu, URL WebSocket générée.")
@@ -3002,7 +2101,6 @@ def test_deriv_reel(message):
             f"❌ *ÉTAPE 2/3 ÉCHOUÉE — génération de l'OTP*\n`{e}`",
             parse_mode="Markdown")
 
-    # Étape 3 : connexion WS + requête balance
     try:
         solde = deriv_connecter()
         bot.send_message(uid,
@@ -3073,10 +2171,6 @@ def ia_stats(message):
         lignes.append("/iastats heure · /iastats groq · /iastats contexte")
     bot.send_message(uid, "\n".join(lignes), parse_mode="Markdown")
 
-# ==========================================
-# /rapport
-# ==========================================
-
 def generer_rapport_texte(uid):
     stats = init_daily_stats(uid)
     total = stats["trades"]
@@ -3119,10 +2213,6 @@ def envoyer_rapports_quotidiens_auto():
                 dernier_envoi = cle_jour
         except Exception as e:
             print(f"[Rapport Auto] {e}", flush=True)
-
-# ==========================================
-# /pause /resume
-# ==========================================
 
 @bot.message_handler(commands=['pause'])
 def pause_manuelle(message):
@@ -3189,10 +2279,6 @@ def status_technique(message):
     )
     bot.send_message(uid, txt, parse_mode="Markdown")
 
-# ==========================================
-# SCANNER PRINCIPAL
-# ==========================================
-
 def _analyser_une_paire(paire):
     try:
         statut, raison = est_symbole_autorise(paire)
@@ -3224,7 +2310,7 @@ def scanner_marche_auto():
     toutes_paires = ELITE_PAIRS_MT5
     while True:
         try:
-            time.sleep(8)  # ✅ V57: cycle plus rapide (15→8s), adapté au scalping M1
+            time.sleep(8)
             libres = [u for u in utilisateurs_actifs if est_autorise(u)]
             if not libres:
                 continue
@@ -3273,9 +2359,6 @@ def scanner_marche_auto():
                     peut_trader, raison = utilisateur_peut_trader(uid)
                     if not peut_trader: continue
 
-                    # ✅ NOUVEAU : EXÉCUTION 100% AUTOMATIQUE (comme l'EA vidéo)
-                    # Si auto-trading est ON, on ouvre directement le trade réel
-                    # via Deriv, sans passer par le bouton "Copier".
                     if peut_ouvrir_automatiquement(paire):
                         try:
                             trade_id, sizing = ouvrir_trade(
@@ -3289,6 +2372,11 @@ def scanner_marche_auto():
                                 contexte_marche=res.get("contexte_marche"),
                                 executer_reel=True,
                             )
+                            multiplicateur_affiche = (trades_actifs.get(uid, {})
+                                                       .get("deriv_multiplier_final")
+                                                       or CONTROL_STATE['multiplier'])
+                            note_mult = (f" ⚠️ ajusté par Deriv (x{CONTROL_STATE['multiplier']} refusé sur {nom})"
+                                         if multiplicateur_affiche != CONTROL_STATE['multiplier'] else "")
                             txt_auto = (
                                 f"🤖 *TRADE OUVERT AUTOMATIQUEMENT*\n"
                                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3298,7 +2386,7 @@ def scanner_marche_auto():
                                 f"🛑 SL : {res['sl']:.5f}  🎯 TP : {res['tp']:.5f}\n"
                                 f"⚖️ R/R : {res['rr']}R · 🎖️ Confiance {res['confiance']}%\n"
                                 f"🤖 Score IA : {res.get('ia_score','?')}%\n"
-                                f"💵 Mise réelle : ${CONTROL_STATE['stake_usd']} x{CONTROL_STATE['multiplier']}\n"
+                                f"💵 Mise réelle : ${CONTROL_STATE['stake_usd']} x{multiplicateur_affiche}{note_mult}\n"
                                 f"🆔 {trade_id}"
                             )
                             bot.send_message(uid, txt_auto, parse_mode="Markdown")
@@ -3310,7 +2398,6 @@ def scanner_marche_auto():
                                 pass
                         continue
 
-                    # ── Mode manuel classique (auto-trading OFF) : bouton "Copier" ──
                     markup = InlineKeyboardMarkup().add(
                         InlineKeyboardButton(f"⚡ Copier {nom}", callback_data=f"set_{cle}")
                     )
@@ -3391,10 +2478,6 @@ def scanner_marche_auto():
                         pass
         except Exception as e:
             print(f"[Scanner V55] {e}", flush=True)
-
-# ==========================================
-# MONITORING DES TRADES
-# ==========================================
 
 def monitorer_trades_actifs():
     while True:
@@ -3514,10 +2597,6 @@ def envoyer_message_resultat(uid, trade, result, perte_totale, partiel_deja_pris
     try: bot.send_message(uid, msg, parse_mode="Markdown")
     except: pass
 
-# ==========================================
-# GESTION DES CLÉS VIP
-# ==========================================
-
 DUREES_VALIDES = {
     "1s": (7,"1 Semaine"), "2s": (14,"2 Semaines"),
     "1m": (30,"1 Mois"),   "3m": (90,"3 Mois"),
@@ -3614,10 +2693,6 @@ def historique_trades(message):
         lignes.append(f"{emoji} {t['symbol']} {t['direction']} | "
                       f"{t['pnl']:+.2f}$ | {date_str}")
     bot.send_message(uid, "\n".join(lignes), parse_mode="Markdown")
-
-# ==========================================
-# ✅ NOUVEAU : PANNEAU DE CONTRÔLE TELEGRAM
-# ==========================================
 
 def obtenir_clavier(uid):
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -3809,10 +2884,6 @@ def confirmer_stop_urgence(call):
         f"Utilise à nouveau '🛑 STOP D'URGENCE' pour lever le blocage quand tu es prêt à reprendre.",
         reply_markup=obtenir_clavier(uid), parse_mode="Markdown")
 
-# ==========================================
-# INTERFACE TELEGRAM PRINCIPALE
-# ==========================================
-
 @bot.message_handler(commands=['start'])
 def bienvenue(message):
     uid = message.chat.id
@@ -3938,7 +3009,7 @@ def save_devise(call):
 
     px  = obtenir_prix_broker_realtime(actif) or 0
     nom = NOMS_AFFICHAGE.get(actif, actif)
-    fmt = ".5f"  # ✅ FIX: ".0f" écrasait les décimales des indices Volatility (SL et entrée s'affichaient identiques)
+    fmt = ".0f" if actif in VOLATILE_PAIRS else ".5f"
     if px <= 0:
         return bot.send_message(uid,
             f"⚠️ Impossible de récupérer le prix actuel de {nom}. Réessaie dans un instant.",
@@ -3988,7 +3059,6 @@ def save_devise(call):
             f"Aucun trade ouvert pour protéger la qualité de l'entrée.",
             parse_mode="Markdown")
 
-    # Exécution manuelle : réelle uniquement si auto-trading est ON (cohérence globale)
     executer_reel_manuel = CONTROL_STATE["auto_trading_active"] and not CONTROL_STATE["stop_urgence_actif"]
 
     trade_id, sizing = ouvrir_trade(uid, actif, entry_direction, px,
@@ -4026,14 +3096,8 @@ def save_devise(call):
     )
     bot.send_message(uid, signal, parse_mode="Markdown")
 
-# ==========================================
-# LANCEMENT
-# ==========================================
-
 if __name__ == "__main__":
     keep_alive()
-    # ✅ Connexion Deriv tentée au démarrage (non bloquante si elle échoue —
-    # l'admin pourra réessayer via le bouton "AUTO-TRADING" dans /menu).
     try:
         deriv_connecter()
         print("✅ Deriv connecté au démarrage", flush=True)
