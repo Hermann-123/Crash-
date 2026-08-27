@@ -248,35 +248,33 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price=None
     """
     Ouvre un contrat Multiplicateur. direction: "BUY" -> MULTUP, "SELL" -> MULTDOWN.
     stake : mise en USD. multiplier : effet de levier demandé (ex 10) —
-    peut être automatiquement corrigé si l'actif n'accepte pas cette valeur
-    (voir plus bas). Retourne (contract_id, multiplicateur_reellement_utilise).
+    peut être automatiquement corrigé si l'actif n'accepte pas cette valeur.
+    Retourne (contract_id, multiplicateur_reellement_utilise).
 
-    ✅ FIX #1 : sur les contrats Multiplicateurs, l'API Deriv attend
-    stop_loss/take_profit comme des MONTANTS EN DOLLARS (perte/profit max
-    avant clôture auto), PAS des niveaux de prix absolus — confirmé par la
-    doc Deriv (limit_order.stop_loss/take_profit = montant $, cf.
-    community.deriv.com/t/take-profit-and-stop-loss-multipliers). On
-    convertit le niveau de prix en montant $ via : montant = mise ×
-    multiplicateur × (distance de prix / prix d'entrée).
+    ✅ FIX #4 (confirmé par la doc officielle Deriv — section Multiplicateurs :
+    "Request a Price: Use the proposal API to get a quote... Buy the
+    Contract: Execute the trade using the buy API with the ID from the
+    proposal response") : Deriv exige un flux en DEUX étapes obligatoires
+    pour tous les types de contrats — proposal (avec les paramètres du
+    contrat : symbol, contract_type, amount, multiplier...) PUIS buy (avec
+    UNIQUEMENT l'ID de la proposition reçue + son prix). Le code précédent
+    envoyait "symbol" et les autres paramètres directement dans l'appel
+    "buy", ce que Deriv rejetait avec "Properties not allowed: symbol" —
+    ce nom de champ n'est simplement pas autorisé à cet endroit du flux.
 
-    ✅ FIX #2 : chaque actif Deriv a sa PROPRE liste de multiplicateurs
-    valides (ex: V50 n'accepte que 80/200/400/600/800 — very différent
-    d'un forex ou d'un gold). Si le multiplicateur configuré globalement
-    (/mult) est refusé, on lit la liste des valeurs acceptées directement
-    dans le message d'erreur Deriv et on retente une fois avec la plus
-    petite (la plus conservatrice en termes de levier) — plutôt que
-    d'échouer silencieusement à chaque cycle.
+    ✅ FIX #1 (conservé) : stop_loss/take_profit sont des MONTANTS EN
+    DOLLARS (pas des niveaux de prix) — montant = mise × multiplicateur ×
+    (distance de prix / prix d'entrée).
 
-    ✅ FIX #3 : Deriv exige un minimum de $1.00 par contrat. Si la mise
-    demandée est sous ce seuil (ex: mise totale $1 découpée en 85%/15%,
-    donnant $0.85 et $0.15 — les deux invalides), on relève cette mise
-    précise au minimum de $1.00 plutôt que d'échouer. Cela peut dépenser
-    légèrement plus que la mise configurée sur les petites valeurs — c'est
-    documenté dans le message renvoyé à l'appelant.
+    ✅ FIX #2 (conservé) : si le multiplicateur configuré est refusé par
+    l'actif, on relit la liste des valeurs acceptées dans le message
+    d'erreur Deriv et on retente avec la plus petite.
+
+    ✅ FIX #3 (conservé) : la mise est relevée au minimum $1.00 exigé par
+    Deriv si elle est réglée plus bas.
     """
     sym = deriv_symbole(symbole)
     contract_type = "MULTUP" if direction.upper() == "BUY" else "MULTDOWN"
-
     stake_ajuste = max(round(stake, 2), MISE_MIN_DERIV_USD)
 
     def _construire_limit_order(mult):
@@ -294,26 +292,25 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price=None
                     limit_order["take_profit"] = montant_tp
         return limit_order
 
-    def _tenter(mult):
-        payload = {
-            "buy": 1,
-            "price": stake_ajuste,
-            "parameters": {
-                "amount": stake_ajuste,
-                "basis": "stake",
-                "contract_type": contract_type,
-                "currency": "USD",
-                "symbol": sym,
-                "multiplier": mult,
-            }
+    def _proposer(mult):
+        """Étape 1/2 : demande une proposition de contrat (prix, faisabilité)."""
+        proposal_payload = {
+            "proposal": 1,
+            "amount": stake_ajuste,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": "USD",
+            "symbol": sym,
+            "multiplier": mult,
         }
         limit_order = _construire_limit_order(mult)
         if limit_order:
-            payload["parameters"]["limit_order"] = limit_order
-        return _deriv_trading_request(payload), limit_order
+            proposal_payload["limit_order"] = limit_order
+        resp = _deriv_trading_request(proposal_payload)
+        return resp, limit_order
 
     try:
-        resp, limit_order = _tenter(multiplier)
+        resp_proposal, limit_order = _proposer(multiplier)
         multiplicateur_utilise = multiplier
     except RuntimeError as e:
         valeurs_ok = _parser_multiplicateurs_acceptes(str(e))
@@ -323,9 +320,19 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price=None
         print(f"[Deriv] {sym}: multiplicateur x{multiplier} refusé — "
               f"retenté avec x{multiplicateur_utilise} (valeurs acceptées par "
               f"Deriv pour cet actif: {valeurs_ok})", flush=True)
-        resp, limit_order = _tenter(multiplicateur_utilise)
+        resp_proposal, limit_order = _proposer(multiplicateur_utilise)
 
-    buy_info = resp.get("buy", {})
+    proposal_data = resp_proposal.get("proposal", {})
+    proposal_id = proposal_data.get("id")
+    prix_ask = proposal_data.get("ask_price", stake_ajuste)
+    if not proposal_id:
+        raise RuntimeError(f"Deriv: proposition reçue sans ID exploitable — réponse: {resp_proposal}")
+
+    # Étape 2/2 : achat effectif à partir de l'ID de la proposition (pas de
+    # paramètres bruts ici — c'est précisément ce que Deriv rejetait).
+    buy_payload = {"buy": proposal_id, "price": prix_ask}
+    resp_buy = _deriv_trading_request(buy_payload)
+    buy_info = resp_buy.get("buy", {})
     contract_id = buy_info.get("contract_id")
     print(f"[Deriv] Contrat ouvert {sym} {contract_type} mise={stake_ajuste} "
           f"multiplicateur=x{multiplicateur_utilise} limit_order={limit_order} "
