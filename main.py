@@ -300,7 +300,7 @@ def deriv_ouvrir_contrat(symbole, direction, stake, multiplier, entry_price=None
             "basis": "stake",
             "contract_type": contract_type,
             "currency": "USD",
-            "underlying_symbol": sym,
+            "symbol": sym,
             "multiplier": mult,
         }
         limit_order = _construire_limit_order(mult)
