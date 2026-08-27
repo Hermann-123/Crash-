@@ -206,7 +206,8 @@ def _deriv_trading_request(payload, timeout=10, _retry=True):
         while time.time() - debut < timeout:
             resp = json.loads(ws.recv())
             if resp.get("error"):
-                raise RuntimeError(f"Deriv API erreur: {resp['error'].get('message')}")
+                erreur = resp["error"]
+                raise RuntimeError(f"Deriv API erreur: {erreur.get('message')} — détails complets: {erreur}")
             if cle_attendue and cle_attendue in resp:
                 return resp
             if resp.get("msg_type") == cle_attendue:
