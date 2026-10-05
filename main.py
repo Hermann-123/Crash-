@@ -58,6 +58,11 @@ async def run_platform_pipeline():
 
         total_tickets = sum(len(v) for v in portfolio.values())
 
+        await bot.send_message(
+            settings.TELEGRAM_CHANNEL_ID,
+            f"🎟 Tickets disponibles : {total_tickets}"
+        )
+
         core_module.LAST_SCAN_SUMMARY = {
             "matches": len(matches),
             "picks": len(all_picks),
@@ -77,6 +82,7 @@ async def run_platform_pipeline():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot.delete_webhook(drop_pending_updates=True)
+    await bot.send_message(settings.TELEGRAM_CHANNEL_ID, "✅ Bot en ligne")
 
     saved_summary = load_json("last_scan_summary.json", {})
     core_module.LAST_SCAN_SUMMARY = saved_summary
