@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+numpy
+scipy
+APScheduler
+aiogram
+httpx
