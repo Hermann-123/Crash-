@@ -23,6 +23,33 @@ market_builder = MarketBuilder()
 ticket_factory = TicketFactory()
 
 
+async def notify_startup():
+    channel_id = settings.TELEGRAM_CHANNEL_ID
+
+    if not channel_id:
+        logger.error("TELEGRAM_CHANNEL_ID est vide ou absent.")
+        return
+
+    try:
+        me = await bot.get_me()
+        logger.info(f"Bot connecté : @{me.username}")
+
+        chat = await bot.get_chat(channel_id)
+        logger.info(
+            f"Canal trouvé : id={chat.id}, title={getattr(chat, 'title', None)}"
+        )
+
+        await bot.send_message(
+            chat_id=channel_id,
+            text="✅ Bot en ligne et opérationnel."
+        )
+
+        logger.info("Message de démarrage envoyé avec succès.")
+
+    except Exception as e:
+        logger.exception(f"Impossible d'envoyer le message de démarrage : {e}")
+
+
 async def run_platform_pipeline():
     if core_module.PIPELINE_LOCK.locked():
         logger.warning("Pipeline déjà en cours, scan ignoré.")
@@ -57,15 +84,17 @@ async def run_platform_pipeline():
         core_module.CACHE_PORTFOLIO = portfolio
 
         total_tickets = sum(len(v) for v in portfolio.values())
+        logger.info(f"Éléments générés : {total_tickets}")
 
-        if settings.TELEGRAM_CHANNEL_ID:
+        if settings.TELEGRAM_CHANNEL_ID and total_tickets > 0:
             try:
                 await bot.send_message(
-                    settings.TELEGRAM_CHANNEL_ID,
-                    f"🎟 Tickets disponibles : {total_tickets}"
+                    chat_id=settings.TELEGRAM_CHANNEL_ID,
+                    text=f"✅ Nouveaux éléments disponibles : {total_tickets}."
                 )
+                logger.info("Notification envoyée avec succès.")
             except Exception as e:
-                logger.exception(f"Erreur envoi Telegram (tickets): {e}")
+                logger.exception(f"Erreur envoi notification : {e}")
 
         core_module.LAST_SCAN_SUMMARY = {
             "matches": len(matches),
@@ -87,11 +116,7 @@ async def run_platform_pipeline():
 async def lifespan(app: FastAPI):
     await bot.delete_webhook(drop_pending_updates=True)
 
-    if settings.TELEGRAM_CHANNEL_ID:
-        try:
-            await bot.send_message(settings.TELEGRAM_CHANNEL_ID, "✅ Bot en ligne")
-        except Exception as e:
-            logger.exception(f"Erreur envoi Telegram (startup): {e}")
+    await notify_startup()
 
     saved_summary = load_json("last_scan_summary.json", {})
     core_module.LAST_SCAN_SUMMARY = saved_summary
