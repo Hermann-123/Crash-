@@ -23,31 +23,20 @@ market_builder = MarketBuilder()
 ticket_factory = TicketFactory()
 
 
-async def notify_startup():
-    channel_id = settings.TELEGRAM_CHANNEL_ID
-
-    if not channel_id:
-        logger.error("TELEGRAM_CHANNEL_ID est vide ou absent.")
+async def send_ticket_alert(count: int):
+    """Envoie une alerte Telegram quand des tickets sont disponibles."""
+    if not settings.TELEGRAM_CHANNEL_ID:
+        logger.error("TELEGRAM_CHANNEL_ID manquant")
         return
-
+    
     try:
-        me = await bot.get_me()
-        logger.info(f"Bot connecté : @{me.username}")
-
-        chat = await bot.get_chat(channel_id)
-        logger.info(
-            f"Canal trouvé : id={chat.id}, title={getattr(chat, 'title', None)}"
-        )
-
         await bot.send_message(
-            chat_id=channel_id,
-            text="✅ Bot en ligne et opérationnel."
+            chat_id=settings.TELEGRAM_CHANNEL_ID,
+            text=f"🎟 {count} ticket(s) disponible(s)"
         )
-
-        logger.info("Message de démarrage envoyé avec succès.")
-
+        logger.info(f"Alerte envoyée : {count} tickets")
     except Exception as e:
-        logger.exception(f"Impossible d'envoyer le message de démarrage : {e}")
+        logger.error(f"Erreur envoi alerte : {e}")
 
 
 async def run_platform_pipeline():
@@ -84,17 +73,10 @@ async def run_platform_pipeline():
         core_module.CACHE_PORTFOLIO = portfolio
 
         total_tickets = sum(len(v) for v in portfolio.values())
-        logger.info(f"Éléments générés : {total_tickets}")
 
-        if settings.TELEGRAM_CHANNEL_ID and total_tickets > 0:
-            try:
-                await bot.send_message(
-                    chat_id=settings.TELEGRAM_CHANNEL_ID,
-                    text=f"✅ Nouveaux éléments disponibles : {total_tickets}."
-                )
-                logger.info("Notification envoyée avec succès.")
-            except Exception as e:
-                logger.exception(f"Erreur envoi notification : {e}")
+        # NOUVEAU : Envoie une alerte si des tickets sont disponibles
+        if total_tickets > 0:
+            await send_ticket_alert(total_tickets)
 
         core_module.LAST_SCAN_SUMMARY = {
             "matches": len(matches),
@@ -115,8 +97,6 @@ async def run_platform_pipeline():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot.delete_webhook(drop_pending_updates=True)
-
-    await notify_startup()
 
     saved_summary = load_json("last_scan_summary.json", {})
     core_module.LAST_SCAN_SUMMARY = saved_summary
