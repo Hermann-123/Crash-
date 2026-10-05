@@ -1,8 +1,8 @@
-pyTelegramBotAPI
-requests
-pandas
-ta
-websocket-client
-websockets
-flask
-metaapi-cloud-sdk
+fastapi
+uvicorn
+pydantic
+numpy
+scipy
+APScheduler
+aiogram
+httpx
