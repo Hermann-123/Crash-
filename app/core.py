@@ -1,44 +1,131 @@
-import os
-import logging
 import asyncio
-from pathlib import Path
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("WallStreet_OS_V3")
-
-
-def _env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
-
-class Settings:
-    TELEGRAM_BOT_TOKEN: str = _env("TELEGRAM_BOT_TOKEN")
-    ADMIN_ID: int = int(_env("ADMIN_ID", "0") or "0")
-    ODDS_API_KEY: str = _env("ODDS_API_KEY")
-    API_FOOTBALL_KEY: str = _env("API_FOOTBALL_KEY")
-    ARCHIVE_CHANNEL_ID: str = _env("ARCHIVE_CHANNEL_ID")
-    PORT: int = int(_env("PORT", "8080"))
-
-    SCAN_INTERVAL_MINUTES: int = int(_env("SCAN_INTERVAL_MINUTES", "45"))
-    MAX_MATCHES_PER_SCAN: int = int(_env("MAX_MATCHES_PER_SCAN", "20"))
-
-    MIN_EDGE_PERCENT: float = float(_env("MIN_EDGE_PERCENT", "4.0"))
-    MIN_CONFIDENCE_PERCENT: float = float(_env("MIN_CONFIDENCE_PERCENT", "58.0"))
-    MIN_SAFE_PROBABILITY: float = float(_env("MIN_SAFE_PROBABILITY", "62.0"))
-    MIN_VALUE_PROBABILITY: float = float(_env("MIN_VALUE_PROBABILITY", "56.0"))
-
-    DATA_DIR: str = _env("DATA_DIR", "data")
+from datetime import datetime
+from contextlib import asynccontextmanager
+import uvicorn
+from fastapi import FastAPI
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import app.core as core_module
+from app.core import settings, logger
+from app.data_providers import OddsProvider, FootballDataProvider
+from app.services import SmartPoissonEngine, ConfidenceEngine, MarketBuilder, TicketFactory
+from app.storage import save_json, load_json
+from app.bot import bot, dp
 
 
-settings = Settings()
+odds_provider = OddsProvider()
+football_provider = FootballDataProvider()
 
-DATA_PATH = Path(settings.DATA_DIR)
-DATA_PATH.mkdir(parents=True, exist_ok=True)
+engine = SmartPoissonEngine()
+confidence_engine = ConfidenceEngine()
+market_builder = MarketBuilder()
+ticket_factory = TicketFactory()
 
-CACHE_PORTFOLIO = {}
-LAST_SCAN_SUMMARY = {}
-PIPELINE_LOCK = asyncio.Lock()
-MANUAL_ANALYSIS_CACHE = {}
+
+async def run_platform_pipeline():
+    if core_module.PIPELINE_LOCK.locked():
+        logger.warning("Pipeline déjà en cours, scan ignoré.")
+        return
+
+    async with core_module.PIPELINE_LOCK:
+        logger.info("🔄 Démarrage scan premium...")
+        matches = await odds_provider.fetch_upcoming_matches()
+
+        all_picks = []
+
+        for match in matches:
+            try:
+                home_form = await football_provider.get_team_form(match.home_team)
+                away_form = await football_provider.get_team_form(match.away_team)
+
+                sim = engine.simulate(match, home_form, away_form)
+                audit = confidence_engine.score(match, sim, home_form, away_form)
+
+                if not audit.is_approved:
+                    continue
+
+                picks = market_builder.build(match, sim, audit)
+                all_picks.extend(picks)
+
+                await asyncio.sleep(0.2)
+
+            except Exception as e:
+                logger.exception(f"Erreur pipeline {match.match_id}: {e}")
+
+        portfolio = ticket_factory.build_portfolio(all_picks)
+        core_module.CACHE_PORTFOLIO = portfolio
+
+        total_tickets = sum(len(v) for v in portfolio.values())
+
+        if settings.TELEGRAM_CHANNEL_ID:
+            try:
+                await bot.send_message(
+                    settings.TELEGRAM_CHANNEL_ID,
+                    f"🎟 Tickets disponibles : {total_tickets}"
+                )
+            except Exception as e:
+                logger.exception(f"Erreur envoi Telegram (tickets): {e}")
+
+        core_module.LAST_SCAN_SUMMARY = {
+            "matches": len(matches),
+            "picks": len(all_picks),
+            "tickets": total_tickets,
+            "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        }
+
+        save_json("last_scan_summary.json", core_module.LAST_SCAN_SUMMARY)
+        save_json(
+            "portfolio.json",
+            {str(k): [t.model_dump() for t in v] for k, v in portfolio.items()}
+        )
+
+        logger.info(f"✅ Scan terminé: {core_module.LAST_SCAN_SUMMARY}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    if settings.TELEGRAM_CHANNEL_ID:
+        try:
+            await bot.send_message(settings.TELEGRAM_CHANNEL_ID, "✅ Bot en ligne")
+        except Exception as e:
+            logger.exception(f"Erreur envoi Telegram (startup): {e}")
+
+    saved_summary = load_json("last_scan_summary.json", {})
+    core_module.LAST_SCAN_SUMMARY = saved_summary
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        run_platform_pipeline,
+        "interval",
+        minutes=settings.SCAN_INTERVAL_MINUTES,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
+
+    startup_task = asyncio.create_task(run_platform_pipeline())
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+
+    yield
+
+    scheduler.shutdown()
+    startup_task.cancel()
+    polling_task.cancel()
+    await bot.session.close()
+
+
+app = FastAPI(title="WallStreet OS V3", lifespan=lifespan)
+
+
+@app.get("/")
+async def root():
+    return {
+        "status": "ONLINE",
+        "version": "V3 Premium",
+        "last_scan": core_module.LAST_SCAN_SUMMARY
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=settings.PORT, reload=False)
