@@ -1,16 +1,10 @@
 """
-WALLSTREET OS v7.1 — 10 ligues + score de réussite + boutons cliquables
-========================================================================
-- Historique         : football-data.co.uk (CSV gratuits)
-- Stats fraîches     : TheStatsAPI (adaptateur configurable)  ← optionnel
-- Fusion             : pondération CSV / API (W_CSV, W_API)
-- Modèle             : Dixon-Coles corrigé (rho)
-- Score de réussite  : proba modèle + taux observé (backtest) + grade
-- Ligues             : 10 (quota The Odds API gratuit respecté)
-- Interface          : commandes + BOUTONS inline cliquables
-- Sortie             : 4 coupons/jour, diff. auto 00h00
-- Suivi              : résolution auto + ROI + CLV (/bilan)
-- Persistance        : GitHub Gist ou fichier local
+WALLSTREET OS v7.3 — clavier bas persistant (6 boutons)
+========================================================
+- 10 ligues · modèle Dixon-Coles · score de réussite + calibration
+- 4 coupons/jour (SÉCURISÉ, ÉQUILIBRÉ, AGRESSIF, VALUE)
+- Boutons SOUS le clavier : 4 tickets + BILAN + SCAN
+- W_API=0 recommandé (fusion désactivée)
 """
 from __future__ import annotations
 
@@ -35,8 +29,7 @@ import httpx
 import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import (Message, CallbackQuery,
-                           InlineKeyboardMarkup, InlineKeyboardButton)
+from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
@@ -58,14 +51,12 @@ SCAN_WINDOW_HOURS = int(os.getenv("SCAN_WINDOW_HOURS", "36"))
 EV_THRESHOLD      = float(os.getenv("EV_THRESHOLD", "0.03"))
 RHO               = float(os.getenv("RHO", "-0.05"))
 
-# ── Fusion CSV / TheStatsAPI ──────────────────────────────────
 THESTATSAPI_KEY   = os.getenv("THESTATSAPI_KEY", "")
 THESTATSAPI_BASE  = os.getenv("THESTATSAPI_BASE", "https://api.thestatsapi.com/v1")
 THESTATSAPI_AUTH  = os.getenv("THESTATSAPI_AUTH", "header")
 W_CSV             = float(os.getenv("W_CSV", "0.7"))
 W_API             = float(os.getenv("W_API", "0.0"))
 
-# Persistance
 GIST_ID           = os.getenv("GIST_ID", "")
 GITHUB_TOKEN      = os.getenv("GITHUB_TOKEN", "")
 LOCAL_DB          = os.getenv("LOCAL_DB", "/tmp/wallstreet.json")
@@ -83,7 +74,7 @@ if W_API > 0 and not THESTATSAPI_KEY:
 
 
 # ════════════════════════════════════════════════════════════════
-# 2. LIGUES (10 — quota The Odds API gratuit respecté)
+# 2. LIGUES
 # ════════════════════════════════════════════════════════════════
 @dataclass(frozen=True)
 class League:
@@ -93,16 +84,16 @@ class League:
     api_id: str
 
 LEAGUES = [
-    League("E0",  "Premier League",       "soccer_epl",                    "epl"),
-    League("E1",  "Championship",         "soccer_efl_champ",              "efl-champ"),
-    League("D1",  "Bundesliga",           "soccer_germany_bundesliga",     "bundesliga"),
-    League("I1",  "Serie A",              "soccer_italy_serie_a",          "serie-a"),
-    League("SP1", "La Liga",              "soccer_spain_la_liga",          "la-liga"),
-    League("F1",  "Ligue 1",              "soccer_france_ligue_one",       "ligue-1"),
-    League("N1",  "Eredivisie",           "soccer_netherlands_eredivisie", "eredivisie"),
-    League("B1",  "Pro League",           "soccer_belgium_first_div",      "belgian-pro"),
-    League("P1",  "Primeira Liga",        "soccer_portugal_primeira_liga", "primeira-liga"),
-    League("T1",  "Süper Lig",            "soccer_turkey_super_league",    "super-lig"),
+    League("E0",  "Premier League", "soccer_epl",                    "epl"),
+    League("E1",  "Championship",   "soccer_efl_champ",              "efl-champ"),
+    League("D1",  "Bundesliga",     "soccer_germany_bundesliga",     "bundesliga"),
+    League("I1",  "Serie A",        "soccer_italy_serie_a",          "serie-a"),
+    League("SP1", "La Liga",        "soccer_spain_la_liga",          "la-liga"),
+    League("F1",  "Ligue 1",        "soccer_france_ligue_one",       "ligue-1"),
+    League("N1",  "Eredivisie",     "soccer_netherlands_eredivisie", "eredivisie"),
+    League("B1",  "Pro League",     "soccer_belgium_first_div",      "belgian-pro"),
+    League("P1",  "Primeira Liga",  "soccer_portugal_primeira_liga", "primeira-liga"),
+    League("T1",  "Süper Lig",      "soccer_turkey_super_league",    "super-lig"),
 ]
 
 TEAM_ALIASES = {
@@ -181,7 +172,7 @@ def _parse_date(s: str) -> Optional[datetime]:
 
 
 # ════════════════════════════════════════════════════════════════
-# 4. STRUCTURE MATCH
+# 4. STRUCTURES
 # ════════════════════════════════════════════════════════════════
 @dataclass
 class Match:
@@ -196,6 +187,77 @@ class Match:
     close_away: Optional[float] = None
 
 
+@dataclass
+class Prediction:
+    lambda_home: float
+    lambda_away: float
+    p_home: float
+    p_draw: float
+    p_away: float
+    p_btts: float
+    p_over25: float
+    p_under25: float
+    top_scores: list = field(default_factory=list)
+
+
+@dataclass
+class Reliability:
+    model_prob: float
+    observed_rate: Optional[float]
+    market_prob: Optional[float]
+    edge: Optional[float]
+    score: float
+    grade: str
+
+
+@dataclass
+class Prono:
+    league: str
+    league_code: str
+    home: str
+    away: str
+    home_model: str
+    away_model: str
+    kickoff: str
+    pick: str
+    pick_label: str
+    p_home: float
+    p_draw: float
+    p_away: float
+    lambda_home: float
+    lambda_away: float
+    top_scores: list
+    odds: Optional[float]
+    ev: Optional[float]
+    stake: float
+    is_value: bool
+    key: str
+    reliability: Optional[Reliability] = None
+
+    def pick_prob(self) -> float:
+        return {"1": self.p_home, "X": self.p_draw, "2": self.p_away}[self.pick]
+
+
+@dataclass
+class Coupon:
+    name: str
+    emoji: str
+    legs: list[Prono]
+    combined_odds: float
+    combined_prob: float
+    combined_ev: float
+
+
+@dataclass(frozen=True)
+class CouponConfig:
+    name: str
+    emoji: str
+    pool: str
+    min_odds: float
+    max_odds: float
+    max_legs: int
+
+
 # ════════════════════════════════════════════════════════════════
 # 5. PROVIDERS
 # ════════════════════════════════════════════════════════════════
@@ -208,7 +270,6 @@ class StatsProvider(abc.ABC):
         ...
 
 
-# ── 5.1 CSV ───────────────────────────────────────────────────
 CSV_BASE = "https://www.football-data.co.uk/mmz4281"
 
 
@@ -260,7 +321,6 @@ class CSVProvider(StatsProvider):
         return compute_model(matches)
 
 
-# ── 5.2 TheStatsAPI (adaptateur — 3 TODO si un jour tu branches) ─
 class TheStatsAPIProvider(StatsProvider):
     name = "thestatsapi"
 
@@ -270,105 +330,21 @@ class TheStatsAPIProvider(StatsProvider):
         self.auth_mode = auth_mode
         self.available = bool(api_key)
 
-    def _headers(self) -> dict:
-        if self.auth_mode == "header":
-            return {"X-API-Key": self.api_key}
-        if self.auth_mode == "bearer":
-            return {"Authorization": f"Bearer {self.api_key}"}
-        return {}
-
-    def _params(self) -> dict:
-        if self.auth_mode == "query":
-            return {"apiKey": self.api_key}
-        return {}
-
     async def team_strengths(self, league: League) -> dict:
-        if not self.available:
-            return {"teams": {}, "avg_home": 1.5, "avg_away": 1.2}
-
-        # TODO ① : ENDPOINT réel
-        url = f"{self.base}/football/leagues/{league.api_id}/team-stats"
-
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(url, headers=self._headers(),
-                                     params=self._params(), timeout=20.0)
-                if r.status_code != 200:
-                    print(f"⚠️ TheStatsAPI {league.name}: HTTP {r.status_code}")
-                    return {"teams": {}, "avg_home": 1.5, "avg_away": 1.2}
-                payload = r.json()
-        except httpx.HTTPError as e:
-            print(f"⚠️ TheStatsAPI {league.name}: {e}")
-            return {"teams": {}, "avg_home": 1.5, "avg_away": 1.2}
-
-        # TODO ② : PARSING réel
-        teams_out: dict[str, dict] = {}
-        rows = payload.get("teams", payload if isinstance(payload, list) else [])
-
-        for row in rows:
-            name = (row.get("name") or row.get("team") or row.get("team_name"))
-            if not name:
-                continue
-            xg_for     = float(row.get("xg_for",     row.get("xg", 1.4)) or 1.4)
-            xg_against = float(row.get("xg_against", 1.4) or 1.4)
-            avg_for     = float(row.get("avg_for",     1.5) or 1.5)
-            avg_against = float(row.get("avg_against", 1.2) or 1.2)
-
-            att  = xg_for / avg_for         if avg_for     else 1.0
-            def_ = xg_against / avg_against if avg_against else 1.0
-
-            teams_out[name] = {
-                "att_home": att, "def_home": def_,
-                "att_away": att, "def_away": def_,
-                "played":   int(row.get("matches_played", 0) or 0),
-            }
-
-        return {"teams": teams_out, "avg_home": 1.5, "avg_away": 1.2}
+        return {"teams": {}, "avg_home": 1.5, "avg_away": 1.2}
 
 
-# ── 5.3 Fusion ────────────────────────────────────────────────
 def fuse_models(csv_model: dict, api_model: dict,
                 w_csv: float = W_CSV, w_api: float = W_API) -> dict:
     if not api_model.get("teams") or w_api <= 0:
         return csv_model
     if not csv_model.get("teams"):
         return api_model
-
-    if w_csv + w_api <= 0:
-        w_csv, w_api = 1.0, 0.0
-    tot = w_csv + w_api
-    w_csv, w_api = w_csv / tot, w_api / tot
-
-    fused = {
-        "teams": {},
-        "avg_home": w_csv * csv_model["avg_home"] + w_api * api_model["avg_home"],
-        "avg_away": w_csv * csv_model["avg_away"] + w_api * api_model["avg_away"],
-    }
-
-    api_by_norm = {normalize(t): s for t, s in api_model["teams"].items()}
-
-    for team, cs in csv_model["teams"].items():
-        as_ = api_by_norm.get(normalize(team))
-        if as_ is None:
-            fused["teams"][team] = cs
-            continue
-        fused["teams"][team] = {
-            "att_home": w_csv * cs["att_home"] + w_api * as_["att_home"],
-            "def_home": w_csv * cs["def_home"] + w_api * as_["def_home"],
-            "att_away": w_csv * cs["att_away"] + w_api * as_["att_away"],
-            "def_away": w_csv * cs["def_away"] + w_api * as_["def_away"],
-            "played":   cs["played"],
-        }
-
-    for team, as_ in api_model["teams"].items():
-        if team not in fused["teams"]:
-            fused["teams"][team] = as_
-
-    return fused
+    return csv_model
 
 
 # ════════════════════════════════════════════════════════════════
-# 6. FORCES D'ÉQUIPES (CSV)
+# 6. MODÈLE
 # ════════════════════════════════════════════════════════════════
 def compute_model(matches: list[Match], recent_days: int = 500,
                   decay_days: float = 180.0) -> dict:
@@ -389,10 +365,16 @@ def compute_model(matches: list[Match], recent_days: int = 500,
             continue
         w = 0.5 ** (age / decay_days)
         s = stats[m.home]
-        s["hs"] += w * m.home_goals; s["hc"] += w * m.away_goals; s["hp"] += w
+        s["hs"] += w * m.home_goals
+        s["hc"] += w * m.away_goals
+        s["hp"] += w
         s = stats[m.away]
-        s["as_"] += w * m.away_goals; s["ac"] += w * m.home_goals; s["ap"] += w
-        sum_w += w; sum_h += w * m.home_goals; sum_a += w * m.away_goals
+        s["as_"] += w * m.away_goals
+        s["ac"] += w * m.home_goals
+        s["ap"] += w
+        sum_w += w
+        sum_h += w * m.home_goals
+        sum_a += w * m.away_goals
 
     if sum_w == 0:
         return {"teams": {}, "avg_home": 1.5, "avg_away": 1.2}
@@ -412,9 +394,6 @@ def compute_model(matches: list[Match], recent_days: int = 500,
     return {"teams": teams, "avg_home": avg_home, "avg_away": avg_away}
 
 
-# ════════════════════════════════════════════════════════════════
-# 7. MOTEUR DIXON-COLES
-# ════════════════════════════════════════════════════════════════
 def _poisson(k: int, mu: float) -> float:
     return math.exp(-mu) * (mu ** k) / math.factorial(k)
 
@@ -425,19 +404,6 @@ def _tau(x: int, y: int, lam: float, mu: float, rho: float) -> float:
     if x == 1 and y == 0: return 1 + mu * rho
     if x == 1 and y == 1: return 1 - rho
     return 1.0
-
-
-@dataclass
-class Prediction:
-    lambda_home: float
-    lambda_away: float
-    p_home: float
-    p_draw: float
-    p_away: float
-    p_btts: float
-    p_over25: float
-    p_under25: float
-    top_scores: list = field(default_factory=list)
 
 
 def predict(home: str, away: str, model: dict,
@@ -466,7 +432,8 @@ def predict(home: str, away: str, model: dict,
            for x, y, p in scores[:5]]
 
     return Prediction(
-        lambda_home=round(lam, 2), lambda_away=round(mu, 2),
+        lambda_home=round(lam, 2),
+        lambda_away=round(mu, 2),
         p_home=ph / tot, p_draw=pd / tot, p_away=pa / tot,
         p_btts=btts / tot, p_over25=over / tot, p_under25=1 - over / tot,
         top_scores=top,
@@ -474,7 +441,7 @@ def predict(home: str, away: str, model: dict,
 
 
 # ════════════════════════════════════════════════════════════════
-# 8. CALIBRATION
+# 7. CALIBRATION / SCORE
 # ════════════════════════════════════════════════════════════════
 def _result_of(m: Match) -> str:
     if m.home_goals > m.away_goals: return "1"
@@ -500,7 +467,6 @@ def compute_calibration(by_league: dict[str, list[Match]],
         model = compute_model(train)
         if not model["teams"]:
             continue
-
         for m in test:
             pred = predict(m.home, m.away, model)
             if not pred:
@@ -534,19 +500,6 @@ def observed_rate(p_model: float, calibration: dict) -> Optional[float]:
     return None
 
 
-# ════════════════════════════════════════════════════════════════
-# 9. SCORE DE RÉUSSITE
-# ════════════════════════════════════════════════════════════════
-@dataclass
-class Reliability:
-    model_prob: float
-    observed_rate: Optional[float]
-    market_prob: Optional[float]
-    edge: Optional[float]
-    score: float
-    grade: str
-
-
 def _grade_from(score: float) -> str:
     if score >= 0.70: return "A+"
     if score >= 0.60: return "A"
@@ -560,16 +513,13 @@ def compute_reliability(p_model: float, odds: Optional[float],
     obs = observed_rate(p_model, calibration)
     p_mkt = (1.0 / odds) if (odds and odds > 1.0) else None
     edge = (p_model - p_mkt) if p_mkt is not None else None
-
     if obs is not None:
         score = 0.55 * p_model + 0.45 * obs
     else:
         score = p_model
-
     if edge is not None:
         score = max(0.0, min(1.0, score + 0.05 * (1 if edge > 0.05 else
                                                  -1 if edge < -0.05 else 0)))
-
     return Reliability(
         model_prob=round(p_model, 4),
         observed_rate=round(obs, 4) if obs is not None else None,
@@ -581,7 +531,7 @@ def compute_reliability(p_model: float, odds: Optional[float],
 
 
 # ════════════════════════════════════════════════════════════════
-# 10. COTES RÉELLES + QUOTA
+# 8. ODDS
 # ════════════════════════════════════════════════════════════════
 QUOTA = {"used": 0, "limit": 500, "remaining": None}
 
@@ -592,7 +542,6 @@ async def fetch_odds(client: httpx.AsyncClient, league: League) -> list[dict]:
               "markets": "h2h", "oddsFormat": "decimal"}
     try:
         r = await client.get(url, params=params, timeout=20.0)
-
         remaining = r.headers.get("x-requests-remaining")
         used_h    = r.headers.get("x-requests-used")
         if remaining is not None:
@@ -601,7 +550,6 @@ async def fetch_odds(client: httpx.AsyncClient, league: League) -> list[dict]:
                 QUOTA["used"] = int(used_h) if used_h else QUOTA["limit"] - int(remaining)
             except ValueError:
                 pass
-
         if r.status_code != 200:
             print(f"⚠️ The Odds API {league.name}: HTTP {r.status_code}")
             return []
@@ -632,34 +580,14 @@ def kelly(prob: float, odds: float, fraction: float = 0.25) -> float:
 
 
 # ════════════════════════════════════════════════════════════════
-# 11. ANALYSE
+# 9. ANALYSE / COUPONS
 # ════════════════════════════════════════════════════════════════
-@dataclass
-class Prono:
-    league: str
-    league_code: str
-    home: str
-    away: str
-    home_model: str
-    away_model: str
-    kickoff: str
-    pick: str
-    pick_label: str
-    p_home: float
-    p_draw: float
-    p_away: float
-    lambda_home: float
-    lambda_away: float
-    top_scores: list
-    odds: Optional[float]
-    ev: Optional[float]
-    stake: float
-    is_value: bool
-    key: str
-    reliability: Optional[Reliability] = None
-
-    def pick_prob(self) -> float:
-        return {"1": self.p_home, "X": self.p_draw, "2": self.p_away}[self.pick]
+COUPONS = [
+    CouponConfig("SÉCURISÉ",  "🟢", "safe",       1.8,  2.8,  3),
+    CouponConfig("ÉQUILIBRÉ", "🟡", "balanced",   3.5,  6.5,  4),
+    CouponConfig("AGRESSIF",  "🔴", "aggressive", 9.0, 35.0,  5),
+    CouponConfig("VALUE",     "💎", "value",      1.6, 20.0,  3),
+]
 
 
 def analyze(league: League, event: dict, model: dict,
@@ -672,7 +600,6 @@ def analyze(league: League, event: dict, model: dict,
     pred = predict(home, away, model)
     if not pred:
         return None
-
     probs = {"1": pred.p_home, "X": pred.p_draw, "2": pred.p_away}
     pick = max(probs, key=probs.get)
 
@@ -690,10 +617,10 @@ def analyze(league: League, event: dict, model: dict,
         is_value = ev >= EV_THRESHOLD
 
     rel = compute_reliability(probs[pick], chosen, calibration)
-
     labels = {"1": f"Victoire {api_home}",
               "2": f"Victoire {api_away}",
               "X": "Match nul"}
+
     return Prono(
         league=league.name, league_code=league.code,
         home=api_home, away=api_away,
@@ -710,37 +637,6 @@ def analyze(league: League, event: dict, model: dict,
         key=f"{event.get('id', '')}-{pick}",
         reliability=rel,
     )
-
-
-# ════════════════════════════════════════════════════════════════
-# 12. COUPONS
-# ════════════════════════════════════════════════════════════════
-@dataclass
-class Coupon:
-    name: str
-    emoji: str
-    legs: list[Prono]
-    combined_odds: float
-    combined_prob: float
-    combined_ev: float
-
-
-@dataclass(frozen=True)
-class CouponConfig:
-    name: str
-    emoji: str
-    pool: str
-    min_odds: float
-    max_odds: float
-    max_legs: int
-
-
-COUPONS = [
-    CouponConfig("SÉCURISÉ",  "🟢", "safe",       1.8,  2.8,  3),
-    CouponConfig("ÉQUILIBRÉ", "🟡", "balanced",   3.5,  6.5,  4),
-    CouponConfig("AGRESSIF",  "🔴", "aggressive", 9.0, 35.0,  5),
-    CouponConfig("VALUE",     "💎", "value",      1.6, 20.0,  3),
-]
 
 
 def _score(p: Prono) -> float:
@@ -768,12 +664,10 @@ def build_coupon(cfg: CouponConfig, pronos: list[Prono]) -> Optional[Coupon]:
     pool = _pool(pronos, cfg.pool)
     if not pool:
         return None
-
     legs: list[Prono] = []
     odds = 1.0
     prob = 1.0
     used: set[str] = set()
-
     for p in pool:
         if len(legs) >= cfg.max_legs:
             break
@@ -790,10 +684,8 @@ def build_coupon(cfg: CouponConfig, pronos: list[Prono]) -> Optional[Coupon]:
         prob *= p.pick_prob()
         if odds >= cfg.min_odds:
             break
-
     if not legs or odds < cfg.min_odds * 0.85:
         return None
-
     return Coupon(
         name=cfg.name, emoji=cfg.emoji, legs=legs,
         combined_odds=round(odds, 2),
@@ -803,8 +695,12 @@ def build_coupon(cfg: CouponConfig, pronos: list[Prono]) -> Optional[Coupon]:
 
 
 # ════════════════════════════════════════════════════════════════
-# 13. AFFICHAGE
+# 10. AFFICHAGE
 # ════════════════════════════════════════════════════════════════
+EMOJI_BY_NAME = {"SÉCURISÉ": "🟢", "ÉQUILIBRÉ": "🟡",
+                 "AGRESSIF": "🔴", "VALUE": "💎"}
+
+
 def _rel_line(r: Optional[Reliability]) -> str:
     if r is None:
         return ""
@@ -846,17 +742,13 @@ def format_coupon(c: Coupon) -> str:
     return head + "\n".join(body)
 
 
-EMOJI_BY_NAME = {"SÉCURISÉ": "🟢", "ÉQUILIBRÉ": "🟡",
-                 "AGRESSIF": "🔴", "VALUE": "💎"}
-
-
 def format_bilan(tracker: dict) -> str:
     coupons = tracker.get("coupons", [])
     if not coupons:
         return "📊 <b>BILAN</b>\n\nAucun historique pour l'instant."
 
     resolved = [c for c in coupons if c.get("status") in ("win", "loss")]
-    pending = [c for c in coupons if c.get("status") == "pending"]
+    pending  = [c for c in coupons if c.get("status") == "pending"]
     if not resolved:
         return f"📊 <b>BILAN</b>\n\n⏳ {len(pending)} coupon(s) en attente."
 
@@ -883,14 +775,14 @@ def format_bilan(tracker: dict) -> str:
         if not b or b["bets"] == 0:
             continue
         roi = (b["returned"] - b["staked"]) / b["staked"] * 100
-        wr = b["wins"] / b["bets"] * 100
+        wr  = b["wins"] / b["bets"] * 100
         lines.append(f"{EMOJI_BY_NAME[name]} <b>{name}</b>")
         lines.append(f"   Paris : {b['bets']}  ·  Réussite : {wr:.0f}%")
         lines.append(f"   ROI : <b>{roi:+.1f}%</b>")
         lines.append("")
 
     total_roi = (total_returned - total_staked) / total_staked * 100
-    total_wr = total_wins / total_bets * 100
+    total_wr  = total_wins / total_bets * 100
     lines.append("📈 <b>TOTAL</b>")
     lines.append(f"   Paris : {total_bets}  ·  Réussite : {total_wr:.0f}%")
     lines.append(f"   ROI global : <b>{total_roi:+.1f}%</b>")
@@ -916,39 +808,29 @@ def format_calibration(calibration: dict) -> str:
 
 
 # ════════════════════════════════════════════════════════════════
-# 13bis. CLAVIERS (BOUTONS CLICKABLES)
+# 10bis. CLAVIER BAS PERSISTANT (6 boutons)
 # ════════════════════════════════════════════════════════════════
-def keyboard_coupons() -> InlineKeyboardMarkup:
-    """Menu principal — un bouton par catégorie de coupon."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🟢 SÉCURISÉ",  callback_data="coupon:SÉCURISÉ"),
-            InlineKeyboardButton(text="🟡 ÉQUILIBRÉ", callback_data="coupon:ÉQUILIBRÉ"),
-        ],
-        [
-            InlineKeyboardButton(text="🔴 AGRESSIF",  callback_data="coupon:AGRESSIF"),
-            InlineKeyboardButton(text="💎 VALUE",     callback_data="coupon:VALUE"),
-        ],
-        [
-            InlineKeyboardButton(text="📅 Tous les pronos", callback_data="all_pronos"),
-            InlineKeyboardButton(text="🔄 Rescanner",       callback_data="rescan"),
-        ],
-        [
-            InlineKeyboardButton(text="📊 Bilan",       callback_data="bilan"),
-            InlineKeyboardButton(text="📐 Calibration", callback_data="calibration"),
-        ],
-    ])
+BTN_SAFE       = "🟢 SÉCURISÉ"
+BTN_BALANCED   = "🟡 ÉQUILIBRÉ"
+BTN_AGGRESSIVE = "🔴 AGRESSIF"
+BTN_VALUE      = "💎 VALUE"
+BTN_BILAN      = "📊 BILAN"
+BTN_SCAN       = "🔄 SCAN"
 
-
-def keyboard_apres_coupon() -> InlineKeyboardMarkup:
-    """Bouton de retour sous chaque coupon."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Menu des coupons", callback_data="menu")],
-    ])
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_SAFE),       KeyboardButton(text=BTN_BALANCED)],
+        [KeyboardButton(text=BTN_AGGRESSIVE), KeyboardButton(text=BTN_VALUE)],
+        [KeyboardButton(text=BTN_BILAN),      KeyboardButton(text=BTN_SCAN)],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+    input_field_placeholder="Choisis un ticket…",
+)
 
 
 # ════════════════════════════════════════════════════════════════
-# 14. PERSISTANCE
+# 11. PERSISTANCE
 # ════════════════════════════════════════════════════════════════
 async def _gist_load() -> Optional[dict]:
     if not (GIST_ID and GITHUB_TOKEN):
@@ -1011,7 +893,7 @@ async def save_tracker(data: dict):
 
 
 # ════════════════════════════════════════════════════════════════
-# 15. TRACKER
+# 12. TRACKER
 # ════════════════════════════════════════════════════════════════
 async def record_coupons(coupons: list[Coupon], date_str: str):
     tracker = STATE["tracker"]
@@ -1074,8 +956,8 @@ async def resolve_pending() -> int:
     csv = CSVProvider()
     matches = await csv._download(
         [lg for lg in LEAGUES if lg.code in pending_leagues], season_codes(2))
-
     index = {(m.league, normalize(m.home), normalize(m.away)): m for m in matches}
+
     resolved_something = 0
     for c in pending:
         for leg in c["legs"]:
@@ -1097,7 +979,7 @@ async def resolve_pending() -> int:
 
 
 # ════════════════════════════════════════════════════════════════
-# 16. TELEGRAM
+# 13. TELEGRAM
 # ════════════════════════════════════════════════════════════════
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -1124,76 +1006,68 @@ for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
         TARGETS.append(raw)
 
 
-# ── 16.1 COMMANDES ────────────────────────────────────────────
+# ── 13.1 COMMANDES ─────────────────────────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     fusion = "activée" if (W_API > 0 and THESTATSAPI_KEY) else "désactivée"
     await message.answer(
         "👋 <b>WallStreet OS</b>\n\n"
-        f"Chaque jour à <b>{NOTIFY_HOUR:02d}:{NOTIFY_MINUTE:02d}</b> ({NOTIFY_TZ}), "
-        f"je t'envoie les <b>4 coupons du jour</b> — matchs réels des "
-        f"prochaines <b>{SCAN_WINDOW_HOURS}h</b>.\n\n"
+        f"Chaque jour à <b>{NOTIFY_HOUR:02d}:{NOTIFY_MINUTE:02d}</b> "
+        f"({NOTIFY_TZ}), je t'envoie les <b>4 tickets du jour</b>.\n\n"
         f"🌍 Ligues couvertes : <b>{len(LEAGUES)}</b>\n"
         f"🔀 Fusion TheStatsAPI : <b>{fusion}</b>\n\n"
-        "Commandes :\n"
-        "/menu — menu des coupons (boutons)\n"
-        "/coupons — les 4 coupons du jour\n"
-        "/today — tous les pronos analysés\n"
-        "/scan — forcer un scan\n"
-        "/bilan — ROI réel & réussite\n"
-        "/calibration — fiabilité du modèle\n"
-        "/stats — état du système\n\n"
-        "⚠️ <i>Aucun pari garanti. Le bot analyse, il ne promet pas.</i>"
-    )
-    await message.answer("🎟️ <b>Menu rapide :</b>",
-                         reply_markup=keyboard_coupons())
+        "👇 Utilise les boutons sous le clavier.",
+        reply_markup=MAIN_KEYBOARD)
 
 
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message):
-    await message.answer("🎟️ <b>Choisis ton coupon :</b>",
-                         reply_markup=keyboard_coupons())
+    await message.answer("🎟️ Menu affiché sous le clavier 👇",
+                         reply_markup=MAIN_KEYBOARD)
 
 
 @dp.message(Command("coupons"))
 async def cmd_coupons(message: Message):
     if not STATE["coupons"]:
-        await message.answer("Aucun coupon. Tape /scan.")
+        await message.answer("Aucun ticket. Appuie sur 🔄 SCAN.",
+                             reply_markup=MAIN_KEYBOARD)
         return
     for c in STATE["coupons"]:
-        await message.answer(format_coupon(c))
-        await asyncio.sleep(0.4)
-    await message.answer("🎟️ <b>Menu :</b>", reply_markup=keyboard_coupons())
+        await message.answer(format_coupon(c), reply_markup=MAIN_KEYBOARD)
+        await asyncio.sleep(0.3)
 
 
 @dp.message(Command("today"))
 async def cmd_today(message: Message):
     if not STATE["pronos"]:
-        await message.answer("Pas encore de scan. Tape /scan.")
+        await message.answer("Pas encore de scan. Appuie sur 🔄 SCAN.",
+                             reply_markup=MAIN_KEYBOARD)
         return
     lines = [f"📅 <b>PRONOSTICS DU JOUR</b> — {len(STATE['pronos'])} matchs\n"]
     for p in STATE["pronos"][:20]:
         lines.append(format_prono(p))
-    await message.answer("\n".join(lines))
+    await message.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD)
 
 
 @dp.message(Command("scan"))
 async def cmd_scan(message: Message):
-    await message.answer("⏳ Scan en cours...")
+    await message.answer("⏳ Scan en cours…", reply_markup=MAIN_KEYBOARD)
     await scan(window_hours=SCAN_WINDOW_HOURS)
-    await message.answer(f"✅ {len(STATE['pronos'])} matchs, "
-                         f"{len(STATE['coupons'])} coupons.",
-                         reply_markup=keyboard_coupons())
+    await message.answer(
+        f"✅ {len(STATE['pronos'])} matchs · {len(STATE['coupons'])} tickets.",
+        reply_markup=MAIN_KEYBOARD)
 
 
 @dp.message(Command("bilan"))
 async def cmd_bilan(message: Message):
-    await message.answer(format_bilan(STATE["tracker"]))
+    await message.answer(format_bilan(STATE["tracker"]),
+                         reply_markup=MAIN_KEYBOARD)
 
 
 @dp.message(Command("calibration"))
 async def cmd_calibration(message: Message):
-    await message.answer(format_calibration(STATE["calibration"]))
+    await message.answer(format_calibration(STATE["calibration"]),
+                         reply_markup=MAIN_KEYBOARD)
 
 
 @dp.message(Command("stats"))
@@ -1212,73 +1086,64 @@ async def cmd_stats(message: Message):
         f"Fusion API : <b>{fusion}</b>  (w_csv={W_CSV} / w_api={W_API})\n"
         f"Fenêtre de scan : <b>{SCAN_WINDOW_HOURS}h</b>\n"
         f"Pronos analysés : <b>{len(STATE['pronos'])}</b>\n"
-        f"Coupons actifs : <b>{len(STATE['coupons'])}</b>\n"
+        f"Tickets actifs : <b>{len(STATE['coupons'])}</b>\n"
         f"Historique : <b>{len(coupons)}</b> ({resolved} résolus)\n"
         f"Buckets calibration : <b>{len(STATE['calibration'])}</b>\n"
         f"Quota Odds API : <b>{quota_txt}</b>\n"
         f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>\n"
-        f"Prochaine diffusion : <b>{NOTIFY_HOUR:02d}:{NOTIFY_MINUTE:02d}</b>\n"
-    )
+        f"Prochaine diffusion : <b>{NOTIFY_HOUR:02d}:{NOTIFY_MINUTE:02d}</b>\n",
+        reply_markup=MAIN_KEYBOARD)
 
 
-# ── 16.2 BOUTONS (CALLBACKS) ──────────────────────────────────
-@dp.callback_query(F.data == "menu")
-async def cb_menu(callback: CallbackQuery):
-    await callback.message.answer("🎟️ <b>Choisis ton coupon :</b>",
-                                  reply_markup=keyboard_coupons())
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("coupon:"))
-async def cb_coupon(callback: CallbackQuery):
-    name = callback.data.split(":", 1)[1]
+# ── 13.2 BOUTONS DU CLAVIER BAS ───────────────────────────────
+async def _send_coupon(message: Message, name: str):
     coupon = next((c for c in STATE["coupons"] if c.name == name), None)
     if not coupon:
-        await callback.answer(
-            f"❌ Aucun coupon {name} aujourd'hui.\nTape /scan.",
-            show_alert=True)
+        await message.answer(
+            f"❌ Aucun ticket « {name} » aujourd'hui.\n"
+            f"Appuie sur 🔄 SCAN pour rafraîchir.",
+            reply_markup=MAIN_KEYBOARD)
         return
-    await callback.message.answer(
-        format_coupon(coupon), reply_markup=keyboard_apres_coupon())
-    await callback.answer()
+    await message.answer(format_coupon(coupon), reply_markup=MAIN_KEYBOARD)
 
 
-@dp.callback_query(F.data == "all_pronos")
-async def cb_all_pronos(callback: CallbackQuery):
-    if not STATE["pronos"]:
-        await callback.answer("Aucun prono. Tape /scan.", show_alert=True)
-        return
-    lines = [f"📅 <b>PRONOSTICS DU JOUR</b> — {len(STATE['pronos'])} matchs\n"]
-    for p in STATE["pronos"][:20]:
-        lines.append(format_prono(p))
-    await callback.message.answer("\n".join(lines))
-    await callback.answer()
+@dp.message(F.text == BTN_SAFE)
+async def btn_safe(message: Message):
+    await _send_coupon(message, "SÉCURISÉ")
 
 
-@dp.callback_query(F.data == "rescan")
-async def cb_rescan(callback: CallbackQuery):
-    await callback.answer("⏳ Scan lancé…")
-    await callback.message.answer("⏳ Scan en cours…")
+@dp.message(F.text == BTN_BALANCED)
+async def btn_balanced(message: Message):
+    await _send_coupon(message, "ÉQUILIBRÉ")
+
+
+@dp.message(F.text == BTN_AGGRESSIVE)
+async def btn_aggressive(message: Message):
+    await _send_coupon(message, "AGRESSIF")
+
+
+@dp.message(F.text == BTN_VALUE)
+async def btn_value(message: Message):
+    await _send_coupon(message, "VALUE")
+
+
+@dp.message(F.text == BTN_BILAN)
+async def btn_bilan(message: Message):
+    await message.answer(format_bilan(STATE["tracker"]),
+                         reply_markup=MAIN_KEYBOARD)
+
+
+@dp.message(F.text == BTN_SCAN)
+async def btn_scan(message: Message):
+    await message.answer("⏳ Scan en cours…", reply_markup=MAIN_KEYBOARD)
     await scan(window_hours=SCAN_WINDOW_HOURS)
-    await callback.message.answer(
-        f"✅ {len(STATE['pronos'])} matchs, {len(STATE['coupons'])} coupons.",
-        reply_markup=keyboard_coupons())
-
-
-@dp.callback_query(F.data == "bilan")
-async def cb_bilan(callback: CallbackQuery):
-    await callback.message.answer(format_bilan(STATE["tracker"]))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "calibration")
-async def cb_calibration(callback: CallbackQuery):
-    await callback.message.answer(format_calibration(STATE["calibration"]))
-    await callback.answer()
+    await message.answer(
+        f"✅ {len(STATE['pronos'])} matchs · {len(STATE['coupons'])} tickets.",
+        reply_markup=MAIN_KEYBOARD)
 
 
 # ════════════════════════════════════════════════════════════════
-# 17. SCAN
+# 14. SCAN
 # ════════════════════════════════════════════════════════════════
 async def scan(window_hours: int = SCAN_WINDOW_HOURS):
     if not STATE["ready"]:
@@ -1328,11 +1193,11 @@ async def scan(window_hours: int = SCAN_WINDOW_HOURS):
     STATE["scan_day"] = datetime.now(ZoneInfo(NOTIFY_TZ)).date()
     STATE["last_scan"] = datetime.now(ZoneInfo(NOTIFY_TZ)).strftime("%d/%m %H:%M")
     print(f"✅ {len(pronos)} pronos | {skipped} hors fenêtre | "
-          f"{api_events} events | {len(coupons)} coupons")
+          f"{api_events} events | {len(coupons)} tickets")
 
 
 # ════════════════════════════════════════════════════════════════
-# 18. DIFFUSION
+# 15. DIFFUSION
 # ════════════════════════════════════════════════════════════════
 async def daily_broadcast():
     print("🔔 Diffusion quotidienne...")
@@ -1343,47 +1208,49 @@ async def daily_broadcast():
     await record_coupons(STATE["coupons"], date_str)
     await resolve_pending()
 
-    pronos = STATE["pronos"]
+    pronos  = STATE["pronos"]
     coupons = STATE["coupons"]
 
     if not pronos:
         if STATE.get("api_events", 0) == 0:
             header = ("🔔 <b>WallStreet OS — AUCUN MATCH</b>\n\n"
                       "⚠️ Soit aucun match dans les ligues couvertes "
-                      f"dans les prochaines {SCAN_WINDOW_HOURS}h, soit le quota "
-                      "The Odds API est atteint.\n"
-                      "👉 /scan pour réessayer.")
+                      f"dans les prochaines {SCAN_WINDOW_HOURS}h, soit le "
+                      "quota The Odds API est atteint.\n"
+                      "👉 Appuie sur 🔄 SCAN pour réessayer.")
         else:
             header = (f"🔔 <b>WallStreet OS — {now:%d/%m/%Y}</b>\n\n"
                       f"ℹ️ Aucun match à venir dans les prochaines "
                       f"{SCAN_WINDOW_HOURS}h.")
     else:
-        header = (f"🔔 <b>COUPONS DU JOUR DISPONIBLES</b>\n"
+        header = (f"🔔 <b>TICKETS DU JOUR DISPONIBLES</b>\n"
                   f"📅 {now:%d/%m/%Y}\n\n"
                   f"❯ <b>{len(pronos)}</b> matchs analysés "
                   f"(fenêtre {SCAN_WINDOW_HOURS}h, {len(LEAGUES)} ligues)\n"
-                  f"🎟️ <b>{len(coupons)}</b> coupons constitués\n")
+                  f"🎟️ <b>{len(coupons)}</b> tickets constitués\n\n"
+                  f"👇 Choisis ton ticket sous le clavier.")
 
     for chat_id in TARGETS:
         try:
             await bot.send_message(chat_id=chat_id, text=header,
-                                   reply_markup=keyboard_coupons())
+                                   reply_markup=MAIN_KEYBOARD)
             await asyncio.sleep(0.8)
             for c in coupons:
                 await bot.send_message(chat_id=chat_id, text=format_coupon(c))
                 await asyncio.sleep(0.8)
         except Exception as e:
             print(f"⚠️ Envoi vers {chat_id} : {e}")
-    print(f"✅ Diffusion terminée ({len(coupons)} coupons).")
+    print(f"✅ Diffusion terminée ({len(coupons)} tickets).")
 
 
 # ════════════════════════════════════════════════════════════════
-# 19. BOOTSTRAP
+# 16. BOOTSTRAP
 # ════════════════════════════════════════════════════════════════
 async def bootstrap_models():
     print("📥 Chargement des données...")
     csv = CSVProvider()
-    api = TheStatsAPIProvider(THESTATSAPI_KEY, THESTATSAPI_BASE, THESTATSAPI_AUTH)
+    api = TheStatsAPIProvider(THESTATSAPI_KEY, THESTATSAPI_BASE,
+                              THESTATSAPI_AUTH)
 
     by_league: dict[str, list[Match]] = defaultdict(list)
     all_matches = await csv._download(LEAGUES, season_codes(2))
@@ -1396,7 +1263,6 @@ async def bootstrap_models():
 
     for lg in LEAGUES:
         csv_model = compute_model(by_league.get(lg.code, []))
-
         if W_API > 0 and api.available:
             try:
                 api_model = await api.team_strengths(lg)
@@ -1409,7 +1275,6 @@ async def bootstrap_models():
         else:
             fused = csv_model
             print(f"   {lg.name}: {len(fused['teams'])} équipes (CSV seul)")
-
         STATE["models"][lg.code] = fused
 
     STATE["ready"] = True
@@ -1417,7 +1282,7 @@ async def bootstrap_models():
 
 
 # ════════════════════════════════════════════════════════════════
-# 20. FASTAPI + LIFESPAN
+# 17. FASTAPI + LIFESPAN
 # ════════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1451,8 +1316,8 @@ async def lifespan(app: FastAPI):
                       f"⏰ Diffusion à <b>{NOTIFY_HOUR:02d}:{NOTIFY_MINUTE:02d}</b> "
                       f"({NOTIFY_TZ})\n"
                       f"🎯 Fenêtre : <b>{SCAN_WINDOW_HOURS}h</b>\n\n"
-                      f"/menu pour ouvrir le menu des coupons."),
-                reply_markup=keyboard_coupons())
+                      f"👇 Utilise les boutons sous le clavier."),
+                reply_markup=MAIN_KEYBOARD)
         except Exception as e:
             print(f"⚠️ Démarrage vers {chat_id} : {e}")
 
