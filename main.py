@@ -189,13 +189,18 @@ def parse_date(s: str) -> Optional[datetime]:
     return None
 
 
-def local_dt_from_iso(iso: str) -> Optional[datetime]:
+def local_dt_from_iso(iso) -> Optional[datetime]:
     if not iso:
         return None
     try:
         if isinstance(iso, (int, float)):
             return datetime.fromtimestamp(int(iso), tz=ZoneInfo("UTC")).astimezone(TZ)
-        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+
+        raw = str(iso).strip()
+        if raw.isdigit():
+            return datetime.fromtimestamp(int(raw), tz=ZoneInfo("UTC")).astimezone(TZ)
+
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=ZoneInfo("UTC"))
         return dt.astimezone(TZ)
@@ -203,7 +208,7 @@ def local_dt_from_iso(iso: str) -> Optional[datetime]:
         return None
 
 
-def kickoff_local(iso: str) -> str:
+def kickoff_local(iso) -> str:
     dt = local_dt_from_iso(iso)
     return dt.strftime("%H:%M") if dt else "?"
 
@@ -469,7 +474,6 @@ def predict(home: str, away: str, model: dict, max_goals: int = MAX_GOALS) -> Op
 
     h = teams[home]
     a = teams[away]
-
     lam = h["att_home"] * a["def_away"] * model["avg_home"]
     mu = a["att_away"] * h["def_home"] * model["avg_away"]
 
@@ -515,9 +519,15 @@ async def sportmonks_get(client: httpx.AsyncClient, path: str, params: dict | No
     params = params or {}
     params["api_token"] = SPORTMONKS_API_KEY
     url = f"{SPORTMONKS_BASE}{path}"
+
     r = await client.get(url, params=params, headers=sm_headers(), timeout=30.0)
+    print(f"🌍 GET {r.url} -> {r.status_code}")
     r.raise_for_status()
-    return r.json()
+
+    data = r.json()
+    if isinstance(data, dict):
+        print(f"📦 keys: {list(data.keys())[:10]}")
+    return data
 
 
 def extract_participants(fixture: dict) -> tuple[str, str]:
@@ -541,22 +551,26 @@ def extract_participants(fixture: dict) -> tuple[str, str]:
 
 
 def extract_league_name(fixture: dict) -> str:
-    league = fixture.get("league") or fixture.get("league_id") or {}
-    if isinstance(league, dict):
-        return league.get("name") or fixture.get("league_name") or ""
-    return fixture.get("league_name") or ""
+    league = fixture.get("league") or {}
+    return league.get("name") or fixture.get("league_name") or ""
 
 
-def extract_kickoff_iso(fixture: dict) -> str:
+def extract_kickoff_iso(fixture: dict):
     candidates = [
         fixture.get("starting_at"),
         fixture.get("startingAt"),
         fixture.get("date"),
         fixture.get("starting_at_timestamp"),
-        ((fixture.get("time") or {}).get("starting_at") if isinstance(fixture.get("time"), dict) else None),
-        (((fixture.get("time") or {}).get("starting_at") or {}).get("date_time") if isinstance((fixture.get("time") or {}).get("starting_at"), dict) else None),
-        (((fixture.get("time") or {}).get("starting_at") or {}).get("timestamp") if isinstance((fixture.get("time") or {}).get("starting_at"), dict) else None),
     ]
+
+    time_block = fixture.get("time")
+    if isinstance(time_block, dict):
+        candidates.append(time_block.get("starting_at"))
+        sa = time_block.get("starting_at")
+        if isinstance(sa, dict):
+            candidates.append(sa.get("date_time"))
+            candidates.append(sa.get("timestamp"))
+
     for c in candidates:
         if c:
             return c
@@ -594,7 +608,6 @@ def extract_1x2_odds(fixture: dict) -> dict:
                 name = str(item.get("name") or item.get("label") or item.get("market_name") or "").lower()
                 outcome = str(item.get("outcome") or item.get("outcome_name") or "").lower()
                 value = safe_odd(item.get("value") or item.get("odd") or item.get("price"))
-
                 if value is None:
                     continue
 
@@ -612,13 +625,47 @@ def extract_1x2_odds(fixture: dict) -> dict:
 
 async def fetch_sportmonks_fixtures_today() -> list[dict]:
     date_str = today_iso()
-    async with httpx.AsyncClient() as client:
-        data = await sportmonks_get(
-            client,
-            f"/fixtures/date/{date_str}",
-            params={"include": "participants;league;odds"},
-        )
-        return data.get("data", []) or []
+    all_items = []
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        attempts = [
+            (f"/fixtures/date/{date_str}", {"include": "participants;league;odds"}),
+            ("/fixtures", {"include": "participants;league;odds", "date": date_str}),
+            ("/fixtures", {"filters": f"date:{date_str}", "include": "participants;league;odds"}),
+        ]
+
+        for path, params in attempts:
+            try:
+                data = await sportmonks_get(client, path, params=params)
+                items = data.get("data", []) or []
+                print(f"📡 Tentative {path} => {len(items)}")
+                if items:
+                    all_items = items
+                    break
+            except Exception as e:
+                print(f"⚠️ Tentative échouée {path}: {e}")
+
+        if not all_items:
+            try:
+                data = await sportmonks_get(client, "/fixtures", {"include": "participants;league;odds"})
+                items = data.get("data", []) or []
+                print(f"📡 Fallback /fixtures brut => {len(items)}")
+                all_items = items
+            except Exception as e:
+                print(f"⚠️ fallback brut échoué: {e}")
+                return []
+
+    filtered = []
+    today_ci = today_local_date()
+
+    for fx in all_items:
+        kickoff = extract_kickoff_iso(fx)
+        dt = local_dt_from_iso(kickoff)
+        if dt and dt.date() == today_ci:
+            filtered.append(fx)
+
+    print(f"✅ Fixtures filtrées localement pour {today_ci}: {len(filtered)}")
+    return filtered
 
 
 # =========================================================
@@ -644,14 +691,8 @@ def analyze_fixture(fixture: dict, models: dict) -> Optional[Prono]:
             return None
 
         kickoff = extract_kickoff_iso(fixture)
-        if not kickoff:
-            return None
-
         local_dt = local_dt_from_iso(kickoff)
-        if not local_dt:
-            return None
-
-        if local_dt.date() != today_local_date():
+        if not local_dt or local_dt.date() != today_local_date():
             return None
 
         home_model = find_team(home_api, model["teams"])
@@ -710,9 +751,7 @@ def build_coupon(name: str, subtitle: str, pronos: list[Prono], min_odds: float,
     try:
         pool = []
         for p in pronos:
-            if not hasattr(p, "odds"):
-                continue
-            odd = safe_odd(p.odds)
+            odd = safe_odd(getattr(p, "odds", None))
             if odd:
                 p.odds = odd
                 pool.append(p)
@@ -731,8 +770,6 @@ def build_coupon(name: str, subtitle: str, pronos: list[Prono], min_odds: float,
             if len(legs) >= max_legs:
                 break
             if p.fixture_id in used:
-                continue
-            if not p.odds:
                 continue
 
             new_odds = odds * p.odds
@@ -791,10 +828,9 @@ def format_coupon(c: Coupon) -> str:
         f"{c.subtitle}",
         f"Cote totale : <b>{c.combined_odds}</b>",
         f"Probabilité combinée : <b>{c.combined_prob * 100:.1f}%</b>",
+        f"EV estimée : <b>{c.combined_ev * 100:+.1f}%</b>",
+        "",
     ]
-    if c.combined_ev is not None:
-        lines.append(f"EV estimée : <b>{c.combined_ev * 100:+.1f}%</b>")
-    lines.append("")
 
     for i, p in enumerate(c.legs, 1):
         lines.append(f"<b>{i}. {p.home} vs {p.away}</b>")
@@ -830,30 +866,6 @@ def format_no_match() -> str:
         f"<b>Aucun match exploitable aujourd’hui</b>\n"
         f"Le système n’a retenu aucune sélection fiable pour le moment."
     )
-
-
-def format_top_pronos(pronos: list[Prono]) -> str:
-    if not pronos:
-        return format_no_match()
-
-    lines = [premium_header(), "", "<b>Top pronos du jour</b>", ""]
-    for i, p in enumerate(pronos[:10], 1):
-        lines.append(f"<b>{i}. {p.home} vs {p.away}</b>")
-        lines.append(f"🕒 {kickoff_local(p.kickoff)} • {p.league}")
-        lines.append(f"✅ {p.pick_label}")
-        line = f"📊 Confiance : <b>{p.reliability * 100:.0f}%</b>"
-        if p.odds:
-            line += f" • Cote {p.odds}"
-        lines.append(line)
-        if p.ev is not None:
-            lines.append(f"💎 EV : <b>{p.ev * 100:+.1f}%</b>")
-        tsl = top_score_line(p)
-        if tsl:
-            lines.append(tsl)
-        lines.append("")
-
-    lines.append(PUBLIC_FOOTER)
-    return "\n".join(lines)
 
 
 def format_bilan(tracker: dict) -> str:
@@ -999,9 +1011,9 @@ async def safe_answer(message: Message, text: str):
 
 async def safe_send(chat_id, text: str):
     try:
-        await bot.send_message(chat_id=chat_id, text=text, reply_markup=MAIN_KEYBOARD)
+        await bot.send_message(chat_id, text, reply_markup=MAIN_KEYBOARD)
     except Exception as e:
-        print(f"⚠️ Envoi Telegram échoué vers {chat_id}: {e}")
+        print(f"⚠️ Envoi impossible vers {chat_id}: {e}")
 
 
 @dp.message(Command("start"))
@@ -1023,11 +1035,6 @@ async def scan_cmd(message: Message):
         await safe_answer(message, format_no_match())
         return
     await safe_answer(message, format_summary(len(STATE["pronos"]), len(STATE["coupons"])))
-
-
-@dp.message(Command("today"))
-async def today_cmd(message: Message):
-    await safe_answer(message, format_top_pronos(STATE["pronos"]))
 
 
 @dp.message(Command("bilan"))
@@ -1117,7 +1124,7 @@ async def scan_today_only():
         }
         return
 
-    print(f"🌐 Sportmonks fixtures du jour: {len(fixtures)}")
+    print(f"🌐 Sportmonks fixtures filtrées du jour: {len(fixtures)}")
 
     pronos = []
     rejected = 0
@@ -1213,7 +1220,11 @@ async def scan_today_only():
 async def daily_broadcast():
     await scan_today_only()
 
-    text = format_no_match() if not STATE["coupons"] else format_summary(len(STATE["pronos"]), len(STATE["coupons"]))
+    if not STATE["coupons"]:
+        text = format_no_match()
+    else:
+        text = format_summary(len(STATE["pronos"]), len(STATE["coupons"]))
+
     date_str = datetime.now(TZ).strftime("%Y-%m-%d")
     record_coupons(STATE["coupons"], date_str)
 
