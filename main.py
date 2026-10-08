@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -38,8 +39,6 @@ PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue res
 
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.46"))
 MAX_SIMPLE_SEND = int(os.getenv("MAX_SIMPLE_SEND", "10"))
-WINDOW_BACK_H = float(os.getenv("WINDOW_BACK_H", "8"))
-WINDOW_FWD_H = float(os.getenv("WINDOW_FWD_H", "36"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -195,14 +194,6 @@ def local_dt_from_any(value) -> Optional[datetime]:
     return None
 
 
-def is_match_in_window(dt: Optional[datetime]) -> bool:
-    if not dt:
-        return False
-    now = datetime.now(TZ)
-    delta_hours = (dt - now).total_seconds() / 3600.0
-    return (-WINDOW_BACK_H) <= delta_hours <= WINDOW_FWD_H
-
-
 def kickoff_local(value) -> str:
     dt = local_dt_from_any(value)
     return dt.strftime("%H:%M") if dt else "?"
@@ -235,6 +226,22 @@ def premium_header() -> str:
 
 def score_prono(p: Prono) -> float:
     return p.reliability + ((p.ev or 0.0) * 0.25)
+
+
+def detect_target_date(fixtures: list[dict]) -> Optional[str]:
+    dates = []
+    for fx in fixtures:
+        kickoff = extract_kickoff(fx)
+        dt = local_dt_from_any(kickoff)
+        if dt:
+            dates.append(dt.strftime("%Y-%m-%d"))
+
+    if not dates:
+        return None
+
+    count = Counter(dates)
+    target_date, _ = count.most_common(1)[0]
+    return target_date
 
 
 # =========================================================
@@ -277,7 +284,7 @@ def record_coupons(coupons: list[Coupon], date_str: str):
 
 
 # =========================================================
-# SPORTMONKS RAW ACCESS
+# SPORTMONKS
 # =========================================================
 def sm_headers():
     return {"Accept": "application/json"}
@@ -289,6 +296,8 @@ async def sportmonks_get(client: httpx.AsyncClient, path: str, params: dict | No
     url = f"{SPORTMONKS_BASE}{path}"
     r = await client.get(url, params=params, headers=sm_headers(), timeout=40.0)
     print(f"🌍 GET {r.url} -> {r.status_code}")
+    if r.status_code >= 400:
+        print(f"⚠️ Réponse API: {r.text[:300]}")
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict):
@@ -401,6 +410,7 @@ async def fetch_all_today_fixtures() -> list[dict]:
             ("/fixtures", {"include": "participants;league;odds", "date": date_str}),
             ("/fixtures", {"filters": f"date:{date_str}", "include": "participants;league;odds"}),
             ("/fixtures", {"include": "participants;league;odds"}),
+            ("/fixtures", {"include": "participants;league;odds", "per_page": "200"}),
         ]
 
         for path, params in attempts:
@@ -420,8 +430,8 @@ async def fetch_all_today_fixtures() -> list[dict]:
         home, away = extract_participants(fx)
         kickoff = extract_kickoff(fx)
         parsed = local_dt_from_any(kickoff)
-        inw = is_match_in_window(parsed)
-        print(f"🧪 {home} vs {away} | raw={kickoff} | parsed={parsed} | dans fenêtre={inw}")
+        odds = extract_1x2_odds(fx)
+        print(f"🧪 {home} vs {away} | raw={kickoff} | parsed={parsed} | odds={odds}")
 
     return all_items
 
@@ -440,7 +450,7 @@ def implied_probs_from_odds(odds: dict) -> tuple[float, float, float]:
     return normalize_probs(p1, px, p2)
 
 
-def generic_analyze_fixture(fixture: dict) -> Optional[Prono]:
+def generic_analyze_fixture(fixture: dict, target_date: Optional[str]) -> Optional[Prono]:
     try:
         fixture_id = int(fixture.get("id") or 0)
         if not fixture_id:
@@ -452,7 +462,10 @@ def generic_analyze_fixture(fixture: dict) -> Optional[Prono]:
 
         kickoff = extract_kickoff(fixture)
         dt = local_dt_from_any(kickoff)
-        if not is_match_in_window(dt):
+        if not dt:
+            return None
+
+        if target_date and dt.strftime("%Y-%m-%d") != target_date:
             return None
 
         league = extract_league_name(fixture)
@@ -463,10 +476,8 @@ def generic_analyze_fixture(fixture: dict) -> Optional[Prono]:
             return None
 
         reasons = []
-
         s1, sx, s2 = p1, px, p2
 
-        # avantage domicile léger
         s1 += 0.03
         s2 -= 0.01
         reasons.append("avantage domicile")
@@ -496,7 +507,6 @@ def generic_analyze_fixture(fixture: dict) -> Optional[Prono]:
             ev = probs[pick] * selected_odds - 1
 
         reliability = probs[pick]
-
         if reliability < MIN_CONFIDENCE:
             return None
 
@@ -583,7 +593,7 @@ def format_simple_pronos(pronos: list[Prono], limit: int = 10) -> str:
     if not pronos:
         return (
             f"{premium_header()}\n\n"
-            f"<b>Aucun prono exploitable aujourd’hui</b>\n"
+            f"<b>Aucun prono exploitable</b>\n"
             f"Le système n’a trouvé aucune sélection suffisamment fiable."
         )
 
@@ -681,11 +691,11 @@ async def debug_cmd(message: Message):
     txt = (
         f"<b>Debug</b>\n\n"
         f"Fixtures brutes : <b>{d.get('fixtures_raw', 0)}</b>\n"
+        f"Date cible : <b>{d.get('target_date', '?')}</b>\n"
         f"Analysées : <b>{d.get('analyzed', 0)}</b>\n"
         f"Retenues : <b>{d.get('kept', 0)}</b>\n"
-        f"Hors fenêtre : <b>{d.get('out_of_day', 0)}</b>\n"
+        f"Hors date cible : <b>{d.get('out_of_day', 0)}</b>\n"
         f"Sans odds : <b>{d.get('no_odds', 0)}</b>\n"
-        f"Fenêtre : <b>-{WINDOW_BACK_H:.0f}h → +{WINDOW_FWD_H:.0f}h</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>\n"
         f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
     )
@@ -741,6 +751,9 @@ async def btn_scan(message: Message):
 async def scan_today_only():
     fixtures = await fetch_all_today_fixtures()
 
+    target_date = detect_target_date(fixtures)
+    print(f"🎯 Date cible détectée : {target_date}")
+
     pronos = []
     analyzed = 0
     kept = 0
@@ -751,7 +764,12 @@ async def scan_today_only():
         try:
             kickoff = extract_kickoff(fx)
             dt = local_dt_from_any(kickoff)
-            if not is_match_in_window(dt):
+
+            if not dt:
+                out_of_day += 1
+                continue
+
+            if target_date and dt.strftime("%Y-%m-%d") != target_date:
                 out_of_day += 1
                 continue
 
@@ -761,7 +779,7 @@ async def scan_today_only():
                 continue
 
             analyzed += 1
-            p = generic_analyze_fixture(fx)
+            p = generic_analyze_fixture(fx, target_date)
             if p:
                 pronos.append(p)
                 kept += 1
@@ -787,6 +805,7 @@ async def scan_today_only():
     STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
     STATE["debug"] = {
         "fixtures_raw": len(fixtures),
+        "target_date": target_date,
         "analyzed": analyzed,
         "kept": kept,
         "out_of_day": out_of_day,
@@ -796,9 +815,10 @@ async def scan_today_only():
 
     print("──────── RÉSUMÉ TOUS MATCHS ────────")
     print(f"Fixtures brutes : {len(fixtures)}")
+    print(f"Date cible      : {target_date}")
     print(f"Analysées       : {analyzed}")
     print(f"Retenues        : {kept}")
-    print(f"Hors fenêtre    : {out_of_day}")
+    print(f"Hors date cible : {out_of_day}")
     print(f"Sans odds       : {no_odds}")
     print(f"Coupons         : {len(coupons)}")
     print("────────────────────────────────────")
@@ -877,7 +897,7 @@ async def root():
         "status": "ok",
         "ready": STATE["ready"],
         "today": str(today_local_date()),
-        "window": [f"-{WINDOW_BACK_H}h", f"+{WINDOW_FWD_H}h"],
+        "target_date": STATE["debug"].get("target_date"),
         "pronos": len(STATE["pronos"]),
         "coupons": [c.name for c in STATE["coupons"]],
         "last_scan": STATE["last_scan"],
