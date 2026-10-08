@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -39,6 +38,8 @@ PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue res
 
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.46"))
 MAX_SIMPLE_SEND = int(os.getenv("MAX_SIMPLE_SEND", "10"))
+WINDOW_BACK_H = float(os.getenv("WINDOW_BACK_H", "8"))
+WINDOW_FWD_H = float(os.getenv("WINDOW_FWD_H", "36"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -152,6 +153,7 @@ def today_pretty():
 def local_dt_from_any(value) -> Optional[datetime]:
     if value is None:
         return None
+
     try:
         if isinstance(value, (int, float)):
             return datetime.fromtimestamp(int(value), tz=ZoneInfo("UTC")).astimezone(TZ)
@@ -163,23 +165,42 @@ def local_dt_from_any(value) -> Optional[datetime]:
         if raw.isdigit():
             return datetime.fromtimestamp(int(raw), tz=ZoneInfo("UTC")).astimezone(TZ)
 
-        try:
-            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-            return dt.astimezone(TZ)
-        except Exception:
-            pass
+        candidates = [raw, raw.replace("Z", "+00:00")]
 
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        for c in candidates:
+            try:
+                dt = datetime.fromisoformat(c)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+                return dt.astimezone(TZ)
+            except Exception:
+                pass
+
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%d-%m-%Y %H:%M:%S",
+            "%d-%m-%Y %H:%M",
+        ):
             try:
                 dt = datetime.strptime(raw, fmt).replace(tzinfo=ZoneInfo("UTC"))
                 return dt.astimezone(TZ)
             except Exception:
                 pass
+
     except Exception:
         return None
+
     return None
+
+
+def is_match_in_window(dt: Optional[datetime]) -> bool:
+    if not dt:
+        return False
+    now = datetime.now(TZ)
+    delta_hours = (dt - now).total_seconds() / 3600.0
+    return (-WINDOW_BACK_H) <= delta_hours <= WINDOW_FWD_H
 
 
 def kickoff_local(value) -> str:
@@ -327,35 +348,6 @@ def extract_kickoff(fixture: dict):
     return ""
 
 
-def extract_scores(fixture: dict) -> tuple[Optional[int], Optional[int]]:
-    scores = fixture.get("scores") or []
-    home = away = None
-
-    if isinstance(scores, list):
-        for s in scores:
-            desc = str(s.get("description") or "").lower()
-            score_block = s.get("score") or {}
-            goals = score_block.get("goals")
-            participant = s.get("participant") or {}
-            loc = (participant.get("meta") or {}).get("location") or participant.get("location")
-
-            if goals is None:
-                continue
-
-            if str(loc).lower() == "home":
-                home = goals
-            elif str(loc).lower() == "away":
-                away = goals
-
-            if desc == "current":
-                if str(loc).lower() == "home":
-                    home = goals
-                elif str(loc).lower() == "away":
-                    away = goals
-
-    return home, away
-
-
 def extract_1x2_odds(fixture: dict) -> dict:
     result = {"1": None, "X": None, "2": None}
 
@@ -405,10 +397,10 @@ async def fetch_all_today_fixtures() -> list[dict]:
 
     async with httpx.AsyncClient(timeout=40.0, follow_redirects=True) as client:
         attempts = [
-            (f"/fixtures/date/{date_str}", {"include": "participants;league;odds;scores"}),
-            ("/fixtures", {"include": "participants;league;odds;scores", "date": date_str}),
-            ("/fixtures", {"filters": f"date:{date_str}", "include": "participants;league;odds;scores"}),
-            ("/fixtures", {"include": "participants;league;odds;scores"}),
+            (f"/fixtures/date/{date_str}", {"include": "participants;league;odds"}),
+            ("/fixtures", {"include": "participants;league;odds", "date": date_str}),
+            ("/fixtures", {"filters": f"date:{date_str}", "include": "participants;league;odds"}),
+            ("/fixtures", {"include": "participants;league;odds"}),
         ]
 
         for path, params in attempts:
@@ -423,6 +415,14 @@ async def fetch_all_today_fixtures() -> list[dict]:
                 print(f"⚠️ Tentative échouée {path}: {e}")
 
     print(f"📦 Fixtures brutes récupérées: {len(all_items)}")
+
+    for fx in all_items[:5]:
+        home, away = extract_participants(fx)
+        kickoff = extract_kickoff(fx)
+        parsed = local_dt_from_any(kickoff)
+        inw = is_match_in_window(parsed)
+        print(f"🧪 {home} vs {away} | raw={kickoff} | parsed={parsed} | dans fenêtre={inw}")
+
     return all_items
 
 
@@ -440,16 +440,6 @@ def implied_probs_from_odds(odds: dict) -> tuple[float, float, float]:
     return normalize_probs(p1, px, p2)
 
 
-def extract_recent_form_points(team_obj: dict) -> Optional[float]:
-    # Placeholder souple : selon plan Sportmonks
-    # Si la donnée n'existe pas, on renvoie None
-    for key in ["form_points", "recent_points", "form"]:
-        val = team_obj.get(key)
-        if isinstance(val, (int, float)):
-            return float(val)
-    return None
-
-
 def generic_analyze_fixture(fixture: dict) -> Optional[Prono]:
     try:
         fixture_id = int(fixture.get("id") or 0)
@@ -462,35 +452,30 @@ def generic_analyze_fixture(fixture: dict) -> Optional[Prono]:
 
         kickoff = extract_kickoff(fixture)
         dt = local_dt_from_any(kickoff)
-        if not dt or dt.date() != today_local_date():
+        if not is_match_in_window(dt):
             return None
 
         league = extract_league_name(fixture)
         odds = extract_1x2_odds(fixture)
 
         p1, px, p2 = implied_probs_from_odds(odds)
-
-        # Si aucune cote exploitable, on saute
         if max(p1, px, p2) <= 0:
             return None
 
         reasons = []
 
-        # Base: probabilités implicites
         s1, sx, s2 = p1, px, p2
 
-        # Bonus domicile léger
+        # avantage domicile léger
         s1 += 0.03
         s2 -= 0.01
         reasons.append("avantage domicile")
 
-        # Réduction légère du nul si extrêmes marqués
         favorite_gap = abs(s1 - s2)
         if favorite_gap > 0.12:
             sx -= 0.03
             reasons.append("écart de force sur les cotes")
 
-        # Clamp
         s1 = max(0.01, s1)
         sx = max(0.01, sx)
         s2 = max(0.01, s2)
@@ -538,7 +523,13 @@ def generic_analyze_fixture(fixture: dict) -> Optional[Prono]:
 
 def build_coupon(name: str, subtitle: str, pronos: list[Prono], min_odds: float, max_odds: float, max_legs: int) -> Optional[Coupon]:
     try:
-        pool = [p for p in pronos if p.odds and p.odds > 1.01]
+        pool = []
+        for p in pronos:
+            odd = safe_odd(p.odds)
+            if odd:
+                p.odds = odd
+                pool.append(p)
+
         if not pool:
             return None
 
@@ -546,8 +537,8 @@ def build_coupon(name: str, subtitle: str, pronos: list[Prono], min_odds: float,
 
         legs = []
         used = set()
-        odds = 1.0
-        prob = 1.0
+        combined_odds = 1.0
+        combined_prob = 1.0
 
         for p in pool:
             if len(legs) >= max_legs:
@@ -555,30 +546,30 @@ def build_coupon(name: str, subtitle: str, pronos: list[Prono], min_odds: float,
             if p.fixture_id in used:
                 continue
 
-            test_odds = odds * p.odds
-            if test_odds > max_odds and legs:
+            next_odds = combined_odds * float(p.odds)
+            if next_odds > max_odds and legs:
                 continue
 
             legs.append(p)
             used.add(p.fixture_id)
-            odds = test_odds
-            prob *= p.pick_prob()
+            combined_odds = next_odds
+            combined_prob *= float(p.pick_prob())
 
-            if odds >= min_odds:
+            if combined_odds >= min_odds:
                 break
 
         if not legs:
             return None
-        if odds < min_odds * 0.85:
+        if combined_odds < min_odds * 0.85:
             return None
 
         return Coupon(
             name=name,
             subtitle=subtitle,
             legs=legs,
-            combined_odds=round(odds, 2),
-            combined_prob=round(prob, 4),
-            combined_ev=round(prob * odds - 1, 4),
+            combined_odds=round(combined_odds, 2),
+            combined_prob=round(combined_prob, 4),
+            combined_ev=round((combined_prob * combined_odds) - 1, 4),
         )
     except Exception as e:
         print(f"⚠️ build_coupon crash [{name}]: {e}")
@@ -692,8 +683,9 @@ async def debug_cmd(message: Message):
         f"Fixtures brutes : <b>{d.get('fixtures_raw', 0)}</b>\n"
         f"Analysées : <b>{d.get('analyzed', 0)}</b>\n"
         f"Retenues : <b>{d.get('kept', 0)}</b>\n"
-        f"Hors date : <b>{d.get('out_of_day', 0)}</b>\n"
+        f"Hors fenêtre : <b>{d.get('out_of_day', 0)}</b>\n"
         f"Sans odds : <b>{d.get('no_odds', 0)}</b>\n"
+        f"Fenêtre : <b>-{WINDOW_BACK_H:.0f}h → +{WINDOW_FWD_H:.0f}h</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>\n"
         f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
     )
@@ -759,7 +751,7 @@ async def scan_today_only():
         try:
             kickoff = extract_kickoff(fx)
             dt = local_dt_from_any(kickoff)
-            if not dt or dt.date() != today_local_date():
+            if not is_match_in_window(dt):
                 out_of_day += 1
                 continue
 
@@ -806,7 +798,7 @@ async def scan_today_only():
     print(f"Fixtures brutes : {len(fixtures)}")
     print(f"Analysées       : {analyzed}")
     print(f"Retenues        : {kept}")
-    print(f"Hors date       : {out_of_day}")
+    print(f"Hors fenêtre    : {out_of_day}")
     print(f"Sans odds       : {no_odds}")
     print(f"Coupons         : {len(coupons)}")
     print("────────────────────────────────────")
@@ -885,6 +877,7 @@ async def root():
         "status": "ok",
         "ready": STATE["ready"],
         "today": str(today_local_date()),
+        "window": [f"-{WINDOW_BACK_H}h", f"+{WINDOW_FWD_H}h"],
         "pronos": len(STATE["pronos"]),
         "coupons": [c.name for c in STATE["coupons"]],
         "last_scan": STATE["last_scan"],
