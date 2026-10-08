@@ -43,7 +43,6 @@ RHO = float(os.getenv("RHO", "-0.05"))
 MAX_GOALS = int(os.getenv("MAX_GOALS", "8"))
 RECENT_DAYS = int(os.getenv("RECENT_DAYS", "500"))
 DECAY_DAYS = float(os.getenv("DECAY_DAYS", "180"))
-EV_THRESHOLD = float(os.getenv("EV_THRESHOLD", "0.03"))
 
 LOCAL_DB = os.getenv("LOCAL_DB", "/tmp/wallstreet_ci_sportmonks.json")
 BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
@@ -189,27 +188,42 @@ def parse_date(s: str) -> Optional[datetime]:
     return None
 
 
-def local_dt_from_iso(iso) -> Optional[datetime]:
-    if not iso:
+def local_dt_from_iso(value) -> Optional[datetime]:
+    if value is None:
         return None
     try:
-        if isinstance(iso, (int, float)):
-            return datetime.fromtimestamp(int(iso), tz=ZoneInfo("UTC")).astimezone(TZ)
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(int(value), tz=ZoneInfo("UTC")).astimezone(TZ)
 
-        raw = str(iso).strip()
+        raw = str(value).strip()
+        if not raw:
+            return None
+
         if raw.isdigit():
             return datetime.fromtimestamp(int(raw), tz=ZoneInfo("UTC")).astimezone(TZ)
 
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-        return dt.astimezone(TZ)
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+            return dt.astimezone(TZ)
+        except Exception:
+            pass
+
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                dt = datetime.strptime(raw, fmt).replace(tzinfo=ZoneInfo("UTC"))
+                return dt.astimezone(TZ)
+            except Exception:
+                pass
+
+        return None
     except Exception:
         return None
 
 
-def kickoff_local(iso) -> str:
-    dt = local_dt_from_iso(iso)
+def kickoff_local(value) -> str:
+    dt = local_dt_from_iso(value)
     return dt.strftime("%H:%M") if dt else "?"
 
 
@@ -519,11 +533,9 @@ async def sportmonks_get(client: httpx.AsyncClient, path: str, params: dict | No
     params = params or {}
     params["api_token"] = SPORTMONKS_API_KEY
     url = f"{SPORTMONKS_BASE}{path}"
-
     r = await client.get(url, params=params, headers=sm_headers(), timeout=30.0)
     print(f"🌍 GET {r.url} -> {r.status_code}")
     r.raise_for_status()
-
     data = r.json()
     if isinstance(data, dict):
         print(f"📦 keys: {list(data.keys())[:10]}")
@@ -552,28 +564,46 @@ def extract_participants(fixture: dict) -> tuple[str, str]:
 
 def extract_league_name(fixture: dict) -> str:
     league = fixture.get("league") or {}
-    return league.get("name") or fixture.get("league_name") or ""
+    if isinstance(league, dict):
+        return league.get("name") or fixture.get("league_name") or ""
+    return fixture.get("league_name") or ""
 
 
 def extract_kickoff_iso(fixture: dict):
-    candidates = [
+    direct_candidates = [
         fixture.get("starting_at"),
         fixture.get("startingAt"),
         fixture.get("date"),
         fixture.get("starting_at_timestamp"),
+        fixture.get("starting_at_iso"),
     ]
+
+    for c in direct_candidates:
+        if c:
+            return c
 
     time_block = fixture.get("time")
     if isinstance(time_block, dict):
-        candidates.append(time_block.get("starting_at"))
+        for key in ["starting_at", "date_time", "timestamp", "starting_at_timestamp"]:
+            val = time_block.get(key)
+            if val:
+                return val
+
         sa = time_block.get("starting_at")
         if isinstance(sa, dict):
-            candidates.append(sa.get("date_time"))
-            candidates.append(sa.get("timestamp"))
+            for key in ["date_time", "timestamp", "datetime", "date"]:
+                val = sa.get(key)
+                if val:
+                    return val
 
-    for c in candidates:
-        if c:
-            return c
+    for block_name in ["fixture", "details", "attributes"]:
+        block = fixture.get(block_name)
+        if isinstance(block, dict):
+            for key in ["starting_at", "date", "timestamp", "date_time"]:
+                val = block.get(key)
+                if val:
+                    return val
+
     return ""
 
 
@@ -632,6 +662,7 @@ async def fetch_sportmonks_fixtures_today() -> list[dict]:
             (f"/fixtures/date/{date_str}", {"include": "participants;league;odds"}),
             ("/fixtures", {"include": "participants;league;odds", "date": date_str}),
             ("/fixtures", {"filters": f"date:{date_str}", "include": "participants;league;odds"}),
+            ("/fixtures", {"include": "participants;league;odds"}),
         ]
 
         for path, params in attempts:
@@ -645,27 +676,15 @@ async def fetch_sportmonks_fixtures_today() -> list[dict]:
             except Exception as e:
                 print(f"⚠️ Tentative échouée {path}: {e}")
 
-        if not all_items:
-            try:
-                data = await sportmonks_get(client, "/fixtures", {"include": "participants;league;odds"})
-                items = data.get("data", []) or []
-                print(f"📡 Fallback /fixtures brut => {len(items)}")
-                all_items = items
-            except Exception as e:
-                print(f"⚠️ fallback brut échoué: {e}")
-                return []
+    print(f"📦 Fixtures brutes récupérées: {len(all_items)}")
 
-    filtered = []
-    today_ci = today_local_date()
-
-    for fx in all_items:
+    for fx in all_items[:5]:
+        home, away = extract_participants(fx)
         kickoff = extract_kickoff_iso(fx)
-        dt = local_dt_from_iso(kickoff)
-        if dt and dt.date() == today_ci:
-            filtered.append(fx)
+        parsed = local_dt_from_iso(kickoff)
+        print(f"🧪 {home} vs {away} | raw={kickoff} | parsed={parsed}")
 
-    print(f"✅ Fixtures filtrées localement pour {today_ci}: {len(filtered)}")
-    return filtered
+    return all_items
 
 
 # =========================================================
@@ -692,7 +711,10 @@ def analyze_fixture(fixture: dict, models: dict) -> Optional[Prono]:
 
         kickoff = extract_kickoff_iso(fixture)
         local_dt = local_dt_from_iso(kickoff)
-        if not local_dt or local_dt.date() != today_local_date():
+        if not local_dt:
+            return None
+
+        if local_dt.date() != today_local_date():
             return None
 
         home_model = find_team(home_api, model["teams"])
@@ -1048,12 +1070,14 @@ async def debug_cmd(message: Message):
     txt = (
         f"<b>Debug</b>\n\n"
         f"Date locale : <b>{d.get('today_local', '?')}</b>\n"
-        f"Fixtures total : <b>{d.get('fixtures_total', 0)}</b>\n"
+        f"Fixtures brutes : <b>{d.get('fixtures_raw', 0)}</b>\n"
         f"Retenus : <b>{d.get('kept', 0)}</b>\n"
         f"Rejetés : <b>{d.get('rejected', 0)}</b>\n"
         f"Sans cotes : <b>{d.get('without_odds', 0)}</b>\n"
         f"Sans ligue compatible : <b>{d.get('unknown_league', 0)}</b>\n"
         f"Sans équipe reconnue : <b>{d.get('unmatched_teams', 0)}</b>\n"
+        f"Hors date : <b>{d.get('out_of_day', 0)}</b>\n"
+        f"Date illisible : <b>{d.get('bad_date', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>\n"
         f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
     )
@@ -1106,25 +1130,24 @@ async def scan_today_only():
         print("⏳ modèles pas prêts")
         return
 
-    fixtures = []
     try:
         fixtures = await fetch_sportmonks_fixtures_today()
     except Exception as e:
         print(f"⚠️ fetch Sportmonks échoué: {e}")
         STATE["debug"] = {
             "today_local": str(today_local_date()),
-            "fixtures_total": 0,
+            "fixtures_raw": 0,
             "kept": 0,
             "rejected": 0,
             "without_odds": 0,
             "unknown_league": 0,
             "unmatched_teams": 0,
+            "out_of_day": 0,
+            "bad_date": 0,
             "coupons": 0,
             "error": str(e),
         }
         return
-
-    print(f"🌐 Sportmonks fixtures filtrées du jour: {len(fixtures)}")
 
     pronos = []
     rejected = 0
@@ -1132,24 +1155,42 @@ async def scan_today_only():
     without_odds = 0
     unknown_league = 0
     unmatched_teams = 0
+    out_of_day = 0
+    bad_date = 0
     seen = set()
 
     for fx in fixtures:
         try:
+            fixture_id = int(fx.get("id") or 0)
+            if not fixture_id:
+                rejected += 1
+                continue
+
             league_name = extract_league_name(fx)
             if league_name not in LEAGUE_NAME_TO_CODE:
                 unknown_league += 1
                 continue
 
-            home_api, away_api = extract_participants(fx)
-            league_code = LEAGUE_NAME_TO_CODE[league_name]
-            model = STATE["models"].get(league_code, {"teams": {}})
+            kickoff = extract_kickoff_iso(fx)
+            local_dt = local_dt_from_iso(kickoff)
+            if not local_dt:
+                bad_date += 1
+                continue
+            if local_dt.date() != today_local_date():
+                out_of_day += 1
+                continue
 
+            home_api, away_api = extract_participants(fx)
             if not home_api or not away_api:
                 rejected += 1
                 continue
 
-            if not find_team(home_api, model["teams"]) or not find_team(away_api, model["teams"]):
+            league_code = LEAGUE_NAME_TO_CODE[league_name]
+            model = STATE["models"].get(league_code, {"teams": {}})
+
+            hm = find_team(home_api, model["teams"])
+            am = find_team(away_api, model["teams"])
+            if not hm or not am:
                 unmatched_teams += 1
                 continue
 
@@ -1194,22 +1235,26 @@ async def scan_today_only():
     STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
     STATE["debug"] = {
         "today_local": str(today_local_date()),
-        "fixtures_total": len(fixtures),
+        "fixtures_raw": len(fixtures),
         "kept": kept,
         "rejected": rejected,
         "without_odds": without_odds,
         "unknown_league": unknown_league,
         "unmatched_teams": unmatched_teams,
+        "out_of_day": out_of_day,
+        "bad_date": bad_date,
         "coupons": len(coupons),
     }
 
     print("──────── RÉSUMÉ SPORTMONKS ────────")
-    print(f"Fixtures total         : {len(fixtures)}")
+    print(f"Fixtures brutes        : {len(fixtures)}")
     print(f"Retenus                : {kept}")
     print(f"Rejetés                : {rejected}")
     print(f"Sans cotes             : {without_odds}")
     print(f"Ligues non compatibles : {unknown_league}")
     print(f"Équipes non reconnues  : {unmatched_teams}")
+    print(f"Hors date              : {out_of_day}")
+    print(f"Date illisible         : {bad_date}")
     print(f"Coupons                : {len(coupons)}")
     print("───────────────────────────────────")
 
@@ -1220,11 +1265,7 @@ async def scan_today_only():
 async def daily_broadcast():
     await scan_today_only()
 
-    if not STATE["coupons"]:
-        text = format_no_match()
-    else:
-        text = format_summary(len(STATE["pronos"]), len(STATE["coupons"]))
-
+    text = format_no_match() if not STATE["coupons"] else format_summary(len(STATE["pronos"]), len(STATE["coupons"]))
     date_str = datetime.now(TZ).strftime("%Y-%m-%d")
     record_coupons(STATE["coupons"], date_str)
 
