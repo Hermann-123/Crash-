@@ -38,7 +38,7 @@ TELEGRAM_CHANNEL  = os.getenv("TELEGRAM_CHANNEL", "")
 NOTIFY_HOUR       = int(os.getenv("NOTIFY_HOUR", "0"))
 NOTIFY_MINUTE     = int(os.getenv("NOTIFY_MINUTE", "0"))
 NOTIFY_TZ         = os.getenv("NOTIFY_TZ", "Europe/Paris")
-SCAN_WINDOW_HOURS = int(os.getenv("SCAN_WINDOW_HOURS", "36"))
+SCAN_WINDOW_HOURS = int(os.getenv("SCAN_WINDOW_HOURS", "168"))
 
 EV_THRESHOLD      = float(os.getenv("EV_THRESHOLD", "0.03"))
 RHO               = float(os.getenv("RHO", "-0.05"))
@@ -99,7 +99,7 @@ TEAM_ALIASES = {
     "newcastle united": "newcastle",
     "west ham united": "west ham",
     "brighton and hove albion": "brighton",
-    "brighton & hove albion": "brighton",
+    "brighton hove albion": "brighton",
     "leicester city": "leicester",
     "leeds united": "leeds",
     "sheffield united": "sheffield utd",
@@ -107,7 +107,7 @@ TEAM_ALIASES = {
     "paris st germain": "paris sg",
     "borussia dortmund": "dortmund",
     "bayer leverkusen": "leverkusen",
-    "borussia monchengladbach": "m'gladbach",
+    "borussia monchengladbach": "m gladbach",
     "eintracht frankfurt": "ein frankfurt",
     "atletico madrid": "ath madrid",
     "athletic bilbao": "ath bilbao",
@@ -122,8 +122,8 @@ TEAM_ALIASES = {
     "juventus fc": "juventus",
     "psv eindhoven": "psv",
     "fc groningen": "groningen",
-    "sporting cp": "sp Lisbon",
-    "sporting lisbon": "sp Lisbon",
+    "sporting cp": "sporting",
+    "sporting lisbon": "sporting",
     "fc porto": "porto",
     "sl benfica": "benfica",
     "sc braga": "braga",
@@ -135,6 +135,46 @@ TEAM_ALIASES = {
     "anderlecht": "anderlecht",
     "royal antwerp": "antwerp",
     "genk": "genk",
+
+    "celta vigo": "celta",
+    "real mallorca": "mallorca",
+    "mallorca": "mallorca",
+    "deportivo alaves": "alaves",
+    "alaves": "alaves",
+    "espanyol barcelona": "espanyol",
+    "rcd espanyol": "espanyol",
+    "leganes": "leganes",
+    "real oviedo": "oviedo",
+    "real zaragoza": "zaragoza",
+    "malaga cf": "malaga",
+    "deportivo la coruna": "la coruna",
+
+    "boavista fc": "boavista",
+    "fc arouca": "arouca",
+    "rio ave fc": "rio ave",
+    "fc famalicao": "famalicao",
+    "sporting braga": "braga",
+    "vitoria guimaraes": "guimaraes",
+    "gil vicente fc": "gil vicente",
+    "estrela amadora": "estrela",
+    "casa pia": "casa pia",
+    "moreirense fc": "moreirense",
+
+    "feyenoord rotterdam": "feyenoord",
+    "go ahead eagles": "go ahead eagles",
+    "sparta rotterdam": "sparta",
+    "pec zwolle": "zwolle",
+    "nec nijmegen": "nijmegen",
+    "fortuna sittard": "sittard",
+    "heracles almelo": "heracles",
+    "willem ii": "willem ii",
+
+    "istanbul basaksehir": "basaksehir",
+    "gaziantep fk": "gaziantep",
+    "goztepe": "goztepe",
+    "genclerbirligi": "genclerbirligi",
+    "kasimpasa": "kasimpasa",
+    "samsunspor": "samsunspor",
 }
 
 
@@ -142,26 +182,55 @@ TEAM_ALIASES = {
 # UTILITAIRES
 # ════════════════════════════════════════════════════════════════
 def normalize(name: str) -> str:
-    n = unicodedata.normalize("NFKD", name)
+    n = unicodedata.normalize("NFKD", name or "")
     n = "".join(c for c in n if not unicodedata.combining(c))
     n = n.lower().replace("&", " and ")
     n = re.sub(r"[^a-z0-9 ]", " ", n)
-    return re.sub(r"\s+", " ", n).strip()
+    n = re.sub(r"\s+", " ", n).strip()
+
+    stopwords = {
+        "fc", "cf", "ac", "sc", "sv", "fk", "club",
+        "de", "da", "cd", "ud", "sd"
+    }
+    tokens = [t for t in n.split() if t not in stopwords]
+    return " ".join(tokens).strip()
 
 
 def find_team(api_name: str, teams: dict) -> Optional[str]:
     if api_name in teams:
         return api_name
 
-    alias = TEAM_ALIASES.get(normalize(api_name))
+    norm_api = normalize(api_name)
+
+    alias = TEAM_ALIASES.get(norm_api)
     if alias:
+        alias_norm = normalize(alias)
         for t in teams:
-            if normalize(t) == normalize(alias):
+            if normalize(t) == alias_norm:
                 return t
 
+    for t in teams:
+        if normalize(t) == norm_api:
+            return t
+
+    candidates = []
+    for t in teams:
+        nt = normalize(t)
+        if nt in norm_api or norm_api in nt:
+            candidates.append(t)
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        candidates.sort(key=lambda x: len(normalize(x)))
+        return candidates[0]
+
     lookup = {normalize(t): t for t in teams}
-    close = difflib.get_close_matches(normalize(api_name), lookup.keys(), n=1, cutoff=0.82)
-    return lookup[close[0]] if close else None
+    close = difflib.get_close_matches(norm_api, lookup.keys(), n=1, cutoff=0.72)
+    if close:
+        return lookup[close[0]]
+
+    return None
 
 
 def _f(v) -> Optional[float]:
@@ -331,7 +400,6 @@ class CSVProvider(StatsProvider):
                     return parse_csv(r.text, lg.code) if r.status_code == 200 else []
                 except httpx.HTTPError:
                     return []
-
             batches = await asyncio.gather(*[one(lg, se) for lg in leagues for se in seasons])
         return [m for b in batches for m in b]
 
@@ -549,7 +617,7 @@ def _grade_from(score: float) -> str:
     return "D"
 
 
-def compute_reliability(p_model: float, odds: Optional[float], calibration: dict) -> Reliability:
+def compute_reliability(p_model: float, odds: Optional[float], calibration: dict) -> "Reliability":
     obs = observed_rate(p_model, calibration)
     p_mkt = (1.0 / odds) if (odds and odds > 1.0) else None
     edge = (p_model - p_mkt) if p_mkt is not None else None
@@ -632,7 +700,7 @@ def kelly(prob: float, odds: float, fraction: float = 0.25) -> float:
 
 
 # ════════════════════════════════════════════════════════════════
-# ANALYSE / COUPONS
+# COUPONS
 # ════════════════════════════════════════════════════════════════
 COUPONS = [
     CouponConfig("SÉCURISÉ",  "🟢", "safe",       1.8,  2.8, 3),
@@ -670,7 +738,6 @@ def analyze(league: League, event: dict, model: dict, calibration: dict) -> Opti
         is_value = ev >= EV_THRESHOLD
 
     rel = compute_reliability(probs[pick], chosen, calibration)
-
     labels = {
         "1": f"Victoire {api_home}",
         "2": f"Victoire {api_away}",
@@ -818,517 +885,3 @@ def format_bilan(tracker: dict) -> str:
             b["wins"] += 1
             b["returned"] += c["combined_odds"]
             total_wins += 1
-            total_returned += c["combined_odds"]
-
-    lines = ["📊 <b>BILAN DU SYSTÈME</b>", ""]
-    for name in ["SÉCURISÉ", "ÉQUILIBRÉ", "AGRESSIF", "VALUE"]:
-        b = by_name.get(name)
-        if not b or b["bets"] == 0:
-            continue
-        roi = (b["returned"] - b["staked"]) / b["staked"] * 100
-        wr = b["wins"] / b["bets"] * 100
-        lines.append(f"{EMOJI_BY_NAME[name]} <b>{name}</b>")
-        lines.append(f"   Paris : {b['bets']}  ·  Réussite : {wr:.0f}%")
-        lines.append(f"   ROI : <b>{roi:+.1f}%</b>")
-        lines.append("")
-
-    total_roi = (total_returned - total_staked) / total_staked * 100
-    total_wr = total_wins / total_bets * 100
-    lines.append("📈 <b>TOTAL</b>")
-    lines.append(f"   Paris : {total_bets}  ·  Réussite : {total_wr:.0f}%")
-    lines.append(f"   ROI global : <b>{total_roi:+.1f}%</b>")
-    if pending:
-        lines.append("")
-        lines.append(f"⏳ {len(pending)} coupon(s) en attente.")
-    return "\n".join(lines)
-
-
-# ════════════════════════════════════════════════════════════════
-# CLAVIER BAS
-# ════════════════════════════════════════════════════════════════
-BTN_SAFE       = "🟢 SÉCURISÉ"
-BTN_BALANCED   = "🟡 ÉQUILIBRÉ"
-BTN_AGGRESSIVE = "🔴 AGRESSIF"
-BTN_VALUE      = "💎 VALUE"
-BTN_BILAN      = "📊 BILAN"
-BTN_SCAN       = "🔄 SCAN"
-
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text=BTN_SAFE), KeyboardButton(text=BTN_BALANCED)],
-        [KeyboardButton(text=BTN_AGGRESSIVE), KeyboardButton(text=BTN_VALUE)],
-        [KeyboardButton(text=BTN_BILAN), KeyboardButton(text=BTN_SCAN)],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=False,
-    input_field_placeholder="Choisis un ticket…",
-)
-
-
-# ════════════════════════════════════════════════════════════════
-# PERSISTANCE
-# ════════════════════════════════════════════════════════════════
-async def _gist_load() -> Optional[dict]:
-    if not (GIST_ID and GITHUB_TOKEN):
-        return None
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"https://api.github.com/gists/{GIST_ID}",
-                headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
-                timeout=15.0,
-            )
-            if r.status_code != 200:
-                return None
-            for name, f in (r.json().get("files") or {}).items():
-                if name.endswith(".json"):
-                    content = f.get("content", "")
-                    return json.loads(content) if content.strip() else {}
-    except Exception as e:
-        print(f"⚠️ Lecture Gist échouée : {e}")
-    return None
-
-
-async def _gist_save(state: dict) -> bool:
-    if not (GIST_ID and GITHUB_TOKEN):
-        return False
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.patch(
-                f"https://api.github.com/gists/{GIST_ID}",
-                headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
-                json={"files": {"wallstreet.json": {"content": json.dumps(state, indent=2)}}},
-                timeout=15.0,
-            )
-            return r.status_code == 200
-    except Exception as e:
-        print(f"⚠️ Écriture Gist échouée : {e}")
-        return False
-
-
-async def load_tracker() -> dict:
-    data = await _gist_load()
-    if data is None:
-        try:
-            with open(LOCAL_DB, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = None
-    return data if data else {"coupons": []}
-
-
-async def save_tracker(data: dict):
-    if GIST_ID and GITHUB_TOKEN and await _gist_save(data):
-        return
-    try:
-        with open(LOCAL_DB, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"⚠️ Sauvegarde locale échouée : {e}")
-
-
-# ════════════════════════════════════════════════════════════════
-# TELEGRAM
-# ════════════════════════════════════════════════════════════════
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-STATE = {
-    "models": {},
-    "ready": False,
-    "last_scan": None,
-    "pronos": [],
-    "coupons": [],
-    "scan_day": None,
-    "tracker": {"coupons": []},
-    "calibration": {},
-    "api_events": 0,
-    "debug": {},
-}
-
-TARGETS: list[int | str] = []
-for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
-    if not raw:
-        continue
-    try:
-        TARGETS.append(int(raw))
-    except ValueError:
-        TARGETS.append(raw)
-
-
-# ════════════════════════════════════════════════════════════════
-# COMMANDES
-# ════════════════════════════════════════════════════════════════
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    await message.answer(
-        "👋 <b>WallStreet OS</b>\n\n"
-        "Utilise les boutons sous le clavier.\n"
-        "Si tu veux tester tout de suite : appuie sur 🔄 SCAN",
-        reply_markup=MAIN_KEYBOARD
-    )
-
-
-@dp.message(Command("menu"))
-async def cmd_menu(message: Message):
-    await message.answer("🎟️ Menu affiché sous le clavier 👇", reply_markup=MAIN_KEYBOARD)
-
-
-@dp.message(Command("scan"))
-async def cmd_scan(message: Message):
-    await message.answer("⏳ Scan en cours...", reply_markup=MAIN_KEYBOARD)
-    await scan(window_hours=SCAN_WINDOW_HOURS, debug=False)
-    await message.answer(
-        f"✅ {len(STATE['pronos'])} matchs · {len(STATE['coupons'])} tickets.",
-        reply_markup=MAIN_KEYBOARD
-    )
-
-
-@dp.message(Command("debugscan"))
-async def cmd_debugscan(message: Message):
-    await message.answer("🛠️ Debug scan en cours...", reply_markup=MAIN_KEYBOARD)
-    await scan(window_hours=SCAN_WINDOW_HOURS, debug=True)
-
-    d = STATE.get("debug", {})
-    txt = (
-        "🛠️ <b>DEBUG SCAN</b>\n\n"
-        f"Events API : <b>{d.get('total_events', 0)}</b>\n"
-        f"Hors fenêtre : <b>{d.get('out_window', 0)}</b>\n"
-        f"Équipes non reconnues : <b>{d.get('unmatched', 0)}</b>\n"
-        f"Analyses rejetées : <b>{d.get('rejected', 0)}</b>\n"
-        f"Pronos retenus : <b>{d.get('ok', 0)}</b>\n"
-        f"Coupons : <b>{len(STATE['coupons'])}</b>"
-    )
-    await message.answer(txt, reply_markup=MAIN_KEYBOARD)
-
-
-@dp.message(Command("bilan"))
-async def cmd_bilan(message: Message):
-    await message.answer(format_bilan(STATE["tracker"]), reply_markup=MAIN_KEYBOARD)
-
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    total_teams = sum(len(m["teams"]) for m in STATE["models"].values())
-    await message.answer(
-        f"📊 <b>Statut</b>\n\n"
-        f"Ready : <b>{STATE['ready']}</b>\n"
-        f"Ligues : <b>{len(STATE['models'])}/{len(LEAGUES)}</b>\n"
-        f"Équipes : <b>{total_teams}</b>\n"
-        f"Pronos : <b>{len(STATE['pronos'])}</b>\n"
-        f"Coupons : <b>{len(STATE['coupons'])}</b>\n"
-        f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>\n"
-        f"Quota odds : <b>{QUOTA['used']}/{QUOTA['limit']}</b>",
-        reply_markup=MAIN_KEYBOARD
-    )
-
-
-# ════════════════════════════════════════════════════════════════
-# BOUTONS CLAVIER
-# ════════════════════════════════════════════════════════════════
-async def _send_coupon(message: Message, name: str):
-    coupon = next((c for c in STATE["coupons"] if c.name == name), None)
-    if not coupon:
-        d = STATE.get("debug", {})
-        reason = (
-            f"\n\nDebug:\n"
-            f"- events API: {d.get('total_events', 0)}\n"
-            f"- hors fenêtre: {d.get('out_window', 0)}\n"
-            f"- non reconnus: {d.get('unmatched', 0)}\n"
-            f"- rejetés: {d.get('rejected', 0)}"
-            if d else ""
-        )
-        await message.answer(
-            f"❌ Aucun ticket « {name} » disponible.\n"
-            f"Appuie sur 🔄 SCAN.{reason}",
-            reply_markup=MAIN_KEYBOARD
-        )
-        return
-    await message.answer(format_coupon(coupon), reply_markup=MAIN_KEYBOARD)
-
-
-@dp.message(F.text == BTN_SAFE)
-async def btn_safe(message: Message):
-    await _send_coupon(message, "SÉCURISÉ")
-
-
-@dp.message(F.text == BTN_BALANCED)
-async def btn_balanced(message: Message):
-    await _send_coupon(message, "ÉQUILIBRÉ")
-
-
-@dp.message(F.text == BTN_AGGRESSIVE)
-async def btn_aggressive(message: Message):
-    await _send_coupon(message, "AGRESSIF")
-
-
-@dp.message(F.text == BTN_VALUE)
-async def btn_value(message: Message):
-    await _send_coupon(message, "VALUE")
-
-
-@dp.message(F.text == BTN_BILAN)
-async def btn_bilan(message: Message):
-    await message.answer(format_bilan(STATE["tracker"]), reply_markup=MAIN_KEYBOARD)
-
-
-@dp.message(F.text == BTN_SCAN)
-async def btn_scan(message: Message):
-    await message.answer("⏳ Scan en cours...", reply_markup=MAIN_KEYBOARD)
-    await scan(window_hours=SCAN_WINDOW_HOURS, debug=True)
-    await message.answer(
-        f"✅ {len(STATE['pronos'])} matchs · {len(STATE['coupons'])} tickets.",
-        reply_markup=MAIN_KEYBOARD
-    )
-
-
-# ════════════════════════════════════════════════════════════════
-# SCAN DEBUG
-# ════════════════════════════════════════════════════════════════
-async def scan(window_hours: int = SCAN_WINDOW_HOURS, debug: bool = False):
-    if not STATE["ready"]:
-        print("⏳ Modèles pas prêts.")
-        return
-
-    now_utc = datetime.now(timezone.utc)
-    limit = now_utc + timedelta(hours=window_hours)
-    print(f"🔄 Scan {now_utc:%d/%m %H:%M} → {limit:%d/%m %H:%M} UTC...")
-
-    pronos: list[Prono] = []
-    total_events = 0
-    total_out_window = 0
-    total_unmatched = 0
-    total_no_pred = 0
-    total_ok = 0
-    by_league_debug = {}
-
-    async with httpx.AsyncClient() as client:
-        for lg in LEAGUES:
-            model = STATE["models"].get(lg.code)
-            if not model or not model["teams"]:
-                print(f"   {lg.name}: modèle vide")
-                by_league_debug[lg.name] = {
-                    "events": 0, "out_window": 0, "unmatched": 0, "rejected": 0, "ok": 0
-                }
-                continue
-
-            events = await fetch_odds(client, lg)
-            total_events += len(events)
-
-            lg_out_window = 0
-            lg_unmatched = 0
-            lg_no_pred = 0
-            lg_ok = 0
-
-            print(f"   {lg.name}: {len(events)} event(s) API")
-
-            for ev in events:
-                try:
-                    ko = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00"))
-                except Exception:
-                    lg_no_pred += 1
-                    total_no_pred += 1
-                    continue
-
-                if not (now_utc <= ko <= limit):
-                    lg_out_window += 1
-                    total_out_window += 1
-                    continue
-
-                home_api = ev.get("home_team", "")
-                away_api = ev.get("away_team", "")
-
-                home = find_team(home_api, model["teams"])
-                away = find_team(away_api, model["teams"])
-
-                if not home or not away:
-                    lg_unmatched += 1
-                    total_unmatched += 1
-                    print(f"      ❌ Non reconnu: {home_api} vs {away_api}")
-                    continue
-
-                p = analyze(lg, ev, model, STATE["calibration"])
-                if not p:
-                    lg_no_pred += 1
-                    total_no_pred += 1
-                    print(f"      ⚠️ Analyse rejetée: {home_api} vs {away_api}")
-                    continue
-
-                pronos.append(p)
-                lg_ok += 1
-                total_ok += 1
-
-            by_league_debug[lg.name] = {
-                "events": len(events),
-                "out_window": lg_out_window,
-                "unmatched": lg_unmatched,
-                "rejected": lg_no_pred,
-                "ok": lg_ok,
-            }
-
-            print(
-                f"   {lg.name}: ok={lg_ok} | hors_fenêtre={lg_out_window} | "
-                f"non_reconnus={lg_unmatched} | rejetés={lg_no_pred}"
-            )
-
-            await asyncio.sleep(1)
-
-    STATE["api_events"] = total_events
-    pronos.sort(key=lambda p: _score(p), reverse=True)
-    STATE["pronos"] = pronos
-
-    coupons = []
-    for cfg in COUPONS:
-        c = build_coupon(cfg, pronos)
-        if c:
-            coupons.append(c)
-
-    STATE["coupons"] = coupons
-    STATE["scan_day"] = datetime.now(ZoneInfo(NOTIFY_TZ)).date()
-    STATE["last_scan"] = datetime.now(ZoneInfo(NOTIFY_TZ)).strftime("%d/%m %H:%M")
-
-    STATE["debug"] = {
-        "window_hours": window_hours,
-        "total_events": total_events,
-        "out_window": total_out_window,
-        "unmatched": total_unmatched,
-        "rejected": total_no_pred,
-        "ok": total_ok,
-        "by_league": by_league_debug,
-    }
-
-    print("──────── RÉSUMÉ SCAN ────────")
-    print(f"Events API total      : {total_events}")
-    print(f"Hors fenêtre          : {total_out_window}")
-    print(f"Équipes non reconnues : {total_unmatched}")
-    print(f"Analyses rejetées     : {total_no_pred}")
-    print(f"Pronos retenus        : {total_ok}")
-    print(f"Coupons construits    : {len(coupons)}")
-    print("─────────────────────────────")
-
-
-# ════════════════════════════════════════════════════════════════
-# BOOTSTRAP
-# ════════════════════════════════════════════════════════════════
-async def bootstrap_models():
-    print("📥 Chargement des données...")
-    csvp = CSVProvider()
-    api = TheStatsAPIProvider(THESTATSAPI_KEY, THESTATSAPI_BASE, THESTATSAPI_AUTH)
-
-    by_league: dict[str, list[Match]] = defaultdict(list)
-    all_matches = await csvp._download(LEAGUES, season_codes(2))
-    for m in all_matches:
-        by_league[m.league].append(m)
-
-    print(f"   CSV : {len(all_matches)} matchs chargés.")
-    STATE["calibration"] = compute_calibration(by_league)
-
-    for lg in LEAGUES:
-        csv_model = compute_model(by_league.get(lg.code, []))
-        if W_API > 0 and api.available:
-            try:
-                api_model = await api.team_strengths(lg)
-            except Exception as e:
-                print(f"   ⚠️ API {lg.name}: {e}")
-                api_model = {"teams": {}, "avg_home": 1.5, "avg_away": 1.2}
-            fused = fuse_models(csv_model, api_model)
-            print(f"   {lg.name}: {len(fused['teams'])} équipes")
-        else:
-            fused = csv_model
-            print(f"   {lg.name}: {len(fused['teams'])} équipes (CSV seul)")
-        STATE["models"][lg.code] = fused
-
-    STATE["ready"] = True
-    print("✅ Modèles prêts.")
-
-
-# ════════════════════════════════════════════════════════════════
-# DIFFUSION
-# ════════════════════════════════════════════════════════════════
-async def daily_broadcast():
-    print("🔔 Diffusion quotidienne...")
-    await scan(window_hours=SCAN_WINDOW_HOURS, debug=True)
-
-    now = datetime.now(ZoneInfo(NOTIFY_TZ))
-    if not STATE["pronos"]:
-        d = STATE.get("debug", {})
-        header = (
-            f"🔔 <b>Aucun ticket aujourd'hui</b>\n\n"
-            f"Events API : <b>{d.get('total_events', 0)}</b>\n"
-            f"Hors fenêtre : <b>{d.get('out_window', 0)}</b>\n"
-            f"Non reconnus : <b>{d.get('unmatched', 0)}</b>\n"
-            f"Rejetés : <b>{d.get('rejected', 0)}</b>\n\n"
-            f"Appuie sur 🔄 SCAN pour retester."
-        )
-    else:
-        header = (
-            f"🔔 <b>TICKETS DU JOUR</b>\n"
-            f"📅 {now:%d/%m/%Y}\n\n"
-            f"🎯 {len(STATE['pronos'])} matchs analysés\n"
-            f"🎟️ {len(STATE['coupons'])} tickets construits\n\n"
-            f"👇 Choisis sous le clavier"
-        )
-
-    for chat_id in TARGETS:
-        try:
-            await bot.send_message(chat_id=chat_id, text=header, reply_markup=MAIN_KEYBOARD)
-            await asyncio.sleep(0.5)
-            for c in STATE["coupons"]:
-                await bot.send_message(chat_id=chat_id, text=format_coupon(c))
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            print(f"⚠️ Envoi vers {chat_id}: {e}")
-
-
-# ════════════════════════════════════════════════════════════════
-# FASTAPI
-# ════════════════════════════════════════════════════════════════
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await bot.delete_webhook(drop_pending_updates=True)
-    STATE["tracker"] = await load_tracker()
-    await bootstrap_models()
-
-    scheduler = AsyncIOScheduler(timezone=ZoneInfo(NOTIFY_TZ))
-    scheduler.add_job(
-        daily_broadcast,
-        CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=ZoneInfo(NOTIFY_TZ)),
-        id="daily_coupons",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.start()
-
-    bot_task = asyncio.create_task(dp.start_polling(bot))
-    asyncio.create_task(scan(debug=True))
-
-    yield
-
-    scheduler.shutdown()
-    bot_task.cancel()
-    await bot.session.close()
-
-
-app = FastAPI(title="WallStreet OS Debug", lifespan=lifespan)
-
-
-@app.get("/")
-async def health():
-    return {
-        "status": "ONLINE",
-        "ready": STATE["ready"],
-        "pronos": len(STATE["pronos"]),
-        "coupons": [c.name for c in STATE["coupons"]],
-        "last_scan": STATE["last_scan"],
-        "quota": QUOTA,
-    }
-
-
-@app.get("/debug")
-async def debug_state():
-    return STATE["debug"]
-
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), reload=False)
