@@ -21,24 +21,17 @@ import httpx
 import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-)
+from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
 
 
 # =========================================================
-# 1. CONFIG
+# CONFIG
 # =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+SPORTMONKS_API_KEY = os.getenv("SPORTMONKS_API_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 
@@ -51,44 +44,44 @@ MAX_GOALS = int(os.getenv("MAX_GOALS", "8"))
 RECENT_DAYS = int(os.getenv("RECENT_DAYS", "500"))
 DECAY_DAYS = float(os.getenv("DECAY_DAYS", "180"))
 EV_THRESHOLD = float(os.getenv("EV_THRESHOLD", "0.03"))
-KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 
-LOCAL_DB = os.getenv("LOCAL_DB", "/tmp/wallstreet_ci_v91.json")
+LOCAL_DB = os.getenv("LOCAL_DB", "/tmp/wallstreet_ci_sportmonks.json")
 BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
 BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse premium • Matchs du jour")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
-if not ODDS_API_KEY:
-    raise RuntimeError("ODDS_API_KEY manquant")
+if not SPORTMONKS_API_KEY:
+    raise RuntimeError("SPORTMONKS_API_KEY manquant")
 if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
     raise RuntimeError("TELEGRAM_ADMIN_ID ou TELEGRAM_CHANNEL manquant")
 
 TZ = ZoneInfo(NOTIFY_TZ)
 
+SPORTMONKS_BASE = "https://api.sportmonks.com/v3/football"
+
 
 # =========================================================
-# 2. LIGUES
+# LEAGUES CSV MODEL
 # =========================================================
 @dataclass(frozen=True)
 class League:
     code: str
     name: str
-    odds_key: str
 
 
 LEAGUES = [
-    League("E0", "Premier League", "soccer_epl"),
-    League("E1", "Championship", "soccer_efl_champ"),
-    League("D1", "Bundesliga", "soccer_germany_bundesliga"),
-    League("I1", "Serie A", "soccer_italy_serie_a"),
-    League("SP1", "La Liga", "soccer_spain_la_liga"),
-    League("F1", "Ligue 1", "soccer_france_ligue_one"),
-    League("N1", "Eredivisie", "soccer_netherlands_eredivisie"),
-    League("B1", "Pro League", "soccer_belgium_first_div"),
-    League("P1", "Primeira Liga", "soccer_portugal_primeira_liga"),
-    League("T1", "Süper Lig", "soccer_turkey_super_league"),
+    League("E0", "Premier League"),
+    League("E1", "Championship"),
+    League("D1", "Bundesliga"),
+    League("I1", "Serie A"),
+    League("SP1", "La Liga"),
+    League("F1", "Ligue 1"),
+    League("N1", "Eredivisie"),
+    League("B1", "Pro League"),
+    League("P1", "Primeira Liga"),
+    League("T1", "Süper Lig"),
 ]
 
 TEAM_ALIASES = {
@@ -102,65 +95,32 @@ TEAM_ALIASES = {
     "west ham united": "west ham",
     "brighton and hove albion": "brighton",
     "brighton hove albion": "brighton",
-    "leicester city": "leicester",
-    "leeds united": "leeds",
-    "sheffield united": "sheffield utd",
     "paris saint germain": "paris sg",
     "paris st germain": "paris sg",
     "borussia dortmund": "dortmund",
     "bayer leverkusen": "leverkusen",
-    "borussia monchengladbach": "m gladbach",
     "eintracht frankfurt": "ein frankfurt",
     "atletico madrid": "ath madrid",
     "athletic bilbao": "ath bilbao",
-    "real betis": "betis",
     "real sociedad": "sociedad",
-    "sevilla fc": "sevilla",
-    "celta vigo": "celta",
-    "real mallorca": "mallorca",
-    "deportivo alaves": "alaves",
-    "rcd espanyol": "espanyol",
+    "real betis": "betis",
     "ac milan": "milan",
     "inter milan": "inter",
     "as roma": "roma",
     "ssc napoli": "napoli",
     "juventus fc": "juventus",
     "psv eindhoven": "psv",
-    "feyenoord rotterdam": "feyenoord",
-    "sparta rotterdam": "sparta",
-    "pec zwolle": "zwolle",
-    "nec nijmegen": "nijmegen",
-    "fortuna sittard": "sittard",
-    "heracles almelo": "heracles",
-    "fc groningen": "groningen",
     "sporting cp": "sporting",
     "sporting lisbon": "sporting",
     "fc porto": "porto",
     "sl benfica": "benfica",
-    "sc braga": "braga",
-    "boavista fc": "boavista",
-    "fc arouca": "arouca",
-    "rio ave fc": "rio ave",
-    "fc famalicao": "famalicao",
-    "vitoria guimaraes": "guimaraes",
-    "gil vicente fc": "gil vicente",
     "club brugge": "brugge",
     "royal antwerp": "antwerp",
-    "istanbul basaksehir": "basaksehir",
-    "gaziantep fk": "gaziantep",
-    "real oviedo": "oviedo",
-    "real sporting de gijon": "sp gijon",
-    "real sporting club de gijon": "sp gijon",
-    "deportivo la coruna": "la coruna",
-    "fenerbahce sk": "fenerbahce",
-    "besiktas jk": "besiktas",
-    "galatasaray sk": "galatasaray",
-    "trabzonspor as": "trabzonspor",
 }
 
 
 # =========================================================
-# 3. HELPERS
+# HELPERS
 # =========================================================
 STOP_WORDS = {"fc", "cf", "ac", "sc", "sv", "fk", "club", "de", "da", "cd", "ud", "sd", "as", "sk"}
 
@@ -203,7 +163,11 @@ def today_local_date():
     return datetime.now(TZ).date()
 
 
-def today_pretty() -> str:
+def today_iso():
+    return datetime.now(TZ).strftime("%Y-%m-%d")
+
+
+def today_pretty():
     months = {
         1: "janvier", 2: "février", 3: "mars", 4: "avril", 5: "mai", 6: "juin",
         7: "juillet", 8: "août", 9: "septembre", 10: "octobre",
@@ -211,20 +175,6 @@ def today_pretty() -> str:
     }
     d = datetime.now(TZ)
     return f"{d.day} {months[d.month]} {d.year}"
-
-
-def safe_float(v) -> Optional[float]:
-    try:
-        x = float(v)
-        return x if x > 1.0 else None
-    except Exception:
-        return None
-
-
-def event_key(league_code: str, home: str, away: str, kickoff_iso: str) -> str:
-    dt = local_dt_from_iso(kickoff_iso)
-    hh = dt.strftime("%Y%m%d%H%M") if dt else "nodate"
-    return f"{league_code}|{normalize(home)}|{normalize(away)}|{hh}"
 
 
 def find_team(api_name: str, teams: dict) -> Optional[str]:
@@ -247,13 +197,6 @@ def find_team(api_name: str, teams: dict) -> Optional[str]:
             if normalize(t) == alias_norm:
                 return t
 
-    for a, b in TEAM_ALIASES.items():
-        if normalize(b) == norm_api:
-            for t in teams:
-                nt = normalize(t)
-                if nt == normalize(a) or nt == normalize(b):
-                    return t
-
     api_tokens = set(norm_api.split())
     candidates = []
     for t in teams:
@@ -268,25 +211,15 @@ def find_team(api_name: str, teams: dict) -> Optional[str]:
         candidates.sort(key=lambda x: (-x[0], x[1]))
         return candidates[0][2]
 
-    partials = []
-    for t in teams:
-        nt = normalize(t)
-        if norm_api in nt or nt in norm_api:
-            partials.append((len(nt), t))
-    if partials:
-        partials.sort(key=lambda x: x[0])
-        return partials[0][1]
-
     lookup = {normalize(t): t for t in teams}
     close = difflib.get_close_matches(norm_api, lookup.keys(), n=1, cutoff=0.72)
     if close:
         return lookup[close[0]]
-
     return None
 
 
 # =========================================================
-# 4. STRUCTURES
+# MODEL
 # =========================================================
 @dataclass
 class Match:
@@ -296,9 +229,6 @@ class Match:
     away: str
     home_goals: int
     away_goals: int
-    close_home: Optional[float] = None
-    close_draw: Optional[float] = None
-    close_away: Optional[float] = None
 
 
 @dataclass
@@ -313,9 +243,8 @@ class Prediction:
 
 @dataclass
 class Prono:
-    id: str
+    fixture_id: int
     league: str
-    league_code: str
     home: str
     away: str
     kickoff: str
@@ -337,26 +266,12 @@ class Prono:
 
 @dataclass
 class Coupon:
-    id: str
     name: str
-    emoji: str
     subtitle: str
-    legs: list
+    legs: list[Prono]
     combined_odds: float
     combined_prob: float
     combined_ev: float
-
-
-# =========================================================
-# 5. CSV / MODELS
-# =========================================================
-CSV_BASE = "https://www.football-data.co.uk/mmz4281"
-
-
-def season_codes(n: int = 2) -> list[str]:
-    now = datetime.now()
-    start = now.year if now.month >= 7 else now.year - 1
-    return [f"{str(start - i)[2:]}{str(start - i + 1)[2:]}" for i in range(n)]
 
 
 def parse_csv(text: str, league: str) -> list:
@@ -364,45 +279,45 @@ def parse_csv(text: str, league: str) -> list:
     for row in csv.DictReader(io.StringIO(text)):
         try:
             hg, ag = int(row["FTHG"]), int(row["FTAG"])
+            home = row["HomeTeam"].strip()
+            away = row["AwayTeam"].strip()
         except Exception:
             continue
-        if not row.get("HomeTeam") or not row.get("AwayTeam"):
-            continue
-        out.append(Match(
-            league=league,
-            date=row.get("Date", ""),
-            home=row["HomeTeam"].strip(),
-            away=row["AwayTeam"].strip(),
-            home_goals=hg,
-            away_goals=ag,
-            close_home=safe_float(row.get("B365CH")),
-            close_draw=safe_float(row.get("B365CD")),
-            close_away=safe_float(row.get("B365CA")),
-        ))
+        out.append(Match(league, row.get("Date", ""), home, away, hg, ag))
     return out
 
 
-async def download_csv_models():
-    by_league = defaultdict(list)
+CSV_BASE = "https://www.football-data.co.uk/mmz4281"
+
+
+def season_codes(n: int = 2) -> list:
+    now = datetime.now()
+    start = now.year if now.month >= 7 else now.year - 1
+    return [f"{str(start - i)[2:]}{str(start - i + 1)[2:]}" for i in range(n)]
+
+
+async def download_csv_models() -> dict:
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+        all_matches = defaultdict(list)
         for lg in LEAGUES:
             for se in season_codes(2):
                 url = f"{CSV_BASE}/{se}/{lg.code}.csv"
                 try:
                     r = await client.get(url)
                     if r.status_code == 200:
-                        by_league[lg.code].extend(parse_csv(r.text, lg.code))
+                        for m in parse_csv(r.text, lg.code):
+                            all_matches[lg.code].append(m)
                 except Exception:
                     pass
 
     models = {}
     for lg in LEAGUES:
-        models[lg.code] = compute_model(by_league.get(lg.code, []))
+        models[lg.code] = compute_model(all_matches.get(lg.code, []))
         print(f"📘 {lg.name}: {len(models[lg.code]['teams'])} équipes")
     return models
 
 
-def compute_model(matches: list) -> dict:
+def compute_model(matches: list, recent_days: int = RECENT_DAYS, decay_days: float = DECAY_DAYS) -> dict:
     dated = [(parse_date(m.date), m) for m in matches]
     dated = [(d, m) for d, m in dated if d is not None]
     if not dated:
@@ -411,18 +326,14 @@ def compute_model(matches: list) -> dict:
     dated.sort(key=lambda x: x[0])
     ref = dated[-1][0]
 
-    stats = defaultdict(lambda: {
-        "hs": 0.0, "hc": 0.0,
-        "as_": 0.0, "ac": 0.0,
-        "hp": 0.0, "ap": 0.0
-    })
+    stats = defaultdict(lambda: {"hs": 0.0, "hc": 0.0, "as_": 0.0, "ac": 0.0, "hp": 0.0, "ap": 0.0})
     sum_w = sum_h = sum_a = 0.0
 
     for d, m in dated:
         age = (ref - d).days
-        if age > RECENT_DAYS:
+        if age > recent_days:
             continue
-        w = 0.5 ** (age / DECAY_DAYS)
+        w = 0.5 ** (age / decay_days)
 
         sh = stats[m.home]
         sh["hs"] += w * m.home_goals
@@ -473,22 +384,21 @@ def tau(x: int, y: int, lam: float, mu: float, rho: float) -> float:
     return 1.0
 
 
-def predict(home: str, away: str, model: dict) -> Optional[Prediction]:
+def predict(home: str, away: str, model: dict, max_goals: int = MAX_GOALS) -> Optional[Prediction]:
     teams = model["teams"]
     if home not in teams or away not in teams:
         return None
 
     h = teams[home]
     a = teams[away]
-
     lam = h["att_home"] * a["def_away"] * model["avg_home"]
     mu = a["att_away"] * h["def_home"] * model["avg_away"]
 
-    total = ph = pd = pa = 0.0
+    ph = pd = pa = total = 0.0
     scores = []
 
-    for x in range(MAX_GOALS + 1):
-        for y in range(MAX_GOALS + 1):
+    for x in range(max_goals + 1):
+        for y in range(max_goals + 1):
             p = poisson(x, lam) * poisson(y, mu) * tau(x, y, lam, mu, RHO)
             total += p
             if x > y:
@@ -498,9 +408,6 @@ def predict(home: str, away: str, model: dict) -> Optional[Prediction]:
             else:
                 pa += p
             scores.append((x, y, p))
-
-    if total <= 0:
-        return None
 
     scores.sort(key=lambda z: z[2], reverse=True)
     top = [{"score": f"{x}-{y}", "proba": round(p / total, 3)} for x, y, p in scores[:5]]
@@ -516,35 +423,170 @@ def predict(home: str, away: str, model: dict) -> Optional[Prediction]:
 
 
 # =========================================================
-# 6. ODDS / ANALYSE
+# SPORTMONKS FETCH
 # =========================================================
-def best_odds(event: dict) -> dict:
-    prices = defaultdict(list)
-    for bk in event.get("bookmakers", []):
-        for mkt in bk.get("markets", []):
-            if mkt.get("key") != "h2h":
+def sm_headers():
+    return {
+        "Accept": "application/json",
+    }
+
+
+async def sportmonks_get(client: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
+    params = params or {}
+    params["api_token"] = SPORTMONKS_API_KEY
+    url = f"{SPORTMONKS_BASE}{path}"
+    r = await client.get(url, params=params, headers=sm_headers(), timeout=30.0)
+    r.raise_for_status()
+    return r.json()
+
+
+def extract_participants(fixture: dict) -> tuple[str, str]:
+    participants = fixture.get("participants", []) or fixture.get("participants_data", [])
+    home = away = ""
+
+    for p in participants:
+        meta = (p.get("meta") or {}).get("location") or p.get("location")
+        name = p.get("name") or p.get("participant_name") or ""
+        if str(meta).lower() == "home":
+            home = name
+        elif str(meta).lower() == "away":
+            away = name
+
+    if not home or not away:
+        names = [p.get("name") or p.get("participant_name") for p in participants if (p.get("name") or p.get("participant_name"))]
+        if len(names) >= 2:
+            home, away = names[0], names[1]
+
+    return home, away
+
+
+def extract_league_name(fixture: dict) -> str:
+    league = fixture.get("league") or {}
+    return league.get("name") or fixture.get("league_name") or "Football"
+
+
+def extract_kickoff_iso(fixture: dict) -> str:
+    return (
+        fixture.get("starting_at")
+        or fixture.get("starting_at_timestamp")
+        or fixture.get("startingAt")
+        or fixture.get("date")
+        or ""
+    )
+
+
+def extract_1x2_odds(fixture: dict) -> dict:
+    """
+    Fonction volontairement tolérante car la structure odds peut varier selon le plan/include.
+    On essaie plusieurs chemins.
+    """
+    result = {"1": None, "X": None, "2": None}
+
+    odds_sources = []
+    for key in ["odds", "bookmakers", "markets", "prices"]:
+        value = fixture.get(key)
+        if value:
+            odds_sources.append(value)
+
+    # tentative simple si la fixture contient déjà home/draw/away
+    for block in odds_sources:
+        if isinstance(block, dict):
+            home = block.get("home") or block.get("1")
+            draw = block.get("draw") or block.get("x") or block.get("X")
+            away = block.get("away") or block.get("2")
+            if home:
+                result["1"] = float(home)
+            if draw:
+                result["X"] = float(draw)
+            if away:
+                result["2"] = float(away)
+
+    # structures listes
+    for block in odds_sources:
+        if not isinstance(block, list):
+            continue
+        for item in block:
+            name = str(item.get("name") or item.get("label") or item.get("market_name") or "").lower()
+            value = item.get("value") or item.get("odd") or item.get("price")
+            if value is None:
                 continue
-            for out in mkt.get("outcomes", []):
-                price = out.get("price")
-                if price:
-                    prices[out["name"]].append(price)
-    return {k: max(v) for k, v in prices.items()}
+
+            if name in ["home", "1", "team 1", "home win"]:
+                result["1"] = float(value)
+            elif name in ["draw", "x"]:
+                result["X"] = float(value)
+            elif name in ["away", "2", "team 2", "away win"]:
+                result["2"] = float(value)
+
+            outcome = str(item.get("outcome") or item.get("outcome_name") or "").lower()
+            if outcome in ["home", "1"]:
+                result["1"] = float(value)
+            elif outcome in ["draw", "x"]:
+                result["X"] = float(value)
+            elif outcome in ["away", "2"]:
+                result["2"] = float(value)
+
+    return result
 
 
-def kelly(prob: float, odds: float) -> float:
-    b = odds - 1
-    if b <= 0:
-        return 0.0
-    return max(0.0, ((b * prob - (1 - prob)) / b) * KELLY_FRACTION)
+async def fetch_sportmonks_fixtures_today() -> list[dict]:
+    date_str = today_iso()
+    async with httpx.AsyncClient() as client:
+        data = await sportmonks_get(
+            client,
+            f"/fixtures/date/{date_str}",
+            params={
+                "include": "participants;league;odds",
+            },
+        )
+        return data.get("data", []) or []
 
 
-def analyze_event(league: League, event: dict, model: dict) -> Optional[Prono]:
-    teams = model["teams"]
-    api_home = event.get("home_team", "")
-    api_away = event.get("away_team", "")
+# =========================================================
+# ANALYSE
+# =========================================================
+LEAGUE_NAME_TO_CODE = {
+    "Premier League": "E0",
+    "Championship": "E1",
+    "Bundesliga": "D1",
+    "Serie A": "I1",
+    "La Liga": "SP1",
+    "Ligue 1": "F1",
+    "Eredivisie": "N1",
+    "Pro League": "B1",
+    "Primeira Liga": "P1",
+    "Süper Lig": "T1",
+}
 
-    home_model = find_team(api_home, teams)
-    away_model = find_team(api_away, teams)
+
+def analyze_fixture(fixture: dict, models: dict) -> Optional[Prono]:
+    fixture_id = int(fixture.get("id") or 0)
+    if not fixture_id:
+        return None
+
+    league_name = extract_league_name(fixture)
+    league_code = LEAGUE_NAME_TO_CODE.get(league_name)
+    if not league_code:
+        return None
+
+    model = models.get(league_code, {"teams": {}})
+    if not model["teams"]:
+        return None
+
+    home_api, away_api = extract_participants(fixture)
+    if not home_api or not away_api:
+        return None
+
+    kickoff = extract_kickoff_iso(fixture)
+    if not kickoff:
+        return None
+
+    local_dt = local_dt_from_iso(kickoff)
+    if not local_dt or local_dt.date() != today_local_date():
+        return None
+
+    home_model = find_team(home_api, model["teams"])
+    away_model = find_team(away_api, model["teams"])
     if not home_model or not away_model:
         return None
 
@@ -555,32 +597,25 @@ def analyze_event(league: League, event: dict, model: dict) -> Optional[Prono]:
     probs = {"1": pred.p_home, "X": pred.p_draw, "2": pred.p_away}
     pick = max(probs, key=probs.get)
 
-    odds_map = best_odds(event)
-    selected_odds = {
-        "1": odds_map.get(api_home),
-        "X": odds_map.get("Draw"),
-        "2": odds_map.get(api_away),
-    }.get(pick)
+    odds_map = extract_1x2_odds(fixture)
+    selected_odds = odds_map.get(pick)
+
+    labels = {
+        "1": f"Victoire {home_api}",
+        "X": "Match nul",
+        "2": f"Victoire {away_api}",
+    }
 
     ev = None
     if selected_odds and selected_odds > 1:
         ev = probs[pick] * selected_odds - 1
 
-    labels = {
-        "1": f"Victoire {api_home}",
-        "X": "Match nul",
-        "2": f"Victoire {api_away}",
-    }
-
-    pid = event_key(league.code, api_home, api_away, event.get("commence_time", ""))
-
     return Prono(
-        id=pid,
-        league=league.name,
-        league_code=league.code,
-        home=api_home,
-        away=api_away,
-        kickoff=event.get("commence_time", ""),
+        fixture_id=fixture_id,
+        league=league_name,
+        home=home_api,
+        away=away_api,
+        kickoff=kickoff,
         pick=pick,
         pick_label=labels[pick],
         odds=round(selected_odds, 2) if selected_odds else None,
@@ -595,49 +630,13 @@ def analyze_event(league: League, event: dict, model: dict) -> Optional[Prono]:
     )
 
 
-# =========================================================
-# 7. COUPONS
-# =========================================================
-COUPON_CONFIGS = [
-    ("TICKET SÉCURISÉ", "🟢", "Sélections les plus fiables", 1.8, 2.8, 3, "safe"),
-    ("TICKET ÉQUILIBRÉ", "🟡", "Équilibre entre sécurité et gain", 3.0, 6.5, 4, "balanced"),
-    ("TICKET AGRESSIF", "🔴", "Cote forte, risque élevé", 6.0, 20.0, 5, "aggressive"),
-    ("TICKET VALUE", "💎", "Valeur potentielle détectée", 1.6, 12.0, 3, "value"),
-]
-
-
 def score_prono(p: Prono) -> float:
     return p.reliability + ((p.ev or 0.0) * 0.15)
 
 
-def pool_for(pronos: list, kind: str) -> list:
-    priced = [p for p in pronos if p.odds and p.odds > 1.0]
-
-    if kind == "safe":
-        pool = [p for p in priced if p.reliability >= 0.52 and p.odds <= 1.9]
-        pool.sort(key=score_prono, reverse=True)
-    elif kind == "balanced":
-        pool = [p for p in priced if 1.30 <= p.odds <= 2.60]
-        pool.sort(key=score_prono, reverse=True)
-    elif kind == "aggressive":
-        pool = [p for p in priced if p.odds >= 1.75]
-        pool.sort(key=lambda x: (x.odds, x.reliability), reverse=True)
-    else:
-        pool = [p for p in priced if (p.ev or -999) >= EV_THRESHOLD]
-        pool.sort(key=lambda x: ((x.ev or 0), x.reliability), reverse=True)
-
-    uniq = {}
-    for p in pool:
-        uniq[p.id] = p
-    return list(uniq.values())
-
-
-def build_coupon(name: str, emoji: str, subtitle: str,
-                 min_odds: float, max_odds: float, max_legs: int,
-                 kind: str, pronos: list) -> Optional[Coupon]:
-    pool = pool_for(pronos, kind)
-    if not pool:
-        return None
+def build_coupon(name: str, subtitle: str, pronos: list[Prono], min_odds: float, max_odds: float, max_legs: int) -> Optional[Coupon]:
+    pool = [p for p in pronos if p.odds and p.odds > 1.0]
+    pool.sort(key=score_prono, reverse=True)
 
     legs = []
     odds = 1.0
@@ -647,26 +646,25 @@ def build_coupon(name: str, emoji: str, subtitle: str,
     for p in pool:
         if len(legs) >= max_legs:
             break
-        if p.id in used:
+        if p.fixture_id in used:
             continue
         new_odds = odds * p.odds
         if new_odds > max_odds and legs:
             continue
         legs.append(p)
-        used.add(p.id)
+        used.add(p.fixture_id)
         odds = new_odds
         prob *= p.pick_prob()
         if odds >= min_odds:
             break
 
-    if not legs or odds < min_odds * 0.85:
+    if not legs:
+        return None
+    if odds < min_odds * 0.85:
         return None
 
-    cid = f"{datetime.now(TZ).strftime('%Y%m%d')}-{normalize(name)}"
     return Coupon(
-        id=cid,
         name=name,
-        emoji=emoji,
         subtitle=subtitle,
         legs=legs,
         combined_odds=round(odds, 2),
@@ -676,14 +674,13 @@ def build_coupon(name: str, emoji: str, subtitle: str,
 
 
 # =========================================================
-# 8. FORMATAGE PREMIUM
+# FORMAT
 # =========================================================
 def premium_header() -> str:
     return (
-        f"🏷️ <b>{BRAND_NAME}</b>\n"
-        f"✨ {BRAND_TAGLINE}\n"
-        f"📅 <b>{today_pretty()}</b>\n"
-        f"🕓 Côte d’Ivoire • GMT+0"
+        f"<b>{BRAND_NAME}</b>\n"
+        f"{BRAND_TAGLINE}\n"
+        f"{today_pretty()} • Côte d’Ivoire"
     )
 
 
@@ -698,31 +695,30 @@ def format_coupon(c: Coupon) -> str:
     lines = [
         premium_header(),
         "",
-        f"{c.emoji} <b>{c.name}</b>",
-        "━━━━━━━━━━━━━━━━━━",
-        f"🎯 {c.subtitle}",
-        f"💰 Cote totale : <b>{c.combined_odds}</b>",
-        f"📈 Probabilité combinée : <b>{c.combined_prob * 100:.1f}%</b>",
-        f"💎 EV estimée : <b>{c.combined_ev * 100:+.1f}%</b>",
+        f"<b>{c.name}</b>",
+        f"{c.subtitle}",
+        f"Cote totale : <b>{c.combined_odds}</b>",
+        f"Probabilité combinée : <b>{c.combined_prob * 100:.1f}%</b>",
         "",
     ]
 
     for i, p in enumerate(c.legs, 1):
-        conf = p.reliability * 100
-        lines.extend([
-            f"<b>{i}. {p.home} vs {p.away}</b>",
-            f"🕒 {kickoff_local(p.kickoff)} • {p.league}",
-            f"✅ <b>{p.pick_label}</b>",
-            f"📊 Confiance : <b>{conf:.0f}%</b> • Cote {p.odds}",
-        ])
+        lines.append(f"<b>{i}. {p.home} vs {p.away}</b>")
+        lines.append(f"🕒 {kickoff_local(p.kickoff)} • {p.league}")
+        lines.append(f"✅ <b>{p.pick_label}</b>")
+        line = f"📊 Confiance : <b>{p.reliability * 100:.0f}%</b>"
+        if p.odds:
+            line += f" • Cote {p.odds}"
+        lines.append(line)
+
         if p.ev is not None:
-            lines.append(f"💹 EV : <b>{p.ev * 100:+.1f}%</b>")
+            lines.append(f"💎 EV : <b>{p.ev * 100:+.1f}%</b>")
+
         tsl = top_score_line(p)
         if tsl:
             lines.append(tsl)
         lines.append("")
 
-    lines.append("━━━━━━━━━━━━━━━━━━")
     lines.append(PUBLIC_FOOTER)
     return "\n".join(lines)
 
@@ -730,94 +726,66 @@ def format_coupon(c: Coupon) -> str:
 def format_summary(pronos_count: int, coupons_count: int) -> str:
     return (
         f"{premium_header()}\n\n"
-        f"🔥 <b>TICKETS DU JOUR DISPONIBLES</b>\n"
-        f"⚽ Matchs analysés : <b>{pronos_count}</b>\n"
-        f"🎟️ Tickets générés : <b>{coupons_count}</b>\n\n"
-        f"👇 Choisis ton ticket."
+        f"<b>Tickets du jour disponibles</b>\n"
+        f"Matchs analysés : <b>{pronos_count}</b>\n"
+        f"Tickets générés : <b>{coupons_count}</b>"
     )
 
 
 def format_no_match() -> str:
     return (
         f"{premium_header()}\n\n"
-        f"❌ <b>Aucun match exploitable aujourd’hui</b>\n"
-        f"Le bot envoie uniquement les matchs du jour en heure de Côte d’Ivoire."
+        f"<b>Aucun match exploitable aujourd’hui</b>\n"
+        f"Le système n’a retenu aucune sélection fiable pour le moment."
     )
-
-
-def format_top_pronos(pronos: list) -> str:
-    if not pronos:
-        return format_no_match()
-    lines = [f"{premium_header()}", "", "🏆 <b>TOP PRONOS DU JOUR</b>", ""]
-    for i, p in enumerate(pronos[:10], 1):
-        lines.append(f"<b>{i}. {p.home} vs {p.away}</b>")
-        lines.append(f"🕒 {kickoff_local(p.kickoff)} • {p.league}")
-        lines.append(f"✅ {p.pick_label}")
-        lines.append(f"📊 Confiance : <b>{p.reliability * 100:.0f}%</b> • Cote {p.odds or '?'}")
-        if p.ev is not None:
-            lines.append(f"💎 EV : <b>{p.ev * 100:+.1f}%</b>")
-        tsl = top_score_line(p)
-        if tsl:
-            lines.append(tsl)
-        lines.append("")
-    lines.append(PUBLIC_FOOTER)
-    return "\n".join(lines)
 
 
 def format_bilan(tracker: dict) -> str:
     coupons = tracker.get("coupons", [])
     if not coupons:
-        return f"{premium_header()}\n\n📊 <b>BILAN</b>\n\nAucun historique pour le moment."
+        return f"{premium_header()}\n\n<b>Bilan</b>\nAucun historique pour le moment."
 
     resolved = [c for c in coupons if c.get("status") in ("win", "loss")]
     pending = [c for c in coupons if c.get("status") == "pending"]
 
-    lines = [premium_header(), "", "📊 <b>BILAN PREMIUM</b>", ""]
+    if not resolved:
+        return f"{premium_header()}\n\n<b>Bilan</b>\n⏳ {len(pending)} ticket(s) en attente."
 
-    if resolved:
-        by_name = defaultdict(lambda: {"bets": 0, "wins": 0, "returned": 0.0, "staked": 0.0})
-        total_bets = total_wins = 0
-        total_returned = total_staked = 0.0
-        emoji_map = {
-            "TICKET SÉCURISÉ": "🟢",
-            "TICKET ÉQUILIBRÉ": "🟡",
-            "TICKET AGRESSIF": "🔴",
-            "TICKET VALUE": "💎",
-        }
+    by_name = defaultdict(lambda: {"bets": 0, "wins": 0, "returned": 0.0, "staked": 0.0})
+    total_bets = total_wins = 0
+    total_returned = total_staked = 0.0
 
-        for c in resolved:
-            name = c["name"]
-            by_name[name]["bets"] += 1
-            by_name[name]["staked"] += 1
-            total_bets += 1
-            total_staked += 1
-            if c["status"] == "win":
-                by_name[name]["wins"] += 1
-                by_name[name]["returned"] += c.get("combined_odds", 0.0)
-                total_wins += 1
-                total_returned += c.get("combined_odds", 0.0)
+    for c in resolved:
+        name = c["name"]
+        by_name[name]["bets"] += 1
+        by_name[name]["staked"] += 1
+        total_bets += 1
+        total_staked += 1
+        if c["status"] == "win":
+            by_name[name]["wins"] += 1
+            by_name[name]["returned"] += c.get("combined_odds", 0.0)
+            total_wins += 1
+            total_returned += c.get("combined_odds", 0.0)
 
-        for name in ["TICKET SÉCURISÉ", "TICKET ÉQUILIBRÉ", "TICKET AGRESSIF", "TICKET VALUE"]:
-            b = by_name.get(name)
-            if not b or b["bets"] == 0:
-                continue
-            wr = b["wins"] / b["bets"] * 100
-            roi = ((b["returned"] - b["staked"]) / b["staked"]) * 100 if b["staked"] else 0
-            lines.append(f"{emoji_map.get(name, '🎟️')} <b>{name}</b>")
-            lines.append(f"• Paris : {b['bets']}")
-            lines.append(f"• Réussite : {wr:.0f}%")
-            lines.append(f"• ROI : <b>{roi:+.1f}%</b>")
-            lines.append("")
+    lines = [premium_header(), "", "<b>Bilan</b>", ""]
+    for name in ["Ticket Sécurisé", "Ticket Équilibré", "Ticket Agressif", "Ticket Value"]:
+        b = by_name.get(name)
+        if not b or b["bets"] == 0:
+            continue
+        wr = b["wins"] / b["bets"] * 100
+        roi = ((b["returned"] - b["staked"]) / b["staked"]) * 100 if b["staked"] else 0
+        lines.append(f"<b>{name}</b>")
+        lines.append(f"• Paris : {b['bets']}")
+        lines.append(f"• Réussite : {wr:.0f}%")
+        lines.append(f"• ROI : <b>{roi:+.1f}%</b>")
+        lines.append("")
 
-        total_wr = total_wins / total_bets * 100 if total_bets else 0
-        total_roi = ((total_returned - total_staked) / total_staked) * 100 if total_staked else 0
-        lines.append("📈 <b>GLOBAL</b>")
-        lines.append(f"• Paris : {total_bets}")
-        lines.append(f"• Réussite : {total_wr:.0f}%")
-        lines.append(f"• ROI : <b>{total_roi:+.1f}%</b>")
-    else:
-        lines.append("Aucun ticket encore résolu.")
-
+    total_wr = total_wins / total_bets * 100 if total_bets else 0
+    total_roi = ((total_returned - total_staked) / total_staked) * 100 if total_staked else 0
+    lines.append("<b>Global</b>")
+    lines.append(f"• Paris : {total_bets}")
+    lines.append(f"• Réussite : {total_wr:.0f}%")
+    lines.append(f"• ROI : <b>{total_roi:+.1f}%</b>")
     if pending:
         lines.append("")
         lines.append(f"⏳ En attente : {len(pending)} ticket(s)")
@@ -825,7 +793,7 @@ def format_bilan(tracker: dict) -> str:
 
 
 # =========================================================
-# 9. TRACKER
+# TRACKER
 # =========================================================
 def load_tracker() -> dict:
     try:
@@ -844,31 +812,20 @@ def save_tracker(data: dict):
         print(f"⚠️ Sauvegarde tracker échouée : {e}")
 
 
-def record_coupons(coupons: list, date_str: str):
+def record_coupons(coupons: list[Coupon], date_str: str):
     tracker = STATE["tracker"]
     existing = {c["id"] for c in tracker["coupons"]}
 
     for c in coupons:
-        if c.id in existing:
+        cid = f"{date_str}-{normalize(c.name)}"
+        if cid in existing:
             continue
         tracker["coupons"].append({
-            "id": c.id,
+            "id": cid,
             "date": date_str,
             "name": c.name,
             "combined_odds": c.combined_odds,
             "status": "pending",
-            "legs": [
-                {
-                    "id": leg.id,
-                    "league_code": leg.league_code,
-                    "home": leg.home,
-                    "away": leg.away,
-                    "pick": leg.pick,
-                    "kickoff": leg.kickoff,
-                    "status": "pending",
-                }
-                for leg in c.legs
-            ],
         })
 
     tracker["coupons"] = tracker["coupons"][-500:]
@@ -876,17 +833,17 @@ def record_coupons(coupons: list, date_str: str):
 
 
 # =========================================================
-# 10. STATE / BOT
+# TELEGRAM
 # =========================================================
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-BTN_SAFE = "🟢 SÉCURISÉ"
-BTN_BAL = "🟡 ÉQUILIBRÉ"
-BTN_AGG = "🔴 AGRESSIF"
-BTN_VAL = "💎 VALUE"
-BTN_BILAN = "📊 BILAN"
-BTN_SCAN = "🔄 SCAN"
+BTN_SAFE = "Sécurisé"
+BTN_BAL = "Équilibré"
+BTN_AGG = "Agressif"
+BTN_VAL = "Value"
+BTN_BILAN = "Bilan"
+BTN_SCAN = "Actualiser"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -895,28 +852,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_BILAN), KeyboardButton(text=BTN_SCAN)],
     ],
     resize_keyboard=True,
-    one_time_keyboard=False,
     input_field_placeholder="Choisis un ticket…",
-)
-
-INLINE_KEYBOARD = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🟢 Sécurisé", callback_data="coupon:safe"),
-            InlineKeyboardButton(text="🟡 Équilibré", callback_data="coupon:balanced"),
-        ],
-        [
-            InlineKeyboardButton(text="🔴 Agressif", callback_data="coupon:aggressive"),
-            InlineKeyboardButton(text="💎 Value", callback_data="coupon:value"),
-        ],
-        [
-            InlineKeyboardButton(text="🏆 Top pronos", callback_data="view:top"),
-            InlineKeyboardButton(text="📊 Bilan", callback_data="view:bilan"),
-        ],
-        [
-            InlineKeyboardButton(text="🔄 Re-scan", callback_data="view:scan"),
-        ],
-    ]
 )
 
 STATE = {
@@ -931,372 +867,192 @@ STATE = {
 
 TARGETS = []
 for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
-    if not raw:
-        continue
+    if raw:
+        try:
+            TARGETS.append(int(raw))
+        except ValueError:
+            TARGETS.append(raw)
+
+
+async def safe_answer(message: Message, text: str):
     try:
-        TARGETS.append(int(raw))
-    except ValueError:
-        TARGETS.append(raw)
-
-
-# =========================================================
-# 11. ENVOI TELEGRAM
-# =========================================================
-async def safe_send(chat_id, text: str, inline: bool = False):
-    try:
-        kb = INLINE_KEYBOARD if inline else MAIN_KEYBOARD
-        await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-    except Exception as e:
-        print(f"⚠️ Envoi Telegram échoué vers {chat_id}: {e}")
-
-
-async def safe_answer(message: Message, text: str, inline: bool = False):
-    try:
-        kb = INLINE_KEYBOARD if inline else MAIN_KEYBOARD
-        await message.answer(text, reply_markup=kb)
+        await message.answer(text, reply_markup=MAIN_KEYBOARD)
     except Exception as e:
         print(f"⚠️ Réponse Telegram échouée : {e}")
 
 
-# =========================================================
-# 12. HANDLERS
-# =========================================================
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def start_cmd(message: Message):
     await safe_answer(
         message,
-        f"👋 <b>Bienvenue sur {BRAND_NAME}</b>\n\n"
-        f"✨ {BRAND_TAGLINE}\n\n"
-        f"• Matchs du jour uniquement\n"
-        f"• Heure Côte d’Ivoire\n"
-        f"• Tickets intelligents\n"
-        f"• Bilan automatique\n\n"
-        f"👇 Choisis une option.",
-        inline=True,
-    )
-
-
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await safe_answer(
-        message,
-        "❓ <b>AIDE</b>\n\n"
-        "• /start — accueil premium\n"
-        "• /scan — relancer le scan du jour\n"
-        "• /today — top pronos du jour\n"
-        "• /coupons — afficher tous les tickets\n"
-        "• /bilan — bilan des tickets\n"
-        "• /debug — état technique",
-        inline=True,
+        f"Bienvenue sur <b>{BRAND_NAME}</b>\n\n"
+        f"{BRAND_TAGLINE}\n"
+        f"Fuseau : Côte d’Ivoire\n\n"
+        f"Utilise le clavier ci-dessous."
     )
 
 
 @dp.message(Command("scan"))
-async def cmd_scan(message: Message):
-    await safe_answer(message, "⏳ Scan premium du jour en cours...")
+async def scan_cmd(message: Message):
+    await safe_answer(message, "⏳ Analyse en cours...")
     await scan_today_only()
     if not STATE["coupons"]:
-        await safe_answer(message, format_no_match(), inline=True)
+        await safe_answer(message, format_no_match())
         return
     await safe_answer(
         message,
-        format_summary(len(STATE["pronos"]), len(STATE["coupons"])),
-        inline=True,
+        format_summary(len(STATE['pronos']), len(STATE['coupons'])),
     )
-
-
-@dp.message(Command("today"))
-async def cmd_today(message: Message):
-    await safe_answer(message, format_top_pronos(STATE["pronos"]), inline=True)
-
-
-@dp.message(Command("coupons"))
-async def cmd_coupons(message: Message):
-    if not STATE["coupons"]:
-        await safe_answer(message, format_no_match(), inline=True)
-        return
-    for c in STATE["coupons"]:
-        await safe_answer(message, format_coupon(c), inline=True)
-        await asyncio.sleep(0.3)
 
 
 @dp.message(Command("bilan"))
-async def cmd_bilan(message: Message):
-    await safe_answer(message, format_bilan(STATE["tracker"]), inline=True)
-
-
-@dp.message(Command("debug"))
-async def cmd_debug(message: Message):
-    d = STATE["debug"]
-    txt = (
-        f"🛠️ <b>DEBUG</b>\n\n"
-        f"Date locale : <b>{d.get('today_local', '?')}</b>\n"
-        f"Events API : <b>{d.get('total_events', 0)}</b>\n"
-        f"Hors jour : <b>{d.get('out_of_day', 0)}</b>\n"
-        f"Non reconnus : <b>{d.get('unmatched', 0)}</b>\n"
-        f"Rejetés : <b>{d.get('rejected', 0)}</b>\n"
-        f"Retenus : <b>{d.get('kept', 0)}</b>\n"
-        f"Coupons : <b>{d.get('coupons', 0)}</b>\n"
-        f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
-    )
-    await safe_answer(message, txt)
+async def bilan_cmd(message: Message):
+    await safe_answer(message, format_bilan(STATE["tracker"]))
 
 
 async def send_coupon_by_name(message: Message, name: str):
     coupon = next((c for c in STATE["coupons"] if c.name == name), None)
     if not coupon:
-        await safe_answer(message, format_no_match(), inline=True)
+        await safe_answer(message, format_no_match())
         return
-    await safe_answer(message, format_coupon(coupon), inline=True)
+    await safe_answer(message, format_coupon(coupon))
 
 
 @dp.message(F.text == BTN_SAFE)
-async def btn_safe(message: Message):
-    await send_coupon_by_name(message, "TICKET SÉCURISÉ")
+async def button_safe(message: Message):
+    await send_coupon_by_name(message, "Ticket Sécurisé")
 
 
 @dp.message(F.text == BTN_BAL)
-async def btn_bal(message: Message):
-    await send_coupon_by_name(message, "TICKET ÉQUILIBRÉ")
+async def button_bal(message: Message):
+    await send_coupon_by_name(message, "Ticket Équilibré")
 
 
 @dp.message(F.text == BTN_AGG)
-async def btn_agg(message: Message):
-    await send_coupon_by_name(message, "TICKET AGRESSIF")
+async def button_agg(message: Message):
+    await send_coupon_by_name(message, "Ticket Agressif")
 
 
 @dp.message(F.text == BTN_VAL)
-async def btn_val(message: Message):
-    await send_coupon_by_name(message, "TICKET VALUE")
+async def button_val(message: Message):
+    await send_coupon_by_name(message, "Ticket Value")
 
 
 @dp.message(F.text == BTN_BILAN)
-async def btn_bilan(message: Message):
-    await safe_answer(message, format_bilan(STATE["tracker"]), inline=True)
+async def button_bilan(message: Message):
+    await safe_answer(message, format_bilan(STATE["tracker"]))
 
 
 @dp.message(F.text == BTN_SCAN)
-async def btn_scan(message: Message):
-    await cmd_scan(message)
-
-
-# --- Callbacks inline ---
-@dp.callback_query(F.data.startswith("coupon:"))
-async def cb_coupon(cb: CallbackQuery):
-    kind = cb.data.split(":", 1)[1]
-    mapping = {
-        "safe": "TICKET SÉCURISÉ",
-        "balanced": "TICKET ÉQUILIBRÉ",
-        "aggressive": "TICKET AGRESSIF",
-        "value": "TICKET VALUE",
-    }
-    name = mapping.get(kind)
-    coupon = next((c for c in STATE["coupons"] if c.name == name), None)
-
-    try:
-        if not coupon:
-            await cb.message.answer(format_no_match(), reply_markup=INLINE_KEYBOARD)
-        else:
-            await cb.message.answer(format_coupon(coupon), reply_markup=INLINE_KEYBOARD)
-        await cb.answer()
-    except Exception as e:
-        print(f"⚠️ Callback coupon échoué : {e}")
-        await cb.answer("Erreur", show_alert=False)
-
-
-@dp.callback_query(F.data == "view:top")
-async def cb_top(cb: CallbackQuery):
-    try:
-        await cb.message.answer(format_top_pronos(STATE["pronos"]), reply_markup=INLINE_KEYBOARD)
-        await cb.answer()
-    except Exception as e:
-        print(f"⚠️ Callback top échoué : {e}")
-        await cb.answer("Erreur", show_alert=False)
-
-
-@dp.callback_query(F.data == "view:bilan")
-async def cb_bilan(cb: CallbackQuery):
-    try:
-        await cb.message.answer(format_bilan(STATE["tracker"]), reply_markup=INLINE_KEYBOARD)
-        await cb.answer()
-    except Exception as e:
-        print(f"⚠️ Callback bilan échoué : {e}")
-        await cb.answer("Erreur", show_alert=False)
-
-
-@dp.callback_query(F.data == "view:scan")
-async def cb_scan(cb: CallbackQuery):
-    try:
-        await cb.answer("Scan en cours...", show_alert=False)
-    except Exception:
-        pass
-    await scan_today_only()
-    if not STATE["coupons"]:
-        await cb.message.answer(format_no_match(), reply_markup=INLINE_KEYBOARD)
-        return
-    await cb.message.answer(
-        format_summary(len(STATE["pronos"]), len(STATE["coupons"])),
-        reply_markup=INLINE_KEYBOARD,
-    )
+async def button_scan(message: Message):
+    await scan_cmd(message)
 
 
 # =========================================================
-# 13. SCAN DU JOUR
+# SCAN SPORTMONKS
 # =========================================================
-async def fetch_odds(client: httpx.AsyncClient, league: League) -> list:
-    url = f"https://api.the-odds-api.com/v4/sports/{league.odds_key}/odds/"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "eu",
-        "markets": "h2h",
-        "oddsFormat": "decimal",
-    }
-    for attempt in range(3):
-        try:
-            r = await client.get(url, params=params, timeout=20.0)
-            if r.status_code == 200:
-                data = r.json()
-                print(f"🌐 {league.name}: {len(data)} event(s)")
-                return data
-            if r.status_code == 429:
-                await asyncio.sleep(2 * (attempt + 1))
-                continue
-            print(f"⚠️ Odds API {league.name}: HTTP {r.status_code}")
-            return []
-        except Exception as e:
-            print(f"⚠️ Odds API {league.name}: {e}")
-            await asyncio.sleep(1 + attempt)
-    return []
-
-
 async def scan_today_only():
     if not STATE["ready"]:
         print("⏳ modèles pas prêts")
         return
 
-    local_today = today_local_date()
-    pronos = []
+    fixtures = await fetch_sportmonks_fixtures_today()
+    print(f"🌐 Sportmonks fixtures du jour: {len(fixtures)}")
 
-    total_events = 0
-    out_of_day = 0
+    pronos = []
     unmatched = 0
     rejected = 0
     kept = 0
     seen = set()
 
-    print(f"🔄 Scan jour CI | {local_today}")
-
-    async with httpx.AsyncClient() as client:
-        for lg in LEAGUES:
-            model = STATE["models"].get(lg.code, {"teams": {}})
-            if not model["teams"]:
+    for fx in fixtures:
+        try:
+            p = analyze_fixture(fx, STATE["models"])
+            if not p:
+                rejected += 1
                 continue
-
-            events = await fetch_odds(client, lg)
-            total_events += len(events)
-
-            lg_kept = 0
-            for ev in events:
-                local_dt = local_dt_from_iso(ev.get("commence_time", ""))
-                if not local_dt:
-                    rejected += 1
-                    continue
-
-                if local_dt.date() != local_today:
-                    out_of_day += 1
-                    continue
-
-                p = analyze_event(lg, ev, model)
-                if not p:
-                    unmatched += 1
-                    print(f"❌ Non reconnu: {ev.get('home_team')} vs {ev.get('away_team')}")
-                    continue
-
-                if p.id in seen:
-                    continue
-                seen.add(p.id)
-
-                pronos.append(p)
-                kept += 1
-                lg_kept += 1
-
-            print(f"   {lg.name}: {lg_kept} prono(s) du jour")
-            await asyncio.sleep(0.35)
+            if p.fixture_id in seen:
+                continue
+            seen.add(p.fixture_id)
+            pronos.append(p)
+            kept += 1
+        except Exception as e:
+            print(f"⚠️ analyse fixture échouée: {e}")
+            unmatched += 1
 
     pronos.sort(key=score_prono, reverse=True)
     STATE["pronos"] = pronos
 
     coupons = []
-    built = set()
-    for cfg in COUPON_CONFIGS:
+    for cfg in [
+        ("Ticket Sécurisé", "Sélections les plus fiables", 1.8, 2.8, 3),
+        ("Ticket Équilibré", "Équilibre entre sécurité et gain", 3.0, 6.0, 4),
+        ("Ticket Agressif", "Cote plus élevée, risque plus fort", 6.0, 20.0, 5),
+        ("Ticket Value", "Opportunités de valeur", 1.6, 12.0, 3),
+    ]:
         c = build_coupon(*cfg, pronos)
-        if c and c.id not in built:
+        if c:
             coupons.append(c)
-            built.add(c.id)
 
     STATE["coupons"] = coupons
     STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
     STATE["debug"] = {
-        "today_local": str(local_today),
-        "total_events": total_events,
-        "out_of_day": out_of_day,
-        "unmatched": unmatched,
+        "today_local": str(today_local_date()),
+        "fixtures_total": len(fixtures),
         "rejected": rejected,
+        "unmatched": unmatched,
         "kept": kept,
         "coupons": len(coupons),
     }
 
-    print("──────── RÉSUMÉ JOUR ────────")
-    print(f"Events API total : {total_events}")
-    print(f"Hors du jour     : {out_of_day}")
-    print(f"Non reconnus     : {unmatched}")
-    print(f"Rejetés          : {rejected}")
-    print(f"Retenus          : {kept}")
-    print(f"Coupons          : {len(coupons)}")
-    print("─────────────────────────────")
+    print("──────── RÉSUMÉ SPORTMONKS ────────")
+    print(f"Fixtures total : {len(fixtures)}")
+    print(f"Rejetés        : {rejected}")
+    print(f"Erreurs        : {unmatched}")
+    print(f"Retenus        : {kept}")
+    print(f"Coupons        : {len(coupons)}")
+    print("───────────────────────────────────")
 
 
 # =========================================================
-# 14. DIFFUSION QUOTIDIENNE
+# BROADCAST
 # =========================================================
 async def daily_broadcast():
-    print("🔔 Diffusion quotidienne...")
     await scan_today_only()
 
-    header = format_no_match() if not STATE["coupons"] else format_summary(len(STATE["pronos"]), len(STATE["coupons"]))
+    if not STATE["coupons"]:
+        text = format_no_match()
+    else:
+        text = format_summary(len(STATE["pronos"]), len(STATE["coupons"]))
+
     date_str = datetime.now(TZ).strftime("%Y-%m-%d")
     record_coupons(STATE["coupons"], date_str)
 
     for chat_id in TARGETS:
-        await safe_send(chat_id, header, inline=True)
-        await asyncio.sleep(0.4)
-
-        if STATE["coupons"]:
+        try:
+            await bot.send_message(chat_id, text, reply_markup=MAIN_KEYBOARD)
+            await asyncio.sleep(0.3)
             for c in STATE["coupons"]:
-                await safe_send(chat_id, format_coupon(c), inline=True)
-                await asyncio.sleep(0.5)
-
-    print("✅ Diffusion terminée.")
+                await bot.send_message(chat_id, format_coupon(c), reply_markup=MAIN_KEYBOARD)
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            print(f"⚠️ Envoi impossible vers {chat_id}: {e}")
 
 
 # =========================================================
-# 15. BOOTSTRAP / APP
+# APP
 # =========================================================
 async def bootstrap():
     print("📥 Chargement des modèles CSV...")
     STATE["models"] = await download_csv_models()
     STATE["tracker"] = load_tracker()
     STATE["ready"] = True
-    print("✅ Bot premium CI prêt.")
+    print("✅ Bot Sportmonks prêt.")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-
+    await bot.delete_webhook(drop_pending_updates=True)
     await bootstrap()
 
     scheduler = AsyncIOScheduler(timezone=TZ)
@@ -1305,8 +1061,6 @@ async def lifespan(app: FastAPI):
         CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ),
         id="daily_broadcast",
         replace_existing=True,
-        max_instances=1,
-        coalesce=True,
     )
     scheduler.start()
 
@@ -1315,26 +1069,22 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    scheduler.shutdown(wait=False)
+    scheduler.shutdown()
     bot_task.cancel()
-    try:
-        await bot.session.close()
-    except Exception:
-        pass
+    await bot.session.close()
 
 
-app = FastAPI(title="WallStreet CI Premium v9.1", lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/")
 async def root():
     return {
         "status": "ok",
-        "version": "9.1",
-        "brand": BRAND_NAME,
+        "provider": "Sportmonks",
         "timezone": NOTIFY_TZ,
-        "today_local": str(today_local_date()),
         "ready": STATE["ready"],
+        "today_local": str(today_local_date()),
         "pronos": len(STATE["pronos"]),
         "coupons": [c.name for c in STATE["coupons"]],
         "last_scan": STATE["last_scan"],
@@ -1342,7 +1092,7 @@ async def root():
 
 
 @app.get("/debug")
-async def debug_http():
+async def debug():
     return STATE["debug"]
 
 
