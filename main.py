@@ -22,6 +22,7 @@ import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -34,7 +35,7 @@ from fastapi import FastAPI
 
 
 # =========================================================
-# CONFIG
+# 1. CONFIG
 # =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
@@ -52,11 +53,10 @@ DECAY_DAYS = float(os.getenv("DECAY_DAYS", "180"))
 EV_THRESHOLD = float(os.getenv("EV_THRESHOLD", "0.03"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 
-LOCAL_DB = os.getenv("LOCAL_DB", "/tmp/wallstreet_ci_v10.json")
+LOCAL_DB = os.getenv("LOCAL_DB", "/tmp/wallstreet_ci_v91.json")
 BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
 BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse premium • Matchs du jour")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
-ENABLE_INLINE = os.getenv("ENABLE_INLINE", "1") == "1"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -65,9 +65,11 @@ if not ODDS_API_KEY:
 if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
     raise RuntimeError("TELEGRAM_ADMIN_ID ou TELEGRAM_CHANNEL manquant")
 
+TZ = ZoneInfo(NOTIFY_TZ)
+
 
 # =========================================================
-# LIGUES
+# 2. LIGUES
 # =========================================================
 @dataclass(frozen=True)
 class League:
@@ -158,7 +160,7 @@ TEAM_ALIASES = {
 
 
 # =========================================================
-# HELPERS
+# 3. HELPERS
 # =========================================================
 STOP_WORDS = {"fc", "cf", "ac", "sc", "sv", "fk", "club", "de", "da", "cd", "ud", "sd", "as", "sk"}
 
@@ -185,7 +187,9 @@ def parse_date(s: str) -> Optional[datetime]:
 def local_dt_from_iso(iso: str) -> Optional[datetime]:
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return dt.astimezone(ZoneInfo(NOTIFY_TZ))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        return dt.astimezone(TZ)
     except Exception:
         return None
 
@@ -196,7 +200,7 @@ def kickoff_local(iso: str) -> str:
 
 
 def today_local_date():
-    return datetime.now(ZoneInfo(NOTIFY_TZ)).date()
+    return datetime.now(TZ).date()
 
 
 def today_pretty() -> str:
@@ -205,7 +209,7 @@ def today_pretty() -> str:
         7: "juillet", 8: "août", 9: "septembre", 10: "octobre",
         11: "novembre", 12: "décembre"
     }
-    d = datetime.now(ZoneInfo(NOTIFY_TZ))
+    d = datetime.now(TZ)
     return f"{d.day} {months[d.month]} {d.year}"
 
 
@@ -282,7 +286,7 @@ def find_team(api_name: str, teams: dict) -> Optional[str]:
 
 
 # =========================================================
-# STRUCTURES
+# 4. STRUCTURES
 # =========================================================
 @dataclass
 class Match:
@@ -337,14 +341,14 @@ class Coupon:
     name: str
     emoji: str
     subtitle: str
-    legs: list[Prono]
+    legs: list
     combined_odds: float
     combined_prob: float
     combined_ev: float
 
 
 # =========================================================
-# CSV / MODELS
+# 5. CSV / MODELS
 # =========================================================
 CSV_BASE = "https://www.football-data.co.uk/mmz4281"
 
@@ -355,7 +359,7 @@ def season_codes(n: int = 2) -> list[str]:
     return [f"{str(start - i)[2:]}{str(start - i + 1)[2:]}" for i in range(n)]
 
 
-def parse_csv(text: str, league: str) -> list[Match]:
+def parse_csv(text: str, league: str) -> list:
     out = []
     for row in csv.DictReader(io.StringIO(text)):
         try:
@@ -378,7 +382,7 @@ def parse_csv(text: str, league: str) -> list[Match]:
     return out
 
 
-async def download_csv_models() -> tuple[dict, dict]:
+async def download_csv_models():
     by_league = defaultdict(list)
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
         for lg in LEAGUES:
@@ -395,10 +399,10 @@ async def download_csv_models() -> tuple[dict, dict]:
     for lg in LEAGUES:
         models[lg.code] = compute_model(by_league.get(lg.code, []))
         print(f"📘 {lg.name}: {len(models[lg.code]['teams'])} équipes")
-    return models, by_league
+    return models
 
 
-def compute_model(matches: list[Match]) -> dict:
+def compute_model(matches: list) -> dict:
     dated = [(parse_date(m.date), m) for m in matches]
     dated = [(d, m) for d, m in dated if d is not None]
     if not dated:
@@ -512,7 +516,7 @@ def predict(home: str, away: str, model: dict) -> Optional[Prediction]:
 
 
 # =========================================================
-# ODDS / ANALYSE
+# 6. ODDS / ANALYSE
 # =========================================================
 def best_odds(event: dict) -> dict:
     prices = defaultdict(list)
@@ -592,7 +596,7 @@ def analyze_event(league: League, event: dict, model: dict) -> Optional[Prono]:
 
 
 # =========================================================
-# PREMIUM UI / COUPONS
+# 7. COUPONS
 # =========================================================
 COUPON_CONFIGS = [
     ("TICKET SÉCURISÉ", "🟢", "Sélections les plus fiables", 1.8, 2.8, 3, "safe"),
@@ -606,7 +610,7 @@ def score_prono(p: Prono) -> float:
     return p.reliability + ((p.ev or 0.0) * 0.15)
 
 
-def pool_for(pronos: list[Prono], kind: str) -> list[Prono]:
+def pool_for(pronos: list, kind: str) -> list:
     priced = [p for p in pronos if p.odds and p.odds > 1.0]
 
     if kind == "safe":
@@ -622,7 +626,6 @@ def pool_for(pronos: list[Prono], kind: str) -> list[Prono]:
         pool = [p for p in priced if (p.ev or -999) >= EV_THRESHOLD]
         pool.sort(key=lambda x: ((x.ev or 0), x.reliability), reverse=True)
 
-    # anti-doublons strict
     uniq = {}
     for p in pool:
         uniq[p.id] = p
@@ -631,7 +634,7 @@ def pool_for(pronos: list[Prono], kind: str) -> list[Prono]:
 
 def build_coupon(name: str, emoji: str, subtitle: str,
                  min_odds: float, max_odds: float, max_legs: int,
-                 kind: str, pronos: list[Prono]) -> Optional[Coupon]:
+                 kind: str, pronos: list) -> Optional[Coupon]:
     pool = pool_for(pronos, kind)
     if not pool:
         return None
@@ -659,7 +662,7 @@ def build_coupon(name: str, emoji: str, subtitle: str,
     if not legs or odds < min_odds * 0.85:
         return None
 
-    cid = f"{datetime.now(ZoneInfo(NOTIFY_TZ)).strftime('%Y%m%d')}-{normalize(name)}"
+    cid = f"{datetime.now(TZ).strftime('%Y%m%d')}-{normalize(name)}"
     return Coupon(
         id=cid,
         name=name,
@@ -672,13 +675,9 @@ def build_coupon(name: str, emoji: str, subtitle: str,
     )
 
 
-def top_score_line(p: Prono) -> str:
-    if not p.top_scores:
-        return ""
-    best = p.top_scores[0]
-    return f"🎯 Score probable : <b>{best['score']}</b> ({best['proba'] * 100:.1f}%)"
-
-
+# =========================================================
+# 8. FORMATAGE PREMIUM
+# =========================================================
 def premium_header() -> str:
     return (
         f"🏷️ <b>{BRAND_NAME}</b>\n"
@@ -686,6 +685,13 @@ def premium_header() -> str:
         f"📅 <b>{today_pretty()}</b>\n"
         f"🕓 Côte d’Ivoire • GMT+0"
     )
+
+
+def top_score_line(p: Prono) -> str:
+    if not p.top_scores:
+        return ""
+    best = p.top_scores[0]
+    return f"🎯 Score probable : <b>{best['score']}</b> ({best['proba'] * 100:.1f}%)"
 
 
 def format_coupon(c: Coupon) -> str:
@@ -739,7 +745,7 @@ def format_no_match() -> str:
     )
 
 
-def format_top_pronos(pronos: list[Prono]) -> str:
+def format_top_pronos(pronos: list) -> str:
     if not pronos:
         return format_no_match()
     lines = [f"{premium_header()}", "", "🏆 <b>TOP PRONOS DU JOUR</b>", ""]
@@ -819,7 +825,7 @@ def format_bilan(tracker: dict) -> str:
 
 
 # =========================================================
-# TRACKER
+# 9. TRACKER
 # =========================================================
 def load_tracker() -> dict:
     try:
@@ -838,7 +844,7 @@ def save_tracker(data: dict):
         print(f"⚠️ Sauvegarde tracker échouée : {e}")
 
 
-def record_coupons(coupons: list[Coupon], date_str: str):
+def record_coupons(coupons: list, date_str: str):
     tracker = STATE["tracker"]
     existing = {c["id"] for c in tracker["coupons"]}
 
@@ -869,101 +875,8 @@ def record_coupons(coupons: list[Coupon], date_str: str):
     save_tracker(tracker)
 
 
-def leg_result_from_scores(home_score: int, away_score: int, pick: str) -> str:
-    if home_score > away_score:
-        res = "1"
-    elif home_score == away_score:
-        res = "X"
-    else:
-        res = "2"
-    return "win" if res == pick else "loss"
-
-
-async def fetch_scores_for_league(client: httpx.AsyncClient, league: League, days_from: int = 3) -> list[dict]:
-    url = f"https://api.the-odds-api.com/v4/sports/{league.odds_key}/scores/"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "daysFrom": days_from,
-    }
-    try:
-        r = await client.get(url, params=params, timeout=20.0)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return []
-
-
-async def resolve_pending():
-    tracker = STATE["tracker"]
-    pending = [c for c in tracker["coupons"] if c.get("status") == "pending"]
-    if not pending:
-        return 0
-
-    resolved_count = 0
-    async with httpx.AsyncClient() as client:
-        scores_by_league = {}
-        for lg in LEAGUES:
-            scores_by_league[lg.code] = await fetch_scores_for_league(client, lg, days_from=3)
-            await asyncio.sleep(0.25)
-
-        score_index = {}
-        for lg_code, events in scores_by_league.items():
-            for ev in events:
-                home = ev.get("home_team", "")
-                away = ev.get("away_team", "")
-                kickoff = ev.get("commence_time", "")
-                completed = ev.get("completed", False)
-                scores = ev.get("scores") or []
-                if not completed or len(scores) < 2:
-                    continue
-
-                hscore = ascore = None
-                for s in scores:
-                    if s.get("name") == home:
-                        hscore = int(s.get("score"))
-                    elif s.get("name") == away:
-                        ascore = int(s.get("score"))
-                if hscore is None or ascore is None:
-                    continue
-
-                key = event_key(lg_code, home, away, kickoff)
-                score_index[key] = (hscore, ascore)
-
-        for coupon in pending:
-            all_done = True
-            all_win = True
-            any_result = False
-
-            for leg in coupon["legs"]:
-                if leg["status"] in ("win", "loss"):
-                    any_result = True
-                    if leg["status"] == "loss":
-                        all_win = False
-                    continue
-
-                res = score_index.get(leg["id"])
-                if not res:
-                    all_done = False
-                    continue
-
-                hscore, ascore = res
-                leg_status = leg_result_from_scores(hscore, ascore, leg["pick"])
-                leg["status"] = leg_status
-                any_result = True
-                if leg_status == "loss":
-                    all_win = False
-
-            if any_result and all_done:
-                coupon["status"] = "win" if all_win else "loss"
-                resolved_count += 1
-
-    save_tracker(tracker)
-    return resolved_count
-
-
 # =========================================================
-# TELEGRAM
+# 10. STATE / BOT
 # =========================================================
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -1000,12 +913,14 @@ INLINE_KEYBOARD = InlineKeyboardMarkup(
             InlineKeyboardButton(text="🏆 Top pronos", callback_data="view:top"),
             InlineKeyboardButton(text="📊 Bilan", callback_data="view:bilan"),
         ],
+        [
+            InlineKeyboardButton(text="🔄 Re-scan", callback_data="view:scan"),
+        ],
     ]
 )
 
 STATE = {
     "models": {},
-    "history": {},
     "ready": False,
     "pronos": [],
     "coupons": [],
@@ -1014,7 +929,7 @@ STATE = {
     "tracker": {"coupons": []},
 }
 
-TARGETS: list[int | str] = []
+TARGETS = []
 for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
     if not raw:
         continue
@@ -1024,26 +939,28 @@ for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
         TARGETS.append(raw)
 
 
+# =========================================================
+# 11. ENVOI TELEGRAM
+# =========================================================
 async def safe_send(chat_id, text: str, inline: bool = False):
     try:
-        kwargs = {"chat_id": chat_id, "text": text, "reply_markup": MAIN_KEYBOARD}
-        if inline and ENABLE_INLINE:
-            kwargs["reply_markup"] = INLINE_KEYBOARD
-        await bot.send_message(**kwargs)
+        kb = INLINE_KEYBOARD if inline else MAIN_KEYBOARD
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
     except Exception as e:
         print(f"⚠️ Envoi Telegram échoué vers {chat_id}: {e}")
 
 
 async def safe_answer(message: Message, text: str, inline: bool = False):
     try:
-        if inline and ENABLE_INLINE:
-            await message.answer(text, reply_markup=INLINE_KEYBOARD)
-        else:
-            await message.answer(text, reply_markup=MAIN_KEYBOARD)
+        kb = INLINE_KEYBOARD if inline else MAIN_KEYBOARD
+        await message.answer(text, reply_markup=kb)
     except Exception as e:
         print(f"⚠️ Réponse Telegram échouée : {e}")
 
 
+# =========================================================
+# 12. HANDLERS
+# =========================================================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await safe_answer(
@@ -1078,7 +995,6 @@ async def cmd_help(message: Message):
 async def cmd_scan(message: Message):
     await safe_answer(message, "⏳ Scan premium du jour en cours...")
     await scan_today_only()
-    await resolve_pending()
     if not STATE["coupons"]:
         await safe_answer(message, format_no_match(), inline=True)
         return
@@ -1106,7 +1022,6 @@ async def cmd_coupons(message: Message):
 
 @dp.message(Command("bilan"))
 async def cmd_bilan(message: Message):
-    await resolve_pending()
     await safe_answer(message, format_bilan(STATE["tracker"]), inline=True)
 
 
@@ -1157,7 +1072,6 @@ async def btn_val(message: Message):
 
 @dp.message(F.text == BTN_BILAN)
 async def btn_bilan(message: Message):
-    await resolve_pending()
     await safe_answer(message, format_bilan(STATE["tracker"]), inline=True)
 
 
@@ -1166,10 +1080,70 @@ async def btn_scan(message: Message):
     await cmd_scan(message)
 
 
+# --- Callbacks inline ---
+@dp.callback_query(F.data.startswith("coupon:"))
+async def cb_coupon(cb: CallbackQuery):
+    kind = cb.data.split(":", 1)[1]
+    mapping = {
+        "safe": "TICKET SÉCURISÉ",
+        "balanced": "TICKET ÉQUILIBRÉ",
+        "aggressive": "TICKET AGRESSIF",
+        "value": "TICKET VALUE",
+    }
+    name = mapping.get(kind)
+    coupon = next((c for c in STATE["coupons"] if c.name == name), None)
+
+    try:
+        if not coupon:
+            await cb.message.answer(format_no_match(), reply_markup=INLINE_KEYBOARD)
+        else:
+            await cb.message.answer(format_coupon(coupon), reply_markup=INLINE_KEYBOARD)
+        await cb.answer()
+    except Exception as e:
+        print(f"⚠️ Callback coupon échoué : {e}")
+        await cb.answer("Erreur", show_alert=False)
+
+
+@dp.callback_query(F.data == "view:top")
+async def cb_top(cb: CallbackQuery):
+    try:
+        await cb.message.answer(format_top_pronos(STATE["pronos"]), reply_markup=INLINE_KEYBOARD)
+        await cb.answer()
+    except Exception as e:
+        print(f"⚠️ Callback top échoué : {e}")
+        await cb.answer("Erreur", show_alert=False)
+
+
+@dp.callback_query(F.data == "view:bilan")
+async def cb_bilan(cb: CallbackQuery):
+    try:
+        await cb.message.answer(format_bilan(STATE["tracker"]), reply_markup=INLINE_KEYBOARD)
+        await cb.answer()
+    except Exception as e:
+        print(f"⚠️ Callback bilan échoué : {e}")
+        await cb.answer("Erreur", show_alert=False)
+
+
+@dp.callback_query(F.data == "view:scan")
+async def cb_scan(cb: CallbackQuery):
+    try:
+        await cb.answer("Scan en cours...", show_alert=False)
+    except Exception:
+        pass
+    await scan_today_only()
+    if not STATE["coupons"]:
+        await cb.message.answer(format_no_match(), reply_markup=INLINE_KEYBOARD)
+        return
+    await cb.message.answer(
+        format_summary(len(STATE["pronos"]), len(STATE["coupons"])),
+        reply_markup=INLINE_KEYBOARD,
+    )
+
+
 # =========================================================
-# SCAN
+# 13. SCAN DU JOUR
 # =========================================================
-async def fetch_odds(client: httpx.AsyncClient, league: League) -> list[dict]:
+async def fetch_odds(client: httpx.AsyncClient, league: League) -> list:
     url = f"https://api.the-odds-api.com/v4/sports/{league.odds_key}/odds/"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -1201,14 +1175,13 @@ async def scan_today_only():
         return
 
     local_today = today_local_date()
-    pronos: list[Prono] = []
+    pronos = []
 
     total_events = 0
     out_of_day = 0
     unmatched = 0
     rejected = 0
     kept = 0
-
     seen = set()
 
     print(f"🔄 Scan jour CI | {local_today}")
@@ -1235,13 +1208,8 @@ async def scan_today_only():
 
                 p = analyze_event(lg, ev, model)
                 if not p:
-                    home_api = ev.get("home_team", "")
-                    away_api = ev.get("away_team", "")
-                    if home_api or away_api:
-                        unmatched += 1
-                        print(f"❌ Non reconnu: {home_api} vs {away_api}")
-                    else:
-                        rejected += 1
+                    unmatched += 1
+                    print(f"❌ Non reconnu: {ev.get('home_team')} vs {ev.get('away_team')}")
                     continue
 
                 if p.id in seen:
@@ -1259,15 +1227,15 @@ async def scan_today_only():
     STATE["pronos"] = pronos
 
     coupons = []
-    built_ids = set()
+    built = set()
     for cfg in COUPON_CONFIGS:
         c = build_coupon(*cfg, pronos)
-        if c and c.id not in built_ids:
+        if c and c.id not in built:
             coupons.append(c)
-            built_ids.add(c.id)
+            built.add(c.id)
 
     STATE["coupons"] = coupons
-    STATE["last_scan"] = datetime.now(ZoneInfo(NOTIFY_TZ)).strftime("%d/%m %H:%M")
+    STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
     STATE["debug"] = {
         "today_local": str(local_today),
         "total_events": total_events,
@@ -1289,15 +1257,14 @@ async def scan_today_only():
 
 
 # =========================================================
-# BROADCAST
+# 14. DIFFUSION QUOTIDIENNE
 # =========================================================
 async def daily_broadcast():
-    print("🔔 Diffusion quotidienne Ultra Premium...")
+    print("🔔 Diffusion quotidienne...")
     await scan_today_only()
-    await resolve_pending()
 
     header = format_no_match() if not STATE["coupons"] else format_summary(len(STATE["pronos"]), len(STATE["coupons"]))
-    date_str = datetime.now(ZoneInfo(NOTIFY_TZ)).strftime("%Y-%m-%d")
+    date_str = datetime.now(TZ).strftime("%Y-%m-%d")
     record_coupons(STATE["coupons"], date_str)
 
     for chat_id in TARGETS:
@@ -1313,16 +1280,14 @@ async def daily_broadcast():
 
 
 # =========================================================
-# BOOTSTRAP / APP
+# 15. BOOTSTRAP / APP
 # =========================================================
 async def bootstrap():
     print("📥 Chargement des modèles CSV...")
-    models, history = await download_csv_models()
-    STATE["models"] = models
-    STATE["history"] = history
+    STATE["models"] = await download_csv_models()
     STATE["tracker"] = load_tracker()
     STATE["ready"] = True
-    print("✅ Bot Ultra Premium CI prêt.")
+    print("✅ Bot premium CI prêt.")
 
 
 @asynccontextmanager
@@ -1334,10 +1299,10 @@ async def lifespan(app: FastAPI):
 
     await bootstrap()
 
-    scheduler = AsyncIOScheduler(timezone=ZoneInfo(NOTIFY_TZ))
+    scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(
         daily_broadcast,
-        CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=ZoneInfo(NOTIFY_TZ)),
+        CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ),
         id="daily_broadcast",
         replace_existing=True,
         max_instances=1,
@@ -1358,14 +1323,14 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="WallStreet CI Ultra Premium v10", lifespan=lifespan)
+app = FastAPI(title="WallStreet CI Premium v9.1", lifespan=lifespan)
 
 
 @app.get("/")
 async def root():
     return {
         "status": "ok",
-        "version": "10.0",
+        "version": "9.1",
         "brand": BRAND_NAME,
         "timezone": NOTIFY_TZ,
         "today_local": str(today_local_date()),
