@@ -56,14 +56,10 @@ if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
 TZ = ZoneInfo(NOTIFY_TZ)
 RUNDOWN_BASE = "https://therundown.io/api/v2"
 
-# TheRundown sport IDs (football = 4)
 SPORT_ID = 4
-# Markets : 1 = Moneyline (1X2), 2 = Spread, 3 = Total
 MARKET_IDS = "1,2,3"
-# Bookmakers : Pinnacle(3), Bet365(19), etc. (voir /api/v2/affiliates)
 AFFILIATE_IDS = "3,19,23"
 
-# BetBetter league slugs (football)
 BETBETTER_LEAGUES = [
     "soccer/epl",
     "soccer/la-liga",
@@ -238,7 +234,7 @@ def record_coupons(coupons: list[Coupon], date_str: str):
 
 
 # =========================================================
-# THERUNDOWN — Cotes réelles
+# THERUNDOWN
 # =========================================================
 async def fetch_rundown_events(client: httpx.AsyncClient) -> list[dict]:
     url = f"{RUNDOWN_BASE}/sports/{SPORT_ID}/events/{today_iso()}"
@@ -269,7 +265,6 @@ async def fetch_rundown_events(client: httpx.AsyncClient) -> list[dict]:
 
 
 def parse_rundown_event(ev: dict) -> dict[str, float]:
-    """Retourne {outcome_label: best_odd} pour un event TheRundown."""
     out: dict[str, float] = {}
     teams = ev.get("teams", []) or []
     home = next((t.get("name") for t in teams if not t.get("is_away")), "")
@@ -308,10 +303,9 @@ def parse_rundown_event(ev: dict) -> dict[str, float]:
 
 
 # =========================================================
-# BETBETTER — Probabilités modèle
+# BETBETTER
 # =========================================================
 def fetch_betbetter_probs() -> dict[str, dict]:
-    """Retourne {clé_match: {selection: prob}} depuis BetBetter."""
     if betbetter is None:
         print("⚠️ betbetter non installé")
         return {}
@@ -337,7 +331,6 @@ def fetch_betbetter_probs() -> dict[str, dict]:
 # VALUE ENGINE
 # =========================================================
 def match_betbetter(bb: dict, home: str, away: str) -> dict[str, float]:
-    """Cherche les probas BetBetter pour un match (match approximatif)."""
     h = home.lower().strip()
     a = away.lower().strip()
     for key, sels in bb.items():
@@ -388,14 +381,7 @@ def build_selections(events: list[dict], bb: dict) -> list[Selection]:
                 if edge < MIN_EDGE:
                     continue
 
-                if market_code == "1":
-                    market_label = "1X2"
-                elif market_code == "2":
-                    market_label = "1X2"
-                elif market_code == "X":
-                    market_label = "1X2"
-                else:
-                    market_label = "Over/Under"
+                market_label = "1X2" if market_code in ("1", "X", "2") else "Over/Under"
 
                 selections.append(Selection(
                     event_id=event_id,
@@ -593,6 +579,55 @@ async def debug_cmd(message: Message):
         f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
     )
     await safe_answer(message, txt)
+
+
+# ─── DIAGNOSTIC ───────────────────────────────────────────
+@dp.message(Command("diag"))
+async def diag_cmd(message: Message):
+    await safe_answer(message, "🔍 Test des sport_ids TheRundown en cours…")
+    lines = []
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        for sid in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]:
+            try:
+                url = f"{RUNDOWN_BASE}/sports/{sid}/events/{today_iso()}"
+                r = await client.get(
+                    url,
+                    params={"market_ids": "1,3", "affiliate_ids": AFFILIATE_IDS},
+                    headers={"X-TheRundown-Key": THERUNDOWN_KEY},
+                    timeout=15.0,
+                )
+                try:
+                    data = r.json()
+                    n = len(data.get("events", []) or [])
+                except Exception:
+                    n = 0
+                lines.append(f"id={sid} → {r.status_code} | {n} events")
+            except Exception:
+                lines.append(f"id={sid} → ERR")
+    await safe_answer(message, "<b>Sport IDs</b>\n" + "\n".join(lines))
+
+
+@dp.message(Command("bbsample"))
+async def bbsample_cmd(message: Message):
+    if betbetter is None:
+        await safe_answer(message, "BetBetter non installé")
+        return
+    try:
+        feed = betbetter.get_picks("soccer/epl")
+        picks = feed.get("picks", []) or []
+        if not picks:
+            await safe_answer(message, "Aucun pick EPL")
+            return
+        sample = picks[0]
+        keys = list(sample.keys())
+        txt = "<b>Champs BetBetter</b>\n\n" + "\n".join(f"• <code>{k}</code>" for k in keys)
+        txt += "\n\n<b>Exemple :</b>\n"
+        for k in keys:
+            v = str(sample[k])[:60]
+            txt += f"<code>{k}</code> = {v}\n"
+        await safe_answer(message, txt)
+    except Exception as e:
+        await safe_answer(message, f"Erreur: {e}")
 
 
 @dp.message(F.text == BTN_SIMPLE)
