@@ -7,7 +7,7 @@ import re
 import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -44,9 +44,8 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Value betting • Modèle indépenda
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
-MIN_PROB = float(os.getenv("MIN_PROB", "0.45"))
+MIN_PROB = float(os.getenv("MIN_PROB", "0.65"))
 MAX_SIMPLE_SEND = int(os.getenv("MAX_SIMPLE_SEND", "10"))
-HORIZON_HOURS = int(os.getenv("HORIZON_HOURS", "96"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -208,13 +207,16 @@ def kickoff_local(iso_str: str) -> str:
     return dt.strftime("%H:%M") if dt else "?"
 
 
-def is_upcoming(iso_str: str, hours: int = HORIZON_HOURS) -> bool:
+def is_today(iso_str: str) -> bool:
+    """Match uniquement aujourd'hui (date locale) et pas encore commencé."""
     dt = parse_dt_safe(iso_str)
     if not dt:
         return False
     now = datetime.now(TZ)
-    delta_h = (dt - now).total_seconds() / 3600
-    return -1 <= delta_h <= hours
+    if dt.date() != now.date():
+        return False
+    # Écarte les matchs déjà commencés (buffer 15 min)
+    return dt > now + timedelta(minutes=15)
 
 
 def parse_bb_game(game: str) -> tuple[str, str]:
@@ -227,7 +229,6 @@ def parse_bb_game(game: str) -> tuple[str, str]:
 
 
 def edge_bar(edge: float) -> str:
-    """Représente l'edge avec des barres visuelles."""
     if edge >= 0.10:
         return "🟢🟢🟢"
     if edge >= 0.07:
@@ -460,7 +461,6 @@ def find_odds_for_pick(event: dict, pick: dict, home: str, away: str) -> tuple[O
         if r[0] is not None:
             return r
 
-        # Fallback : Spread -0.5 = victoire → Moneyline
         if target is not None and abs(target - (-0.5)) < 0.01:
             if is_home:
                 return find_best_odds(event, "h2h", lambda o: _match_name(normalize_name(o.get("name", "")), home_norm))
@@ -489,7 +489,7 @@ def fuzzy_find(bb_data: dict, home: str, away: str) -> Optional[dict]:
 
 def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
     selections: list[Selection] = []
-    seen_keys = set()  # anti-doublon intra-même match
+    seen_keys = set()
 
     for ev in odds_events:
         try:
@@ -498,13 +498,14 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
             if not home or not away:
                 continue
 
+            # ⚠️ FILTRE : uniquement aujourd'hui
+            kickoff = ev.get("commence_time", "")
+            if not is_today(kickoff):
+                continue
+
             key = f"{normalize_name(away)}|{normalize_name(home)}"
             bb_match = bb_data.get(key) or fuzzy_find(bb_data, home, away)
             if not bb_match:
-                continue
-
-            kickoff = ev.get("commence_time", "")
-            if not is_upcoming(kickoff):
                 continue
 
             event_id = ev.get("id", "")
@@ -518,6 +519,21 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
                 if prob < MIN_PROB:
                     continue
 
+                # Filtre marchés : uniquement 1X2 et Over 0.5 / 1.5
+                market = pick.get("market", "")
+                line = pick.get("line")
+
+                if market == "Spread":
+                    continue  # on bannit les handicaps
+
+                if market == "Total":
+                    try:
+                        line_f = float(line) if line is not None else None
+                    except (ValueError, TypeError):
+                        line_f = None
+                    if line_f not in (0.5, 1.5):
+                        continue
+
                 odds, book = find_odds_for_pick(ev, pick, home, away)
                 if odds is None:
                     continue
@@ -526,9 +542,7 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
                 if edge < MIN_EDGE:
                     continue
 
-                market = pick.get("market", "")
                 selection = pick.get("selection", "")
-                line = pick.get("line")
                 confidence = pick.get("confidence", "")
 
                 if market == "Moneyline":
@@ -540,16 +554,12 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
                         label = "Match nul"
                     market_label = "1X2"
                 elif market == "Total":
-                    label = f"{selection} {line} buts" if line is not None else selection
+                    label = f"{selection} {line} buts"
                     market_label = "Over/Under"
-                elif market == "Spread":
-                    label = f"{selection} ({line:+g})" if isinstance(line, (int, float)) else selection
-                    market_label = "Handicap"
                 else:
                     label = selection
                     market_label = market
 
-                # Anti-doublon : même match + même marché = 1 seule fois
                 dedup = f"{event_id}|{market_label}|{label}"
                 if dedup in seen_keys:
                     continue
@@ -583,12 +593,11 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
 
 
 # =========================================================
-# COUPON BUILDER — anti-doublon global
+# COUPON BUILDER
 # =========================================================
 def build_coupon(name: str, subtitle: str, emoji: str, pool: list[Selection],
                  min_odds: float, max_odds: float, max_legs: int,
                  globally_used: set) -> Optional[Coupon]:
-    # Filtre : retire les matchs déjà utilisés dans un autre coupon
     pool = [s for s in pool if s.odds and s.odds > 1.01 and s.event_id not in globally_used]
     if not pool:
         return None
@@ -622,7 +631,6 @@ def build_coupon(name: str, subtitle: str, emoji: str, pool: list[Selection],
     if combined_odds < min_odds * 0.85:
         return None
 
-    # Marque les events comme utilisés globalement
     for s in legs:
         globally_used.add(s.event_id)
 
@@ -638,34 +646,36 @@ def build_coupon(name: str, subtitle: str, emoji: str, pool: list[Selection],
 
 
 def build_all_coupons(selections: list[Selection]) -> list[Coupon]:
+    """Construit entre 2 et 5 coupons selon les sélections disponibles."""
     coupons: list[Coupon] = []
-    globally_used: set = set()  # <-- anti-doublon entre coupons
+    globally_used: set = set()
 
-    # 1. SÉCURISÉ : favoris 1X2 forte proba
-    safe_pool = [s for s in selections if s.market == "1X2" and s.odds <= 2.20 and s.model_prob >= 0.55]
-    c = build_coupon("Ticket Sécurisé", "Favoris à forte probabilité", "🔒",
-                     safe_pool, 1.6, 3.0, 3, globally_used)
+    # 1. ULTRA SAFE — 1 sélection haute proba
+    ultra_pool = [s for s in selections if s.model_prob >= 0.75 and s.odds <= 1.55]
+    c = build_coupon("Ultra Safe", "1 sélection à très forte probabilité", "🛡",
+                     ultra_pool, 1.30, 1.60, 1, globally_used)
     if c:
         coupons.append(c)
 
-    # 2. ÉQUILIBRÉ : Over/Under + Handicap
-    bal_pool = [s for s in selections if s.market in ("Over/Under", "Handicap") and 1.6 <= s.odds <= 2.5]
-    c = build_coupon("Ticket Équilibré", "Value sur totaux et handicaps", "⚖️",
-                     bal_pool, 2.5, 6.0, 4, globally_used)
+    # 2. SAFE — 2 sélections ~70% chacune → cote ~2
+    safe_pool = [s for s in selections if s.model_prob >= 0.65 and s.odds <= 1.55]
+    c = build_coupon("Safe", "2 sélections solides, cote ~2", "✅",
+                     safe_pool, 1.80, 2.50, 2, globally_used)
     if c:
         coupons.append(c)
 
-    # 3. AGRESSIF : grosses cotes
-    agg_pool = [s for s in selections if s.odds >= 2.3]
-    c = build_coupon("Ticket Agressif", "Gros gains, risque élevé", "🔥",
-                     agg_pool, 5.0, 30.0, 5, globally_used)
+    # 3. ÉQUILIBRÉ — 3 sélections
+    eq_pool = [s for s in selections if s.model_prob >= 0.60]
+    c = build_coupon("Équilibré", "3 sélections, cote 3-5", "⚖️",
+                     eq_pool, 3.0, 5.0, 3, globally_used)
     if c:
         coupons.append(c)
 
-    # 4. VALUE : top edges
-    val_pool = sorted(selections, key=lambda s: s.edge, reverse=True)
-    c = build_coupon("Ticket Value", "Les meilleurs edges du jour", "💎",
-                     val_pool, 1.6, 12.0, 4, globally_used)
+    # 4. VALUE — top edges ≥5%
+    val_pool = sorted([s for s in selections if s.edge >= 0.05],
+                      key=lambda s: s.edge, reverse=True)
+    c = build_coupon("Value", "Meilleurs edges ≥5%", "💎",
+                     val_pool, 1.60, 3.00, 2, globally_used)
     if c:
         coupons.append(c)
 
@@ -673,7 +683,7 @@ def build_all_coupons(selections: list[Selection]) -> list[Coupon]:
 
 
 # =========================================================
-# FORMAT PREMIUM
+# FORMAT
 # =========================================================
 def format_header() -> str:
     return (
@@ -693,7 +703,7 @@ def format_selection_block(s: Selection, idx: int) -> str:
     elif conf_upper == "LEAN":
         conf_tag = "  ⚡ LEAN"
 
-    lines = [
+    return "\n".join([
         f"<b>┌─ Sélection #{idx}</b>",
         f"<b>│ 🏟 {s.home}  vs  {s.away}</b>",
         f"│ 🕐 <b>{kickoff_local(s.kickoff)}</b>  •  {s.league}",
@@ -703,8 +713,7 @@ def format_selection_block(s: Selection, idx: int) -> str:
         f"│ 💰 Cote : <b>{s.odds}</b>  ({s.bookmaker})",
         f"│ ⚡ Edge : <b>{s.edge*100:+.1f}%</b>  {edge_bar(s.edge)}",
         f"<b>└───────────────</b>",
-    ]
-    return "\n".join(lines)
+    ])
 
 
 def format_simples(selections: list[Selection], limit: int = 10) -> str:
@@ -714,13 +723,10 @@ def format_simples(selections: list[Selection], limit: int = 10) -> str:
             f"<b>❌ Aucune value détectée aujourd'hui</b>\n"
             f"<i>Le modèle et le marché sont alignés, on ne force pas.</i>"
         )
-
     lines = [
-        format_header(),
-        "",
+        format_header(), "",
         f"<b>📋 TOP VALUE BETS DU JOUR</b>",
-        f"<i>{len(selections)} sélections analysées • Top {min(limit, len(selections))}</i>",
-        "",
+        f"<i>{len(selections)} sélections • Top {min(limit, len(selections))}</i>", "",
     ]
     for i, s in enumerate(selections[:limit], 1):
         lines.append(format_selection_block(s, i))
@@ -730,29 +736,25 @@ def format_simples(selections: list[Selection], limit: int = 10) -> str:
 
 
 def format_coupon(c: Coupon) -> str:
-    prob_level = "🟢 Faible risque" if c.combined_prob >= 0.35 else \
-                 "🟡 Risque modéré" if c.combined_prob >= 0.15 else \
+    prob_level = "🟢 Faible risque" if c.combined_prob >= 0.40 else \
+                 "🟡 Risque modéré" if c.combined_prob >= 0.20 else \
                  "🔴 Risque élevé"
 
     lines = [
-        format_header(),
-        "",
+        format_header(), "",
         f"<b>{c.emoji} {c.name.upper()}</b>",
-        f"<i>{c.subtitle}</i>",
-        "",
+        f"<i>{c.subtitle}</i>", "",
         f"<b>┏━━━━━━━━━━━━━━━━━┓</b>",
         f"<b>┃ 📊 RÉCAP TICKET</b>",
         f"<b>┃ 🎫 Cote totale : {c.combined_odds}</b>",
         f"<b>┃ 📈 Proba combinée : {c.combined_prob*100:.1f}%</b>",
         f"<b>┃ 💎 EV estimée : {c.combined_ev*100:+.1f}%</b>",
         f"<b>┃ 🎯 {prob_level}</b>",
-        f"<b>┗━━━━━━━━━━━━━━━━━┛</b>",
-        "",
+        f"<b>┗━━━━━━━━━━━━━━━━━┛</b>", "",
     ]
     for i, s in enumerate(c.legs, 1):
         lines.append(format_selection_block(s, i))
         lines.append("")
-
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
 
@@ -768,19 +770,33 @@ def format_summary() -> str:
     )
 
 
-def format_channel_announcement() -> str:
-    """Message court envoyé sur le canal pour annoncer la dispo."""
-    n_sel = len(STATE["selections"])
-    n_coup = len(STATE["coupons"])
-    noms = "\n".join([f"  • {c.emoji} <b>{c.name}</b>" for c in STATE["coupons"]])
+def format_coupons_ready() -> str:
+    """Notification : types de coupons disponibles."""
+    if not STATE["coupons"]:
+        return (
+            f"{format_header()}\n\n"
+            f"<b>📭 Aucun coupon disponible aujourd'hui</b>\n"
+            f"<i>Pas assez de value bets sur les matchs du jour.</i>"
+        )
+
+    lignes = []
+    for c in STATE["coupons"]:
+        n_legs = len(c.legs)
+        prob = c.combined_prob * 100
+        lignes.append(
+            f"{c.emoji} <b>{c.name}</b>\n"
+            f"   • {n_legs} sélection{'s' if n_legs > 1 else ''}\n"
+            f"   • Cote <b>{c.combined_odds}</b> • Proba <b>{prob:.0f}%</b>"
+        )
+
     return (
         f"{format_header()}\n\n"
-        f"<b>🔔 NOUVEAUX PRONOSTICS DISPONIBLES !</b>\n"
+        f"<b>🔔 COUPONS DU JOUR PRÊTS !</b>\n"
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        f"📊 <b>{n_sel} value bets</b> analysées\n"
-        f"🎫 <b>{n_coup} coupons</b> prêts :\n"
-        f"{noms}\n\n"
-        f"<i>➡️ Ouvre le bot pour consulter les détails</i>"
+        f"<b>{len(STATE['coupons'])} coupons disponibles :</b>\n\n"
+        + "\n\n".join(lignes) +
+        f"\n\n<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"<i>➡️ Choisis un coupon avec le clavier ci-dessous</i>"
     )
 
 
@@ -831,6 +847,10 @@ async def start_cmd(message: Message):
 async def scan_cmd(message: Message):
     await safe_answer(message, "⏳ Analyse en cours...")
     await scan()
+    # 1. Notification des coupons dispo
+    await safe_answer(message, format_coupons_ready())
+    await asyncio.sleep(0.5)
+    # 2. Résumé
     await safe_answer(message, format_summary())
 
 
@@ -842,14 +862,8 @@ async def debug_cmd(message: Message):
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"BetBetter matchs : <b>{d.get('bb_matches', 0)}</b>\n"
         f"Events Odds API : <b>{d.get('odds_events', 0)}</b>\n"
+        f"Matchs aujourd'hui : <b>{d.get('today_events', 0)}</b>\n"
         f"Appariés : <b>{d.get('matched', 0)}</b>\n"
-        f"Tentatives : <b>{d.get('attempts', 0)}</b>\n"
-        f"Passe proba : <b>{d.get('passed_prob', 0)}</b>\n"
-        f"Cotes trouvées : <b>{d.get('found_odds', 0)}</b>\n"
-        f"  • ML : <b>{d.get('found_ml', 0)}</b>\n"
-        f"  • Total : <b>{d.get('found_tot', 0)}</b>\n"
-        f"  • Spread : <b>{d.get('found_spr', 0)}</b>\n"
-        f"Passe edge : <b>{d.get('passed_edge', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>\n"
         f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
@@ -872,22 +886,22 @@ async def send_coupon_by_name(message: Message, name: str):
 
 @dp.message(F.text == BTN_SAFE)
 async def btn_safe(message: Message):
-    await send_coupon_by_name(message, "Ticket Sécurisé")
+    await send_coupon_by_name(message, "Safe")
 
 
 @dp.message(F.text == BTN_BAL)
 async def btn_bal(message: Message):
-    await send_coupon_by_name(message, "Ticket Équilibré")
+    await send_coupon_by_name(message, "Équilibré")
 
 
 @dp.message(F.text == BTN_AGG)
 async def btn_agg(message: Message):
-    await send_coupon_by_name(message, "Ticket Agressif")
+    await send_coupon_by_name(message, "Ultra Safe")
 
 
 @dp.message(F.text == BTN_VAL)
 async def btn_val(message: Message):
-    await send_coupon_by_name(message, "Ticket Value")
+    await send_coupon_by_name(message, "Value")
 
 
 @dp.message(F.text == BTN_BILAN)
@@ -911,53 +925,17 @@ async def scan():
         events = await fetch_all_odds_events()
         print(f"📦 Events Odds API: {len(events)}")
 
+        # Compte les events du jour
+        today_events = [e for e in events if is_today(e.get("commence_time", ""))]
+        print(f"📅 Matchs aujourd'hui: {len(today_events)}")
+
         matched = 0
-        for ev in events:
+        for ev in today_events:
             h = ev.get("home_team", "")
             a = ev.get("away_team", "")
             key = f"{normalize_name(a)}|{normalize_name(h)}"
             if key in bb or fuzzy_find(bb, h, a):
                 matched += 1
-
-        attempts = 0
-        passed_prob = 0
-        found_odds = 0
-        found_ml = 0
-        found_tot = 0
-        found_spr = 0
-        passed_edge = 0
-
-        for ev in events:
-            h = ev.get("home_team", "")
-            a = ev.get("away_team", "")
-            key = f"{normalize_name(a)}|{normalize_name(h)}"
-            bb_match = bb.get(key) or fuzzy_find(bb, h, a)
-            if not bb_match:
-                continue
-            for pick in bb_match["picks"]:
-                attempts += 1
-                pp = pick.get("modelProbabilityPct")
-                if pp is None:
-                    continue
-                prob = float(pp) / 100.0
-                if prob < MIN_PROB:
-                    continue
-                passed_prob += 1
-                odds, _ = find_odds_for_pick(ev, pick, h, a)
-                if odds is None:
-                    continue
-                found_odds += 1
-                mk = pick.get("market", "")
-                if mk == "Moneyline":
-                    found_ml += 1
-                elif mk == "Total":
-                    found_tot += 1
-                elif mk == "Spread":
-                    found_spr += 1
-                if prob * odds - 1.0 >= MIN_EDGE:
-                    passed_edge += 1
-
-        print(f"🔎 Tentatives: {attempts} | proba ok: {passed_prob} | cotes: {found_odds} (ML={found_ml} O/U={found_tot} Spr={found_spr}) | edge ok: {passed_edge}")
 
         selections = build_selections(events, bb)
         selections.sort(key=lambda s: s.score(), reverse=True)
@@ -968,21 +946,16 @@ async def scan():
         STATE["debug"] = {
             "bb_matches": len(bb),
             "odds_events": len(events),
+            "today_events": len(today_events),
             "matched": matched,
-            "attempts": attempts,
-            "passed_prob": passed_prob,
-            "found_odds": found_odds,
-            "found_ml": found_ml,
-            "found_tot": found_tot,
-            "found_spr": found_spr,
-            "passed_edge": passed_edge,
             "selections": len(selections),
             "coupons": len(STATE["coupons"]),
         }
 
         print("──────── RÉSUMÉ ────────")
-        print(f"Sélections: {len(selections)}")
-        print(f"Coupons   : {len(STATE['coupons'])}")
+        print(f"Matchs du jour : {len(today_events)}")
+        print(f"Sélections     : {len(selections)}")
+        print(f"Coupons        : {len(STATE['coupons'])}")
         for c in STATE["coupons"]:
             print(f"  • {c.name} : {len(c.legs)} matchs, cote {c.combined_odds}")
         print("────────────────────────")
@@ -998,8 +971,8 @@ async def daily_broadcast():
     record_coupons(STATE["coupons"], date_str)
 
     for chat_id in TARGETS:
-        # 1. Annonce "prêts"
-        await safe_send(chat_id, format_channel_announcement())
+        # 1. Notification coupons prêts
+        await safe_send(chat_id, format_coupons_ready())
         await asyncio.sleep(1)
 
         # 2. Récap
