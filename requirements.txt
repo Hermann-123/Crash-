@@ -5,4 +5,3 @@ pydantic==2.9.2
 httpx==0.27.2
 uvicorn[standard]==0.32.1
 betbetter==1.1.0
-runtime.txt
