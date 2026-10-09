@@ -43,10 +43,10 @@ BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
 BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Value betting • Modèle indépendant")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.04"))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.45"))
 MAX_SIMPLE_SEND = int(os.getenv("MAX_SIMPLE_SEND", "10"))
-HORIZON_HOURS = int(os.getenv("HORIZON_HOURS", "72"))
+HORIZON_HOURS = int(os.getenv("HORIZON_HOURS", "96"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -97,6 +97,7 @@ class Selection:
     edge: float
     bookmaker: str
     confidence: str
+    fair_odds: Optional[float] = None
 
     def score(self) -> float:
         bonus = 0.05 if self.confidence.upper() == "STRONG" else 0.0
@@ -107,6 +108,7 @@ class Selection:
 class Coupon:
     name: str
     subtitle: str
+    emoji: str
     legs: list[Selection]
     combined_odds: float
     combined_prob: float
@@ -119,13 +121,13 @@ class Coupon:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-BTN_SAFE = "Sécurisé"
-BTN_BAL = "Équilibré"
-BTN_AGG = "Agressif"
-BTN_VAL = "Value"
-BTN_SIMPLE = "Simples"
-BTN_SCAN = "Actualiser"
-BTN_BILAN = "Bilan"
+BTN_SAFE = "🔒 Sécurisé"
+BTN_BAL = "⚖️ Équilibré"
+BTN_AGG = "🔥 Agressif"
+BTN_VAL = "💎 Value"
+BTN_SIMPLE = "📋 Simples"
+BTN_SCAN = "🔄 Actualiser"
+BTN_BILAN = "📊 Bilan"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -174,14 +176,6 @@ def today_pretty():
     return f"{d.day} {months[d.month]} {d.year}"
 
 
-def premium_header() -> str:
-    return (
-        f"<b>{BRAND_NAME}</b>\n"
-        f"{BRAND_TAGLINE}\n"
-        f"{today_pretty()} • Côte d’Ivoire"
-    )
-
-
 def normalize_name(s: str) -> str:
     if not s:
         return ""
@@ -224,13 +218,23 @@ def is_upcoming(iso_str: str, hours: int = HORIZON_HOURS) -> bool:
 
 
 def parse_bb_game(game: str) -> tuple[str, str]:
-    """'Away @ Home' -> (away, home)."""
     if not game:
         return "", ""
     if "@" in game:
         parts = game.split("@")
         return parts[0].strip(), parts[1].strip()
     return "", ""
+
+
+def edge_bar(edge: float) -> str:
+    """Représente l'edge avec des barres visuelles."""
+    if edge >= 0.10:
+        return "🟢🟢🟢"
+    if edge >= 0.07:
+        return "🟢🟢⚪"
+    if edge >= 0.04:
+        return "🟢⚪⚪"
+    return "⚪⚪⚪"
 
 
 # =========================================================
@@ -349,7 +353,7 @@ async def fetch_all_odds_events() -> list[dict]:
 
 
 # =========================================================
-# MATCHING & VALUE
+# MATCHING
 # =========================================================
 def find_best_odds(event: dict, market_key: str, predicate) -> tuple[Optional[float], Optional[str]]:
     best = None
@@ -371,6 +375,10 @@ def find_best_odds(event: dict, market_key: str, predicate) -> tuple[Optional[fl
     return best, best_book
 
 
+def _match_name(n: str, target: str) -> bool:
+    return n == target or (target and (target in n or n in target))
+
+
 def find_odds_for_pick(event: dict, pick: dict, home: str, away: str) -> tuple[Optional[float], Optional[str]]:
     market = (pick.get("market") or "").strip()
     selection = (pick.get("selection") or "").strip()
@@ -381,21 +389,13 @@ def find_odds_for_pick(event: dict, pick: dict, home: str, away: str) -> tuple[O
     away_norm = normalize_name(away)
 
     if market == "Moneyline":
-        if sel_norm and (sel_norm == home_norm or sel_norm in home_norm or home_norm in sel_norm):
-            def filt(o):
-                n = normalize_name(o.get("name", ""))
-                return n == home_norm or n in home_norm or home_norm in n
-        elif sel_norm and (sel_norm == away_norm or sel_norm in away_norm or away_norm in sel_norm):
-            def filt(o):
-                n = normalize_name(o.get("name", ""))
-                return n == away_norm or n in away_norm or away_norm in n
-        elif "draw" in sel_norm or "nul" in sel_norm or sel_norm == "x":
-            def filt(o):
-                n = normalize_name(o.get("name", ""))
-                return "draw" in n or n == "x"
-        else:
-            return None, None
-        return find_best_odds(event, "h2h", filt)
+        if _match_name(sel_norm, home_norm):
+            return find_best_odds(event, "h2h", lambda o: _match_name(normalize_name(o.get("name", "")), home_norm))
+        if _match_name(sel_norm, away_norm):
+            return find_best_odds(event, "h2h", lambda o: _match_name(normalize_name(o.get("name", "")), away_norm))
+        if "draw" in sel_norm or "nul" in sel_norm or sel_norm == "x":
+            return find_best_odds(event, "h2h", lambda o: "draw" in normalize_name(o.get("name", "")) or normalize_name(o.get("name", "")) == "x")
+        return None, None
 
     if market == "Total":
         is_over = "over" in sel_norm or "plus" in sel_norm
@@ -403,56 +403,70 @@ def find_odds_for_pick(event: dict, pick: dict, home: str, away: str) -> tuple[O
         if not (is_over or is_under):
             return None, None
         try:
-            target_point = float(line) if line is not None else None
+            target = float(line) if line is not None else None
         except (ValueError, TypeError):
-            target_point = None
+            target = None
 
-        def filt(o):
+        def filt_exact(o):
             n = normalize_name(o.get("name", ""))
-            if is_over and n != "over":
-                return False
-            if is_under and n != "under":
-                return False
-            if target_point is not None:
+            if is_over and n != "over": return False
+            if is_under and n != "under": return False
+            if target is not None:
                 try:
-                    pt = float(o.get("point", -1))
-                    return abs(pt - target_point) < 0.01
+                    return abs(float(o.get("point", -999)) - target) < 0.01
                 except (ValueError, TypeError):
                     return False
             return True
 
-        return find_best_odds(event, "totals", filt)
+        r = find_best_odds(event, "totals", filt_exact)
+        if r[0] is not None:
+            return r
+
+        if target is not None:
+            def filt_fuzzy(o):
+                n = normalize_name(o.get("name", ""))
+                if is_over and n != "over": return False
+                if is_under and n != "under": return False
+                try:
+                    return abs(float(o.get("point", -999)) - target) <= 0.26
+                except (ValueError, TypeError):
+                    return False
+            return find_best_odds(event, "totals", filt_fuzzy)
+        return None, None
 
     if market == "Spread":
-        is_home = bool(sel_norm) and (sel_norm == home_norm or sel_norm in home_norm or home_norm in sel_norm)
-        is_away = bool(sel_norm) and (sel_norm == away_norm or sel_norm in away_norm or away_norm in sel_norm)
+        is_home = _match_name(sel_norm, home_norm)
+        is_away = _match_name(sel_norm, away_norm)
         if not (is_home or is_away):
             return None, None
-
         try:
-            target_point = float(line) if line is not None else None
+            target = float(line) if line is not None else None
         except (ValueError, TypeError):
-            target_point = None
+            target = None
 
-        def filt(o):
+        def filt_exact(o):
             n = normalize_name(o.get("name", ""))
-            if is_home and not (n == home_norm or n in home_norm or home_norm in n):
-                return False
-            if is_away and not (n == away_norm or n in away_norm or away_norm in n):
-                return False
-            if target_point is not None:
+            if is_home and not _match_name(n, home_norm): return False
+            if is_away and not _match_name(n, away_norm): return False
+            if target is not None:
                 try:
                     pt = float(o.get("point", -999))
-                    if abs(pt - target_point) < 0.01:
-                        return True
-                    if abs(pt + target_point) < 0.01:
-                        return True
-                    return False
+                    return abs(pt - target) < 0.01 or abs(pt + target) < 0.01
                 except (ValueError, TypeError):
                     return False
             return True
 
-        return find_best_odds(event, "spreads", filt)
+        r = find_best_odds(event, "spreads", filt_exact)
+        if r[0] is not None:
+            return r
+
+        # Fallback : Spread -0.5 = victoire → Moneyline
+        if target is not None and abs(target - (-0.5)) < 0.01:
+            if is_home:
+                return find_best_odds(event, "h2h", lambda o: _match_name(normalize_name(o.get("name", "")), home_norm))
+            if is_away:
+                return find_best_odds(event, "h2h", lambda o: _match_name(normalize_name(o.get("name", "")), away_norm))
+        return None, None
 
     return None, None
 
@@ -475,6 +489,7 @@ def fuzzy_find(bb_data: dict, home: str, away: str) -> Optional[dict]:
 
 def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
     selections: list[Selection] = []
+    seen_keys = set()  # anti-doublon intra-même match
 
     for ev in odds_events:
         try:
@@ -534,6 +549,18 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
                     label = selection
                     market_label = market
 
+                # Anti-doublon : même match + même marché = 1 seule fois
+                dedup = f"{event_id}|{market_label}|{label}"
+                if dedup in seen_keys:
+                    continue
+                seen_keys.add(dedup)
+
+                fair = pick.get("fairOdds")
+                try:
+                    fair_f = float(fair) if fair is not None else None
+                except (ValueError, TypeError):
+                    fair_f = None
+
                 selections.append(Selection(
                     event_id=event_id,
                     league=league,
@@ -547,6 +574,7 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
                     edge=round(edge, 4),
                     bookmaker=book or "?",
                     confidence=confidence,
+                    fair_odds=fair_f,
                 ))
         except Exception as e:
             print(f"⚠️ build_selections crash: {e}")
@@ -555,11 +583,13 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
 
 
 # =========================================================
-# COUPON BUILDER
+# COUPON BUILDER — anti-doublon global
 # =========================================================
-def build_coupon(name: str, subtitle: str, pool: list[Selection],
-                 min_odds: float, max_odds: float, max_legs: int) -> Optional[Coupon]:
-    pool = [s for s in pool if s.odds and s.odds > 1.01]
+def build_coupon(name: str, subtitle: str, emoji: str, pool: list[Selection],
+                 min_odds: float, max_odds: float, max_legs: int,
+                 globally_used: set) -> Optional[Coupon]:
+    # Filtre : retire les matchs déjà utilisés dans un autre coupon
+    pool = [s for s in pool if s.odds and s.odds > 1.01 and s.event_id not in globally_used]
     if not pool:
         return None
 
@@ -592,9 +622,14 @@ def build_coupon(name: str, subtitle: str, pool: list[Selection],
     if combined_odds < min_odds * 0.85:
         return None
 
+    # Marque les events comme utilisés globalement
+    for s in legs:
+        globally_used.add(s.event_id)
+
     return Coupon(
         name=name,
         subtitle=subtitle,
+        emoji=emoji,
         legs=legs,
         combined_odds=round(combined_odds, 2),
         combined_prob=round(combined_prob, 4),
@@ -604,24 +639,33 @@ def build_coupon(name: str, subtitle: str, pool: list[Selection],
 
 def build_all_coupons(selections: list[Selection]) -> list[Coupon]:
     coupons: list[Coupon] = []
+    globally_used: set = set()  # <-- anti-doublon entre coupons
 
+    # 1. SÉCURISÉ : favoris 1X2 forte proba
     safe_pool = [s for s in selections if s.market == "1X2" and s.odds <= 2.20 and s.model_prob >= 0.55]
-    c = build_coupon("Ticket Sécurisé", "Favoris à forte proba (1X2)", safe_pool, 1.6, 3.0, 3)
+    c = build_coupon("Ticket Sécurisé", "Favoris à forte probabilité", "🔒",
+                     safe_pool, 1.6, 3.0, 3, globally_used)
     if c:
         coupons.append(c)
 
+    # 2. ÉQUILIBRÉ : Over/Under + Handicap
     bal_pool = [s for s in selections if s.market in ("Over/Under", "Handicap") and 1.6 <= s.odds <= 2.5]
-    c = build_coupon("Ticket Équilibré", "Value sur totaux et handicaps", bal_pool, 2.5, 6.0, 4)
+    c = build_coupon("Ticket Équilibré", "Value sur totaux et handicaps", "⚖️",
+                     bal_pool, 2.5, 6.0, 4, globally_used)
     if c:
         coupons.append(c)
 
+    # 3. AGRESSIF : grosses cotes
     agg_pool = [s for s in selections if s.odds >= 2.3]
-    c = build_coupon("Ticket Agressif", "Cotes élevées, gain potentiel fort", agg_pool, 5.0, 30.0, 5)
+    c = build_coupon("Ticket Agressif", "Gros gains, risque élevé", "🔥",
+                     agg_pool, 5.0, 30.0, 5, globally_used)
     if c:
         coupons.append(c)
 
+    # 4. VALUE : top edges
     val_pool = sorted(selections, key=lambda s: s.edge, reverse=True)
-    c = build_coupon("Ticket Value", "Les meilleurs edges du jour", val_pool, 1.6, 12.0, 4)
+    c = build_coupon("Ticket Value", "Les meilleurs edges du jour", "💎",
+                     val_pool, 1.6, 12.0, 4, globally_used)
     if c:
         coupons.append(c)
 
@@ -629,67 +673,127 @@ def build_all_coupons(selections: list[Selection]) -> list[Coupon]:
 
 
 # =========================================================
-# FORMAT
+# FORMAT PREMIUM
 # =========================================================
-def format_selection_line(s: Selection, idx: int) -> list[str]:
+def format_header() -> str:
+    return (
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"     <b>⚡ {BRAND_NAME.upper()} ⚡</b>\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"<i>{BRAND_TAGLINE}</i>\n"
+        f"<i>📅 {today_pretty()} • 🇨🇮 Côte d’Ivoire</i>"
+    )
+
+
+def format_selection_block(s: Selection, idx: int) -> str:
     conf_tag = ""
-    if s.confidence and s.confidence.upper() == "STRONG":
-        conf_tag = " 🔥"
-    return [
-        f"<b>{idx}. {s.home} vs {s.away}</b>",
-        f"🕒 {kickoff_local(s.kickoff)} • {s.league}",
-        f"✅ <b>{s.pick_label}</b>  <i>({s.market})</i>{conf_tag}",
-        f"📊 Modèle : <b>{s.model_prob*100:.1f}%</b> • Cote <b>{s.odds}</b> ({s.bookmaker})",
-        f"💎 Edge : <b>{s.edge*100:+.1f}%</b>",
-        "",
+    conf_upper = (s.confidence or "").upper()
+    if conf_upper == "STRONG":
+        conf_tag = "  🔥 <b>STRONG</b>"
+    elif conf_upper == "LEAN":
+        conf_tag = "  ⚡ LEAN"
+
+    lines = [
+        f"<b>┌─ Sélection #{idx}</b>",
+        f"<b>│ 🏟 {s.home}  vs  {s.away}</b>",
+        f"│ 🕐 <b>{kickoff_local(s.kickoff)}</b>  •  {s.league}",
+        f"│ 🎯 Pari : <b>{s.pick_label}</b>",
+        f"│ 🏷 Marché : <i>{s.market}</i>{conf_tag}",
+        f"│ 📈 Proba modèle : <b>{s.model_prob*100:.1f}%</b>",
+        f"│ 💰 Cote : <b>{s.odds}</b>  ({s.bookmaker})",
+        f"│ ⚡ Edge : <b>{s.edge*100:+.1f}%</b>  {edge_bar(s.edge)}",
+        f"<b>└───────────────</b>",
     ]
+    return "\n".join(lines)
 
 
 def format_simples(selections: list[Selection], limit: int = 10) -> str:
     if not selections:
         return (
-            f"{premium_header()}\n\n"
-            f"<b>Aucune value détectée</b>\n"
-            f"Le modèle et le marché sont alignés aujourd’hui."
+            f"{format_header()}\n\n"
+            f"<b>❌ Aucune value détectée aujourd'hui</b>\n"
+            f"<i>Le modèle et le marché sont alignés, on ne force pas.</i>"
         )
-    lines = [premium_header(), "", "<b>Top value bets du jour</b>", ""]
+
+    lines = [
+        format_header(),
+        "",
+        f"<b>📋 TOP VALUE BETS DU JOUR</b>",
+        f"<i>{len(selections)} sélections analysées • Top {min(limit, len(selections))}</i>",
+        "",
+    ]
     for i, s in enumerate(selections[:limit], 1):
-        lines.extend(format_selection_line(s, i))
-    lines.append(PUBLIC_FOOTER)
+        lines.append(format_selection_block(s, i))
+        lines.append("")
+    lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
 
 
 def format_coupon(c: Coupon) -> str:
+    prob_level = "🟢 Faible risque" if c.combined_prob >= 0.35 else \
+                 "🟡 Risque modéré" if c.combined_prob >= 0.15 else \
+                 "🔴 Risque élevé"
+
     lines = [
-        premium_header(),
+        format_header(),
         "",
-        f"<b>{c.name}</b>",
+        f"<b>{c.emoji} {c.name.upper()}</b>",
         f"<i>{c.subtitle}</i>",
-        f"Cote totale : <b>{c.combined_odds}</b>",
-        f"Proba combinée : <b>{c.combined_prob*100:.1f}%</b>",
-        f"EV combinée : <b>{c.combined_ev*100:+.1f}%</b>",
+        "",
+        f"<b>┏━━━━━━━━━━━━━━━━━┓</b>",
+        f"<b>┃ 📊 RÉCAP TICKET</b>",
+        f"<b>┃ 🎫 Cote totale : {c.combined_odds}</b>",
+        f"<b>┃ 📈 Proba combinée : {c.combined_prob*100:.1f}%</b>",
+        f"<b>┃ 💎 EV estimée : {c.combined_ev*100:+.1f}%</b>",
+        f"<b>┃ 🎯 {prob_level}</b>",
+        f"<b>┗━━━━━━━━━━━━━━━━━┛</b>",
         "",
     ]
     for i, s in enumerate(c.legs, 1):
-        lines.extend(format_selection_line(s, i))
-    lines.append(PUBLIC_FOOTER)
+        lines.append(format_selection_block(s, i))
+        lines.append("")
+
+    lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
 
 
 def format_summary() -> str:
     return (
-        f"{premium_header()}\n\n"
-        f"<b>Analyse du jour prête</b>\n"
-        f"Value bets : <b>{len(STATE['selections'])}</b>\n"
-        f"Coupons : <b>{len(STATE['coupons'])}</b>"
+        f"{format_header()}\n\n"
+        f"<b>✅ ANALYSE DU JOUR PRÊTE</b>\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"🎯 Value bets : <b>{len(STATE['selections'])}</b>\n"
+        f"🎫 Coupons disponibles : <b>{len(STATE['coupons'])}</b>\n"
+        f"🔄 Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
+    )
+
+
+def format_channel_announcement() -> str:
+    """Message court envoyé sur le canal pour annoncer la dispo."""
+    n_sel = len(STATE["selections"])
+    n_coup = len(STATE["coupons"])
+    noms = "\n".join([f"  • {c.emoji} <b>{c.name}</b>" for c in STATE["coupons"]])
+    return (
+        f"{format_header()}\n\n"
+        f"<b>🔔 NOUVEAUX PRONOSTICS DISPONIBLES !</b>\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        f"📊 <b>{n_sel} value bets</b> analysées\n"
+        f"🎫 <b>{n_coup} coupons</b> prêts :\n"
+        f"{noms}\n\n"
+        f"<i>➡️ Ouvre le bot pour consulter les détails</i>"
     )
 
 
 def format_bilan(tracker: dict) -> str:
     coupons = tracker.get("coupons", [])
     if not coupons:
-        return f"{premium_header()}\n\n<b>Bilan</b>\nAucun historique pour le moment."
-    return f"{premium_header()}\n\n<b>Bilan</b>\nTickets enregistrés : <b>{len(coupons)}</b>"
+        return f"{format_header()}\n\n<b>📊 Bilan</b>\n<i>Aucun historique pour le moment.</i>"
+    return (
+        f"{format_header()}\n\n"
+        f"<b>📊 BILAN</b>\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"🎫 Tickets enregistrés : <b>{len(coupons)}</b>"
+    )
 
 
 # =========================================================
@@ -697,21 +801,30 @@ def format_bilan(tracker: dict) -> str:
 # =========================================================
 async def safe_answer(message: Message, text: str):
     try:
-        await message.answer(text, reply_markup=MAIN_KEYBOARD)
+        await message.answer(text, parse_mode="HTML", reply_markup=MAIN_KEYBOARD)
     except Exception as e:
         print(f"⚠️ Réponse Telegram échouée : {e}")
 
 
 async def safe_send(chat_id, text: str):
     try:
-        await bot.send_message(chat_id=chat_id, text=text)
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
     except Exception as e:
         print(f"⚠️ Envoi impossible vers {chat_id}: {e}")
 
 
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
-    await safe_answer(message, f"Bienvenue sur <b>{BRAND_NAME}</b>\n\n{BRAND_TAGLINE}\nUtilise le clavier ci-dessous.")
+    txt = (
+        f"{format_header()}\n\n"
+        f"<b>👋 Bienvenue !</b>\n\n"
+        f"Ce bot analyse chaque jour les matchs de football et détecte les "
+        f"<b>value bets</b> en comparant :\n"
+        f"  • Les probabilités d'un <b>modèle indépendant</b>\n"
+        f"  • Les <b>cotes réelles</b> de 40+ bookmakers\n\n"
+        f"<b>Utilise les boutons ci-dessous 👇</b>"
+    )
+    await safe_answer(message, txt)
 
 
 @dp.message(Command("scan"))
@@ -725,42 +838,23 @@ async def scan_cmd(message: Message):
 async def debug_cmd(message: Message):
     d = STATE["debug"]
     txt = (
-        f"<b>Debug</b>\n\n"
+        f"<b>🔍 DEBUG</b>\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"BetBetter matchs : <b>{d.get('bb_matches', 0)}</b>\n"
         f"Events Odds API : <b>{d.get('odds_events', 0)}</b>\n"
         f"Appariés : <b>{d.get('matched', 0)}</b>\n"
         f"Tentatives : <b>{d.get('attempts', 0)}</b>\n"
         f"Passe proba : <b>{d.get('passed_prob', 0)}</b>\n"
         f"Cotes trouvées : <b>{d.get('found_odds', 0)}</b>\n"
+        f"  • ML : <b>{d.get('found_ml', 0)}</b>\n"
+        f"  • Total : <b>{d.get('found_tot', 0)}</b>\n"
+        f"  • Spread : <b>{d.get('found_spr', 0)}</b>\n"
         f"Passe edge : <b>{d.get('passed_edge', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>\n"
         f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
     )
     await safe_answer(message, txt)
-
-
-@dp.message(Command("bbsample"))
-async def bbsample_cmd(message: Message):
-    if betbetter is None:
-        await safe_answer(message, "BetBetter non installé")
-        return
-    try:
-        feed = betbetter.get_picks("soccer/epl")
-        picks = feed.get("picks", []) or []
-        if not picks:
-            await safe_answer(message, "Aucun pick EPL")
-            return
-        sample = picks[0]
-        keys = list(sample.keys())
-        txt = "<b>Champs BetBetter</b>\n\n" + "\n".join(f"• <code>{k}</code>" for k in keys)
-        txt += "\n\n<b>Exemple :</b>\n"
-        for k in keys:
-            v = str(sample[k])[:60]
-            txt += f"<code>{k}</code> = {v}\n"
-        await safe_answer(message, txt)
-    except Exception as e:
-        await safe_answer(message, f"Erreur: {e}")
 
 
 @dp.message(F.text == BTN_SIMPLE)
@@ -814,24 +908,6 @@ async def scan():
         bb = fetch_betbetter_picks()
         print(f"🧠 BetBetter matchs uniques: {len(bb)}")
 
-        market_stats = {"Moneyline": 0, "Total": 0, "Spread": 0, "Autre": 0}
-        prob_above = 0
-        total_picks = 0
-        for match in bb.values():
-            for p in match["picks"]:
-                total_picks += 1
-                mk = p.get("market", "")
-                if mk in market_stats:
-                    market_stats[mk] += 1
-                else:
-                    market_stats["Autre"] += 1
-                pp = p.get("modelProbabilityPct")
-                if pp is not None and float(pp) / 100.0 >= MIN_PROB:
-                    prob_above += 1
-        print(f"📊 Picks BetBetter total: {total_picks}")
-        print(f"   Moneyline={market_stats['Moneyline']} Total={market_stats['Total']} Spread={market_stats['Spread']} Autre={market_stats['Autre']}")
-        print(f"   Proba>={MIN_PROB}: {prob_above}")
-
         events = await fetch_all_odds_events()
         print(f"📦 Events Odds API: {len(events)}")
 
@@ -846,6 +922,9 @@ async def scan():
         attempts = 0
         passed_prob = 0
         found_odds = 0
+        found_ml = 0
+        found_tot = 0
+        found_spr = 0
         passed_edge = 0
 
         for ev in events:
@@ -868,13 +947,17 @@ async def scan():
                 if odds is None:
                     continue
                 found_odds += 1
+                mk = pick.get("market", "")
+                if mk == "Moneyline":
+                    found_ml += 1
+                elif mk == "Total":
+                    found_tot += 1
+                elif mk == "Spread":
+                    found_spr += 1
                 if prob * odds - 1.0 >= MIN_EDGE:
                     passed_edge += 1
 
-        print(f"🔎 Tentatives: {attempts}")
-        print(f"   Passe proba: {passed_prob}")
-        print(f"   Cote trouvée: {found_odds}")
-        print(f"   Passe edge: {passed_edge}")
+        print(f"🔎 Tentatives: {attempts} | proba ok: {passed_prob} | cotes: {found_odds} (ML={found_ml} O/U={found_tot} Spr={found_spr}) | edge ok: {passed_edge}")
 
         selections = build_selections(events, bb)
         selections.sort(key=lambda s: s.score(), reverse=True)
@@ -889,17 +972,19 @@ async def scan():
             "attempts": attempts,
             "passed_prob": passed_prob,
             "found_odds": found_odds,
+            "found_ml": found_ml,
+            "found_tot": found_tot,
+            "found_spr": found_spr,
             "passed_edge": passed_edge,
             "selections": len(selections),
             "coupons": len(STATE["coupons"]),
         }
 
         print("──────── RÉSUMÉ ────────")
-        print(f"BetBetter : {len(bb)}")
-        print(f"Events    : {len(events)}")
-        print(f"Appariés  : {matched}")
         print(f"Sélections: {len(selections)}")
         print(f"Coupons   : {len(STATE['coupons'])}")
+        for c in STATE["coupons"]:
+            print(f"  • {c.name} : {len(c.legs)} matchs, cote {c.combined_odds}")
         print("────────────────────────")
 
 
@@ -913,16 +998,23 @@ async def daily_broadcast():
     record_coupons(STATE["coupons"], date_str)
 
     for chat_id in TARGETS:
-        await safe_send(chat_id, format_summary())
-        await asyncio.sleep(0.3)
+        # 1. Annonce "prêts"
+        await safe_send(chat_id, format_channel_announcement())
+        await asyncio.sleep(1)
 
+        # 2. Récap
+        await safe_send(chat_id, format_summary())
+        await asyncio.sleep(0.5)
+
+        # 3. Top value bets
         if STATE["selections"]:
             await safe_send(chat_id, format_simples(STATE["selections"], MAX_SIMPLE_SEND))
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
 
+        # 4. Chaque coupon
         for c in STATE["coupons"]:
             await safe_send(chat_id, format_coupon(c))
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
 
 
 # =========================================================
