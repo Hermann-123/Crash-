@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,7 +30,7 @@ except Exception:
 # CONFIG
 # =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-THERUNDOWN_KEY = os.getenv("THERUNDOWN_API_KEY", "")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 
@@ -44,21 +46,27 @@ PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue res
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.04"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.45"))
 MAX_SIMPLE_SEND = int(os.getenv("MAX_SIMPLE_SEND", "10"))
-HORIZON_HOURS = int(os.getenv("HORIZON_HOURS", "48"))
+HORIZON_HOURS = int(os.getenv("HORIZON_HOURS", "72"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
-if not THERUNDOWN_KEY:
-    raise RuntimeError("THERUNDOWN_API_KEY manquant")
+if not ODDS_API_KEY:
+    raise RuntimeError("ODDS_API_KEY manquant")
 if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
     raise RuntimeError("TELEGRAM_ADMIN_ID ou TELEGRAM_CHANNEL manquant")
 
 TZ = ZoneInfo(NOTIFY_TZ)
-RUNDOWN_BASE = "https://therundown.io/api/v2"
+ODDS_BASE = "https://api.the-odds-api.com/v4"
 
-SPORT_ID = 4
-MARKET_IDS = "1,2,3"
-AFFILIATE_IDS = "3,19,23"
+SOCCER_KEYS = [
+    "soccer_epl",
+    "soccer_spain_la_liga",
+    "soccer_italy_serie_a",
+    "soccer_germany_bundesliga",
+    "soccer_france_ligue_one",
+    "soccer_uefa_champs_league",
+    "soccer_uefa_europa_league",
+]
 
 BETBETTER_LEAGUES = [
     "soccer/epl",
@@ -85,10 +93,11 @@ class Selection:
     model_prob: float
     edge: float
     bookmaker: str
-    source: str
+    confidence: str
 
     def score(self) -> float:
-        return self.edge + (self.model_prob - 0.5) * 0.1
+        bonus = 0.05 if self.confidence.upper() == "STRONG" else 0.0
+        return self.edge + bonus + (self.model_prob - 0.5) * 0.1
 
 
 @dataclass
@@ -170,11 +179,26 @@ def premium_header() -> str:
     )
 
 
-def iso_to_local(iso_str: str) -> Optional[datetime]:
-    if not iso_str:
+def normalize_name(s: str) -> str:
+    if not s:
+        return ""
+    s = str(s).lower().strip()
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+    for suffix in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
+        s = s.replace(suffix, "")
+    s = re.sub(r"[^a-z0-9 ]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def parse_dt_safe(s: str) -> Optional[datetime]:
+    if not s:
         return None
+    s = str(s).strip()
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+    s = s.replace("Z", "+00:00")
     try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=ZoneInfo("UTC"))
         return dt.astimezone(TZ)
@@ -183,17 +207,27 @@ def iso_to_local(iso_str: str) -> Optional[datetime]:
 
 
 def kickoff_local(iso_str: str) -> str:
-    dt = iso_to_local(iso_str)
+    dt = parse_dt_safe(iso_str)
     return dt.strftime("%H:%M") if dt else "?"
 
 
 def is_upcoming(iso_str: str, hours: int = HORIZON_HOURS) -> bool:
-    dt = iso_to_local(iso_str)
+    dt = parse_dt_safe(iso_str)
     if not dt:
         return False
     now = datetime.now(TZ)
     delta_h = (dt - now).total_seconds() / 3600
     return -1 <= delta_h <= hours
+
+
+def parse_bb_game(game: str) -> tuple[str, str]:
+    """'Away @ Home' -> (away, home)."""
+    if not game:
+        return "", ""
+    if "@" in game:
+        parts = game.split("@")
+        return parts[0].strip(), parts[1].strip()
+    return "", ""
 
 
 # =========================================================
@@ -234,78 +268,9 @@ def record_coupons(coupons: list[Coupon], date_str: str):
 
 
 # =========================================================
-# THERUNDOWN
+# BETBETTER — Probabilités du modèle
 # =========================================================
-async def fetch_rundown_events(client: httpx.AsyncClient) -> list[dict]:
-    url = f"{RUNDOWN_BASE}/sports/{SPORT_ID}/events/{today_iso()}"
-    params = {
-        "market_ids": MARKET_IDS,
-        "affiliate_ids": AFFILIATE_IDS,
-        "main_line": "true",
-        "hide_closed": "true",
-    }
-    headers = {"X-TheRundown-Key": THERUNDOWN_KEY}
-    try:
-        r = await client.get(url, params=params, headers=headers, timeout=30.0)
-    except Exception as e:
-        print(f"⚠️ TheRundown crash: {e}")
-        return []
-
-    remaining = r.headers.get("x-datapoints-remaining", "?")
-    print(f"🌍 TheRundown -> {r.status_code} | datapoints_remaining={remaining}")
-
-    if r.status_code >= 400:
-        print(f"⚠️ Body: {r.text[:300]}")
-        return []
-
-    try:
-        return r.json().get("events", []) or []
-    except Exception:
-        return []
-
-
-def parse_rundown_event(ev: dict) -> dict[str, float]:
-    out: dict[str, float] = {}
-    teams = ev.get("teams", []) or []
-    home = next((t.get("name") for t in teams if not t.get("is_away")), "")
-    away = next((t.get("name") for t in teams if t.get("is_away")), "")
-
-    for mkt in ev.get("markets", []) or []:
-        mkt_id = mkt.get("market_id")
-        name = str(mkt.get("name", "")).lower()
-
-        for part in mkt.get("participants", []) or []:
-            p_name = part.get("name", "")
-            prices = part.get("line_prices", []) or []
-            best = None
-            for p in prices:
-                price = p.get("price")
-                if isinstance(price, (int, float)) and price > 1.01:
-                    if best is None or price > best:
-                        best = float(price)
-
-            if best is None:
-                continue
-
-            if mkt_id == 1 or "moneyline" in name or "1x2" in name:
-                if p_name == home:
-                    out[f"1|{home}"] = best
-                elif p_name == away:
-                    out[f"2|{away}"] = best
-                elif "draw" in p_name.lower() or p_name.lower() == "x":
-                    out["X|Match nul"] = best
-            elif mkt_id == 3 or "total" in name:
-                point = part.get("line") or part.get("point") or ""
-                label = f"O/U {point}|{p_name} {point} buts"
-                out[label] = best
-
-    return out
-
-
-# =========================================================
-# BETBETTER
-# =========================================================
-def fetch_betbetter_probs() -> dict[str, dict]:
+def fetch_betbetter_picks() -> dict[str, dict]:
     if betbetter is None:
         print("⚠️ betbetter non installé")
         return {}
@@ -314,74 +279,220 @@ def fetch_betbetter_probs() -> dict[str, dict]:
     for league in BETBETTER_LEAGUES:
         try:
             feed = betbetter.get_picks(league)
-            for p in feed.get("picks", []) or []:
-                game = p.get("game", "")
-                selection = p.get("selection", "")
-                prob_pct = p.get("modelProbabilityPct")
-                if prob_pct is None:
+            picks = feed.get("picks", []) or []
+            print(f"🧠 BetBetter {league}: {len(picks)} picks")
+            for p in picks:
+                if p.get("locked"):
                     continue
-                key = f"{game}".lower().strip()
-                result.setdefault(key, {})[selection.lower().strip()] = float(prob_pct) / 100.0
+                game = p.get("game", "")
+                away, home = parse_bb_game(game)
+                if not home or not away:
+                    continue
+                key = f"{normalize_name(away)}|{normalize_name(home)}"
+                if key not in result:
+                    result[key] = {
+                        "away": away,
+                        "home": home,
+                        "kickoff": p.get("gameTimeUtc", ""),
+                        "league": league,
+                        "picks": [],
+                    }
+                result[key]["picks"].append(p)
         except Exception as e:
             print(f"⚠️ betbetter {league}: {e}")
     return result
 
 
 # =========================================================
-# VALUE ENGINE
+# THE ODDS API — Cotes réelles
 # =========================================================
-def match_betbetter(bb: dict, home: str, away: str) -> dict[str, float]:
-    h = home.lower().strip()
-    a = away.lower().strip()
-    for key, sels in bb.items():
-        if h in key and a in key:
-            return sels
-        if h in key or a in key:
-            return sels
-    return {}
+async def fetch_odds_for_sport(client: httpx.AsyncClient, sport_key: str) -> list[dict]:
+    url = f"{ODDS_BASE}/sports/{sport_key}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "eu",
+        "markets": "h2h,totals",
+        "oddsFormat": "decimal",
+    }
+    try:
+        r = await client.get(url, params=params, timeout=30.0)
+    except Exception as e:
+        print(f"⚠️ HTTP crash {sport_key}: {e}")
+        return []
+
+    remaining = r.headers.get("x-requests-remaining", "?")
+    used = r.headers.get("x-requests-used", "?")
+    print(f"🌍 {sport_key} -> {r.status_code} | used={used} remaining={remaining}")
+
+    if r.status_code >= 400:
+        print(f"⚠️ Body: {r.text[:200]}")
+        return []
+    try:
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
-def build_selections(events: list[dict], bb: dict) -> list[Selection]:
+async def fetch_all_odds_events() -> list[dict]:
+    all_events: list[dict] = []
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        for key in SOCCER_KEYS:
+            events = await fetch_odds_for_sport(client, key)
+            all_events.extend(events)
+            await asyncio.sleep(0.3)
+    print(f"📦 Total odds events: {len(all_events)}")
+    return all_events
+
+
+# =========================================================
+# MATCHING & VALUE
+# =========================================================
+def find_best_odds(event: dict, market_key: str, predicate) -> tuple[Optional[float], Optional[str]]:
+    best = None
+    best_book = None
+    for book in event.get("bookmakers", []) or []:
+        for mkt in book.get("markets", []) or []:
+            if mkt.get("key") != market_key:
+                continue
+            for o in mkt.get("outcomes", []) or []:
+                try:
+                    if not predicate(o):
+                        continue
+                    price = float(o.get("price", 0))
+                    if price > 1.01 and (best is None or price > best):
+                        best = price
+                        best_book = book.get("title") or book.get("key", "?")
+                except Exception:
+                    continue
+    return best, best_book
+
+
+def find_odds_for_pick(event: dict, pick: dict, home: str, away: str) -> tuple[Optional[float], Optional[str]]:
+    market = (pick.get("market") or "").strip()
+    selection = (pick.get("selection") or "").strip()
+    line = pick.get("line")
+
+    sel_norm = normalize_name(selection)
+    home_norm = normalize_name(home)
+    away_norm = normalize_name(away)
+
+    if market == "Moneyline":
+        if sel_norm and (sel_norm == home_norm or sel_norm in home_norm or home_norm in sel_norm):
+            def filt(o):
+                n = normalize_name(o.get("name", ""))
+                return n == home_norm or n in home_norm or home_norm in n
+        elif sel_norm and (sel_norm == away_norm or sel_norm in away_norm or away_norm in sel_norm):
+            def filt(o):
+                n = normalize_name(o.get("name", ""))
+                return n == away_norm or n in away_norm or away_norm in n
+        elif "draw" in sel_norm or "nul" in sel_norm or sel_norm == "x":
+            def filt(o):
+                n = normalize_name(o.get("name", ""))
+                return "draw" in n or n == "x"
+        else:
+            return None, None
+        return find_best_odds(event, "h2h", filt)
+
+    if market == "Total":
+        is_over = "over" in sel_norm or "plus" in sel_norm
+        is_under = "under" in sel_norm or "moins" in sel_norm
+        if not (is_over or is_under):
+            return None, None
+        try:
+            target_point = float(line) if line is not None else None
+        except (ValueError, TypeError):
+            target_point = None
+
+        def filt(o):
+            n = normalize_name(o.get("name", ""))
+            if is_over and n != "over":
+                return False
+            if is_under and n != "under":
+                return False
+            if target_point is not None:
+                try:
+                    pt = float(o.get("point", -1))
+                    return abs(pt - target_point) < 0.01
+                except (ValueError, TypeError):
+                    return False
+            return True
+
+        return find_best_odds(event, "totals", filt)
+
+    return None, None
+
+
+def fuzzy_find(bb_data: dict, home: str, away: str) -> Optional[dict]:
+    hn = normalize_name(home)
+    an = normalize_name(away)
+    for key, data in bb_data.items():
+        k_away, k_home = key.split("|", 1)
+        if (hn in k_home or k_home in hn) and (an in k_away or k_away in an):
+            return data
+    for key, data in bb_data.items():
+        if hn in key and an in key:
+            return data
+    return None
+
+
+def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
     selections: list[Selection] = []
 
-    for ev in events:
+    for ev in odds_events:
         try:
-            teams = ev.get("teams", []) or []
-            home = next((t.get("name") for t in teams if not t.get("is_away")), "")
-            away = next((t.get("name") for t in teams if t.get("is_away")), "")
-            kickoff = ev.get("event_date", "")
-            event_id = ev.get("event_id", "")
-            league = ev.get("sport_name") or ev.get("league_name") or "Football"
-
+            home = ev.get("home_team", "")
+            away = ev.get("away_team", "")
             if not home or not away:
                 continue
+
+            key = f"{normalize_name(away)}|{normalize_name(home)}"
+            bb_match = bb_data.get(key) or fuzzy_find(bb_data, home, away)
+            if not bb_match:
+                continue
+
+            kickoff = ev.get("commence_time", "")
             if not is_upcoming(kickoff):
                 continue
 
-            probs = match_betbetter(bb, home, away)
-            odds_map = parse_rundown_event(ev)
+            event_id = ev.get("id", "")
+            league = ev.get("sport_title", "") or bb_match.get("league", "")
 
-            for key, odd in odds_map.items():
-                market_code, pick_label = key.split("|", 1)
-
-                prob = None
-                if market_code == "1":
-                    prob = probs.get(home.lower()) or probs.get("home")
-                elif market_code == "2":
-                    prob = probs.get(away.lower()) or probs.get("away")
-                elif market_code == "X":
-                    prob = probs.get("draw") or probs.get("x")
-                else:
+            for pick in bb_match["picks"]:
+                prob_pct = pick.get("modelProbabilityPct")
+                if prob_pct is None:
+                    continue
+                prob = float(prob_pct) / 100.0
+                if prob < MIN_PROB:
                     continue
 
-                if prob is None or prob < MIN_PROB:
+                odds, book = find_odds_for_pick(ev, pick, home, away)
+                if odds is None:
                     continue
 
-                edge = prob * odd - 1.0
+                edge = prob * odds - 1.0
                 if edge < MIN_EDGE:
                     continue
 
-                market_label = "1X2" if market_code in ("1", "X", "2") else "Over/Under"
+                market = pick.get("market", "")
+                selection = pick.get("selection", "")
+                line = pick.get("line")
+                confidence = pick.get("confidence", "")
+
+                if market == "Moneyline":
+                    if normalize_name(selection) == normalize_name(home):
+                        label = f"Victoire {home}"
+                    elif normalize_name(selection) == normalize_name(away):
+                        label = f"Victoire {away}"
+                    else:
+                        label = "Match nul"
+                    market_label = "1X2"
+                elif market == "Total":
+                    label = f"{selection} {line} buts" if line else selection
+                    market_label = "Over/Under"
+                else:
+                    label = selection
+                    market_label = market
 
                 selections.append(Selection(
                     event_id=event_id,
@@ -390,12 +501,12 @@ def build_selections(events: list[dict], bb: dict) -> list[Selection]:
                     away=away,
                     kickoff=kickoff,
                     market=market_label,
-                    pick_label=pick_label,
-                    odds=round(odd, 2),
+                    pick_label=label,
+                    odds=round(odds, 2),
                     model_prob=round(prob, 4),
                     edge=round(edge, 4),
-                    bookmaker="TheRundown",
-                    source="BetBetter model",
+                    bookmaker=book or "?",
+                    confidence=confidence,
                 ))
         except Exception as e:
             print(f"⚠️ build_selections crash: {e}")
@@ -454,23 +565,23 @@ def build_coupon(name: str, subtitle: str, pool: list[Selection],
 def build_all_coupons(selections: list[Selection]) -> list[Coupon]:
     coupons: list[Coupon] = []
 
-    safe_pool = [s for s in selections if s.odds <= 2.20 and s.model_prob >= 0.55]
-    c = build_coupon("Ticket Sécurisé", "Sélections les plus stables", safe_pool, 1.6, 2.8, 3)
+    safe_pool = [s for s in selections if s.market == "1X2" and s.odds <= 2.20 and s.model_prob >= 0.55]
+    c = build_coupon("Ticket Sécurisé", "Favoris à forte proba (1X2)", safe_pool, 1.6, 3.0, 3)
     if c:
         coupons.append(c)
 
-    bal_pool = [s for s in selections if s.market == "1X2" and 1.5 <= s.odds <= 3.5]
-    c = build_coupon("Ticket Équilibré", "Bon compromis risque/gain", bal_pool, 3.0, 6.0, 4)
+    bal_pool = [s for s in selections if s.market == "Over/Under" and 1.6 <= s.odds <= 2.5]
+    c = build_coupon("Ticket Équilibré", "Value sur les totaux de buts", bal_pool, 2.5, 6.0, 4)
     if c:
         coupons.append(c)
 
-    agg_pool = [s for s in selections if s.odds >= 2.5]
-    c = build_coupon("Ticket Agressif", "Risque plus fort, gain plus haut", agg_pool, 5.0, 25.0, 5)
+    agg_pool = [s for s in selections if s.odds >= 2.3]
+    c = build_coupon("Ticket Agressif", "Cotes élevées, gain potentiel fort", agg_pool, 5.0, 30.0, 5)
     if c:
         coupons.append(c)
 
     val_pool = sorted(selections, key=lambda s: s.edge, reverse=True)
-    c = build_coupon("Ticket Value", "Les meilleures opportunités de value", val_pool, 1.8, 12.0, 3)
+    c = build_coupon("Ticket Value", "Les meilleurs edges du jour", val_pool, 1.6, 12.0, 4)
     if c:
         coupons.append(c)
 
@@ -481,11 +592,14 @@ def build_all_coupons(selections: list[Selection]) -> list[Coupon]:
 # FORMAT
 # =========================================================
 def format_selection_line(s: Selection, idx: int) -> list[str]:
+    conf_tag = ""
+    if s.confidence and s.confidence.upper() == "STRONG":
+        conf_tag = " 🔥"
     return [
         f"<b>{idx}. {s.home} vs {s.away}</b>",
         f"🕒 {kickoff_local(s.kickoff)} • {s.league}",
-        f"✅ <b>{s.pick_label}</b>  <i>({s.market})</i>",
-        f"📊 Modèle : <b>{s.model_prob*100:.1f}%</b> • Cote <b>{s.odds}</b>",
+        f"✅ <b>{s.pick_label}</b>  <i>({s.market})</i>{conf_tag}",
+        f"📊 Modèle : <b>{s.model_prob*100:.1f}%</b> • Cote <b>{s.odds}</b> ({s.bookmaker})",
         f"💎 Edge : <b>{s.edge*100:+.1f}%</b>",
         "",
     ]
@@ -572,62 +686,14 @@ async def debug_cmd(message: Message):
     d = STATE["debug"]
     txt = (
         f"<b>Debug</b>\n\n"
-        f"Events TheRundown : <b>{d.get('events_raw', 0)}</b>\n"
-        f"Matchs BetBetter : <b>{d.get('bb_matches', 0)}</b>\n"
+        f"BetBetter matchs : <b>{d.get('bb_matches', 0)}</b>\n"
+        f"Events Odds API : <b>{d.get('odds_events', 0)}</b>\n"
+        f"Matchs appariés : <b>{d.get('matched', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>\n"
         f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
     )
     await safe_answer(message, txt)
-
-
-# ─── DIAGNOSTIC ───────────────────────────────────────────
-@dp.message(Command("diag"))
-async def diag_cmd(message: Message):
-    await safe_answer(message, "🔍 Test des sport_ids TheRundown en cours…")
-    lines = []
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        for sid in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]:
-            try:
-                url = f"{RUNDOWN_BASE}/sports/{sid}/events/{today_iso()}"
-                r = await client.get(
-                    url,
-                    params={"market_ids": "1,3", "affiliate_ids": AFFILIATE_IDS},
-                    headers={"X-TheRundown-Key": THERUNDOWN_KEY},
-                    timeout=15.0,
-                )
-                try:
-                    data = r.json()
-                    n = len(data.get("events", []) or [])
-                except Exception:
-                    n = 0
-                lines.append(f"id={sid} → {r.status_code} | {n} events")
-            except Exception:
-                lines.append(f"id={sid} → ERR")
-    await safe_answer(message, "<b>Sport IDs</b>\n" + "\n".join(lines))
-
-
-@dp.message(Command("bbsample"))
-async def bbsample_cmd(message: Message):
-    if betbetter is None:
-        await safe_answer(message, "BetBetter non installé")
-        return
-    try:
-        feed = betbetter.get_picks("soccer/epl")
-        picks = feed.get("picks", []) or []
-        if not picks:
-            await safe_answer(message, "Aucun pick EPL")
-            return
-        sample = picks[0]
-        keys = list(sample.keys())
-        txt = "<b>Champs BetBetter</b>\n\n" + "\n".join(f"• <code>{k}</code>" for k in keys)
-        txt += "\n\n<b>Exemple :</b>\n"
-        for k in keys:
-            v = str(sample[k])[:60]
-            txt += f"<code>{k}</code> = {v}\n"
-        await safe_answer(message, txt)
-    except Exception as e:
-        await safe_answer(message, f"Erreur: {e}")
 
 
 @dp.message(F.text == BTN_SIMPLE)
@@ -678,13 +744,20 @@ async def btn_scan(message: Message):
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
-        bb = fetch_betbetter_probs()
-        print(f"🧠 BetBetter matchs récupérés: {len(bb)}")
+        bb = fetch_betbetter_picks()
+        print(f"🧠 BetBetter matchs uniques: {len(bb)}")
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            events = await fetch_rundown_events(client)
+        events = await fetch_all_odds_events()
+        print(f"📦 Events Odds API: {len(events)}")
 
-        print(f"📦 Events TheRundown: {len(events)}")
+        # Compte les matchs appariés
+        matched = 0
+        for ev in events:
+            h = ev.get("home_team", "")
+            a = ev.get("away_team", "")
+            key = f"{normalize_name(a)}|{normalize_name(h)}"
+            if key in bb or fuzzy_find(bb, h, a):
+                matched += 1
 
         selections = build_selections(events, bb)
         selections.sort(key=lambda s: s.score(), reverse=True)
@@ -693,17 +766,19 @@ async def scan():
         STATE["coupons"] = build_all_coupons(selections)
         STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
         STATE["debug"] = {
-            "events_raw": len(events),
             "bb_matches": len(bb),
+            "odds_events": len(events),
+            "matched": matched,
             "selections": len(selections),
             "coupons": len(STATE["coupons"]),
         }
 
         print("──────── RÉSUMÉ ────────")
-        print(f"Events TheRundown : {len(events)}")
-        print(f"Matchs BetBetter  : {len(bb)}")
-        print(f"Sélections        : {len(selections)}")
-        print(f"Coupons           : {len(STATE['coupons'])}")
+        print(f"BetBetter : {len(bb)}")
+        print(f"Events    : {len(events)}")
+        print(f"Appariés  : {matched}")
+        print(f"Sélections: {len(selections)}")
+        print(f"Coupons   : {len(STATE['coupons'])}")
         print("────────────────────────")
 
 
@@ -735,7 +810,7 @@ async def daily_broadcast():
 async def bootstrap():
     STATE["tracker"] = load_tracker()
     STATE["ready"] = True
-    print("✅ Bot prêt (TheRundown + BetBetter).")
+    print("✅ Bot prêt (BetBetter + The Odds API).")
 
 
 @asynccontextmanager
