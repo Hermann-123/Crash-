@@ -66,6 +66,9 @@ SOCCER_KEYS = [
     "soccer_france_ligue_one",
     "soccer_uefa_champs_league",
     "soccer_uefa_europa_league",
+    "soccer_efl_champ",
+    "soccer_netherlands_eredivisie",
+    "soccer_portugal_primeira_liga",
 ]
 
 BETBETTER_LEAGUES = [
@@ -268,7 +271,7 @@ def record_coupons(coupons: list[Coupon], date_str: str):
 
 
 # =========================================================
-# BETBETTER — Probabilités du modèle
+# BETBETTER
 # =========================================================
 def fetch_betbetter_picks() -> dict[str, dict]:
     if betbetter is None:
@@ -304,14 +307,14 @@ def fetch_betbetter_picks() -> dict[str, dict]:
 
 
 # =========================================================
-# THE ODDS API — Cotes réelles
+# THE ODDS API
 # =========================================================
 async def fetch_odds_for_sport(client: httpx.AsyncClient, sport_key: str) -> list[dict]:
     url = f"{ODDS_BASE}/sports/{sport_key}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
-        "markets": "h2h,totals",
+        "markets": "h2h,spreads,totals",
         "oddsFormat": "decimal",
     }
     try:
@@ -420,6 +423,37 @@ def find_odds_for_pick(event: dict, pick: dict, home: str, away: str) -> tuple[O
 
         return find_best_odds(event, "totals", filt)
 
+    if market == "Spread":
+        is_home = bool(sel_norm) and (sel_norm == home_norm or sel_norm in home_norm or home_norm in sel_norm)
+        is_away = bool(sel_norm) and (sel_norm == away_norm or sel_norm in away_norm or away_norm in sel_norm)
+        if not (is_home or is_away):
+            return None, None
+
+        try:
+            target_point = float(line) if line is not None else None
+        except (ValueError, TypeError):
+            target_point = None
+
+        def filt(o):
+            n = normalize_name(o.get("name", ""))
+            if is_home and not (n == home_norm or n in home_norm or home_norm in n):
+                return False
+            if is_away and not (n == away_norm or n in away_norm or away_norm in n):
+                return False
+            if target_point is not None:
+                try:
+                    pt = float(o.get("point", -999))
+                    if abs(pt - target_point) < 0.01:
+                        return True
+                    if abs(pt + target_point) < 0.01:
+                        return True
+                    return False
+                except (ValueError, TypeError):
+                    return False
+            return True
+
+        return find_best_odds(event, "spreads", filt)
+
     return None, None
 
 
@@ -427,7 +461,10 @@ def fuzzy_find(bb_data: dict, home: str, away: str) -> Optional[dict]:
     hn = normalize_name(home)
     an = normalize_name(away)
     for key, data in bb_data.items():
-        k_away, k_home = key.split("|", 1)
+        try:
+            k_away, k_home = key.split("|", 1)
+        except ValueError:
+            continue
         if (hn in k_home or k_home in hn) and (an in k_away or k_away in an):
             return data
     for key, data in bb_data.items():
@@ -488,8 +525,11 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
                         label = "Match nul"
                     market_label = "1X2"
                 elif market == "Total":
-                    label = f"{selection} {line} buts" if line else selection
+                    label = f"{selection} {line} buts" if line is not None else selection
                     market_label = "Over/Under"
+                elif market == "Spread":
+                    label = f"{selection} ({line:+g})" if isinstance(line, (int, float)) else selection
+                    market_label = "Handicap"
                 else:
                     label = selection
                     market_label = market
@@ -570,8 +610,8 @@ def build_all_coupons(selections: list[Selection]) -> list[Coupon]:
     if c:
         coupons.append(c)
 
-    bal_pool = [s for s in selections if s.market == "Over/Under" and 1.6 <= s.odds <= 2.5]
-    c = build_coupon("Ticket Équilibré", "Value sur les totaux de buts", bal_pool, 2.5, 6.0, 4)
+    bal_pool = [s for s in selections if s.market in ("Over/Under", "Handicap") and 1.6 <= s.odds <= 2.5]
+    c = build_coupon("Ticket Équilibré", "Value sur totaux et handicaps", bal_pool, 2.5, 6.0, 4)
     if c:
         coupons.append(c)
 
@@ -688,12 +728,39 @@ async def debug_cmd(message: Message):
         f"<b>Debug</b>\n\n"
         f"BetBetter matchs : <b>{d.get('bb_matches', 0)}</b>\n"
         f"Events Odds API : <b>{d.get('odds_events', 0)}</b>\n"
-        f"Matchs appariés : <b>{d.get('matched', 0)}</b>\n"
+        f"Appariés : <b>{d.get('matched', 0)}</b>\n"
+        f"Tentatives : <b>{d.get('attempts', 0)}</b>\n"
+        f"Passe proba : <b>{d.get('passed_prob', 0)}</b>\n"
+        f"Cotes trouvées : <b>{d.get('found_odds', 0)}</b>\n"
+        f"Passe edge : <b>{d.get('passed_edge', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>\n"
         f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
     )
     await safe_answer(message, txt)
+
+
+@dp.message(Command("bbsample"))
+async def bbsample_cmd(message: Message):
+    if betbetter is None:
+        await safe_answer(message, "BetBetter non installé")
+        return
+    try:
+        feed = betbetter.get_picks("soccer/epl")
+        picks = feed.get("picks", []) or []
+        if not picks:
+            await safe_answer(message, "Aucun pick EPL")
+            return
+        sample = picks[0]
+        keys = list(sample.keys())
+        txt = "<b>Champs BetBetter</b>\n\n" + "\n".join(f"• <code>{k}</code>" for k in keys)
+        txt += "\n\n<b>Exemple :</b>\n"
+        for k in keys:
+            v = str(sample[k])[:60]
+            txt += f"<code>{k}</code> = {v}\n"
+        await safe_answer(message, txt)
+    except Exception as e:
+        await safe_answer(message, f"Erreur: {e}")
 
 
 @dp.message(F.text == BTN_SIMPLE)
@@ -747,10 +814,27 @@ async def scan():
         bb = fetch_betbetter_picks()
         print(f"🧠 BetBetter matchs uniques: {len(bb)}")
 
+        market_stats = {"Moneyline": 0, "Total": 0, "Spread": 0, "Autre": 0}
+        prob_above = 0
+        total_picks = 0
+        for match in bb.values():
+            for p in match["picks"]:
+                total_picks += 1
+                mk = p.get("market", "")
+                if mk in market_stats:
+                    market_stats[mk] += 1
+                else:
+                    market_stats["Autre"] += 1
+                pp = p.get("modelProbabilityPct")
+                if pp is not None and float(pp) / 100.0 >= MIN_PROB:
+                    prob_above += 1
+        print(f"📊 Picks BetBetter total: {total_picks}")
+        print(f"   Moneyline={market_stats['Moneyline']} Total={market_stats['Total']} Spread={market_stats['Spread']} Autre={market_stats['Autre']}")
+        print(f"   Proba>={MIN_PROB}: {prob_above}")
+
         events = await fetch_all_odds_events()
         print(f"📦 Events Odds API: {len(events)}")
 
-        # Compte les matchs appariés
         matched = 0
         for ev in events:
             h = ev.get("home_team", "")
@@ -758,6 +842,39 @@ async def scan():
             key = f"{normalize_name(a)}|{normalize_name(h)}"
             if key in bb or fuzzy_find(bb, h, a):
                 matched += 1
+
+        attempts = 0
+        passed_prob = 0
+        found_odds = 0
+        passed_edge = 0
+
+        for ev in events:
+            h = ev.get("home_team", "")
+            a = ev.get("away_team", "")
+            key = f"{normalize_name(a)}|{normalize_name(h)}"
+            bb_match = bb.get(key) or fuzzy_find(bb, h, a)
+            if not bb_match:
+                continue
+            for pick in bb_match["picks"]:
+                attempts += 1
+                pp = pick.get("modelProbabilityPct")
+                if pp is None:
+                    continue
+                prob = float(pp) / 100.0
+                if prob < MIN_PROB:
+                    continue
+                passed_prob += 1
+                odds, _ = find_odds_for_pick(ev, pick, h, a)
+                if odds is None:
+                    continue
+                found_odds += 1
+                if prob * odds - 1.0 >= MIN_EDGE:
+                    passed_edge += 1
+
+        print(f"🔎 Tentatives: {attempts}")
+        print(f"   Passe proba: {passed_prob}")
+        print(f"   Cote trouvée: {found_odds}")
+        print(f"   Passe edge: {passed_edge}")
 
         selections = build_selections(events, bb)
         selections.sort(key=lambda s: s.score(), reverse=True)
@@ -769,6 +886,10 @@ async def scan():
             "bb_matches": len(bb),
             "odds_events": len(events),
             "matched": matched,
+            "attempts": attempts,
+            "passed_prob": passed_prob,
+            "found_odds": found_odds,
+            "passed_edge": passed_edge,
             "selections": len(selections),
             "coupons": len(STATE["coupons"]),
         }
