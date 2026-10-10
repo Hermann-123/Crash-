@@ -59,7 +59,7 @@ if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
 TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 SOCCER_KEYS = [
     "soccer_epl",
