@@ -460,10 +460,7 @@ async def fetch_odds(client: httpx.AsyncClient, fixture_id: str) -> dict:
 
 
 def parse_odds(data) -> dict:
-    """
-    Parse la structure réelle de 5DollarFootballAPI.
-    Format : data.bookmakers[].odds["1x2"|"btts"|"goal_line"].closing/opening
-    """
+    """Parse la structure réelle de 5DollarFootballAPI."""
     result = {"h2h": {}, "totals": {}, "btts": {}}
     if not isinstance(data, dict):
         return result
@@ -496,7 +493,7 @@ def parse_odds(data) -> dict:
             if isinstance(v, (int, float)) and v > 1.01:
                 result["btts"][k_dst] = max(result["btts"].get(k_dst, 0), float(v))
 
-        # Over/Under (goal_line principal)
+        # Over/Under principal
         gl = odds.get("goal_line") or {}
         gl_block = gl.get("closing") or gl.get("opening") or {}
         over_v = gl_block.get("over")
@@ -646,12 +643,7 @@ Cote : {sel.odds}
 Proba croisée du bot : {sel.model_prob*100:.1f}%{dc_line}
 Edge calculé : {sel.edge*100:+.1f}%
 
-⚠️ IMPORTANT : Sois mesuré, pas excessivement prudent.
-- Si le pari est cohérent → ACCEPT avec proba réaliste
-- Si petit risque → CAUTION mais proba proche du bot
-- Seulement si vraiment douteux → REJECT
-
-Donne une proba entre 40 et 90.
+⚠️ Sois mesuré, pas excessivement prudent.
 
 Réponds EXACTEMENT :
 
@@ -863,7 +855,7 @@ def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
                     stats["skip_label"] += 1
                     continue
 
-                # Croisement Dixon-Coles (1X2 uniquement)
+                # Croisement Dixon-Coles
                 dc_prob = None
                 if dc and market_label == "1X2":
                     if pick_label.startswith("Victoire "):
@@ -951,12 +943,13 @@ def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
 # COUPONS
 # =========================================================
 def build_coupon_target(name, subtitle, emoji, pool, min_odds, max_odds,
-                        max_legs, globally_used, min_prob):
+                        max_legs, globally_used, min_prob, allow_fair=False):
     pool = [s for s in pool
             if s.odds and s.odds > 1.01
             and s.event_id not in globally_used
             and s.ai_verdict != "REJECT"
-            and s.final_prob() >= min_prob]
+            and s.final_prob() >= min_prob
+            and (allow_fair or "fair" not in s.bookmaker.lower())]
     if not pool:
         return None
 
@@ -1002,7 +995,6 @@ def build_coupon_target(name, subtitle, emoji, pool, min_odds, max_odds,
     if combined_odds > max_odds * 1.30:
         return None
 
-    # Classement croissant par cote
     legs.sort(key=lambda s: s.odds)
 
     for s in legs:
@@ -1017,24 +1009,31 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
 
+    # SÉCURISÉ : uniquement vraies cotes API
     pool_safe = [s for s in selections if s.final_prob() >= 0.65]
-    c = build_coupon_target("Ticket Sécurisé", "Cote ~2 • Priorité sûreté",
-                            "🔒", pool_safe, 1.70, 2.30, 4, used, min_prob=0.65)
+    c = build_coupon_target("Ticket Sécurisé", "Cote ~2 • Vraies cotes",
+                            "🔒", pool_safe, 1.70, 2.30, 4, used, min_prob=0.65,
+                            allow_fair=False)
     if c:
         coupons.append(c)
 
+    # ÉQUILIBRÉ : uniquement vraies cotes API
     pool_bal = [s for s in selections if s.final_prob() >= 0.58]
-    c = build_coupon_target("Ticket Équilibré", "Cote 3-4.5 • Compromis",
-                            "⚖️", pool_bal, 2.80, 4.80, 6, used, min_prob=0.58)
+    c = build_coupon_target("Ticket Équilibré", "Cote 3-4.5 • Vraies cotes",
+                            "⚖️", pool_bal, 2.80, 4.80, 6, used, min_prob=0.58,
+                            allow_fair=False)
     if c:
         coupons.append(c)
 
+    # VALUE : accepte les fairOdds si nécessaire
     pool_val = [s for s in selections if s.final_prob() >= 0.50]
-    c = build_coupon_target("Ticket Value", "Cote 9-10 • Meilleurs edges",
-                            "💎", pool_val, 7.50, 12.00, 9, used, min_prob=0.50)
+    c = build_coupon_target("Ticket Value", "Cote 9-10 • Toutes sources",
+                            "💎", pool_val, 7.50, 12.00, 9, used, min_prob=0.50,
+                            allow_fair=True)
     if c:
         coupons.append(c)
 
+    # Fallback : top 3
     if not coupons and selections:
         top3 = sorted(selections, key=lambda s: s.final_prob(), reverse=True)[:3]
         if top3:
@@ -1045,7 +1044,7 @@ def build_all_coupons(selections):
                 combined_odds *= s.odds
                 combined_prob *= s.final_prob()
             coupons.append(Coupon(
-                "Sélection du jour", "Top 3 des meilleures probas",
+                "Sélection du jour", "Top 3 (cotes BetBetter)",
                 "⭐", top3, round(combined_odds, 2), round(combined_prob, 4),
                 round(combined_prob * combined_odds - 1, 4),
             ))
@@ -1085,6 +1084,11 @@ def format_selection_block(s: Selection, idx: int, show_ai=True):
     prob_display = s.final_prob() * 100
     prob_source = "IA" if s.ai_prob else "croisée"
 
+    # Marquer les cotes fair
+    fair_warning = ""
+    if "fair" in s.bookmaker.lower():
+        fair_warning = " ⚠️ <i>cote non réelle</i>"
+
     lines = [
         f"<b>┌─ Sélection #{idx}</b>",
         f"<b>│ 🏟 {s.home}  vs  {s.away}</b>",
@@ -1095,7 +1099,7 @@ def format_selection_block(s: Selection, idx: int, show_ai=True):
     if s.dc_prob is not None:
         lines.append(f"│ 🧮 Dixon-Coles : <b>{s.dc_prob*100:.1f}%</b>")
 
-    lines.append(f"│ 💰 Cote : <b>{s.odds}</b>  <i>({s.bookmaker})</i>")
+    lines.append(f"│ 💰 Cote : <b>{s.odds}</b>  <i>({s.bookmaker})</i>{fair_warning}")
     lines.append(f"│ ⚡ Edge : <b>{s.edge*100:+.1f}%</b>  {edge_bar(s.edge)}")
 
     if show_ai and s.ai_verdict:
@@ -1299,14 +1303,21 @@ async def scan():
             print(f"💰 Récupération cotes pour {len(to_odds)} matchs...")
 
             odds_map = {}
+            stats_api = {"empty": 0, "no_parse": 0, "ok": 0}
             for fx in to_odds:
                 raw = await fetch_odds(client, fx["event_id"])
-                if raw:
+                if not raw:
+                    stats_api["empty"] += 1
+                else:
                     parsed = parse_odds(raw)
                     if parsed.get("h2h") or parsed.get("totals") or parsed.get("btts"):
                         odds_map[fx["event_id"]] = parsed
-                await asyncio.sleep(0.2)
-            print(f"💰 Cotes parsées: {len(odds_map)}")
+                        stats_api["ok"] += 1
+                    else:
+                        stats_api["no_parse"] += 1
+                await asyncio.sleep(0.3)
+            print(f"💰 Cotes parsées: {len(odds_map)} | "
+                  f"API vide={stats_api['empty']} non-parsé={stats_api['no_parse']} ok={stats_api['ok']}")
 
         selections = build_selections(fixtures_norm, odds_map, bb, dc_verdicts)
         print(f"🎯 Sélections: {len(selections)}")
