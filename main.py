@@ -101,7 +101,6 @@ class Selection:
     ai_critique: str = ""
 
     def final_prob(self) -> float:
-        """Proba calibrée : IA > Dixon-Coles+BetBetter > BetBetter seul."""
         if self.ai_prob and 0.30 <= self.ai_prob <= 0.92:
             return self.ai_prob
         return self.model_prob
@@ -461,47 +460,75 @@ async def fetch_odds(client: httpx.AsyncClient, fixture_id: str) -> dict:
 
 
 def parse_odds(data) -> dict:
+    """
+    Parse la structure réelle de 5DollarFootballAPI.
+    Format : data.bookmakers[].odds["1x2"|"btts"|"goal_line"].closing/opening
+    """
     result = {"h2h": {}, "totals": {}, "btts": {}}
-    if not isinstance(data, (dict, list)):
+    if not isinstance(data, dict):
         return result
 
-    def walk(obj):
-        if isinstance(obj, dict):
-            for k in ("home", "draw", "away", "1", "X", "2"):
-                v = obj.get(k)
-                if isinstance(v, (int, float)) and v > 1.01:
-                    key = {"1": "home", "X": "draw", "2": "away"}.get(k, k)
-                    if key in ("home", "draw", "away"):
-                        result["h2h"][key] = max(result["h2h"].get(key, 0), float(v))
-                elif isinstance(v, dict):
-                    p = v.get("price") or v.get("odd") or v.get("value") or v.get("decimal")
-                    if isinstance(p, (int, float)) and p > 1.01:
-                        key = {"1": "home", "X": "draw", "2": "away"}.get(k, k)
-                        if key in ("home", "draw", "away"):
-                            result["h2h"][key] = max(result["h2h"].get(key, 0), float(p))
-            for k, v in obj.items():
-                k_low = str(k).lower()
-                m = re.match(r"(over|under)_?([\d.]+)", k_low)
-                if m:
-                    if isinstance(v, (int, float)) and v > 1.01:
-                        result["totals"][f"{m.group(1)}_{m.group(2)}"] = float(v)
-                    elif isinstance(v, dict):
-                        p = v.get("price") or v.get("odd")
-                        if isinstance(p, (int, float)) and p > 1.01:
-                            result["totals"][f"{m.group(1)}_{m.group(2)}"] = float(p)
-                if k_low in ("yes", "both_teams_yes", "gg", "btts_yes"):
-                    if isinstance(v, (int, float)) and v > 1.01:
-                        result["btts"]["yes"] = float(v)
-                if k_low in ("no", "both_teams_no", "ng", "btts_no"):
-                    if isinstance(v, (int, float)) and v > 1.01:
-                        result["btts"]["no"] = float(v)
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item)
+    payload = data.get("data") or data
+    bookmakers = payload.get("bookmakers") if isinstance(payload, dict) else None
+    if not isinstance(bookmakers, list):
+        return result
 
-    walk(data)
+    for book in bookmakers:
+        if not isinstance(book, dict):
+            continue
+        odds = book.get("odds") or {}
+        if not isinstance(odds, dict):
+            continue
+
+        # 1X2
+        x2 = odds.get("1x2") or {}
+        block = x2.get("closing") or x2.get("opening") or {}
+        for k_src, k_dst in (("home", "home"), ("draw", "draw"), ("away", "away")):
+            v = block.get(k_src)
+            if isinstance(v, (int, float)) and v > 1.01:
+                result["h2h"][k_dst] = max(result["h2h"].get(k_dst, 0), float(v))
+
+        # BTTS
+        btts = odds.get("btts") or {}
+        bt = btts.get("closing") or btts.get("opening") or {}
+        for k_src, k_dst in (("yes", "yes"), ("no", "no")):
+            v = bt.get(k_src)
+            if isinstance(v, (int, float)) and v > 1.01:
+                result["btts"][k_dst] = max(result["btts"].get(k_dst, 0), float(v))
+
+        # Over/Under (goal_line principal)
+        gl = odds.get("goal_line") or {}
+        gl_block = gl.get("closing") or gl.get("opening") or {}
+        over_v = gl_block.get("over")
+        under_v = gl_block.get("under")
+        line_v = gl_block.get("line")
+        if line_v is not None:
+            try:
+                lf = float(line_v)
+                if isinstance(over_v, (int, float)) and over_v > 1.01:
+                    result["totals"][f"over_{lf}"] = float(over_v)
+                if isinstance(under_v, (int, float)) and under_v > 1.01:
+                    result["totals"][f"under_{lf}"] = float(under_v)
+            except (ValueError, TypeError):
+                pass
+
+        # goal_line_fixed (liste de lignes)
+        glf = odds.get("goal_line_fixed") or []
+        if isinstance(glf, list):
+            for entry in glf:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    line_f = float(entry.get("line"))
+                except (ValueError, TypeError):
+                    continue
+                for key, prefix in (("over", "over"), ("under", "under")):
+                    v = entry.get(key)
+                    if isinstance(v, (int, float)) and v > 1.01:
+                        result["totals"][f"{prefix}_{line_f}"] = max(
+                            result["totals"].get(f"{prefix}_{line_f}", 0), float(v)
+                        )
+
     return result
 
 
@@ -836,7 +863,7 @@ def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
                     stats["skip_label"] += 1
                     continue
 
-                # Croisement avec Dixon-Coles
+                # Croisement Dixon-Coles (1X2 uniquement)
                 dc_prob = None
                 if dc and market_label == "1X2":
                     if pick_label.startswith("Victoire "):
@@ -975,6 +1002,9 @@ def build_coupon_target(name, subtitle, emoji, pool, min_odds, max_odds,
     if combined_odds > max_odds * 1.30:
         return None
 
+    # Classement croissant par cote
+    legs.sort(key=lambda s: s.odds)
+
     for s in legs:
         globally_used.add(s.event_id)
 
@@ -1008,6 +1038,7 @@ def build_all_coupons(selections):
     if not coupons and selections:
         top3 = sorted(selections, key=lambda s: s.final_prob(), reverse=True)[:3]
         if top3:
+            top3.sort(key=lambda s: s.odds)
             combined_odds = 1.0
             combined_prob = 1.0
             for s in top3:
