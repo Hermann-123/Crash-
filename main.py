@@ -25,6 +25,12 @@ try:
 except Exception:
     betbetter = None
 
+try:
+    from dixon_coles import download_and_train as dc_train, DixonColesModel
+except Exception:
+    dc_train = None
+    DixonColesModel = None
+
 
 # =========================================================
 # CONFIG
@@ -86,6 +92,7 @@ class Selection:
     edge: float
     bookmaker: str
     confidence: str
+    dc_prob: Optional[float] = None
     ai_prob: Optional[float] = None
     fair_odds: Optional[float] = None
     ai_verdict: str = ""
@@ -94,6 +101,7 @@ class Selection:
     ai_critique: str = ""
 
     def final_prob(self) -> float:
+        """Proba calibrée : IA > Dixon-Coles+BetBetter > BetBetter seul."""
         if self.ai_prob and 0.30 <= self.ai_prob <= 0.92:
             return self.ai_prob
         return self.model_prob
@@ -138,6 +146,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 AI_MATCH_CACHE: dict = {}
 AI_REVIEW_CACHE: dict = {}
 ODDS_ENDPOINT_WORKING: dict = {"path": None}
+DC_MODEL: Optional["DixonColesModel"] = None
 
 STATE = {
     "ready": False,
@@ -303,6 +312,22 @@ def record_coupons(coupons: list[Coupon], date_str: str):
         })
     tracker["coupons"] = tracker["coupons"][-500:]
     save_tracker(tracker)
+
+
+# =========================================================
+# DIXON-COLES INIT
+# =========================================================
+async def init_dixon_coles():
+    global DC_MODEL
+    if dc_train is None:
+        print("⚠️ Module Dixon-Coles non disponible")
+        return
+    try:
+        print("🎓 Initialisation Dixon-Coles...")
+        DC_MODEL = await dc_train()
+    except Exception as e:
+        print(f"⚠️ Dixon-Coles init crash: {e}")
+        DC_MODEL = None
 
 
 # =========================================================
@@ -578,48 +603,40 @@ async def ai_review_selection(client, sel: Selection) -> None:
         sel.ai_critique = c.get("critique", "")
         return
 
+    dc_line = ""
+    if sel.dc_prob is not None:
+        dc_line = f"\nProba Dixon-Coles (modèle math) : {sel.dc_prob*100:.1f}%"
+
     prompt = f"""Tu es un analyste football INDÉPENDANT et CRITIQUE. Ton rôle est de VÉRIFIER le travail d'un bot qui peut se tromper.
 
-📋 Données brutes du bot :
+📋 Données brutes :
 Match : {sel.home} vs {sel.away}
 Compétition : {sel.league}
 Heure : {kickoff_local(sel.kickoff)}
 Marché : {sel.market}
-Pari proposé par le bot : {sel.pick_label}
-Cote proposée : {sel.odds}
-Proba brute du bot : {sel.model_prob*100:.1f}%
-Edge calculé par le bot : {sel.edge*100:+.1f}%
+Pari proposé : {sel.pick_label}
+Cote : {sel.odds}
+Proba croisée du bot : {sel.model_prob*100:.1f}%{dc_line}
+Edge calculé : {sel.edge*100:+.1f}%
 
-🎯 Ta mission (4 étapes obligatoires) :
+⚠️ IMPORTANT : Sois mesuré, pas excessivement prudent.
+- Si le pari est cohérent → ACCEPT avec proba réaliste
+- Si petit risque → CAUTION mais proba proche du bot
+- Seulement si vraiment douteux → REJECT
 
-1. ANALYSE CONTEXTUELLE : Que sais-tu réellement de ce match ? Forme récente, enjeu, style de jeu, contexte (déplacement, rotation, fatigue).
+Donne une proba entre 40 et 90.
 
-2. CRITIQUE DU BOT : Le pari proposé est-il cohérent avec la réalité du match ? Le bot a-t-il pu surestimer ? Y a-t-il un risque évident qu'il ignore ?
-
-3. PROBA CALIBRÉE : Donne TA propre probabilité (30-92) du pari, honnêtement.
-
-4. VERDICT FRANC :
-   - ACCEPT = pari cohérent, bot a raison
-   - CAUTION = risque réel, bot surestime, mise réduite
-   - REJECT = pari douteux, bot se trompe, ne pas jouer
-
-RÈGLES STRICTES :
-- Tu DOIS signaler si le bot te semble à côté de la plaque
-- Tu n'es PAS obligé d'être d'accord avec le bot
-- N'invente JAMAIS de stat/blessure/compo
-- Si tu ne connais pas assez ce match → CAUTION + PROBA ~50
-
-Réponds EXACTEMENT (rien d'autre) :
+Réponds EXACTEMENT :
 
 VERDICT: ACCEPT
-PROBA: 78
-CRITIQUE_BOT: [1 phrase : le bot a-t-il raison ou tort ? pourquoi ?]
-ANALYSE: [2-3 phrases sur le contexte réel du match]
+PROBA: 72
+CRITIQUE_BOT: [1 phrase sur si le bot a raison ou tort]
+ANALYSE: [2 phrases sur le contexte réel]
 CONSEIL: [1 phrase d'action]"""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 500},
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 500},
     }
 
     try:
@@ -646,7 +663,7 @@ CONSEIL: [1 phrase d'action]"""
                 if m:
                     try:
                         p = float(m.group(1))
-                        if 30 <= p <= 92:
+                        if 35 <= p <= 92:
                             ai_prob = p / 100.0
                     except ValueError:
                         pass
@@ -696,9 +713,9 @@ def pick_label_for(market, selection, home, away, line):
     away_norm = normalize_name(away)
 
     if market_lower in ("moneyline", "money line", "1x2", "winner", "match winner"):
-        if sel_norm == home_norm or (sel_norm and sel_norm in home_norm):
+        if sel_norm and (sel_norm == home_norm or sel_norm in home_norm or home_norm in sel_norm):
             return f"Victoire {home}", "1X2"
-        if sel_norm == away_norm or (sel_norm and sel_norm in away_norm):
+        if sel_norm and (sel_norm == away_norm or sel_norm in away_norm or away_norm in sel_norm):
             return f"Victoire {away}", "1X2"
         if "draw" in sel_norm or "nul" in sel_norm or sel_norm == "x":
             return "Match nul", "1X2"
@@ -707,15 +724,15 @@ def pick_label_for(market, selection, home, away, line):
     if (market_lower in ("total", "totals", "over/under", "goals", "goals over/under")
             or "over" in sel_norm or "under" in sel_norm
             or "plus" in sel_norm or "moins" in sel_norm):
-        is_over = ("over" in sel_norm or "plus" in sel_norm or "+" in sel_norm)
-        is_under = ("under" in sel_norm or "moins" in sel_norm or "-" in sel_norm)
+        is_over = "over" in sel_norm or "plus" in sel_norm
+        is_under = "under" in sel_norm or "moins" in sel_norm
         if not (is_over or is_under):
             return None, None
         try:
             line_f = float(line) if line is not None else None
         except (ValueError, TypeError):
             line_f = None
-        if line_f is None or line_f < 0.5 or line_f > 4.5:
+        if line_f is None or line_f < 0.5 or line_f > 5.5:
             return None, None
         return f"{'Over' if is_over else 'Under'} {line_f} buts", "Over/Under"
 
@@ -731,14 +748,17 @@ def pick_label_for(market, selection, home, away, line):
             lf = float(line) if line is not None else 0.0
         except (ValueError, TypeError):
             lf = 0.0
-        # On n'accepte que les handicaps simples
-        if lf not in (-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5):
-            return None, None
-        if sel_norm == home_norm or (sel_norm and sel_norm in home_norm):
+        if sel_norm and (sel_norm == home_norm or sel_norm in home_norm or home_norm in sel_norm):
             return f"{home} ({lf:+g})", "Handicap"
-        if sel_norm == away_norm or (sel_norm and sel_norm in away_norm):
+        if sel_norm and (sel_norm == away_norm or sel_norm in away_norm or away_norm in sel_norm):
             return f"{away} ({lf:+g})", "Handicap"
         return None, None
+
+    if sel_norm:
+        if sel_norm == home_norm or (sel_norm and sel_norm in home_norm):
+            return f"Victoire {home}", "1X2"
+        if sel_norm == away_norm or (sel_norm and sel_norm in away_norm):
+            return f"Victoire {away}", "1X2"
 
     return None, None
 
@@ -774,12 +794,13 @@ def find_bb_for_fixture(fx, bb_data):
     return None
 
 
-def build_selections(fixtures_norm, odds_map, bb_data):
+def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
     selections: list[Selection] = []
     seen = set()
     used_today = load_used_today()
+    dc_verdicts = dc_verdicts or {}
     stats = {"total": 0, "skip_used": 0, "skip_prob": 0, "skip_label": 0,
-             "skip_odd": 0, "skip_edge": 0, "fallback": 0}
+             "skip_odd": 0, "skip_edge": 0, "fallback": 0, "dc_used": 0, "dc_disagree": 0}
 
     for fx in fixtures_norm:
         try:
@@ -798,6 +819,7 @@ def build_selections(fixtures_norm, odds_map, bb_data):
             if not bb_match:
                 continue
             odds = odds_map.get(event_id, {})
+            dc = dc_verdicts.get(event_id)
 
             for pick in bb_match["picks"]:
                 stats["total"] += 1
@@ -805,9 +827,6 @@ def build_selections(fixtures_norm, odds_map, bb_data):
                 if prob_pct is None:
                     continue
                 prob = float(prob_pct) / 100.0
-                if prob < 0.55:
-                    stats["skip_prob"] += 1
-                    continue
 
                 market = pick.get("market", "")
                 selection = pick.get("selection", "")
@@ -815,6 +834,25 @@ def build_selections(fixtures_norm, odds_map, bb_data):
                 pick_label, market_label = pick_label_for(market, selection, home, away, line)
                 if not pick_label:
                     stats["skip_label"] += 1
+                    continue
+
+                # Croisement avec Dixon-Coles
+                dc_prob = None
+                if dc and market_label == "1X2":
+                    if pick_label.startswith("Victoire "):
+                        team = pick_label.replace("Victoire ", "")
+                        dc_prob = dc["home"] if normalize_name(team) == normalize_name(home) else dc["away"]
+                    elif pick_label == "Match nul":
+                        dc_prob = dc["draw"]
+                    if dc_prob is not None:
+                        stats["dc_used"] += 1
+                        ecart = abs(prob - dc_prob)
+                        if ecart > 0.15:
+                            stats["dc_disagree"] += 1
+                        prob = (prob * 0.6) + (dc_prob * 0.4)
+
+                if prob < 0.55:
+                    stats["skip_prob"] += 1
                     continue
 
                 best_odd = None
@@ -869,6 +907,7 @@ def build_selections(fixtures_norm, odds_map, bb_data):
                     odds=round(best_odd, 2), model_prob=round(prob, 4),
                     edge=round(edge, 4), bookmaker=bookmaker,
                     confidence=pick.get("confidence", ""),
+                    dc_prob=round(dc_prob, 4) if dc_prob is not None else None,
                 ))
         except Exception as e:
             print(f"⚠️ build_selections crash: {e}")
@@ -876,7 +915,8 @@ def build_selections(fixtures_norm, odds_map, bb_data):
     print(f"📊 STATS: total={stats['total']} skip_used={stats['skip_used']} "
           f"skip_prob={stats['skip_prob']} skip_label={stats['skip_label']} "
           f"skip_odd={stats['skip_odd']} skip_edge={stats['skip_edge']} "
-          f"fallback={stats['fallback']}")
+          f"fallback={stats['fallback']} dc_used={stats['dc_used']} "
+          f"dc_disagree={stats['dc_disagree']}")
     return selections
 
 
@@ -930,9 +970,9 @@ def build_coupon_target(name, subtitle, emoji, pool, min_odds, max_odds,
 
     if not legs:
         return None
-    if combined_odds < min_odds * 0.85:
+    if combined_odds < min_odds * 0.65:
         return None
-    if combined_odds > max_odds * 1.15:
+    if combined_odds > max_odds * 1.30:
         return None
 
     for s in legs:
@@ -947,23 +987,37 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
 
-    pool_safe = [s for s in selections if s.final_prob() >= 0.70]
-    c = build_coupon_target("Ticket Sécurisé", "Cote ~2 • Proba ≥ 70%",
-                            "🔒", pool_safe, 1.85, 2.15, 4, used, min_prob=0.70)
+    pool_safe = [s for s in selections if s.final_prob() >= 0.65]
+    c = build_coupon_target("Ticket Sécurisé", "Cote ~2 • Priorité sûreté",
+                            "🔒", pool_safe, 1.70, 2.30, 4, used, min_prob=0.65)
     if c:
         coupons.append(c)
 
-    pool_bal = [s for s in selections if s.final_prob() >= 0.62]
-    c = build_coupon_target("Ticket Équilibré", "Cote 3-4.5 • Proba ≥ 62%",
-                            "⚖️", pool_bal, 3.00, 4.50, 6, used, min_prob=0.62)
+    pool_bal = [s for s in selections if s.final_prob() >= 0.58]
+    c = build_coupon_target("Ticket Équilibré", "Cote 3-4.5 • Compromis",
+                            "⚖️", pool_bal, 2.80, 4.80, 6, used, min_prob=0.58)
     if c:
         coupons.append(c)
 
-    pool_val = [s for s in selections if s.final_prob() >= 0.55]
-    c = build_coupon_target("Ticket Value", "Cote 9-10 • Proba ≥ 55%",
-                            "💎", pool_val, 8.50, 10.50, 9, used, min_prob=0.55)
+    pool_val = [s for s in selections if s.final_prob() >= 0.50]
+    c = build_coupon_target("Ticket Value", "Cote 9-10 • Meilleurs edges",
+                            "💎", pool_val, 7.50, 12.00, 9, used, min_prob=0.50)
     if c:
         coupons.append(c)
+
+    if not coupons and selections:
+        top3 = sorted(selections, key=lambda s: s.final_prob(), reverse=True)[:3]
+        if top3:
+            combined_odds = 1.0
+            combined_prob = 1.0
+            for s in top3:
+                combined_odds *= s.odds
+                combined_prob *= s.final_prob()
+            coupons.append(Coupon(
+                "Sélection du jour", "Top 3 des meilleures probas",
+                "⭐", top3, round(combined_odds, 2), round(combined_prob, 4),
+                round(combined_prob * combined_odds - 1, 4),
+            ))
 
     return coupons
 
@@ -998,7 +1052,7 @@ def format_selection_block(s: Selection, idx: int, show_ai=True):
             day_tag = "📅 <b>Demain</b> "
 
     prob_display = s.final_prob() * 100
-    prob_source = "IA" if s.ai_prob else "modèle"
+    prob_source = "IA" if s.ai_prob else "croisée"
 
     lines = [
         f"<b>┌─ Sélection #{idx}</b>",
@@ -1006,9 +1060,13 @@ def format_selection_block(s: Selection, idx: int, show_ai=True):
         f"│ {day_tag}🕐 <b>{kickoff_local(s.kickoff)}</b>  •  {s.league}",
         f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>{conf_tag}",
         f"│ 📊 Proba {prob_source} : <b>{prob_display:.1f}%</b>",
-        f"│ 💰 Cote : <b>{s.odds}</b>  <i>({s.bookmaker})</i>",
-        f"│ ⚡ Edge : <b>{s.edge*100:+.1f}%</b>  {edge_bar(s.edge)}",
     ]
+    if s.dc_prob is not None:
+        lines.append(f"│ 🧮 Dixon-Coles : <b>{s.dc_prob*100:.1f}%</b>")
+
+    lines.append(f"│ 💰 Cote : <b>{s.odds}</b>  <i>({s.bookmaker})</i>")
+    lines.append(f"│ ⚡ Edge : <b>{s.edge*100:+.1f}%</b>  {edge_bar(s.edge)}")
+
     if show_ai and s.ai_verdict:
         lines.append(f"│")
         lines.append(f"│ 🧠 <b>AVIS IA</b> : {ai_verdict_emoji(s.ai_verdict)} <b>{s.ai_verdict}</b>")
@@ -1128,6 +1186,7 @@ async def debug_cmd(message):
     txt = (
         f"<b>🔍 DEBUG</b>\n\n"
         f"BetBetter matchs : <b>{d.get('bb_matches', 0)}</b>\n"
+        f"Dixon-Coles prédictions : <b>{d.get('dc_predictions', 0)}</b>\n"
         f"Fixtures J/J+1 : <b>{d.get('fixtures_upcoming', 0)}</b>\n"
         f"Matchés fuzzy : <b>{d.get('matched_fuzzy', 0)}</b>\n"
         f"Matchés IA : <b>{d.get('matched_ai', 0)}</b>\n"
@@ -1189,6 +1248,15 @@ async def scan():
             fixtures_norm = [f for f in fixtures_norm if f["event_id"] and f["home"] and f["away"]]
             print(f"🎯 Fixtures normalisées: {len(fixtures_norm)}")
 
+            # Dixon-Coles predictions
+            dc_verdicts = {}
+            if DC_MODEL:
+                for fx in fixtures_norm:
+                    pred = DC_MODEL.predict(fx["home"], fx["away"])
+                    if pred:
+                        dc_verdicts[fx["event_id"]] = pred
+                print(f"🧮 Dixon-Coles : {len(dc_verdicts)} prédictions")
+
             matched_fuzzy = sum(1 for fx in fixtures_norm if find_bb_for_fixture(fx, bb))
 
             matched_ai = 0
@@ -1209,7 +1277,7 @@ async def scan():
                 await asyncio.sleep(0.2)
             print(f"💰 Cotes parsées: {len(odds_map)}")
 
-        selections = build_selections(fixtures_norm, odds_map, bb)
+        selections = build_selections(fixtures_norm, odds_map, bb, dc_verdicts)
         print(f"🎯 Sélections: {len(selections)}")
 
         if GEMINI_API_KEY and selections:
@@ -1219,7 +1287,6 @@ async def scan():
         STATE["selections"] = selections
         STATE["coupons"] = build_all_coupons(selections)
 
-        # Anti-répétition : on marque les picks utilisés
         used_picks = [s for c in STATE["coupons"] for s in c.legs]
         mark_picks_used(used_picks)
 
@@ -1227,6 +1294,7 @@ async def scan():
 
         STATE["debug"] = {
             "bb_matches": len(bb),
+            "dc_predictions": len(dc_verdicts),
             "fixtures_raw": len(fixtures_raw),
             "fixtures_upcoming": len(fixtures_norm),
             "matched_fuzzy": matched_fuzzy,
@@ -1241,6 +1309,7 @@ async def scan():
 
         print("──────── RÉSUMÉ ────────")
         print(f"Fixtures J/J+1     : {len(fixtures_norm)}")
+        print(f"Dixon-Coles        : {len(dc_verdicts)}")
         print(f"Matchés fuzzy      : {matched_fuzzy}")
         print(f"Matchés IA         : {matched_ai}")
         print(f"Cotes récupérées   : {len(odds_map)}")
@@ -1275,6 +1344,7 @@ async def startup_scan_and_notify():
 
 async def bootstrap():
     STATE["tracker"] = load_tracker()
+    await init_dixon_coles()
     STATE["ready"] = True
     print("✅ Bot prêt.")
 
@@ -1321,6 +1391,7 @@ async def root():
         "selections": len(STATE["selections"]),
         "coupons": [c.name for c in STATE["coupons"]],
         "last_scan": STATE["last_scan"],
+        "dc_trained": DC_MODEL is not None,
     }
 
 
