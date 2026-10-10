@@ -213,6 +213,7 @@ def kickoff_local(iso_str) -> str:
 
 
 def is_upcoming(iso_str) -> bool:
+    """Accepte aujourd'hui (pas commencé) et demain."""
     dt = parse_dt_safe(iso_str)
     if not dt:
         return False
@@ -331,10 +332,10 @@ def fetch_betbetter_picks() -> dict[str, dict]:
 
 
 # =========================================================
-# 5DOLLARFOOTBALLAPI — FIXTURES (2 fenêtres de 24h)
+# 5DOLLARFOOTBALLAPI — FIXTURES
 # =========================================================
 async def fetch_fixtures(client: httpx.AsyncClient) -> list[dict]:
-    """Récupère les fixtures sur 48h en 2 fenêtres de 24h (limite API)."""
+    """Récupère les fixtures sur 48h en 2 fenêtres de 24h."""
     now = datetime.now(TZ)
 
     start1 = int(now.timestamp())
@@ -392,15 +393,14 @@ async def fetch_fixtures(client: httpx.AsyncClient) -> list[dict]:
 
     print(f"📦 Total fixtures uniques: {len(all_fixtures)}")
 
+    # Filtre J/J+1 via kickoff_utc ou kickoff_ts
     upcoming = []
     for fx in all_fixtures:
         dt_val = (
-            fx.get("date")
+            fx.get("kickoff_utc")
+            or fx.get("kickoff_ts")
+            or fx.get("date")
             or fx.get("kickoff")
-            or fx.get("scheduled_at")
-            or fx.get("start_time")
-            or fx.get("commence_time")
-            or fx.get("time")
             or ""
         )
         if is_upcoming(dt_val):
@@ -411,49 +411,61 @@ async def fetch_fixtures(client: httpx.AsyncClient) -> list[dict]:
 
 
 def extract_fixture_fields(fx: dict) -> dict:
+    # Structure 5DFootballAPI : {"teams": {"home": {"name": "..."}, "away": {...}}}
+    teams = fx.get("teams") or {}
     home = ""
     away = ""
-    for k in ("home_team", "homeTeam", "home", "team_home", "local_team", "home_name"):
-        v = fx.get(k)
-        if isinstance(v, dict):
-            home = v.get("name") or v.get("nom") or v.get("team_name") or ""
-            if home: break
-        elif isinstance(v, str) and v:
-            home = v
-            break
+    if isinstance(teams, dict):
+        h = teams.get("home")
+        a = teams.get("away")
+        if isinstance(h, dict):
+            home = h.get("name") or ""
+        elif isinstance(h, str):
+            home = h
+        if isinstance(a, dict):
+            away = a.get("name") or ""
+        elif isinstance(a, str):
+            away = a
 
-    for k in ("away_team", "awayTeam", "away", "team_away", "visitor_team", "away_name"):
-        v = fx.get(k)
-        if isinstance(v, dict):
-            away = v.get("name") or v.get("nom") or v.get("team_name") or ""
-            if away: break
-        elif isinstance(v, str) and v:
-            away = v
-            break
+    # Fallback pour d'autres formats possibles
+    if not home:
+        for k in ("home_team", "homeTeam", "home", "team_home"):
+            v = fx.get(k)
+            if isinstance(v, dict):
+                home = v.get("name") or ""
+                if home: break
+            elif isinstance(v, str) and v:
+                home = v
+                break
 
+    if not away:
+        for k in ("away_team", "awayTeam", "away", "team_away"):
+            v = fx.get(k)
+            if isinstance(v, dict):
+                away = v.get("name") or ""
+                if away: break
+            elif isinstance(v, str) and v:
+                away = v
+                break
+
+    # Ligue
     league = ""
-    for k in ("league", "competition", "tournament", "league_name"):
-        v = fx.get(k)
-        if isinstance(v, dict):
-            league = v.get("name") or v.get("nom") or ""
-            if league: break
-        elif isinstance(v, str) and v:
-            league = v
-            break
+    lg = fx.get("league")
+    if isinstance(lg, dict):
+        league = lg.get("name") or ""
+    elif isinstance(lg, str):
+        league = lg
 
+    # Kickoff : kickoff_utc en priorité, sinon kickoff_ts (Unix)
     kickoff = (
-        fx.get("date")
+        fx.get("kickoff_utc")
+        or fx.get("kickoff_ts")
+        or fx.get("date")
         or fx.get("kickoff")
-        or fx.get("scheduled_at")
-        or fx.get("start_time")
-        or fx.get("commence_time")
-        or fx.get("time")
         or ""
     )
 
-    event_id = str(
-        fx.get("id") or fx.get("fixture_id") or fx.get("match_id") or fx.get("event_id") or ""
-    )
+    event_id = str(fx.get("id") or "")
 
     return {
         "event_id": event_id,
@@ -551,7 +563,7 @@ def parse_odds(data) -> dict:
 
 
 # =========================================================
-# GEMINI — MATCHING & REVIEW
+# GEMINI — MATCHING IA
 # =========================================================
 async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
                           candidates: list[tuple[str, str, str]]) -> Optional[str]:
@@ -652,6 +664,9 @@ async def ai_rematch_all(bb_data: dict, fixtures_norm: list[dict]) -> int:
     return count
 
 
+# =========================================================
+# GEMINI — REVUE ANALYTIQUE
+# =========================================================
 async def ai_review_selection(client: httpx.AsyncClient, sel: Selection) -> None:
     if not GEMINI_API_KEY:
         return
