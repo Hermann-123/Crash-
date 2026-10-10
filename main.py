@@ -45,7 +45,7 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Value betting • Modèle indépenda
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
-MIN_PROB = float(os.getenv("MIN_PROB", "0.65"))
+MIN_PROB = float(os.getenv("MIN_PROB", "0.60"))
 MAX_SIMPLE_SEND = int(os.getenv("MAX_SIMPLE_SEND", "10"))
 AI_REVIEW_ENABLED = os.getenv("AI_REVIEW_ENABLED", "true").lower() == "true"
 
@@ -59,7 +59,7 @@ if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
 TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 SOCCER_KEYS = [
     "soccer_epl",
@@ -390,21 +390,20 @@ async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
     lignes = "\n".join(f"{i+1}. {h} vs {a}" for i, (_, h, a) in enumerate(candidates))
 
     prompt = (
-        f"Un modèle donne un match : \"{bb_home} vs {bb_away}\".\n"
-        f"Parmi cette liste, quel match correspond au MÊME match ?\n\n"
+        f"Match modèle : \"{bb_home} vs {bb_away}\".\n"
+        f"Trouve le MÊME match dans la liste :\n\n"
         f"{lignes}\n\n"
-        f"Réponds UNIQUEMENT par le numéro (1-{len(candidates)}), ou 0 si aucun ne correspond. "
-        f"Réponse attendue : un seul chiffre."
+        f"Réponds UNIQUEMENT par le numéro (1-{len(candidates)}) ou 0."
     )
 
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "Tu réponds uniquement par un chiffre entre 0 et 20."},
+            {"role": "system", "content": "Tu réponds uniquement par un chiffre."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0,
-        "max_completion_tokens": 50,
+        "max_completion_tokens": 20,
     }
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
@@ -491,7 +490,7 @@ async def ai_rematch_all(bb_data: dict, events: list[dict]) -> int:
                 print(f"  🤖 Match IA : {bb_home} vs {bb_away} → {matched_id}")
                 unmatched_candidates = [c for c in unmatched_candidates if c[0] != matched_id]
 
-            await asyncio.sleep(2.1)
+            await asyncio.sleep(0.3)
 
     return count
 
@@ -511,44 +510,40 @@ async def ai_review_selection(client: httpx.AsyncClient, sel: Selection) -> None
         sel.ai_advice = cached.get("advice", "")
         return
 
-    prompt = f"""Tu es un analyste football expert, honnête et franc. Tu as le DROIT de refuser un pari.
+    prompt = f"""Tu es un analyste football honnête. Tu as le DROIT de refuser un pari.
 
-📋 Contexte du match :
-- Match : {sel.home} vs {sel.away}
-- Compétition : {sel.league}
-- Coup d'envoi : {kickoff_local(sel.kickoff)}
-- Marché : {sel.market}
-- Pari proposé : {sel.pick_label}
-- Cote disponible : {sel.odds} (chez {sel.bookmaker})
-- Probabilité du modèle BetBetter : {sel.model_prob*100:.1f}%
-- Edge calculé : {sel.edge*100:+.1f}%
+Match : {sel.home} vs {sel.away}
+Compétition : {sel.league}
+Heure : {kickoff_local(sel.kickoff)}
+Marché : {sel.market}
+Pari : {sel.pick_label}
+Cote : {sel.odds} ({sel.bookmaker})
+Proba modèle : {sel.model_prob*100:.1f}%
+Edge : {sel.edge*100:+.1f}%
 
-🎯 Ta mission :
-Analyse ce pari en 3-4 phrases MAXIMUM. Sois franc, tu peux contredire le modèle.
-Si tu ne connais pas assez ce match, dis-le et mets CAUTION.
+Analyse en 3 phrases. Sois franc, tu peux contredire le modèle.
 
-Réponds EXACTEMENT dans ce format (rien d'autre) :
+Réponds EXACTEMENT :
 
 VERDICT: ACCEPT
-ANALYSE: [ton analyse en 3-4 phrases courtes. Mentionne les forces, faiblesses et risques principaux.]
-CONSEIL: [1 phrase d'action pour le parieur]
+ANALYSE: [3 phrases maximum sur forces/faiblesses/risques]
+CONSEIL: [1 phrase d'action]
 
-Règles strictes :
-- VERDICT = ACCEPT → pari cohérent, feu vert
-- VERDICT = CAUTION → risque réel, mise réduite conseillée
-- VERDICT = REJECT → pari douteux, ne pas jouer
-- N'invente JAMAIS de statistiques, blessures ou compos
-- Ne donne pas de probabilités chiffrées
-- Sois bref et direct"""
+Règles :
+- ACCEPT = pari cohérent
+- CAUTION = risque réel, mise réduite
+- REJECT = pari douteux, ne pas jouer
+- N'invente AUCUNE stat, blessure ou compo
+- Pas de probas chiffrées"""
 
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "Tu es un analyste football honnête. Tu réponds STRICTEMENT au format demandé."},
+            {"role": "system", "content": "Tu réponds STRICTEMENT au format VERDICT/ANALYSE/CONSEIL."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,
-        "max_completion_tokens": 600,
+        "max_completion_tokens": 400,
     }
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
@@ -604,7 +599,7 @@ async def ai_review_all(selections: list[Selection]) -> None:
             await ai_review_selection(client, s)
             if (i + 1) % 5 == 0:
                 print(f"  ... {i+1}/{len(selections)}")
-            await asyncio.sleep(2.1)
+            await asyncio.sleep(0.3)
 
     accepted = sum(1 for s in selections if s.ai_verdict == "ACCEPT")
     caution = sum(1 for s in selections if s.ai_verdict == "CAUTION")
@@ -695,6 +690,40 @@ def find_odds_for_pick(event: dict, pick: dict, home: str, away: str) -> tuple[O
             return find_best_odds(event, "totals", filt_fuzzy)
         return None, None
 
+    if market == "Spread":
+        is_home = _match_name(sel_norm, home_norm)
+        is_away = _match_name(sel_norm, away_norm)
+        if not (is_home or is_away):
+            return None, None
+        try:
+            target = float(line) if line is not None else None
+        except (ValueError, TypeError):
+            target = None
+
+        def filt_exact(o):
+            n = normalize_name(o.get("name", ""))
+            if is_home and not _match_name(n, home_norm): return False
+            if is_away and not _match_name(n, away_norm): return False
+            if target is not None:
+                try:
+                    pt = float(o.get("point", -999))
+                    return abs(pt - target) < 0.01 or abs(pt + target) < 0.01
+                except (ValueError, TypeError):
+                    return False
+            return True
+
+        r = find_best_odds(event, "spreads", filt_exact)
+        if r[0] is not None:
+            return r
+
+        # Fallback : Spread -0.5 = victoire simple → Moneyline
+        if target is not None and abs(target - (-0.5)) < 0.01:
+            if is_home:
+                return find_best_odds(event, "h2h", lambda o: _match_name(normalize_name(o.get("name", "")), home_norm))
+            if is_away:
+                return find_best_odds(event, "h2h", lambda o: _match_name(normalize_name(o.get("name", "")), away_norm))
+        return None, None
+
     return None, None
 
 
@@ -764,14 +793,22 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
                 market = pick.get("market", "")
                 line = pick.get("line")
 
+                # Filtre Spread : lignes entre -1.5 et +1.5
                 if market == "Spread":
-                    continue
+                    try:
+                        line_f = float(line) if line is not None else None
+                    except (ValueError, TypeError):
+                        line_f = None
+                    if line_f is None or line_f < -1.5 or line_f > 1.5:
+                        continue
+
+                # Filtre Total : lignes 0.5, 1.5 ou 2.5
                 if market == "Total":
                     try:
                         line_f = float(line) if line is not None else None
                     except (ValueError, TypeError):
                         line_f = None
-                    if line_f not in (0.5, 1.5):
+                    if line_f not in (0.5, 1.5, 2.5):
                         continue
 
                 odds, book = find_odds_for_pick(ev, pick, home, away)
@@ -796,6 +833,13 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
                 elif market == "Total":
                     label = f"{selection} {line} buts"
                     market_label = "Over/Under"
+                elif market == "Spread":
+                    try:
+                        line_disp = float(line)
+                        label = f"{selection} ({line_disp:+g})"
+                    except (ValueError, TypeError):
+                        label = selection
+                    market_label = "Handicap"
                 else:
                     label = selection
                     market_label = market
@@ -894,28 +938,28 @@ def build_all_coupons(selections: list[Selection]) -> list[Coupon]:
     coupons: list[Coupon] = []
     globally_used: set = set()
 
-    ultra_pool = [s for s in selections if s.model_prob >= 0.75 and s.odds <= 1.55]
+    ultra_pool = [s for s in selections if s.model_prob >= 0.70 and s.odds <= 1.60]
     c = build_coupon("Ultra Safe", "1 sélection à très forte probabilité", "🛡",
-                     ultra_pool, 1.30, 1.60, 1, globally_used)
+                     ultra_pool, 1.20, 1.60, 1, globally_used)
     if c:
         coupons.append(c)
 
-    safe_pool = [s for s in selections if s.model_prob >= 0.65 and s.odds <= 1.55]
+    safe_pool = [s for s in selections if s.model_prob >= 0.60 and s.odds <= 1.60]
     c = build_coupon("Safe", "2 sélections solides, cote ~2", "✅",
-                     safe_pool, 1.80, 2.50, 2, globally_used)
+                     safe_pool, 1.70, 2.50, 2, globally_used)
     if c:
         coupons.append(c)
 
-    eq_pool = [s for s in selections if s.model_prob >= 0.60]
+    eq_pool = [s for s in selections if s.model_prob >= 0.55]
     c = build_coupon("Équilibré", "3 sélections, cote 3-5", "⚖️",
-                     eq_pool, 3.0, 5.0, 3, globally_used)
+                     eq_pool, 2.5, 5.0, 3, globally_used)
     if c:
         coupons.append(c)
 
-    val_pool = sorted([s for s in selections if s.edge >= 0.05],
+    val_pool = sorted([s for s in selections if s.edge >= 0.04],
                       key=lambda s: s.edge, reverse=True)
-    c = build_coupon("Value", "Meilleurs edges ≥5%", "💎",
-                     val_pool, 1.60, 3.00, 2, globally_used)
+    c = build_coupon("Value", "Meilleurs edges ≥4%", "💎",
+                     val_pool, 1.50, 3.00, 2, globally_used)
     if c:
         coupons.append(c)
 
@@ -980,7 +1024,7 @@ def format_simples(selections: list[Selection], limit: int = 10) -> str:
     if not selections:
         return (
             f"{format_header()}\n\n"
-            f"<b>❌ Aucune value détectée aujourd'hui</b>\n"
+            f"<b>❌ Aucune value détectée</b>\n"
             f"<i>Le modèle et le marché sont alignés, on ne force pas.</i>"
         )
     lines = [
@@ -1085,7 +1129,7 @@ def format_coupons_ready() -> str:
     if not STATE["coupons"]:
         return (
             f"{format_header()}\n\n"
-            f"<b>📭 Aucun coupon disponible aujourd'hui</b>\n"
+            f"<b>📭 Aucun coupon disponible</b>\n"
             f"<i>L'IA a rejeté les sélections ou pas assez de value.</i>"
         )
 
@@ -1172,7 +1216,7 @@ async def debug_cmd(message: Message):
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"BetBetter matchs : <b>{d.get('bb_matches', 0)}</b>\n"
         f"Events Odds API : <b>{d.get('odds_events', 0)}</b>\n"
-        f"Matchs aujourd'hui : <b>{d.get('today_events', 0)}</b>\n"
+        f"Matchs (J/J+1) : <b>{d.get('today_events', 0)}</b>\n"
         f"Appariés fuzzy : <b>{d.get('matched_fuzzy', 0)}</b>\n"
         f"Appariés IA : <b>{d.get('matched_ai', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
@@ -1240,7 +1284,7 @@ async def scan():
         print(f"📦 Events Odds API: {len(events)}")
 
         today_events = [e for e in events if is_today(e.get("commence_time", ""))]
-        print(f"📅 Matchs (aujourd'hui + demain): {len(today_events)}")
+        print(f"📅 Matchs (J+J+1): {len(today_events)}")
 
         matched_fuzzy = 0
         for ev in today_events:
