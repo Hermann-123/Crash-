@@ -47,11 +47,11 @@ NOTIFY_TZ = os.getenv("NOTIFY_TZ", "Africa/Abidjan")
 
 LOCAL_DB = os.getenv("LOCAL_DB", "/tmp/tracker.json")
 BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
-BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Value betting • Modèle indépendant")
+BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Value betting • Dixon-Coles + Marché")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.02"))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.55"))
 
 if not BOT_TOKEN:
@@ -65,7 +65,6 @@ TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
 
-# Championnats à scanner (1 requête par ligue)
 SOCCER_KEYS = [
     "soccer_epl",
     "soccer_spain_la_liga",
@@ -77,11 +76,6 @@ SOCCER_KEYS = [
     "soccer_efl_champ",
     "soccer_netherlands_eredivisie",
     "soccer_portugal_primeira_liga",
-]
-
-BETBETTER_LEAGUES = [
-    "soccer/epl", "soccer/la-liga", "soccer/serie-a",
-    "soccer/bundesliga", "soccer/ligue-1",
 ]
 
 MAX_LEGS_PER_COUPON = 9
@@ -103,7 +97,7 @@ class Selection:
     model_prob: float
     edge: float
     bookmaker: str
-    confidence: str
+    source: str = "house"
     dc_prob: Optional[float] = None
     ai_prob: Optional[float] = None
     fair_odds: Optional[float] = None
@@ -154,7 +148,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     input_field_placeholder="Choisis un ticket…",
 )
 
-AI_MATCH_CACHE: dict = {}
 AI_REVIEW_CACHE: dict = {}
 DC_MODEL: Optional["DixonColesModel"] = None
 
@@ -237,15 +230,6 @@ def is_upcoming(iso_str) -> bool:
     return False
 
 
-def parse_bb_game(game: str) -> tuple[str, str]:
-    if not game:
-        return "", ""
-    if "@" in game:
-        parts = game.split("@")
-        return parts[0].strip(), parts[1].strip()
-    return "", ""
-
-
 def edge_bar(edge: float) -> str:
     if edge >= 0.10:
         return "🟢🟢🟢"
@@ -261,7 +245,7 @@ def ai_verdict_emoji(v: str) -> str:
 
 
 # =========================================================
-# TRACKER + ANTI-RÉPÉTITION
+# TRACKER
 # =========================================================
 def load_tracker() -> dict:
     try:
@@ -320,9 +304,6 @@ def record_coupons(coupons: list[Coupon], date_str: str):
     save_tracker(tracker)
 
 
-# =========================================================
-# DIXON-COLES
-# =========================================================
 async def init_dixon_coles():
     global DC_MODEL
     if dc_train is None:
@@ -337,61 +318,24 @@ async def init_dixon_coles():
 
 
 # =========================================================
-# BETBETTER
-# =========================================================
-def fetch_betbetter_picks() -> dict[str, dict]:
-    if betbetter is None:
-        print("⚠️ betbetter non installé")
-        return {}
-    result: dict[str, dict] = {}
-    for league in BETBETTER_LEAGUES:
-        try:
-            feed = betbetter.get_picks(league)
-            picks = feed.get("picks", []) or []
-            print(f"🧠 BetBetter {league}: {len(picks)} picks")
-            for p in picks:
-                if p.get("locked"):
-                    continue
-                game = p.get("game", "")
-                away, home = parse_bb_game(game)
-                if not home or not away:
-                    continue
-                key = f"{normalize_name(away)}|{normalize_name(home)}"
-                if key not in result:
-                    result[key] = {
-                        "away": away, "home": home,
-                        "kickoff": p.get("gameTimeUtc", ""),
-                        "league": league, "picks": [],
-                    }
-                result[key]["picks"].append(p)
-        except Exception as e:
-            print(f"⚠️ betbetter {league}: {e}")
-    return result
-
-
-# =========================================================
-# THE ODDS API — FIXTURES + COTES (1 appel par ligue)
+# THE ODDS API
 # =========================================================
 async def fetch_odds_api_league(client: httpx.AsyncClient, sport_key: str) -> list[dict]:
-    """Récupère les matchs + cotes d'une ligue."""
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
-        "markets": "h2h,spreads,totals",
+        "markets": "h2h,spreads,totals,btts",
         "oddsFormat": "decimal",
     }
     try:
         r = await client.get(url, params=params, timeout=30.0)
-
         remaining = r.headers.get("x-requests-remaining", "?")
         used = r.headers.get("x-requests-used", "?")
         print(f"🌍 {sport_key} -> {r.status_code} | used={used} remaining={remaining}")
-
         if r.status_code >= 400:
             print(f"⚠️ Body: {r.text[:200]}")
             return []
-
         data = r.json()
         return data if isinstance(data, list) else []
     except Exception as e:
@@ -400,7 +344,6 @@ async def fetch_odds_api_league(client: httpx.AsyncClient, sport_key: str) -> li
 
 
 async def fetch_all_events_with_odds() -> list[dict]:
-    """Récupère tous les matchs avec leurs cotes (10 requêtes max)."""
     all_events: list[dict] = []
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         for key in SOCCER_KEYS:
@@ -423,12 +366,8 @@ def extract_event_fields(ev: dict) -> dict:
 
 
 def extract_odds_from_event(ev: dict) -> dict:
-    """
-    Extrait les meilleures cotes (meilleure cote = la plus haute)
-    pour h2h, totals et btts depuis les bookmakers.
-    """
-    result = {"h2h": {}, "totals": {}, "btts": {}}
-
+    """Extrait h2h + spreads + totals + btts."""
+    result = {"h2h": {}, "spreads": {}, "totals": {}, "btts": {}}
     home = ev.get("home_team", "")
     away = ev.get("away_team", "")
 
@@ -453,6 +392,23 @@ def extract_odds_from_event(ev: dict) -> dict:
                     elif "draw" in name.lower():
                         result["h2h"]["draw"] = max(result["h2h"].get("draw", 0), price)
 
+                elif mk == "spreads":
+                    point = out.get("point")
+                    if point is None:
+                        continue
+                    try:
+                        pt = float(point)
+                    except (ValueError, TypeError):
+                        continue
+                    if name == home:
+                        result["spreads"][f"home_{pt}"] = max(
+                            result["spreads"].get(f"home_{pt}", 0), price
+                        )
+                    elif name == away:
+                        result["spreads"][f"away_{pt}"] = max(
+                            result["spreads"].get(f"away_{pt}", 0), price
+                        )
+
                 elif mk == "totals":
                     point = out.get("point")
                     if point is None:
@@ -466,93 +422,17 @@ def extract_odds_from_event(ev: dict) -> dict:
                             continue
                         result["totals"][key] = max(result["totals"].get(key, 0), price)
 
+                elif mk == "btts":
+                    if "yes" in name.lower():
+                        result["btts"]["yes"] = max(result["btts"].get("yes", 0), price)
+                    elif "no" in name.lower():
+                        result["btts"]["no"] = max(result["btts"].get("no", 0), price)
+
     return result
 
 
 # =========================================================
-# GEMINI — MATCHING
-# =========================================================
-async def ai_match_teams(client, bb_home, bb_away, candidates) -> Optional[str]:
-    if not GEMINI_API_KEY or not candidates:
-        return None
-    cache_key = f"{normalize_name(bb_home)}|{normalize_name(bb_away)}"
-    if cache_key in AI_MATCH_CACHE:
-        return AI_MATCH_CACHE[cache_key]
-    candidates = candidates[:20]
-    lignes = "\n".join(f"{i+1}. {h} vs {a}" for i, (_, h, a) in enumerate(candidates))
-    prompt = (
-        f'Match modèle : "{bb_home} vs {bb_away}".\n'
-        f"Trouve le MÊME match dans la liste :\n\n{lignes}\n\n"
-        f"Réponds UNIQUEMENT par le numéro (1-{len(candidates)}) ou 0."
-    )
-    payload = {"contents": [{"parts": [{"text": prompt}]}],
-               "generationConfig": {"temperature": 0, "maxOutputTokens": 20}}
-    try:
-        r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=15.0)
-        if r.status_code >= 400:
-            AI_MATCH_CACHE[cache_key] = None
-            return None
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        m = re.search(r"\d+", text)
-        if not m:
-            AI_MATCH_CACHE[cache_key] = None
-            return None
-        num = int(m.group())
-        if 1 <= num <= len(candidates):
-            mid = candidates[num - 1][0]
-            AI_MATCH_CACHE[cache_key] = mid
-            return mid
-        AI_MATCH_CACHE[cache_key] = None
-        return None
-    except Exception:
-        AI_MATCH_CACHE[cache_key] = None
-        return None
-
-
-async def ai_rematch_all(bb_data, fixtures_norm) -> int:
-    if not GEMINI_API_KEY:
-        return 0
-    candidates = [(f["event_id"], f["home"], f["away"]) for f in fixtures_norm if f["event_id"]]
-    if not candidates:
-        return 0
-    already = set()
-    for key in bb_data.keys():
-        try:
-            k_away, k_home = key.split("|", 1)
-        except ValueError:
-            continue
-        for eid, h, a in candidates:
-            hn, an = normalize_name(h), normalize_name(a)
-            if (hn in k_home or k_home in hn) and (an in k_away or k_away in an):
-                already.add(eid)
-                break
-    unmatched = [c for c in candidates if c[0] not in already]
-    if not unmatched:
-        return 0
-    print(f"🤖 Gemini : {len(unmatched)} events non appariés")
-    count = 0
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        for key, data in bb_data.items():
-            bb_home, bb_away = data["home"], data["away"]
-            hn, an = normalize_name(bb_home), normalize_name(bb_away)
-            found = any(
-                (normalize_name(h) in hn or hn in normalize_name(h)) and
-                (normalize_name(a) in an or an in normalize_name(a))
-                for _, h, a in candidates
-            )
-            if found:
-                continue
-            mid = await ai_match_teams(client, bb_home, bb_away, unmatched)
-            if mid:
-                count += 1
-                print(f"  🤖 Match IA : {bb_home} vs {bb_away} → {mid}")
-                unmatched = [c for c in unmatched if c[0] != mid]
-            await asyncio.sleep(1.2)
-    return count
-
-
-# =========================================================
-# GEMINI — REVIEW CRITIQUE
+# GEMINI — REVIEW
 # =========================================================
 async def ai_review_selection(client, sel: Selection) -> None:
     if not GEMINI_API_KEY:
@@ -567,19 +447,15 @@ async def ai_review_selection(client, sel: Selection) -> None:
         sel.ai_critique = c.get("critique", "")
         return
 
-    dc_line = ""
-    if sel.dc_prob is not None:
-        dc_line = f"\nProba Dixon-Coles : {sel.dc_prob*100:.1f}%"
-
     prompt = f"""Tu es un analyste football INDÉPENDANT et CRITIQUE.
 
 Match : {sel.home} vs {sel.away}
 Compétition : {sel.league}
 Heure : {kickoff_local(sel.kickoff)}
 Marché : {sel.market}
-Pari : {sel.pick_label}
-Cote (vraie, chez bookmaker) : {sel.odds}
-Proba croisée du bot : {sel.model_prob*100:.1f}%{dc_line}
+Pari (généré par Dixon-Coles) : {sel.pick_label}
+Cote (vraie, bookmaker) : {sel.odds}
+Proba Dixon-Coles : {sel.model_prob*100:.1f}%
 Edge : {sel.edge*100:+.1f}%
 
 ⚠️ Sois mesuré. ACCEPT si cohérent, CAUTION si risque, REJECT si douteux.
@@ -596,7 +472,6 @@ CONSEIL: [1 phrase]"""
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.3, "maxOutputTokens": 500},
     }
-
     try:
         r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=30.0)
         if r.status_code >= 400:
@@ -662,212 +537,135 @@ async def ai_review_all(selections: list[Selection]) -> None:
 
 
 # =========================================================
-# PICK LABEL
+# HOUSE PICKS (Dixon-Coles)
 # =========================================================
-def pick_label_for(market, selection, home, away, line):
-    sel_norm = normalize_name(selection)
-    market_lower = (market or "").strip().lower()
-    home_norm = normalize_name(home)
-    away_norm = normalize_name(away)
-
-    if market_lower in ("moneyline", "money line", "1x2", "winner", "match winner"):
-        if sel_norm and (sel_norm == home_norm or sel_norm in home_norm or home_norm in sel_norm):
-            return f"Victoire {home}", "1X2"
-        if sel_norm and (sel_norm == away_norm or sel_norm in away_norm or away_norm in sel_norm):
-            return f"Victoire {away}", "1X2"
-        if "draw" in sel_norm or "nul" in sel_norm or sel_norm == "x":
-            return "Match nul", "1X2"
-        return None, None
-
-    if (market_lower in ("total", "totals", "over/under", "goals", "goals over/under")
-            or "over" in sel_norm or "under" in sel_norm
-            or "plus" in sel_norm or "moins" in sel_norm):
-        is_over = "over" in sel_norm or "plus" in sel_norm
-        is_under = "under" in sel_norm or "moins" in sel_norm
-        if not (is_over or is_under):
-            return None, None
-        try:
-            line_f = float(line) if line is not None else None
-        except (ValueError, TypeError):
-            line_f = None
-        if line_f is None or line_f < 0.5 or line_f > 5.5:
-            return None, None
-        return f"{'Over' if is_over else 'Under'} {line_f} buts", "Over/Under"
-
-    if "btts" in market_lower or "both" in market_lower or "les 2" in market_lower:
-        if "yes" in sel_norm or "oui" in sel_norm or sel_norm == "gg":
-            return "Les 2 marquent : Oui", "BTTS"
-        if "no" in sel_norm or "non" in sel_norm or sel_norm == "ng":
-            return "Les 2 marquent : Non", "BTTS"
-        return None, None
-
-    if market_lower in ("spread", "handicap", "asian handicap", "handicap asiatique"):
-        try:
-            lf = float(line) if line is not None else 0.0
-        except (ValueError, TypeError):
-            lf = 0.0
-        if sel_norm and (sel_norm == home_norm or sel_norm in home_norm or home_norm in sel_norm):
-            return f"{home} ({lf:+g})", "Handicap"
-        if sel_norm and (sel_norm == away_norm or sel_norm in away_norm or away_norm in sel_norm):
-            return f"{away} ({lf:+g})", "Handicap"
-        return None, None
-
-    if sel_norm:
-        if sel_norm == home_norm or (sel_norm and sel_norm in home_norm):
-            return f"Victoire {home}", "1X2"
-        if sel_norm == away_norm or (sel_norm and sel_norm in away_norm):
-            return f"Victoire {away}", "1X2"
-
-    return None, None
-
-
-# =========================================================
-# SELECTIONS
-# =========================================================
-def find_bb_for_event(ev_fields, bb_data):
-    home = ev_fields.get("home", "")
-    away = ev_fields.get("away", "")
-    event_id = ev_fields.get("event_id", "")
-    key = f"{normalize_name(away)}|{normalize_name(home)}"
-    if key in bb_data:
-        return bb_data[key]
-    hn, an = normalize_name(home), normalize_name(away)
-    for ck, cid in AI_MATCH_CACHE.items():
-        if cid == event_id and "|" in ck:
-            c_away, c_home = ck.split("|", 1)
-            for k, d in bb_data.items():
-                try:
-                    d_away, d_home = k.split("|", 1)
-                except ValueError:
-                    continue
-                if d_away == c_away and d_home == c_home:
-                    return d
-    for k, d in bb_data.items():
-        try:
-            k_away, k_home = k.split("|", 1)
-        except ValueError:
-            continue
-        if (hn in k_home or k_home in hn) and (an in k_away or k_away in an):
-            return d
-    return None
-
-
-def build_selections(fixtures_norm, odds_by_id, bb_data, dc_verdicts=None):
+def build_house_picks(events_norm, odds_by_id, used_today):
+    """
+    Génère NOS propres picks à partir de Dixon-Coles + cotes.
+    Marchés couverts : 1X2, Over/Under 1.5/2.5/3.5, BTTS.
+    """
     selections: list[Selection] = []
     seen = set()
-    used_today = load_used_today()
-    dc_verdicts = dc_verdicts or {}
-    stats = {"total": 0, "skip_used": 0, "skip_prob": 0, "skip_label": 0,
-             "skip_odd": 0, "skip_edge": 0, "dc_used": 0, "dc_disagree": 0,
-             "no_odds": 0}
+    stats = {"1x2": 0, "ou": 0, "btts": 0}
 
-    for fx in fixtures_norm:
+    if not DC_MODEL:
+        return selections
+
+    for fx in events_norm:
         try:
-            home, away = fx.get("home", ""), fx.get("away", "")
-            event_id, league = fx.get("event_id", ""), fx.get("league", "")
-            kickoff = fx.get("kickoff", "")
-            if not home or not away or not event_id:
-                continue
-            if not is_upcoming(kickoff):
-                continue
+            home, away = fx["home"], fx["away"]
+            event_id, league = fx["event_id"], fx["league"]
+            kickoff = fx["kickoff"]
+
             if event_id in used_today:
-                stats["skip_used"] += 1
                 continue
 
-            bb_match = find_bb_for_event(fx, bb_data)
-            if not bb_match:
+            pred = DC_MODEL.predict_all(home, away)
+            if not pred:
                 continue
 
             odds = odds_by_id.get(event_id, {})
-            if not (odds.get("h2h") or odds.get("totals")):
-                stats["no_odds"] += 1
+            if not odds:
                 continue
 
-            dc = dc_verdicts.get(event_id)
-
-            for pick in bb_match["picks"]:
-                stats["total"] += 1
-                prob_pct = pick.get("modelProbabilityPct")
-                if prob_pct is None:
+            # === 1X2 ===
+            h2h = odds.get("h2h", {})
+            for key, prob in (("home", pred["p_home"]),
+                              ("draw", pred["p_draw"]),
+                              ("away", pred["p_away"])):
+                odd = h2h.get(key)
+                if not odd or odd <= 1.01:
                     continue
-                prob = float(prob_pct) / 100.0
-
-                market = pick.get("market", "")
-                selection = pick.get("selection", "")
-                line = pick.get("line")
-                pick_label, market_label = pick_label_for(market, selection, home, away, line)
-                if not pick_label:
-                    stats["skip_label"] += 1
-                    continue
-
-                dc_prob = None
-                if dc and market_label == "1X2":
-                    if pick_label.startswith("Victoire "):
-                        team = pick_label.replace("Victoire ", "")
-                        dc_prob = dc["home"] if normalize_name(team) == normalize_name(home) else dc["away"]
-                    elif pick_label == "Match nul":
-                        dc_prob = dc["draw"]
-                    if dc_prob is not None:
-                        stats["dc_used"] += 1
-                        ecart = abs(prob - dc_prob)
-                        if ecart > 0.15:
-                            stats["dc_disagree"] += 1
-                        prob = (prob * 0.6) + (dc_prob * 0.4)
-
                 if prob < MIN_PROB:
-                    stats["skip_prob"] += 1
                     continue
-
-                best_odd = None
-                bookmaker = "The Odds API"
-
-                if market_label == "1X2":
-                    if pick_label.startswith("Victoire "):
-                        team = pick_label.replace("Victoire ", "")
-                        if normalize_name(team) == normalize_name(home):
-                            best_odd = odds.get("h2h", {}).get("home")
-                        else:
-                            best_odd = odds.get("h2h", {}).get("away")
-                    else:
-                        best_odd = odds.get("h2h", {}).get("draw")
-                elif market_label == "Over/Under":
-                    try:
-                        lf = float(line)
-                    except (ValueError, TypeError):
-                        lf = None
-                    key = f"{'over' if 'Over' in pick_label else 'under'}_{lf}"
-                    best_odd = odds.get("totals", {}).get(key)
-
-                if best_odd is None or best_odd <= 1.01:
-                    stats["skip_odd"] += 1
-                    continue
-
-                edge = prob * best_odd - 1.0
+                edge = prob * odd - 1.0
                 if edge < MIN_EDGE:
-                    stats["skip_edge"] += 1
                     continue
 
-                dedup = f"{event_id}|{market_label}|{pick_label}"
+                if key == "home":
+                    label = f"Victoire {home}"
+                elif key == "away":
+                    label = f"Victoire {away}"
+                else:
+                    label = "Match nul"
+
+                dedup = f"{event_id}|1X2|{label}"
                 if dedup in seen:
                     continue
                 seen.add(dedup)
 
                 selections.append(Selection(
                     event_id=event_id, league=league, home=home, away=away,
-                    kickoff=kickoff, market=market_label, pick_label=pick_label,
-                    odds=round(best_odd, 2), model_prob=round(prob, 4),
-                    edge=round(edge, 4), bookmaker=bookmaker,
-                    confidence=pick.get("confidence", ""),
-                    dc_prob=round(dc_prob, 4) if dc_prob is not None else None,
+                    kickoff=kickoff, market="1X2", pick_label=label,
+                    odds=round(odd, 2), model_prob=round(prob, 4),
+                    edge=round(edge, 4), bookmaker="The Odds API",
+                    source="house",
                 ))
-        except Exception as e:
-            print(f"⚠️ build_selections crash: {e}")
+                stats["1x2"] += 1
 
-    print(f"📊 STATS: total={stats['total']} skip_used={stats['skip_used']} "
-          f"skip_prob={stats['skip_prob']} skip_label={stats['skip_label']} "
-          f"skip_odd={stats['skip_odd']} skip_edge={stats['skip_edge']} "
-          f"no_odds={stats['no_odds']} dc_used={stats['dc_used']} "
-          f"dc_disagree={stats['dc_disagree']}")
+            # === Over/Under ===
+            totals = odds.get("totals", {})
+            for line in (1.5, 2.5, 3.5):
+                for prefix, prob_key in (("over", f"over_{line}"), ("under", f"under_{line}")):
+                    prob = pred.get(prob_key)
+                    if prob is None or prob < MIN_PROB:
+                        continue
+                    odd = totals.get(f"{prefix}_{line}")
+                    if not odd or odd <= 1.01:
+                        continue
+                    edge = prob * odd - 1.0
+                    if edge < MIN_EDGE:
+                        continue
+
+                    label = f"{'Over' if prefix == 'over' else 'Under'} {line} buts"
+                    dedup = f"{event_id}|O/U|{label}"
+                    if dedup in seen:
+                        continue
+                    seen.add(dedup)
+
+                    selections.append(Selection(
+                        event_id=event_id, league=league, home=home, away=away,
+                        kickoff=kickoff, market="Over/Under", pick_label=label,
+                        odds=round(odd, 2), model_prob=round(prob, 4),
+                        edge=round(edge, 4), bookmaker="The Odds API",
+                        source="house",
+                    ))
+                    stats["ou"] += 1
+
+            # === BTTS ===
+            btts = odds.get("btts", {})
+            for key, prob_key, label in (
+                ("yes", "btts_yes", "Les 2 marquent : Oui"),
+                ("no", "btts_no", "Les 2 marquent : Non"),
+            ):
+                prob = pred.get(prob_key)
+                if prob is None or prob < MIN_PROB:
+                    continue
+                odd = btts.get(key)
+                if not odd or odd <= 1.01:
+                    continue
+                edge = prob * odd - 1.0
+                if edge < MIN_EDGE:
+                    continue
+
+                dedup = f"{event_id}|BTTS|{label}"
+                if dedup in seen:
+                    continue
+                seen.add(dedup)
+
+                selections.append(Selection(
+                    event_id=event_id, league=league, home=home, away=away,
+                    kickoff=kickoff, market="BTTS", pick_label=label,
+                    odds=round(odd, 2), model_prob=round(prob, 4),
+                    edge=round(edge, 4), bookmaker="The Odds API",
+                    source="house",
+                ))
+                stats["btts"] += 1
+
+        except Exception as e:
+            print(f"⚠️ build_house_picks crash: {e}")
+
+    print(f"🏠 Picks maison : 1X2={stats['1x2']} O/U={stats['ou']} BTTS={stats['btts']}")
     return selections
 
 
@@ -990,12 +788,6 @@ def format_header():
 
 
 def format_selection_block(s: Selection, idx: int, show_ai=True):
-    conf_tag = ""
-    if (s.confidence or "").upper() == "STRONG":
-        conf_tag = "  🔥 <b>STRONG</b>"
-    elif (s.confidence or "").upper() == "LEAN":
-        conf_tag = "  ⚡ LEAN"
-
     dt = parse_dt_safe(s.kickoff)
     day_tag = ""
     if dt:
@@ -1006,26 +798,22 @@ def format_selection_block(s: Selection, idx: int, show_ai=True):
             day_tag = "📅 <b>Demain</b> "
 
     prob_display = s.final_prob() * 100
-    prob_source = "IA" if s.ai_prob else "croisée"
+    prob_source = "IA" if s.ai_prob else "Dixon-Coles"
 
     lines = [
         f"<b>┌─ Sélection #{idx}</b>",
         f"<b>│ 🏟 {s.home}  vs  {s.away}</b>",
         f"│ {day_tag}🕐 <b>{kickoff_local(s.kickoff)}</b>  •  {s.league}",
-        f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>{conf_tag}",
+        f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>",
         f"│ 📊 Proba {prob_source} : <b>{prob_display:.1f}%</b>",
+        f"│ 💰 Cote : <b>{s.odds}</b>  <i>({s.bookmaker})</i>",
+        f"│ ⚡ Edge : <b>{s.edge*100:+.1f}%</b>  {edge_bar(s.edge)}",
     ]
-    if s.dc_prob is not None:
-        lines.append(f"│ 🧮 Dixon-Coles : <b>{s.dc_prob*100:.1f}%</b>")
-
-    lines.append(f"│ 💰 Cote : <b>{s.odds}</b>  <i>({s.bookmaker})</i>")
-    lines.append(f"│ ⚡ Edge : <b>{s.edge*100:+.1f}%</b>  {edge_bar(s.edge)}")
-
     if show_ai and s.ai_verdict:
         lines.append(f"│")
         lines.append(f"│ 🧠 <b>AVIS IA</b> : {ai_verdict_emoji(s.ai_verdict)} <b>{s.ai_verdict}</b>")
         if s.ai_critique:
-            lines.append(f"│ 🔍 <b>Critique du bot</b> : <i>{s.ai_critique}</i>")
+            lines.append(f"│ 🔍 <b>Critique</b> : <i>{s.ai_critique}</i>")
         if s.ai_analysis:
             lines.append(f"│ 💬 <i>{s.ai_analysis}</i>")
         if s.ai_advice:
@@ -1139,13 +927,11 @@ async def debug_cmd(message):
     d = STATE["debug"]
     txt = (
         f"<b>🔍 DEBUG</b>\n\n"
-        f"BetBetter matchs : <b>{d.get('bb_matches', 0)}</b>\n"
         f"Dixon-Coles prédictions : <b>{d.get('dc_predictions', 0)}</b>\n"
         f"Events Odds API : <b>{d.get('events_total', 0)}</b>\n"
         f"Events J/J+1 : <b>{d.get('events_upcoming', 0)}</b>\n"
-        f"Matchés fuzzy : <b>{d.get('matched_fuzzy', 0)}</b>\n"
-        f"Matchés IA : <b>{d.get('matched_ai', 0)}</b>\n"
         f"Cotes extraites : <b>{d.get('odds_fetched', 0)}</b>\n"
+        f"Picks maison : <b>{d.get('house_picks', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"✅ ACCEPT : <b>{d.get('ai_accept', 0)}</b>\n"
         f"⚠️ CAUTION : <b>{d.get('ai_caution', 0)}</b>\n"
@@ -1194,14 +980,10 @@ async def btn_scan(message):
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
-        bb = fetch_betbetter_picks()
-        print(f"🧠 BetBetter matchs: {len(bb)}")
-
-        # 1. Récupérer tous les events avec cotes (10 requêtes)
+        # 1. Events + cotes
         events_raw = await fetch_all_events_with_odds()
         print(f"📦 Events The Odds API: {len(events_raw)}")
 
-        # 2. Normaliser + filtrer J/J+1
         events_norm = []
         odds_by_id = {}
         for ev in events_raw:
@@ -1214,28 +996,21 @@ async def scan():
             odds_by_id[fields["event_id"]] = extract_odds_from_event(ev)
         print(f"🎯 Events J/J+1: {len(events_norm)}")
 
-        # 3. Dixon-Coles
+        # 2. Dixon-Coles predictions
         dc_verdicts = {}
         if DC_MODEL:
             for fx in events_norm:
-                pred = DC_MODEL.predict(fx["home"], fx["away"])
+                pred = DC_MODEL.predict_all(fx["home"], fx["away"])
                 if pred:
                     dc_verdicts[fx["event_id"]] = pred
             print(f"🧮 Dixon-Coles : {len(dc_verdicts)} prédictions")
 
-        # 4. Matching fuzzy
-        matched_fuzzy = sum(1 for fx in events_norm if find_bb_for_event(fx, bb))
+        # 3. House picks (nos propres pronostics)
+        used_today = load_used_today()
+        selections = build_house_picks(events_norm, odds_by_id, used_today)
+        print(f"🏠 Picks maison total : {len(selections)}")
 
-        # 5. Matching IA
-        matched_ai = 0
-        if GEMINI_API_KEY and events_norm:
-            matched_ai = await ai_rematch_all(bb, events_norm)
-            print(f"🤖 IA matchs ajoutés: {matched_ai}")
-
-        # 6. Construire les sélections
-        selections = build_selections(events_norm, odds_by_id, bb, dc_verdicts)
-        print(f"🎯 Sélections: {len(selections)}")
-
+        # 4. Revue IA
         if GEMINI_API_KEY and selections:
             await ai_review_all(selections)
 
@@ -1249,13 +1024,11 @@ async def scan():
         STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
 
         STATE["debug"] = {
-            "bb_matches": len(bb),
             "dc_predictions": len(dc_verdicts),
             "events_total": len(events_raw),
             "events_upcoming": len(events_norm),
-            "matched_fuzzy": matched_fuzzy,
-            "matched_ai": matched_ai,
             "odds_fetched": len(odds_by_id),
+            "house_picks": len(selections),
             "selections": len(selections),
             "ai_accept": sum(1 for s in selections if s.ai_verdict == "ACCEPT"),
             "ai_caution": sum(1 for s in selections if s.ai_verdict == "CAUTION"),
@@ -1267,10 +1040,8 @@ async def scan():
         print(f"Events The Odds API : {len(events_raw)}")
         print(f"Events J/J+1        : {len(events_norm)}")
         print(f"Dixon-Coles         : {len(dc_verdicts)}")
-        print(f"Matchés fuzzy       : {matched_fuzzy}")
-        print(f"Matchés IA          : {matched_ai}")
         print(f"Cotes extraites     : {len(odds_by_id)}")
-        print(f"Sélections          : {len(selections)}")
+        print(f"Picks maison        : {len(selections)}")
         print(f"Coupons             : {len(STATE['coupons'])}")
         for c in STATE["coupons"]:
             print(f"  • {c.name} : {len(c.legs)} legs, cote {c.combined_odds}")
@@ -1303,7 +1074,7 @@ async def bootstrap():
     STATE["tracker"] = load_tracker()
     await init_dixon_coles()
     STATE["ready"] = True
-    print("✅ Bot prêt (The Odds API).")
+    print("✅ Bot prêt (Dixon-Coles + The Odds API).")
 
 
 # =========================================================
