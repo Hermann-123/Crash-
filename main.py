@@ -6,7 +6,7 @@ import os
 import re
 import unicodedata
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -30,6 +30,7 @@ except Exception:
 # CONFIG
 # =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
@@ -51,11 +52,13 @@ MAX_FIXTURES_FOR_ODDS = int(os.getenv("MAX_FIXTURES_FOR_ODDS", "25"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
+if not FOOTBALL_API_KEY:
+    raise RuntimeError("FOOTBALL_API_KEY manquant")
 if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
     raise RuntimeError("TELEGRAM_ADMIN_ID ou TELEGRAM_CHANNEL manquant")
 
 TZ = ZoneInfo(NOTIFY_TZ)
-INFER_BASE = "https://api.infersports.dev/v1"
+FOOTBALL_API_BASE = "https://api.5dollarfootballapi.com/v1"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
 
 BETBETTER_LEAGUES = [
@@ -65,6 +68,9 @@ BETBETTER_LEAGUES = [
     "soccer/bundesliga",
     "soccer/ligue-1",
 ]
+
+# Flag pour ne logger la structure brute qu'une seule fois
+STRUCTURE_LOGGED = {"fixtures": False, "odds": False}
 
 
 # =========================================================
@@ -133,7 +139,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 AI_MATCH_CACHE: dict = {}
 AI_REVIEW_CACHE: dict = {}
-ODDS_SAMPLE_LOGGED = {"done": False}
 
 STATE = {
     "ready": False,
@@ -204,7 +209,6 @@ def kickoff_local(iso_str: str) -> str:
 
 
 def is_upcoming(iso_str: str) -> bool:
-    """Accepte aujourd'hui (pas commencé) et demain."""
     dt = parse_dt_safe(iso_str)
     if not dt:
         return False
@@ -240,24 +244,6 @@ def edge_bar(edge: float) -> str:
 
 def ai_verdict_emoji(v: str) -> str:
     return {"ACCEPT": "✅", "CAUTION": "⚠️", "REJECT": "❌"}.get(v.upper(), "❓")
-
-
-def get_team_name(team_obj) -> str:
-    """Extrait le nom d'équipe, gère plusieurs formats."""
-    if isinstance(team_obj, dict):
-        return team_obj.get("name") or team_obj.get("nom") or ""
-    if isinstance(team_obj, str):
-        return team_obj
-    return ""
-
-
-def get_event_field(event: dict, *keys) -> str:
-    """Cherche un champ dans plusieurs clés possibles (anglais + français)."""
-    for k in keys:
-        v = event.get(k)
-        if v:
-            return v
-    return ""
 
 
 # =========================================================
@@ -334,142 +320,183 @@ def fetch_betbetter_picks() -> dict[str, dict]:
 
 
 # =========================================================
-# INFERSPORTS — FIXTURES
+# FOOTBALL-API — FIXTURES
 # =========================================================
-async def fetch_infersports_events(client: httpx.AsyncClient) -> list[dict]:
-    """Récupère tous les events InferSports."""
+async def fetch_fixtures(client: httpx.AsyncClient) -> list[dict]:
+    """Récupère les fixtures via 5DollarFootballAPI."""
+    url = f"{FOOTBALL_API_BASE}/fixtures"
+    params = {"date": today_iso()}
+    headers = {"x-api-key": FOOTBALL_API_KEY}
+
     try:
-        r = await client.get(f"{INFER_BASE}/events", timeout=30.0)
-        print(f"🌍 InferSports /v1/events -> {r.status_code}")
+        r = await client.get(url, params=params, headers=headers, timeout=30.0)
+        print(f"🌍 5DFootballAPI /fixtures?date={today_iso()} -> {r.status_code}")
 
         if r.status_code >= 400:
             print(f"⚠️ Body: {r.text[:300]}")
-            return []
+            # Tentative avec clé en paramètre
+            r = await client.get(url, params={**params, "api_key": FOOTBALL_API_KEY}, timeout=30.0)
+            print(f"🌍 (retry with api_key param) -> {r.status_code}")
+            if r.status_code >= 400:
+                print(f"⚠️ Body: {r.text[:300]}")
+                return []
 
         data = r.json()
-        events = data.get("data", []) if isinstance(data, dict) else data
-        print(f"📦 Events bruts InferSports: {len(events)}")
 
-        # Filtrer : sport football + statut programmé + date J/J+1
+        # LOG LA STRUCTURE UNE SEULE FOIS
+        if not STRUCTURE_LOGGED["fixtures"]:
+            print("=" * 70)
+            print("🔬 STRUCTURE BRUTE DES FIXTURES")
+            print(json.dumps(data, ensure_ascii=False, indent=2)[:2500])
+            print("=" * 70)
+            STRUCTURE_LOGGED["fixtures"] = True
+
+        # Chercher la liste (data / fixtures / response / matches)
+        fixtures = []
+        if isinstance(data, list):
+            fixtures = data
+        elif isinstance(data, dict):
+            for key in ("data", "fixtures", "response", "matches", "results"):
+                if isinstance(data.get(key), list):
+                    fixtures = data[key]
+                    break
+
+        print(f"📦 Fixtures brutes: {len(fixtures)}")
+
+        # Filtrer
         upcoming = []
-        for ev in events:
-            if not isinstance(ev, dict):
+        for fx in fixtures:
+            if not isinstance(fx, dict):
                 continue
-            sport = str(ev.get("sport", "")).lower()
-            if sport != "football":
+            dt_str = (
+                fx.get("date")
+                or fx.get("kickoff")
+                or fx.get("scheduled_at")
+                or fx.get("start_time")
+                or fx.get("commence_time")
+                or ""
+            )
+            if not is_upcoming(dt_str):
                 continue
+            upcoming.append(fx)
 
-            status = str(ev.get("status", "")).lower()
-            if status not in ("scheduled", "programme", "programmé", ""):
-                continue
-
-            scheduled = ev.get("scheduled_at", "")
-            if not is_upcoming(scheduled):
-                continue
-
-            event_id = ev.get("id", "")
-            if not event_id or not event_id.startswith("evt_"):
-                continue
-
-            upcoming.append(ev)
-
-        print(f"📅 Events foot (J/J+1, programmés): {len(upcoming)}")
-
-        # Log un exemple pour debug
-        if upcoming and not ODDS_SAMPLE_LOGGED["done"]:
-            print(f"🔍 Exemple event: {json.dumps(upcoming[0], ensure_ascii=False)[:500]}")
-
+        print(f"📅 Fixtures J/J+1: {len(upcoming)}")
         return upcoming
     except Exception as e:
-        print(f"⚠️ InferSports crash: {e}")
+        print(f"⚠️ 5DFootballAPI fixtures crash: {e}")
         return []
 
 
-def extract_event_fields(ev: dict) -> dict:
-    """Normalise un event InferSports en {home, away, league, kickoff, event_id}."""
-    # Équipes (anglais + français)
-    home = get_team_name(ev.get("home_team")) or get_team_name(ev.get("équipe_domicile")) or get_team_name(ev.get("equipe_domicile"))
-    away = get_team_name(ev.get("away_team")) or get_team_name(ev.get("équipe_extérieure")) or get_team_name(ev.get("equipe_exterieure"))
+def extract_fixture_fields(fx: dict) -> dict:
+    """Normalise une fixture avec plusieurs clés possibles."""
+    # Équipes
+    home = ""
+    away = ""
+    for k in ("home_team", "homeTeam", "home", "team_home"):
+        v = fx.get(k)
+        if isinstance(v, dict):
+            home = v.get("name") or v.get("nom") or ""
+            break
+        elif isinstance(v, str) and v:
+            home = v
+            break
+
+    for k in ("away_team", "awayTeam", "away", "team_away"):
+        v = fx.get(k)
+        if isinstance(v, dict):
+            away = v.get("name") or v.get("nom") or ""
+            break
+        elif isinstance(v, str) and v:
+            away = v
+            break
 
     # Ligue
     league = ""
-    lg = ev.get("league")
-    if isinstance(lg, dict):
-        league = lg.get("name", "")
-    elif isinstance(lg, str):
-        league = lg
+    for k in ("league", "competition", "tournament"):
+        v = fx.get(k)
+        if isinstance(v, dict):
+            league = v.get("name") or v.get("nom") or ""
+            break
+        elif isinstance(v, str) and v:
+            league = v
+            break
+
+    # Date
+    kickoff = (
+        fx.get("date")
+        or fx.get("kickoff")
+        or fx.get("scheduled_at")
+        or fx.get("start_time")
+        or fx.get("commence_time")
+        or ""
+    )
+
+    # ID
+    event_id = str(fx.get("id") or fx.get("fixture_id") or fx.get("match_id") or fx.get("event_id") or "")
 
     return {
-        "event_id": ev.get("id", ""),
+        "event_id": event_id,
         "home": home,
         "away": away,
         "league": league,
-        "kickoff": ev.get("scheduled_at", ""),
+        "kickoff": kickoff,
+        "raw": fx,
     }
 
 
 # =========================================================
-# INFERSPORTS — ODDS
+# FOOTBALL-API — ODDS
 # =========================================================
-async def fetch_infersports_odds(client: httpx.AsyncClient, event_id: str) -> dict:
-    """
-    Récupère les cotes d'un event.
-    Log la structure brute une seule fois pour comprendre le format.
-    """
+async def fetch_odds(client: httpx.AsyncClient, fixture_id: str) -> dict:
+    """Récupère les cotes d'une fixture."""
+    url = f"{FOOTBALL_API_BASE}/odds/{fixture_id}"
+    headers = {"x-api-key": FOOTBALL_API_KEY}
+
     try:
-        r = await client.get(f"{INFER_BASE}/events/{event_id}/odds", timeout=20.0)
+        r = await client.get(url, headers=headers, timeout=20.0)
         if r.status_code >= 400:
-            # 404 = pas de cotes dispo pour ce match
-            if r.status_code != 404:
-                print(f"⚠️ Odds {event_id} -> {r.status_code}: {r.text[:150]}")
-            return {}
+            # Tentative alternative
+            r = await client.get(url, params={"api_key": FOOTBALL_API_KEY}, timeout=20.0)
+            if r.status_code >= 400:
+                if r.status_code != 404:
+                    print(f"⚠️ Odds {fixture_id} -> {r.status_code}: {r.text[:150]}")
+                return {}
 
         data = r.json()
 
-        # Log la structure brute une seule fois
-        if not ODDS_SAMPLE_LOGGED["done"]:
-            print("=" * 60)
-            print("🔬 STRUCTURE BRUTE DES COTES (à copier pour debug)")
-            print(json.dumps(data, ensure_ascii=False, indent=2)[:2000])
-            print("=" * 60)
-            ODDS_SAMPLE_LOGGED["done"] = True
+        if not STRUCTURE_LOGGED["odds"]:
+            print("=" * 70)
+            print("🔬 STRUCTURE BRUTE DES COTES")
+            print(json.dumps(data, ensure_ascii=False, indent=2)[:2500])
+            print("=" * 70)
+            STRUCTURE_LOGGED["odds"] = True
 
         return data
     except Exception as e:
-        print(f"⚠️ Odds crash {event_id}: {e}")
+        print(f"⚠️ Odds crash {fixture_id}: {e}")
         return {}
 
 
-def parse_odds(data: dict, home: str, away: str) -> dict:
-    """
-    Parse défensif : essaie plusieurs structures possibles.
-    Retourne {"h2h": {...}, "totals": {...}, "btts": {...}}
-    """
+def parse_odds(data: dict) -> dict:
+    """Parse défensif : cherche les cotes 1X2, Over/Under, BTTS."""
     result = {"h2h": {}, "totals": {}, "btts": {}}
 
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) and not isinstance(data, list):
         return result
 
-    # Chercher une clé "markets", "odds", "data", "prices"
-    payload = data
-    for key in ("data", "markets", "odds", "prices", "bookmakers"):
-        if key in data and isinstance(data[key], (dict, list)):
-            payload = data[key]
-            break
-
-    # Parcours générique : on cherche partout des clés h2h/home/draw/away
     def walk(obj):
         if isinstance(obj, dict):
-            # 1X2 dans un dict
-            if "home" in obj or "draw" in obj or "away" in obj:
-                for k in ("home", "draw", "away"):
-                    v = obj.get(k)
-                    if isinstance(v, (int, float)) and v > 1.01:
-                        result["h2h"][k] = max(result["h2h"].get(k, 0), float(v))
-                    elif isinstance(v, dict):
-                        p = v.get("price") or v.get("odd") or v.get("cote")
-                        if isinstance(p, (int, float)) and p > 1.01:
-                            result["h2h"][k] = max(result["h2h"].get(k, 0), float(p))
+            # 1X2
+            for k in ("home", "draw", "away", "1", "X", "2"):
+                v = obj.get(k)
+                if isinstance(v, (int, float)) and v > 1.01:
+                    key = {"1": "home", "X": "draw", "2": "away"}.get(k, k)
+                    result["h2h"][key] = max(result["h2h"].get(key, 0), float(v))
+                elif isinstance(v, dict):
+                    p = v.get("price") or v.get("odd") or v.get("cote") or v.get("value")
+                    if isinstance(p, (int, float)) and p > 1.01:
+                        key = {"1": "home", "X": "draw", "2": "away"}.get(k, k)
+                        result["h2h"][key] = max(result["h2h"].get(key, 0), float(p))
 
             # Over/Under
             for k, v in obj.items():
@@ -477,18 +504,35 @@ def parse_odds(data: dict, home: str, away: str) -> dict:
                 m = re.match(r"(over|under)_?([\d.]+)", k_low)
                 if m and isinstance(v, (int, float)) and v > 1.01:
                     result["totals"][f"{m.group(1)}_{m.group(2)}"] = float(v)
-                if "yes" in k_low and isinstance(v, (int, float)) and v > 1.01:
-                    result["btts"]["yes"] = float(v)
-                if "no" in k_low and isinstance(v, (int, float)) and v > 1.01:
-                    result["btts"]["no"] = float(v)
+                elif m and isinstance(v, dict):
+                    p = v.get("price") or v.get("odd")
+                    if isinstance(p, (int, float)) and p > 1.01:
+                        result["totals"][f"{m.group(1)}_{m.group(2)}"] = float(p)
 
+                # BTTS
+                if k_low in ("btts_yes", "yes", "both_teams_yes", "gg"):
+                    if isinstance(v, (int, float)) and v > 1.01:
+                        result["btts"]["yes"] = float(v)
+                    elif isinstance(v, dict):
+                        p = v.get("price") or v.get("odd")
+                        if isinstance(p, (int, float)) and p > 1.01:
+                            result["btts"]["yes"] = float(p)
+                if k_low in ("btts_no", "no", "both_teams_no", "ng"):
+                    if isinstance(v, (int, float)) and v > 1.01:
+                        result["btts"]["no"] = float(v)
+                    elif isinstance(v, dict):
+                        p = v.get("price") or v.get("odd")
+                        if isinstance(p, (int, float)) and p > 1.01:
+                            result["btts"]["no"] = float(p)
+
+            # Récursion
             for v in obj.values():
                 walk(v)
         elif isinstance(obj, list):
             for item in obj:
                 walk(item)
 
-    walk(payload)
+    walk(data)
     return result
 
 
@@ -497,54 +541,40 @@ def parse_odds(data: dict, home: str, away: str) -> dict:
 # =========================================================
 async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
                           candidates: list[tuple[str, str, str]]) -> Optional[str]:
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY or not candidates:
         return None
-    if not candidates:
-        return None
-
     cache_key = f"{normalize_name(bb_home)}|{normalize_name(bb_away)}"
     if cache_key in AI_MATCH_CACHE:
         return AI_MATCH_CACHE[cache_key]
-
     candidates = candidates[:20]
     lignes = "\n".join(f"{i+1}. {h} vs {a}" for i, (_, h, a) in enumerate(candidates))
-
     prompt = (
         f"Match modèle : \"{bb_home} vs {bb_away}\".\n"
         f"Trouve le MÊME match dans la liste :\n\n"
         f"{lignes}\n\n"
         f"Réponds UNIQUEMENT par le numéro (1-{len(candidates)}) ou 0."
     )
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 20},
-    }
-
+    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0, "maxOutputTokens": 20}}
     try:
         r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=15.0)
         if r.status_code >= 400:
             AI_MATCH_CACHE[cache_key] = None
             return None
-
         data = r.json()
         try:
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
         except (KeyError, IndexError, TypeError):
             AI_MATCH_CACHE[cache_key] = None
             return None
-
         match = re.search(r"\d+", text)
         if not match:
             AI_MATCH_CACHE[cache_key] = None
             return None
-
         num = int(match.group())
         if 1 <= num <= len(candidates):
             matched_id = candidates[num - 1][0]
             AI_MATCH_CACHE[cache_key] = matched_id
             return matched_id
-
         AI_MATCH_CACHE[cache_key] = None
         return None
     except Exception:
@@ -552,13 +582,11 @@ async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
         return None
 
 
-async def ai_rematch_all(bb_data: dict, events: list[dict]) -> int:
+async def ai_rematch_all(bb_data: dict, fixtures_norm: list[dict]) -> int:
     if not GEMINI_API_KEY:
         return 0
-
-    normalized = [extract_event_fields(e) for e in events]
-    today_candidates = [(e["event_id"], e["home"], e["away"]) for e in normalized if e["event_id"]]
-    if not today_candidates:
+    candidates = [(f["event_id"], f["home"], f["away"]) for f in fixtures_norm if f["event_id"]]
+    if not candidates:
         return 0
 
     already_matched = set()
@@ -567,13 +595,13 @@ async def ai_rematch_all(bb_data: dict, events: list[dict]) -> int:
             k_away, k_home = key.split("|", 1)
         except ValueError:
             continue
-        for eid, h, a in today_candidates:
+        for eid, h, a in candidates:
             hn, an = normalize_name(h), normalize_name(a)
             if (hn in k_home or k_home in hn) and (an in k_away or k_away in an):
                 already_matched.add(eid)
                 break
 
-    unmatched = [c for c in today_candidates if c[0] not in already_matched]
+    unmatched = [c for c in candidates if c[0] not in already_matched]
     if not unmatched:
         return 0
 
@@ -588,7 +616,7 @@ async def ai_rematch_all(bb_data: dict, events: list[dict]) -> int:
             found = any(
                 (normalize_name(h) in hn or hn in normalize_name(h)) and
                 (normalize_name(a) in an or an in normalize_name(a))
-                for _, h, a in today_candidates
+                for _, h, a in candidates
             )
             if found:
                 continue
@@ -636,16 +664,12 @@ VERDICT: ACCEPT
 ANALYSE: [3 phrases max]
 CONSEIL: [1 phrase]"""
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 400},
-    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.3, "maxOutputTokens": 400}}
 
     try:
         r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=30.0)
         if r.status_code >= 400:
             return
-
         data = r.json()
         try:
             text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -672,7 +696,6 @@ CONSEIL: [1 phrase]"""
         sel.ai_verdict = verdict
         sel.ai_analysis = analysis
         sel.ai_advice = advice
-
         AI_REVIEW_CACHE[cache_key] = {"verdict": verdict, "analysis": analysis, "advice": advice}
     except Exception as e:
         print(f"⚠️ Gemini review crash: {e}")
@@ -681,7 +704,6 @@ CONSEIL: [1 phrase]"""
 async def ai_review_all(selections: list[Selection]) -> None:
     if not GEMINI_API_KEY or not AI_REVIEW_ENABLED or not selections:
         return
-
     print(f"🧠 Revue IA de {len(selections)} sélections...")
     async with httpx.AsyncClient(timeout=30.0) as client:
         for i, s in enumerate(selections):
@@ -697,12 +719,12 @@ async def ai_review_all(selections: list[Selection]) -> None:
 
 
 # =========================================================
-# FIND BB FOR EVENT
+# FIND BB FOR FIXTURE
 # =========================================================
-def find_bb_for_event(event_norm: dict, bb_data: dict) -> Optional[dict]:
-    home = event_norm.get("home", "")
-    away = event_norm.get("away", "")
-    event_id = event_norm.get("event_id", "")
+def find_bb_for_fixture(fx: dict, bb_data: dict) -> Optional[dict]:
+    home = fx.get("home", "")
+    away = fx.get("away", "")
+    event_id = fx.get("event_id", "")
 
     key = f"{normalize_name(away)}|{normalize_name(home)}"
     if key in bb_data:
@@ -735,11 +757,11 @@ def find_bb_for_event(event_norm: dict, bb_data: dict) -> Optional[dict]:
 # =========================================================
 # BUILD SELECTIONS
 # =========================================================
-def build_selections(events_norm: list[dict], odds_map: dict, bb_data: dict) -> list[Selection]:
+def build_selections(fixtures_norm: list[dict], odds_map: dict, bb_data: dict) -> list[Selection]:
     selections: list[Selection] = []
     seen_keys = set()
 
-    for fx in events_norm:
+    for fx in fixtures_norm:
         try:
             home = fx.get("home", "")
             away = fx.get("away", "")
@@ -752,7 +774,7 @@ def build_selections(events_norm: list[dict], odds_map: dict, bb_data: dict) -> 
             if not is_upcoming(kickoff):
                 continue
 
-            bb_match = find_bb_for_event(fx, bb_data)
+            bb_match = find_bb_for_fixture(fx, bb_data)
             if not bb_match:
                 continue
 
@@ -836,7 +858,7 @@ def build_selections(events_norm: list[dict], odds_map: dict, bb_data: dict) -> 
                     odds=round(best_odd, 2),
                     model_prob=round(prob, 4),
                     edge=round(edge, 4),
-                    bookmaker="InferSports",
+                    bookmaker="5DFootballAPI",
                     confidence=pick.get("confidence", ""),
                 ))
         except Exception as e:
@@ -1088,8 +1110,8 @@ async def debug_cmd(message):
     txt = (
         f"<b>🔍 DEBUG</b>\n\n"
         f"BetBetter matchs : <b>{d.get('bb_matches', 0)}</b>\n"
-        f"Events InferSports : <b>{d.get('events_total', 0)}</b>\n"
-        f"Events J/J+1 : <b>{d.get('events_upcoming', 0)}</b>\n"
+        f"Fixtures brutes : <b>{d.get('fixtures_raw', 0)}</b>\n"
+        f"Fixtures J/J+1 : <b>{d.get('fixtures_upcoming', 0)}</b>\n"
         f"Appariés fuzzy : <b>{d.get('matched_fuzzy', 0)}</b>\n"
         f"Appariés IA : <b>{d.get('matched_ai', 0)}</b>\n"
         f"Cotes récupérées : <b>{d.get('odds_fetched', 0)}</b>\n"
@@ -1116,22 +1138,28 @@ async def send_coupon(message, name):
 
 
 @dp.message(F.text == BTN_SAFE)
-async def btn_safe(message): await send_coupon(message, "Safe")
+async def btn_safe(message):
+    await send_coupon(message, "Safe")
 
 @dp.message(F.text == BTN_BAL)
-async def btn_bal(message): await send_coupon(message, "Équilibré")
+async def btn_bal(message):
+    await send_coupon(message, "Équilibré")
 
 @dp.message(F.text == BTN_AGG)
-async def btn_agg(message): await send_coupon(message, "Ultra Safe")
+async def btn_agg(message):
+    await send_coupon(message, "Ultra Safe")
 
 @dp.message(F.text == BTN_VAL)
-async def btn_val(message): await send_coupon(message, "Value")
+async def btn_val(message):
+    await send_coupon(message, "Value")
 
 @dp.message(F.text == BTN_BILAN)
-async def btn_bilan(message): await safe_answer(message, format_bilan(STATE["tracker"]))
+async def btn_bilan(message):
+    await safe_answer(message, format_bilan(STATE["tracker"]))
 
 @dp.message(F.text == BTN_SCAN)
-async def btn_scan(message): await scan_cmd(message)
+async def btn_scan(message):
+    await scan_cmd(message)
 
 
 # =========================================================
@@ -1143,42 +1171,37 @@ async def scan():
         print(f"🧠 BetBetter matchs: {len(bb)}")
 
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            events_raw = await fetch_infersports_events(client)
+            fixtures_raw = await fetch_fixtures(client)
+            fixtures_norm = [extract_fixture_fields(fx) for fx in fixtures_raw]
+            fixtures_norm = [f for f in fixtures_norm if f["event_id"] and f["home"] and f["away"]]
+            print(f"🎯 Fixtures normalisées: {len(fixtures_norm)}")
 
-            # Normaliser
-            events_norm = [extract_event_fields(e) for e in events_raw]
-            events_norm = [e for e in events_norm if e["event_id"] and e["home"] and e["away"]]
-            print(f"🎯 Events normalisés: {len(events_norm)}")
-
-            # Matching fuzzy
             matched_fuzzy = 0
-            for fx in events_norm:
-                if find_bb_for_event(fx, bb):
+            for fx in fixtures_norm:
+                if find_bb_for_fixture(fx, bb):
                     matched_fuzzy += 1
 
-            # Matching IA
             matched_ai = 0
-            if GEMINI_API_KEY and events_norm:
+            if GEMINI_API_KEY and fixtures_norm:
                 print("🤖 Matching Gemini...")
-                matched_ai = await ai_rematch_all(bb, events_norm)
+                matched_ai = await ai_rematch_all(bb, fixtures_norm)
                 print(f"🤖 IA matchs ajoutés: {matched_ai}")
 
-            # Récupérer les cotes pour les matchs matchés
-            to_odds = [fx for fx in events_norm if find_bb_for_event(fx, bb)][:MAX_FIXTURES_FOR_ODDS]
+            to_odds = [fx for fx in fixtures_norm if find_bb_for_fixture(fx, bb)][:MAX_FIXTURES_FOR_ODDS]
             print(f"💰 Récupération cotes pour {len(to_odds)} matchs...")
 
             odds_map = {}
             for fx in to_odds:
-                raw = await fetch_infersports_odds(client, fx["event_id"])
+                raw = await fetch_odds(client, fx["event_id"])
                 if raw:
-                    parsed = parse_odds(raw, fx["home"], fx["away"])
+                    parsed = parse_odds(raw)
                     if parsed.get("h2h") or parsed.get("totals") or parsed.get("btts"):
                         odds_map[fx["event_id"]] = parsed
                 await asyncio.sleep(0.2)
 
             print(f"💰 Cotes parsées: {len(odds_map)}")
 
-        selections = build_selections(events_norm, odds_map, bb)
+        selections = build_selections(fixtures_norm, odds_map, bb)
         print(f"🎯 Sélections: {len(selections)}")
 
         if AI_REVIEW_ENABLED and GEMINI_API_KEY and selections:
@@ -1191,8 +1214,8 @@ async def scan():
 
         STATE["debug"] = {
             "bb_matches": len(bb),
-            "events_total": len(events_raw),
-            "events_upcoming": len(events_norm),
+            "fixtures_raw": len(fixtures_raw),
+            "fixtures_upcoming": len(fixtures_norm),
             "matched_fuzzy": matched_fuzzy,
             "matched_ai": matched_ai,
             "odds_fetched": len(odds_map),
@@ -1204,8 +1227,8 @@ async def scan():
         }
 
         print("──────── RÉSUMÉ ────────")
-        print(f"Events InferSports : {len(events_raw)}")
-        print(f"Events J/J+1       : {len(events_norm)}")
+        print(f"Fixtures brutes    : {len(fixtures_raw)}")
+        print(f"Fixtures J/J+1     : {len(fixtures_norm)}")
         print(f"Matchés fuzzy      : {matched_fuzzy}")
         print(f"Matchés IA         : {matched_ai}")
         print(f"Cotes récupérées   : {len(odds_map)}")
@@ -1243,7 +1266,7 @@ async def daily_broadcast():
 async def bootstrap():
     STATE["tracker"] = load_tracker()
     STATE["ready"] = True
-    print("✅ Bot prêt (BetBetter + InferSports + Gemini).")
+    print("✅ Bot prêt (BetBetter + 5DFootballAPI + Gemini).")
 
 
 @asynccontextmanager
