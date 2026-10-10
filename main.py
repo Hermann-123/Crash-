@@ -58,8 +58,8 @@ if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
 
 TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_BASE = "https://api.the-odds-api.com/v4"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 SOCCER_KEYS = [
     "soccer_epl",
