@@ -35,7 +35,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 
-NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "8"))
+NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "0"))
 NOTIFY_MINUTE = int(os.getenv("NOTIFY_MINUTE", "0"))
 NOTIFY_TZ = os.getenv("NOTIFY_TZ", "Africa/Abidjan")
 
@@ -101,8 +101,7 @@ class Selection:
     bookmaker: str
     confidence: str
     fair_odds: Optional[float] = None
-    # Champs IA
-    ai_verdict: str = ""       # ACCEPT / CAUTION / REJECT / ""
+    ai_verdict: str = ""
     ai_analysis: str = ""
     ai_advice: str = ""
 
@@ -220,13 +219,19 @@ def kickoff_local(iso_str: str) -> str:
 
 
 def is_today(iso_str: str) -> bool:
+    """Accepte les matchs d'aujourd'hui (pas commencés) et de demain."""
     dt = parse_dt_safe(iso_str)
     if not dt:
         return False
     now = datetime.now(TZ)
-    if dt.date() != now.date():
-        return False
-    return dt > now + timedelta(minutes=15)
+    today = now.date()
+    tomorrow = today + timedelta(days=1)
+
+    if dt.date() == today and dt > now + timedelta(minutes=15):
+        return True
+    if dt.date() == tomorrow:
+        return True
+    return False
 
 
 def parse_bb_game(game: str) -> tuple[str, str]:
@@ -385,21 +390,21 @@ async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
     lignes = "\n".join(f"{i+1}. {h} vs {a}" for i, (_, h, a) in enumerate(candidates))
 
     prompt = (
-        f"Tu es un expert en football. Un modèle donne un match : \"{bb_home} vs {bb_away}\".\n"
+        f"Un modèle donne un match : \"{bb_home} vs {bb_away}\".\n"
         f"Parmi cette liste, quel match correspond au MÊME match ?\n\n"
         f"{lignes}\n\n"
-        f"Réponds UNIQUEMENT par le numéro (1-{len(candidates)}) ou 0 si aucun ne correspond. "
-        f"Pas d'explication. Juste le numéro."
+        f"Réponds UNIQUEMENT par le numéro (1-{len(candidates)}), ou 0 si aucun ne correspond. "
+        f"Réponse attendue : un seul chiffre."
     )
 
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "Tu réponds uniquement par un numéro."},
+            {"role": "system", "content": "Tu réponds uniquement par un chiffre entre 0 et 20."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0,
-        "max_completion_tokens": 10,
+        "max_completion_tokens": 50,
     }
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
@@ -407,17 +412,33 @@ async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
         r = await client.post(GROQ_URL, json=payload, headers=headers, timeout=15.0)
         if r.status_code >= 400:
             print(f"⚠️ Groq match {r.status_code}: {r.text[:150]}")
+            AI_MATCH_CACHE[cache_key] = None
             return None
-        text = r.json()["choices"][0]["message"]["content"].strip()
-        num = int(re.search(r"\d+", text).group())
+
+        data = r.json()
+        try:
+            text = data["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            AI_MATCH_CACHE[cache_key] = None
+            return None
+
+        text = str(text).strip()
+        match = re.search(r"\d+", text)
+        if not match:
+            AI_MATCH_CACHE[cache_key] = None
+            return None
+
+        num = int(match.group())
         if 1 <= num <= len(candidates):
             matched_id = candidates[num - 1][0]
             AI_MATCH_CACHE[cache_key] = matched_id
             return matched_id
+
         AI_MATCH_CACHE[cache_key] = None
         return None
     except Exception as e:
         print(f"⚠️ Groq match crash: {e}")
+        AI_MATCH_CACHE[cache_key] = None
         return None
 
 
@@ -470,7 +491,7 @@ async def ai_rematch_all(bb_data: dict, events: list[dict]) -> int:
                 print(f"  🤖 Match IA : {bb_home} vs {bb_away} → {matched_id}")
                 unmatched_candidates = [c for c in unmatched_candidates if c[0] != matched_id]
 
-            await asyncio.sleep(2.1)  # rate limit 30 RPM
+            await asyncio.sleep(2.1)
 
     return count
 
@@ -479,7 +500,6 @@ async def ai_rematch_all(bb_data: dict, events: list[dict]) -> int:
 # GROQ — REVUE ANALYTIQUE (LE VETO)
 # =========================================================
 async def ai_review_selection(client: httpx.AsyncClient, sel: Selection) -> None:
-    """Analyse une sélection avec Groq. Remplit ses champs ai_*."""
     if not GROQ_API_KEY:
         return
 
@@ -510,7 +530,7 @@ Si tu ne connais pas assez ce match, dis-le et mets CAUTION.
 Réponds EXACTEMENT dans ce format (rien d'autre) :
 
 VERDICT: ACCEPT
-ANALYSE: [ton analyse en 3-4 phrases courtes. Mentionne les forces, faiblesses et risques principaux. Si tu ne connais pas, dis "données incertaines sur ce match".]
+ANALYSE: [ton analyse en 3-4 phrases courtes. Mentionne les forces, faiblesses et risques principaux.]
 CONSEIL: [1 phrase d'action pour le parieur]
 
 Règles strictes :
@@ -519,7 +539,6 @@ Règles strictes :
 - VERDICT = REJECT → pari douteux, ne pas jouer
 - N'invente JAMAIS de statistiques, blessures ou compos
 - Ne donne pas de probabilités chiffrées
-- Pas de cotes alternatives
 - Sois bref et direct"""
 
     payload = {
@@ -529,21 +548,27 @@ Règles strictes :
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,
-        "max_completion_tokens": 300,
+        "max_completion_tokens": 600,
     }
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
     try:
-        r = await client.post(GROQ_URL, json=payload, headers=headers, timeout=25.0)
+        r = await client.post(GROQ_URL, json=payload, headers=headers, timeout=30.0)
         if r.status_code >= 400:
             print(f"⚠️ Groq review {r.status_code}: {r.text[:200]}")
             return
-        text = r.json()["choices"][0]["message"]["content"]
+
+        data = r.json()
+        try:
+            text = data["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            return
 
         verdict, analysis, advice = "", "", ""
         for line in text.split("\n"):
             line = line.strip()
-            if line.upper().startswith("VERDICT:"):
+            upper = line.upper()
+            if upper.startswith("VERDICT:"):
                 v = line.split(":", 1)[1].strip().upper()
                 if "ACCEPT" in v:
                     verdict = "ACCEPT"
@@ -551,9 +576,9 @@ Règles strictes :
                     verdict = "REJECT"
                 elif "CAUTION" in v:
                     verdict = "CAUTION"
-            elif line.upper().startswith("ANALYSE:"):
+            elif upper.startswith("ANALYSE:"):
                 analysis = line.split(":", 1)[1].strip()
-            elif line.upper().startswith("CONSEIL:"):
+            elif upper.startswith("CONSEIL:"):
                 advice = line.split(":", 1)[1].strip()
 
         sel.ai_verdict = verdict
@@ -568,7 +593,6 @@ Règles strictes :
 
 
 async def ai_review_all(selections: list[Selection]) -> None:
-    """Fait analyser toutes les sélections par Groq (séquentiel pour respecter le rate limit)."""
     if not GROQ_API_KEY or not AI_REVIEW_ENABLED:
         return
     if not selections:
@@ -809,12 +833,11 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
 
 
 # =========================================================
-# COUPON BUILDER — filtre les REJECT de l'IA
+# COUPON BUILDER
 # =========================================================
 def build_coupon(name: str, subtitle: str, emoji: str, pool: list[Selection],
                  min_odds: float, max_odds: float, max_legs: int,
                  globally_used: set) -> Optional[Coupon]:
-    # VETO IA : on garde ACCEPT + CAUTION (avec warning), on jette REJECT
     pool = [
         s for s in pool
         if s.odds and s.odds > 1.01
@@ -920,10 +943,19 @@ def format_selection_block(s: Selection, idx: int, show_ai: bool = True) -> str:
     elif conf_upper == "LEAN":
         conf_tag = "  ⚡ LEAN"
 
+    dt = parse_dt_safe(s.kickoff)
+    day_tag = ""
+    if dt:
+        today = datetime.now(TZ).date()
+        if dt.date() == today:
+            day_tag = "📍 <b>Aujourd'hui</b> "
+        elif dt.date() == today + timedelta(days=1):
+            day_tag = "📅 <b>Demain</b> "
+
     lines = [
         f"<b>┌─ Sélection #{idx}</b>",
         f"<b>│ 🏟 {s.home}  vs  {s.away}</b>",
-        f"│ 🕐 <b>{kickoff_local(s.kickoff)}</b>  •  {s.league}",
+        f"│ {day_tag}🕐 <b>{kickoff_local(s.kickoff)}</b>  •  {s.league}",
         f"│ 🎯 Pari : <b>{s.pick_label}</b>",
         f"│ 🏷 Marché : <i>{s.market}</i>{conf_tag}",
         f"│ 📈 Proba modèle : <b>{s.model_prob*100:.1f}%</b>",
@@ -964,7 +996,6 @@ def format_simples(selections: list[Selection], limit: int = 10) -> str:
 
 
 def format_ia_reviews(selections: list[Selection]) -> str:
-    """Affiche UNIQUEMENT l'analyse IA de toutes les sélections (même rejetées)."""
     if not selections:
         return f"{format_header()}\n\n<b>🧠 Aucune analyse IA disponible</b>"
 
@@ -1062,7 +1093,6 @@ def format_coupons_ready() -> str:
     for c in STATE["coupons"]:
         n_legs = len(c.legs)
         prob = c.combined_prob * 100
-        # Compte les CAUTION dans le coupon
         n_caution = sum(1 for s in c.legs if s.ai_verdict == "CAUTION")
         caution_tag = f" • ⚠️ {n_caution}" if n_caution else ""
         lignes.append(
@@ -1210,7 +1240,7 @@ async def scan():
         print(f"📦 Events Odds API: {len(events)}")
 
         today_events = [e for e in events if is_today(e.get("commence_time", ""))]
-        print(f"📅 Matchs aujourd'hui: {len(today_events)}")
+        print(f"📅 Matchs (aujourd'hui + demain): {len(today_events)}")
 
         matched_fuzzy = 0
         for ev in today_events:
@@ -1235,21 +1265,15 @@ async def scan():
             matched_ai = await ai_rematch_all(bb, events)
             print(f"🤖 Matchings IA ajoutés: {matched_ai}")
 
-        # 1. Construire les sélections candidates
         selections = build_selections(events, bb)
         print(f"🎯 Sélections candidates: {len(selections)}")
 
-        # 2. Faire analyser chaque sélection par l'IA (le VETO)
         if AI_REVIEW_ENABLED and GROQ_API_KEY and selections:
             await ai_review_all(selections)
 
-        # 3. Trier
         selections.sort(key=lambda s: s.score(), reverse=True)
         STATE["selections"] = selections
-
-        # 4. Construire coupons (l'IA a déjà veté les REJECT)
         STATE["coupons"] = build_all_coupons(selections)
-
         STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
 
         ai_accept = sum(1 for s in selections if s.ai_verdict == "ACCEPT")
@@ -1270,7 +1294,7 @@ async def scan():
         }
 
         print("──────── RÉSUMÉ ────────")
-        print(f"Matchs du jour  : {len(today_events)}")
+        print(f"Matchs (J+1)    : {len(today_events)}")
         print(f"Appariés fuzzy  : {matched_fuzzy}")
         print(f"Appariés IA     : {matched_ai}")
         print(f"Sélections      : {len(selections)}")
@@ -1298,7 +1322,6 @@ async def daily_broadcast():
         await safe_send(chat_id, format_summary())
         await asyncio.sleep(0.5)
 
-        # Envoie l'analyse IA des rejets (transparence)
         if STATE["selections"]:
             await safe_send(chat_id, format_ia_reviews(STATE["selections"]))
             await asyncio.sleep(0.5)
