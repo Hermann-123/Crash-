@@ -1,19 +1,15 @@
 """
-Moteur Dixon-Coles simplifié.
-Télécharge l'historique des 5 grands championnats (football-data.co.uk),
-calcule les forces offensives/défensives et prédit les probas 1X2.
+Moteur Dixon-Coles + marchés dérivés (1X2, O/U, BTTS).
 """
 from __future__ import annotations
 
 import csv
 import io
 import math
-from datetime import datetime
 from typing import Optional
 
 import httpx
 
-# URLs football-data.co.uk (CSV publics, ~20 Mo au total)
 LEAGUES = {
     "England Premier League": "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
     "England Championship":    "https://www.football-data.co.uk/mmz4281/2526/E1.csv",
@@ -22,50 +18,29 @@ LEAGUES = {
     "Germany Bundesliga":      "https://www.football-data.co.uk/mmz4281/2526/D1.csv",
     "France Ligue 1":          "https://www.football-data.co.uk/mmz4281/2526/F1.csv",
 }
-# Saison précédente en secours
-LEAGUES_PREV = {
-    "England Premier League": "https://www.football-data.co.uk/mmz4281/2425/E0.csv",
-    "Spain La Liga":           "https://www.football-data.co.uk/mmz4281/2425/SP1.csv",
-    "Italy Serie A":           "https://www.football-data.co.uk/mmz4281/2425/I1.csv",
-    "Germany Bundesliga":      "https://www.football-data.co.uk/mmz4281/2425/D1.csv",
-    "France Ligue 1":          "https://www.football-data.co.uk/mmz4281/2425/F1.csv",
-}
 
 
 class DixonColesModel:
-    """
-    Modèle Poisson bivarié simplifié.
-    Force attaque/défense + avantage domicile.
-    """
-
     def __init__(self):
-        self.teams: dict = {}          # {team: {"att": float, "def": float, "league": str}}
-        self.home_advantage = 1.15     # multiplicateur domicile
-        self.avg_goals = 1.35          # moyenne buts par équipe
+        self.teams: dict = {}
+        self.home_advantage = 1.15
+        self.avg_goals = 1.35
         self._trained = False
 
     def train(self, results: list[dict]) -> bool:
-        """
-        results = [{"home": str, "away": str, "home_goals": int, "away_goals": int, "league": str}]
-        """
         if len(results) < 100:
             return False
-
-        # 1. Moyenne de buts par match (home + away)
         total_goals = sum(r["home_goals"] + r["away_goals"] for r in results)
         self.avg_goals = max(0.5, total_goals / (2 * len(results)))
 
-        # 2. Calcul des forces par équipe
         team_stats: dict = {}
         for r in results:
             h, a = r["home"], r["away"]
             hg, ag = r["home_goals"], r["away_goals"]
             lg = r["league"]
-
             for t in (h, a):
                 if t not in team_stats:
                     team_stats[t] = {"gf": 0, "ga": 0, "n": 0, "league": lg}
-
             team_stats[h]["gf"] += hg
             team_stats[h]["ga"] += ag
             team_stats[h]["n"] += 1
@@ -73,7 +48,6 @@ class DixonColesModel:
             team_stats[a]["ga"] += hg
             team_stats[a]["n"] += 1
 
-        # 3. Forces normalisées
         for t, s in team_stats.items():
             if s["n"] < 3:
                 continue
@@ -84,7 +58,6 @@ class DixonColesModel:
                 "def": max(0.4, min(2.5, dfn)),
                 "league": s["league"],
             }
-
         self._trained = len(self.teams) >= 20
         return self._trained
 
@@ -92,7 +65,20 @@ class DixonColesModel:
         return (lam ** k) * math.exp(-lam) / math.factorial(k)
 
     def predict(self, home: str, away: str, max_goals: int = 6) -> Optional[dict]:
-        """Retourne {"home": p, "draw": p, "away": p} ou None."""
+        """Retourne 1X2 uniquement (compatibilité)."""
+        full = self.predict_all(home, away, max_goals)
+        if not full:
+            return None
+        return {
+            "home": full["p_home"],
+            "draw": full["p_draw"],
+            "away": full["p_away"],
+            "lambda_home": full["lambda_home"],
+            "lambda_away": full["lambda_away"],
+        }
+
+    def predict_all(self, home: str, away: str, max_goals: int = 8) -> Optional[dict]:
+        """Retourne toutes les probas : 1X2 + O/U 1.5/2.5/3.5 + BTTS."""
         h_key = self._find_team(home)
         a_key = self._find_team(away)
         if not h_key or not a_key:
@@ -101,49 +87,64 @@ class DixonColesModel:
         h_data = self.teams[h_key]
         a_data = self.teams[a_key]
 
-        # Expected goals (buts attendus)
         lambda_home = h_data["att"] * a_data["def"] * self.avg_goals * self.home_advantage
         lambda_away = a_data["att"] * h_data["def"] * self.avg_goals
 
-        # Proba de chaque score
+        # Distribution complète des scores
         p_home = p_draw = p_away = 0.0
+        p_over_15 = p_over_25 = p_over_35 = 0.0
+        p_btts_yes = 0.0
+        total = 0.0
+
         for i in range(max_goals + 1):
             for j in range(max_goals + 1):
                 p = self._poisson(lambda_home, i) * self._poisson(lambda_away, j)
+                total += p
                 if i > j:
                     p_home += p
                 elif i == j:
                     p_draw += p
                 else:
                     p_away += p
+                if (i + j) >= 2:
+                    p_over_15 += p
+                if (i + j) >= 3:
+                    p_over_25 += p
+                if (i + j) >= 4:
+                    p_over_35 += p
+                if i >= 1 and j >= 1:
+                    p_btts_yes += p
 
-        total = p_home + p_draw + p_away
         if total <= 0:
             return None
 
         return {
-            "home": round(p_home / total, 4),
-            "draw": round(p_draw / total, 4),
-            "away": round(p_away / total, 4),
+            "p_home": round(p_home / total, 4),
+            "p_draw": round(p_draw / total, 4),
+            "p_away": round(p_away / total, 4),
+            "over_1.5": round(p_over_15 / total, 4),
+            "under_1.5": round((total - p_over_15) / total, 4),
+            "over_2.5": round(p_over_25 / total, 4),
+            "under_2.5": round((total - p_over_25) / total, 4),
+            "over_3.5": round(p_over_35 / total, 4),
+            "under_3.5": round((total - p_over_35) / total, 4),
+            "btts_yes": round(p_btts_yes / total, 4),
+            "btts_no": round((total - p_btts_yes) / total, 4),
             "lambda_home": round(lambda_home, 2),
             "lambda_away": round(lambda_away, 2),
         }
 
     def _find_team(self, name: str) -> Optional[str]:
-        """Match approximatif du nom."""
         if not name:
             return None
         n = name.lower().strip()
-        # 1. Exact
         for t in self.teams:
             if t.lower().strip() == n:
                 return t
-        # 2. Inclusion
         for t in self.teams:
             tl = t.lower().strip()
             if n in tl or tl in n:
                 return t
-        # 3. Premier mot
         first = n.split()[0] if n.split() else ""
         if len(first) > 3:
             for t in self.teams:
@@ -153,7 +154,6 @@ class DixonColesModel:
 
 
 async def download_and_train() -> Optional[DixonColesModel]:
-    """Télécharge les CSV et entraîne le modèle."""
     results: list[dict] = []
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
         for league, url in LEAGUES.items():
@@ -182,13 +182,11 @@ async def download_and_train() -> Optional[DixonColesModel]:
                 print(f"⚠️ Dixon-Coles {league}: {e}")
 
     if not results:
-        print("❌ Dixon-Coles : aucune donnée téléchargée")
+        print("❌ Dixon-Coles : aucune donnée")
         return None
 
     model = DixonColesModel()
     ok = model.train(results)
     if ok:
         print(f"✅ Dixon-Coles entraîné sur {len(results)} matchs ({len(model.teams)} équipes)")
-    else:
-        print("⚠️ Dixon-Coles : entraînement insuffisant")
     return model if ok else None
