@@ -48,6 +48,7 @@ MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.60"))
 MAX_SIMPLE_SEND = int(os.getenv("MAX_SIMPLE_SEND", "10"))
 AI_REVIEW_ENABLED = os.getenv("AI_REVIEW_ENABLED", "true").lower() == "true"
+MAX_FIXTURES_FOR_ODDS = int(os.getenv("MAX_FIXTURES_FOR_ODDS", "25"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -59,8 +60,6 @@ if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
 TZ = ZoneInfo(NOTIFY_TZ)
 API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
-
-API_FOOTBALL_LEAGUES = [39, 140, 135, 78, 61]
 
 BETBETTER_LEAGUES = [
     "soccer/epl",
@@ -318,63 +317,64 @@ def fetch_betbetter_picks() -> dict[str, dict]:
 
 
 # =========================================================
-# API-FOOTBALL
+# API-FOOTBALL — TOUS LES FIXTURES DU JOUR
 # =========================================================
-async def fetch_api_football_fixtures(client: httpx.AsyncClient) -> list[dict]:
+async def fetch_all_fixtures_today(client: httpx.AsyncClient) -> list[dict]:
+    """
+    Récupère TOUS les fixtures du jour (tous championnats confondus) en 1 requête.
+    """
     today = today_iso()
-    all_fixtures: list[dict] = []
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
 
-    for league_id in API_FOOTBALL_LEAGUES:
-        try:
-            url = f"{API_FOOTBALL_BASE}/fixtures"
-            params = {
-                "league": league_id,
-                "date": today,
-                "timezone": "Africa/Abidjan",
-            }
-            r = await client.get(url, headers=headers, params=params, timeout=30.0)
+    try:
+        url = f"{API_FOOTBALL_BASE}/fixtures"
+        params = {
+            "date": today,
+            "timezone": "Africa/Abidjan",
+        }
+        r = await client.get(url, headers=headers, params=params, timeout=30.0)
 
-            remaining = r.headers.get("x-ratelimit-requests-remaining", "?")
-            used = r.headers.get("x-ratelimit-requests-used", "?")
-            print(f"🌍 API-Football league={league_id} -> {r.status_code} | used={used} remaining={remaining}")
+        remaining = r.headers.get("x-ratelimit-requests-remaining", "?")
+        print(f"🌍 API-Football /fixtures?date={today} -> {r.status_code} | remaining={remaining}")
 
-            if r.status_code >= 400:
-                print(f"⚠️ Body: {r.text[:200]}")
+        if r.status_code >= 400:
+            print(f"⚠️ Body: {r.text[:200]}")
+            return []
+
+        data = r.json()
+        fixtures_raw = data.get("response", []) or []
+        print(f"📦 Fixtures brutes du jour: {len(fixtures_raw)}")
+
+        all_fixtures: list[dict] = []
+        for fx in fixtures_raw:
+            fixture_info = fx.get("fixture", {})
+            league_info = fx.get("league", {})
+            teams = fx.get("teams", {})
+            home = teams.get("home", {}).get("name", "")
+            away = teams.get("away", {}).get("name", "")
+            kickoff = fixture_info.get("date", "")
+            fixture_id = fixture_info.get("id")
+
+            if not home or not away or not fixture_id:
+                continue
+            if not is_today(kickoff):
                 continue
 
-            data = r.json()
-            fixtures = data.get("response", []) or []
+            all_fixtures.append({
+                "event_id": str(fixture_id),
+                "home": home,
+                "away": away,
+                "kickoff": kickoff,
+                "league": league_info.get("name", ""),
+                "league_id": league_info.get("id"),
+                "raw": fx,
+            })
 
-            for fx in fixtures:
-                fixture_info = fx.get("fixture", {})
-                league_info = fx.get("league", {})
-                teams = fx.get("teams", {})
-                home = teams.get("home", {}).get("name", "")
-                away = teams.get("away", {}).get("name", "")
-                kickoff = fixture_info.get("date", "")
-                fixture_id = fixture_info.get("id")
-
-                if not home or not away or not fixture_id:
-                    continue
-                if not is_today(kickoff):
-                    continue
-
-                all_fixtures.append({
-                    "event_id": str(fixture_id),
-                    "home": home,
-                    "away": away,
-                    "kickoff": kickoff,
-                    "league": league_info.get("name", ""),
-                    "raw": fx,
-                })
-
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            print(f"⚠️ API-Football league={league_id} crash: {e}")
-
-    print(f"📦 Total fixtures API-Football: {len(all_fixtures)}")
-    return all_fixtures
+        print(f"📅 Fixtures filtrées (J/J+1): {len(all_fixtures)}")
+        return all_fixtures
+    except Exception as e:
+        print(f"⚠️ API-Football fixtures crash: {e}")
+        return []
 
 
 async def fetch_api_football_odds(client: httpx.AsyncClient, fixture_id: int) -> dict:
@@ -393,11 +393,7 @@ async def fetch_api_football_odds(client: httpx.AsyncClient, fixture_id: int) ->
         if not responses:
             return {}
 
-        result = {
-            "h2h": {},
-            "totals": {},
-            "btts": {},
-        }
+        result = {"h2h": {}, "totals": {}, "btts": {}}
 
         for resp in responses:
             for book in resp.get("bookmakers", []) or []:
@@ -709,7 +705,7 @@ def find_bb_for_fixture(fixture: dict, bb_data: dict) -> Optional[dict]:
 # =========================================================
 # BUILD SELECTIONS
 # =========================================================
-def build_selections_from_api_football(fixtures: list[dict], odds_map: dict, bb_data: dict) -> list[Selection]:
+def build_selections(fixtures: list[dict], odds_map: dict, bb_data: dict) -> list[Selection]:
     selections: list[Selection] = []
     seen_keys = set()
 
@@ -1141,7 +1137,7 @@ async def start_cmd(message: Message):
     txt = (
         f"{format_header()}\n\n"
         f"<b>👋 Bienvenue !</b>\n\n"
-        f"Ce bot analyse les matchs avec :\n"
+        f"Ce bot analyse <b>tous les matchs du jour</b> (tous championnats) et détecte les value bets avec :\n"
         f"  • Un <b>modèle statistique</b> (BetBetter)\n"
         f"  • Les <b>cotes réelles</b> d'API-Football\n"
         f"  • Une <b>IA analyste (Gemini)</b> qui valide ou rejette chaque pari\n\n"
@@ -1166,10 +1162,12 @@ async def debug_cmd(message: Message):
         f"<b>🔍 DEBUG</b>\n"
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"BetBetter matchs : <b>{d.get('bb_matches', 0)}</b>\n"
-        f"Fixtures API-Football : <b>{d.get('fixtures', 0)}</b>\n"
-        f"Cotes récupérées : <b>{d.get('odds_fetched', 0)}</b>\n"
+        f"Fixtures API-Football (total) : <b>{d.get('fixtures_raw', 0)}</b>\n"
+        f"Fixtures filtrées (J/J+1) : <b>{d.get('fixtures', 0)}</b>\n"
         f"Appariés fuzzy : <b>{d.get('matched_fuzzy', 0)}</b>\n"
         f"Appariés IA : <b>{d.get('matched_ai', 0)}</b>\n"
+        f"Total appariés : <b>{d.get('matched_total', 0)}</b>\n"
+        f"Cotes récupérées : <b>{d.get('odds_fetched', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"✅ ACCEPT IA : <b>{d.get('ai_accept', 0)}</b>\n"
         f"⚠️ CAUTION IA : <b>{d.get('ai_caution', 0)}</b>\n"
@@ -1228,29 +1226,24 @@ async def btn_scan(message: Message):
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
+        # 1. BetBetter
         bb = fetch_betbetter_picks()
         print(f"🧠 BetBetter matchs uniques: {len(bb)}")
 
+        # 2. Fixtures du jour (TOUS les championnats, 1 requête)
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            fixtures = await fetch_api_football_fixtures(client)
-            print(f"📦 Fixtures API-Football: {len(fixtures)}")
+            fixtures_raw_count = 0
+            fixtures = await fetch_all_fixtures_today(client)
 
-            odds_map: dict = {}
-            for fx in fixtures:
-                fid = int(fx["event_id"])
-                odds = await fetch_api_football_odds(client, fid)
-                if odds:
-                    odds_map[fx["event_id"]] = odds
-                await asyncio.sleep(0.3)
-
-            print(f"💰 Cotes récupérées: {len(odds_map)}")
-
+        # 3. Matching fuzzy
         matched_fuzzy = 0
+        matched_ids = set()
         for fx in fixtures:
             h, a = fx.get("home", ""), fx.get("away", "")
             key = f"{normalize_name(a)}|{normalize_name(h)}"
             if key in bb:
                 matched_fuzzy += 1
+                matched_ids.add(fx["event_id"])
             else:
                 for k in bb.keys():
                     try:
@@ -1260,17 +1253,43 @@ async def scan():
                     hn, an = normalize_name(h), normalize_name(a)
                     if (hn in k_home or k_home in hn) and (an in k_away or k_away in an):
                         matched_fuzzy += 1
+                        matched_ids.add(fx["event_id"])
                         break
 
+        # 4. Matching IA pour le reste
         matched_ai = 0
         if GEMINI_API_KEY:
             print(f"🤖 Matching Gemini en cours...")
             matched_ai = await ai_rematch_all(bb, fixtures)
             print(f"🤖 Matchings IA ajoutés: {matched_ai}")
 
-        selections = build_selections_from_api_football(fixtures, odds_map, bb)
+        # 5. Récupérer les cotes UNIQUEMENT pour les fixtures matchés
+        fixtures_to_odds = []
+        for fx in fixtures:
+            h, a = fx.get("home", ""), fx.get("away", "")
+            if find_bb_for_fixture(fx, bb):
+                fixtures_to_odds.append(fx)
+
+        # Limite pour économiser le quota
+        fixtures_to_odds = fixtures_to_odds[:MAX_FIXTURES_FOR_ODDS]
+        print(f"💰 Récupération des cotes pour {len(fixtures_to_odds)} fixtures matchées...")
+
+        odds_map: dict = {}
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for fx in fixtures_to_odds:
+                fid = int(fx["event_id"])
+                odds = await fetch_api_football_odds(client, fid)
+                if odds:
+                    odds_map[fx["event_id"]] = odds
+                await asyncio.sleep(0.3)
+
+        print(f"💰 Cotes récupérées: {len(odds_map)}")
+
+        # 6. Construire les sélections
+        selections = build_selections(fixtures, odds_map, bb)
         print(f"🎯 Sélections candidates: {len(selections)}")
 
+        # 7. Revue IA
         if AI_REVIEW_ENABLED and GEMINI_API_KEY and selections:
             await ai_review_all(selections)
 
@@ -1285,10 +1304,12 @@ async def scan():
 
         STATE["debug"] = {
             "bb_matches": len(bb),
+            "fixtures_raw": fixtures_raw_count,
             "fixtures": len(fixtures),
-            "odds_fetched": len(odds_map),
             "matched_fuzzy": matched_fuzzy,
             "matched_ai": matched_ai,
+            "matched_total": matched_fuzzy + matched_ai,
+            "odds_fetched": len(odds_map),
             "selections": len(selections),
             "ai_accept": ai_accept,
             "ai_caution": ai_caution,
@@ -1297,10 +1318,11 @@ async def scan():
         }
 
         print("──────── RÉSUMÉ ────────")
-        print(f"Fixtures API-Football : {len(fixtures)}")
-        print(f"Cotes récupérées      : {len(odds_map)}")
+        print(f"BetBetter matchs      : {len(bb)}")
+        print(f"Fixtures du jour      : {len(fixtures)}")
         print(f"Appariés fuzzy        : {matched_fuzzy}")
         print(f"Appariés IA           : {matched_ai}")
+        print(f"Cotes récupérées      : {len(odds_map)}")
         print(f"Sélections            : {len(selections)}")
         print(f"  ✅ ACCEPT IA        : {ai_accept}")
         print(f"  ⚠️ CAUTION IA       : {ai_caution}")
