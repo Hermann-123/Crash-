@@ -21,11 +21,6 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
 
 try:
-    import betbetter
-except Exception:
-    betbetter = None
-
-try:
     from dixon_coles import download_and_train as dc_train, DixonColesModel
 except Exception:
     dc_train = None
@@ -318,14 +313,14 @@ async def init_dixon_coles():
 
 
 # =========================================================
-# THE ODDS API
+# THE ODDS API (markets: h2h, spreads, totals uniquement)
 # =========================================================
 async def fetch_odds_api_league(client: httpx.AsyncClient, sport_key: str) -> list[dict]:
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
-        "markets": "h2h,spreads,totals,btts",
+        "markets": "h2h,spreads,totals",
         "oddsFormat": "decimal",
     }
     try:
@@ -366,8 +361,8 @@ def extract_event_fields(ev: dict) -> dict:
 
 
 def extract_odds_from_event(ev: dict) -> dict:
-    """Extrait h2h + spreads + totals + btts."""
-    result = {"h2h": {}, "spreads": {}, "totals": {}, "btts": {}}
+    """Extrait h2h + spreads + totals (sans btts)."""
+    result = {"h2h": {}, "spreads": {}, "totals": {}}
     home = ev.get("home_team", "")
     away = ev.get("away_team", "")
 
@@ -421,12 +416,6 @@ def extract_odds_from_event(ev: dict) -> dict:
                         except (ValueError, TypeError):
                             continue
                         result["totals"][key] = max(result["totals"].get(key, 0), price)
-
-                elif mk == "btts":
-                    if "yes" in name.lower():
-                        result["btts"]["yes"] = max(result["btts"].get("yes", 0), price)
-                    elif "no" in name.lower():
-                        result["btts"]["no"] = max(result["btts"].get("no", 0), price)
 
     return result
 
@@ -537,16 +526,12 @@ async def ai_review_all(selections: list[Selection]) -> None:
 
 
 # =========================================================
-# HOUSE PICKS (Dixon-Coles)
+# HOUSE PICKS
 # =========================================================
 def build_house_picks(events_norm, odds_by_id, used_today):
-    """
-    Génère NOS propres picks à partir de Dixon-Coles + cotes.
-    Marchés couverts : 1X2, Over/Under 1.5/2.5/3.5, BTTS.
-    """
     selections: list[Selection] = []
     seen = set()
-    stats = {"1x2": 0, "ou": 0, "btts": 0}
+    stats = {"1x2": 0, "ou": 0, "handicap": 0}
 
     if not DC_MODEL:
         return selections
@@ -568,7 +553,7 @@ def build_house_picks(events_norm, odds_by_id, used_today):
             if not odds:
                 continue
 
-            # === 1X2 ===
+            # 1X2
             h2h = odds.get("h2h", {})
             for key, prob in (("home", pred["p_home"]),
                               ("draw", pred["p_draw"]),
@@ -603,7 +588,7 @@ def build_house_picks(events_norm, odds_by_id, used_today):
                 ))
                 stats["1x2"] += 1
 
-            # === Over/Under ===
+            # Over/Under
             totals = odds.get("totals", {})
             for line in (1.5, 2.5, 3.5):
                 for prefix, prob_key in (("over", f"over_{line}"), ("under", f"under_{line}")):
@@ -632,40 +617,10 @@ def build_house_picks(events_norm, odds_by_id, used_today):
                     ))
                     stats["ou"] += 1
 
-            # === BTTS ===
-            btts = odds.get("btts", {})
-            for key, prob_key, label in (
-                ("yes", "btts_yes", "Les 2 marquent : Oui"),
-                ("no", "btts_no", "Les 2 marquent : Non"),
-            ):
-                prob = pred.get(prob_key)
-                if prob is None or prob < MIN_PROB:
-                    continue
-                odd = btts.get(key)
-                if not odd or odd <= 1.01:
-                    continue
-                edge = prob * odd - 1.0
-                if edge < MIN_EDGE:
-                    continue
-
-                dedup = f"{event_id}|BTTS|{label}"
-                if dedup in seen:
-                    continue
-                seen.add(dedup)
-
-                selections.append(Selection(
-                    event_id=event_id, league=league, home=home, away=away,
-                    kickoff=kickoff, market="BTTS", pick_label=label,
-                    odds=round(odd, 2), model_prob=round(prob, 4),
-                    edge=round(edge, 4), bookmaker="The Odds API",
-                    source="house",
-                ))
-                stats["btts"] += 1
-
         except Exception as e:
             print(f"⚠️ build_house_picks crash: {e}")
 
-    print(f"🏠 Picks maison : 1X2={stats['1x2']} O/U={stats['ou']} BTTS={stats['btts']}")
+    print(f"🏠 Picks maison : 1X2={stats['1x2']} O/U={stats['ou']}")
     return selections
 
 
@@ -980,7 +935,6 @@ async def btn_scan(message):
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
-        # 1. Events + cotes
         events_raw = await fetch_all_events_with_odds()
         print(f"📦 Events The Odds API: {len(events_raw)}")
 
@@ -996,7 +950,6 @@ async def scan():
             odds_by_id[fields["event_id"]] = extract_odds_from_event(ev)
         print(f"🎯 Events J/J+1: {len(events_norm)}")
 
-        # 2. Dixon-Coles predictions
         dc_verdicts = {}
         if DC_MODEL:
             for fx in events_norm:
@@ -1005,12 +958,10 @@ async def scan():
                     dc_verdicts[fx["event_id"]] = pred
             print(f"🧮 Dixon-Coles : {len(dc_verdicts)} prédictions")
 
-        # 3. House picks (nos propres pronostics)
         used_today = load_used_today()
         selections = build_house_picks(events_norm, odds_by_id, used_today)
         print(f"🏠 Picks maison total : {len(selections)}")
 
-        # 4. Revue IA
         if GEMINI_API_KEY and selections:
             await ai_review_all(selections)
 
