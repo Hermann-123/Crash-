@@ -31,7 +31,7 @@ except Exception:
 # =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 
@@ -58,8 +58,8 @@ if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
 
 TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_BASE = "https://api.the-odds-api.com/v4"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "openai/gpt-oss-20b"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_MODEL = "gemini-2.0-flash"
 
 SOCCER_KEYS = [
     "soccer_epl",
@@ -219,7 +219,6 @@ def kickoff_local(iso_str: str) -> str:
 
 
 def is_today(iso_str: str) -> bool:
-    """Accepte les matchs d'aujourd'hui (pas commencés) et de demain."""
     dt = parse_dt_safe(iso_str)
     if not dt:
         return False
@@ -373,11 +372,11 @@ async def fetch_all_odds_events() -> list[dict]:
 
 
 # =========================================================
-# GROQ — MATCHING IA
+# GEMINI — MATCHING IA
 # =========================================================
 async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
                           candidates: list[tuple[str, str, str]]) -> Optional[str]:
-    if not GROQ_API_KEY:
+    if not GEMINI_API_KEY:
         return None
     if not candidates:
         return None
@@ -397,31 +396,28 @@ async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
     )
 
     payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": "Tu réponds uniquement par un chiffre."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0,
-        "max_completion_tokens": 20,
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 20},
     }
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
     try:
-        r = await client.post(GROQ_URL, json=payload, headers=headers, timeout=15.0)
+        r = await client.post(
+            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            json=payload,
+            timeout=15.0,
+        )
         if r.status_code >= 400:
-            print(f"⚠️ Groq match {r.status_code}: {r.text[:150]}")
+            print(f"⚠️ Gemini match {r.status_code}: {r.text[:150]}")
             AI_MATCH_CACHE[cache_key] = None
             return None
 
         data = r.json()
         try:
-            text = data["choices"][0]["message"]["content"] or ""
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
         except (KeyError, IndexError, TypeError):
             AI_MATCH_CACHE[cache_key] = None
             return None
 
-        text = str(text).strip()
         match = re.search(r"\d+", text)
         if not match:
             AI_MATCH_CACHE[cache_key] = None
@@ -436,13 +432,13 @@ async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
         AI_MATCH_CACHE[cache_key] = None
         return None
     except Exception as e:
-        print(f"⚠️ Groq match crash: {e}")
+        print(f"⚠️ Gemini match crash: {e}")
         AI_MATCH_CACHE[cache_key] = None
         return None
 
 
 async def ai_rematch_all(bb_data: dict, events: list[dict]) -> int:
-    if not GROQ_API_KEY:
+    if not GEMINI_API_KEY:
         return 0
 
     today_candidates = [
@@ -468,7 +464,7 @@ async def ai_rematch_all(bb_data: dict, events: list[dict]) -> int:
     if not unmatched_candidates:
         return 0
 
-    print(f"🤖 Groq : {len(unmatched_candidates)} events non appariés")
+    print(f"🤖 Gemini : {len(unmatched_candidates)} events non appariés")
 
     count = 0
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -490,16 +486,16 @@ async def ai_rematch_all(bb_data: dict, events: list[dict]) -> int:
                 print(f"  🤖 Match IA : {bb_home} vs {bb_away} → {matched_id}")
                 unmatched_candidates = [c for c in unmatched_candidates if c[0] != matched_id]
 
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(2.0)  # Gemini free tier : 15 RPM
 
     return count
 
 
 # =========================================================
-# GROQ — REVUE ANALYTIQUE (LE VETO)
+# GEMINI — REVUE ANALYTIQUE (LE VETO)
 # =========================================================
 async def ai_review_selection(client: httpx.AsyncClient, sel: Selection) -> None:
-    if not GROQ_API_KEY:
+    if not GEMINI_API_KEY:
         return
 
     cache_key = f"rev|{sel.event_id}|{sel.market}|{sel.pick_label}"
@@ -537,25 +533,23 @@ Règles :
 - Pas de probas chiffrées"""
 
     payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": "Tu réponds STRICTEMENT au format VERDICT/ANALYSE/CONSEIL."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.3,
-        "max_completion_tokens": 400,
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 400},
     }
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
     try:
-        r = await client.post(GROQ_URL, json=payload, headers=headers, timeout=30.0)
+        r = await client.post(
+            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            json=payload,
+            timeout=30.0,
+        )
         if r.status_code >= 400:
-            print(f"⚠️ Groq review {r.status_code}: {r.text[:200]}")
+            print(f"⚠️ Gemini review {r.status_code}: {r.text[:200]}")
             return
 
         data = r.json()
         try:
-            text = data["choices"][0]["message"]["content"] or ""
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError, TypeError):
             return
 
@@ -584,11 +578,11 @@ Règles :
             "verdict": verdict, "analysis": analysis, "advice": advice
         }
     except Exception as e:
-        print(f"⚠️ Groq review crash: {e}")
+        print(f"⚠️ Gemini review crash: {e}")
 
 
 async def ai_review_all(selections: list[Selection]) -> None:
-    if not GROQ_API_KEY or not AI_REVIEW_ENABLED:
+    if not GEMINI_API_KEY or not AI_REVIEW_ENABLED:
         return
     if not selections:
         return
@@ -599,7 +593,7 @@ async def ai_review_all(selections: list[Selection]) -> None:
             await ai_review_selection(client, s)
             if (i + 1) % 5 == 0:
                 print(f"  ... {i+1}/{len(selections)}")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(2.0)  # Gemini free tier : 15 RPM
 
     accepted = sum(1 for s in selections if s.ai_verdict == "ACCEPT")
     caution = sum(1 for s in selections if s.ai_verdict == "CAUTION")
@@ -716,7 +710,6 @@ def find_odds_for_pick(event: dict, pick: dict, home: str, away: str) -> tuple[O
         if r[0] is not None:
             return r
 
-        # Fallback : Spread -0.5 = victoire simple → Moneyline
         if target is not None and abs(target - (-0.5)) < 0.01:
             if is_home:
                 return find_best_odds(event, "h2h", lambda o: _match_name(normalize_name(o.get("name", "")), home_norm))
@@ -793,7 +786,6 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
                 market = pick.get("market", "")
                 line = pick.get("line")
 
-                # Filtre Spread : lignes entre -1.5 et +1.5
                 if market == "Spread":
                     try:
                         line_f = float(line) if line is not None else None
@@ -802,7 +794,6 @@ def build_selections(odds_events: list[dict], bb_data: dict) -> list[Selection]:
                     if line_f is None or line_f < -1.5 or line_f > 1.5:
                         continue
 
-                # Filtre Total : lignes 0.5, 1.5 ou 2.5
                 if market == "Total":
                     try:
                         line_f = float(line) if line is not None else None
@@ -1193,7 +1184,7 @@ async def start_cmd(message: Message):
         f"Ce bot analyse les matchs avec :\n"
         f"  • Un <b>modèle statistique</b> (BetBetter)\n"
         f"  • Les <b>cotes réelles</b> de 40+ bookmakers\n"
-        f"  • Une <b>IA analyste (Groq)</b> qui valide ou rejette chaque pari\n\n"
+        f"  • Une <b>IA analyste (Gemini)</b> qui valide ou rejette chaque pari\n\n"
         f"<b>Utilise les boutons ci-dessous 👇</b>"
     )
     await safe_answer(message, txt)
@@ -1304,15 +1295,15 @@ async def scan():
                         break
 
         matched_ai = 0
-        if GROQ_API_KEY:
-            print(f"🤖 Matching Groq en cours...")
+        if GEMINI_API_KEY:
+            print(f"🤖 Matching Gemini en cours...")
             matched_ai = await ai_rematch_all(bb, events)
             print(f"🤖 Matchings IA ajoutés: {matched_ai}")
 
         selections = build_selections(events, bb)
         print(f"🎯 Sélections candidates: {len(selections)}")
 
-        if AI_REVIEW_ENABLED and GROQ_API_KEY and selections:
+        if AI_REVIEW_ENABLED and GEMINI_API_KEY and selections:
             await ai_review_all(selections)
 
         selections.sort(key=lambda s: s.score(), reverse=True)
@@ -1383,7 +1374,7 @@ async def daily_broadcast():
 async def bootstrap():
     STATE["tracker"] = load_tracker()
     STATE["ready"] = True
-    print("✅ Bot prêt (BetBetter + The Odds API + Groq VETO).")
+    print("✅ Bot prêt (BetBetter + The Odds API + Gemini VETO).")
 
 
 @asynccontextmanager
