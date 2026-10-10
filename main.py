@@ -63,13 +63,12 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1
 
 BETBETTER_LEAGUES = [
     "soccer/epl",
-    "soccer/la-liga",
-    "soccer/serie-a",
-    "soccer/bundesliga",
-    "soccer/ligue-1",
+    "soccer/spain_la_liga",
+    "soccer/italy_serie_a",
+    "soccer/germany_bundesliga",
+    "soccer/france_ligue_one",
 ]
 
-# Flag pour ne logger la structure brute qu'une seule fois
 STRUCTURE_LOGGED = {"fixtures": False, "odds": False}
 
 
@@ -188,9 +187,14 @@ def normalize_name(s: str) -> str:
     return s
 
 
-def parse_dt_safe(s: str) -> Optional[datetime]:
+def parse_dt_safe(s) -> Optional[datetime]:
     if not s:
         return None
+    if isinstance(s, (int, float)):
+        try:
+            return datetime.fromtimestamp(int(s), tz=ZoneInfo("UTC")).astimezone(TZ)
+        except Exception:
+            return None
     s = str(s).strip()
     s = re.sub(r"(\.\d{6})\d+", r"\1", s)
     s = s.replace("Z", "+00:00")
@@ -203,12 +207,12 @@ def parse_dt_safe(s: str) -> Optional[datetime]:
         return None
 
 
-def kickoff_local(iso_str: str) -> str:
+def kickoff_local(iso_str) -> str:
     dt = parse_dt_safe(iso_str)
     return dt.strftime("%H:%M") if dt else "?"
 
 
-def is_upcoming(iso_str: str) -> bool:
+def is_upcoming(iso_str) -> bool:
     dt = parse_dt_safe(iso_str)
     if not dt:
         return False
@@ -244,6 +248,14 @@ def edge_bar(edge: float) -> str:
 
 def ai_verdict_emoji(v: str) -> str:
     return {"ACCEPT": "✅", "CAUTION": "⚠️", "REJECT": "❌"}.get(v.upper(), "❓")
+
+
+def auth_headers() -> dict:
+    """Header d'authentification 5DollarFootballAPI (Bearer)."""
+    return {
+        "Authorization": f"Bearer {FOOTBALL_API_KEY}",
+        "Accept": "application/json",
+    }
 
 
 # =========================================================
@@ -320,119 +332,115 @@ def fetch_betbetter_picks() -> dict[str, dict]:
 
 
 # =========================================================
-# FOOTBALL-API — FIXTURES
+# 5DOLLARFOOTBALLAPI — FIXTURES
 # =========================================================
 async def fetch_fixtures(client: httpx.AsyncClient) -> list[dict]:
-    """Récupère les fixtures via 5DollarFootballAPI."""
+    """Récupère les fixtures (start_time/end_time en Unix, Bearer auth)."""
+    now = datetime.now(TZ)
+    start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = start_dt + timedelta(days=2)
+
+    start_unix = int(start_dt.timestamp())
+    end_unix = int(end_dt.timestamp())
+
     url = f"{FOOTBALL_API_BASE}/fixtures"
-    params = {"date": today_iso()}
-    headers = {"x-api-key": FOOTBALL_API_KEY}
+    params = {"start_time": start_unix, "end_time": end_unix}
 
     try:
-        r = await client.get(url, params=params, headers=headers, timeout=30.0)
-        print(f"🌍 5DFootballAPI /fixtures?date={today_iso()} -> {r.status_code}")
+        r = await client.get(url, params=params, headers=auth_headers(), timeout=30.0)
+        print(f"🌍 /fixtures [{start_unix}..{end_unix}] -> {r.status_code}")
 
         if r.status_code >= 400:
-            print(f"⚠️ Body: {r.text[:300]}")
-            # Tentative avec clé en paramètre
-            r = await client.get(url, params={**params, "api_key": FOOTBALL_API_KEY}, timeout=30.0)
-            print(f"🌍 (retry with api_key param) -> {r.status_code}")
-            if r.status_code >= 400:
-                print(f"⚠️ Body: {r.text[:300]}")
-                return []
+            print(f"⚠️ Body: {r.text[:400]}")
+            return []
 
         data = r.json()
 
-        # LOG LA STRUCTURE UNE SEULE FOIS
         if not STRUCTURE_LOGGED["fixtures"]:
             print("=" * 70)
             print("🔬 STRUCTURE BRUTE DES FIXTURES")
-            print(json.dumps(data, ensure_ascii=False, indent=2)[:2500])
+            print(json.dumps(data, ensure_ascii=False, indent=2)[:3000])
             print("=" * 70)
             STRUCTURE_LOGGED["fixtures"] = True
 
-        # Chercher la liste (data / fixtures / response / matches)
         fixtures = []
         if isinstance(data, list):
             fixtures = data
         elif isinstance(data, dict):
-            for key in ("data", "fixtures", "response", "matches", "results"):
+            for key in ("data", "fixtures", "response", "matches", "results", "events"):
                 if isinstance(data.get(key), list):
                     fixtures = data[key]
                     break
 
         print(f"📦 Fixtures brutes: {len(fixtures)}")
 
-        # Filtrer
         upcoming = []
         for fx in fixtures:
             if not isinstance(fx, dict):
                 continue
-            dt_str = (
+            dt_val = (
                 fx.get("date")
                 or fx.get("kickoff")
                 or fx.get("scheduled_at")
                 or fx.get("start_time")
                 or fx.get("commence_time")
+                or fx.get("time")
                 or ""
             )
-            if not is_upcoming(dt_str):
-                continue
-            upcoming.append(fx)
+            if is_upcoming(dt_val):
+                upcoming.append(fx)
 
         print(f"📅 Fixtures J/J+1: {len(upcoming)}")
         return upcoming
     except Exception as e:
-        print(f"⚠️ 5DFootballAPI fixtures crash: {e}")
+        print(f"⚠️ /fixtures crash: {e}")
         return []
 
 
 def extract_fixture_fields(fx: dict) -> dict:
-    """Normalise une fixture avec plusieurs clés possibles."""
-    # Équipes
     home = ""
     away = ""
-    for k in ("home_team", "homeTeam", "home", "team_home"):
+    for k in ("home_team", "homeTeam", "home", "team_home", "local_team", "home_name"):
         v = fx.get(k)
         if isinstance(v, dict):
-            home = v.get("name") or v.get("nom") or ""
-            break
+            home = v.get("name") or v.get("nom") or v.get("team_name") or ""
+            if home: break
         elif isinstance(v, str) and v:
             home = v
             break
 
-    for k in ("away_team", "awayTeam", "away", "team_away"):
+    for k in ("away_team", "awayTeam", "away", "team_away", "visitor_team", "away_name"):
         v = fx.get(k)
         if isinstance(v, dict):
-            away = v.get("name") or v.get("nom") or ""
-            break
+            away = v.get("name") or v.get("nom") or v.get("team_name") or ""
+            if away: break
         elif isinstance(v, str) and v:
             away = v
             break
 
-    # Ligue
     league = ""
-    for k in ("league", "competition", "tournament"):
+    for k in ("league", "competition", "tournament", "league_name"):
         v = fx.get(k)
         if isinstance(v, dict):
             league = v.get("name") or v.get("nom") or ""
-            break
+            if league: break
         elif isinstance(v, str) and v:
             league = v
             break
 
-    # Date
     kickoff = (
         fx.get("date")
         or fx.get("kickoff")
         or fx.get("scheduled_at")
         or fx.get("start_time")
         or fx.get("commence_time")
+        or fx.get("time")
         or ""
     )
 
-    # ID
-    event_id = str(fx.get("id") or fx.get("fixture_id") or fx.get("match_id") or fx.get("event_id") or "")
+    event_id = str(
+        fx.get("id") or fx.get("fixture_id") or fx.get("match_id") or fx.get("event_id") or ""
+    )
 
     return {
         "event_id": event_id,
@@ -445,29 +453,26 @@ def extract_fixture_fields(fx: dict) -> dict:
 
 
 # =========================================================
-# FOOTBALL-API — ODDS
+# 5DOLLARFOOTBALLAPI — ODDS
 # =========================================================
 async def fetch_odds(client: httpx.AsyncClient, fixture_id: str) -> dict:
     """Récupère les cotes d'une fixture."""
-    url = f"{FOOTBALL_API_BASE}/odds/{fixture_id}"
-    headers = {"x-api-key": FOOTBALL_API_KEY}
+    url = f"{FOOTBALL_API_BASE}/fixtures/{fixture_id}/odds"
 
     try:
-        r = await client.get(url, headers=headers, timeout=20.0)
+        r = await client.get(url, headers=auth_headers(), timeout=20.0)
         if r.status_code >= 400:
-            # Tentative alternative
-            r = await client.get(url, params={"api_key": FOOTBALL_API_KEY}, timeout=20.0)
-            if r.status_code >= 400:
-                if r.status_code != 404:
-                    print(f"⚠️ Odds {fixture_id} -> {r.status_code}: {r.text[:150]}")
-                return {}
+            # Essaie sans /odds à la fin (peut-être un endpoint différent)
+            if r.status_code != 404:
+                print(f"⚠️ Odds {fixture_id} -> {r.status_code}: {r.text[:150]}")
+            return {}
 
         data = r.json()
 
         if not STRUCTURE_LOGGED["odds"]:
             print("=" * 70)
             print("🔬 STRUCTURE BRUTE DES COTES")
-            print(json.dumps(data, ensure_ascii=False, indent=2)[:2500])
+            print(json.dumps(data, ensure_ascii=False, indent=2)[:3000])
             print("=" * 70)
             STRUCTURE_LOGGED["odds"] = True
 
@@ -477,47 +482,49 @@ async def fetch_odds(client: httpx.AsyncClient, fixture_id: str) -> dict:
         return {}
 
 
-def parse_odds(data: dict) -> dict:
-    """Parse défensif : cherche les cotes 1X2, Over/Under, BTTS."""
+def parse_odds(data) -> dict:
+    """Parse défensif : cherche 1X2, Over/Under, BTTS."""
     result = {"h2h": {}, "totals": {}, "btts": {}}
 
-    if not isinstance(data, dict) and not isinstance(data, list):
+    if not isinstance(data, (dict, list)):
         return result
 
     def walk(obj):
         if isinstance(obj, dict):
-            # 1X2
-            for k in ("home", "draw", "away", "1", "X", "2"):
+            for k in ("home", "draw", "away", "1", "X", "2", "home_win", "draw_win", "away_win"):
                 v = obj.get(k)
                 if isinstance(v, (int, float)) and v > 1.01:
-                    key = {"1": "home", "X": "draw", "2": "away"}.get(k, k)
-                    result["h2h"][key] = max(result["h2h"].get(key, 0), float(v))
+                    key = {"1": "home", "X": "draw", "2": "away",
+                           "home_win": "home", "draw_win": "draw", "away_win": "away"}.get(k, k)
+                    if key in ("home", "draw", "away"):
+                        result["h2h"][key] = max(result["h2h"].get(key, 0), float(v))
                 elif isinstance(v, dict):
-                    p = v.get("price") or v.get("odd") or v.get("cote") or v.get("value")
+                    p = v.get("price") or v.get("odd") or v.get("cote") or v.get("value") or v.get("decimal")
                     if isinstance(p, (int, float)) and p > 1.01:
-                        key = {"1": "home", "X": "draw", "2": "away"}.get(k, k)
-                        result["h2h"][key] = max(result["h2h"].get(key, 0), float(p))
+                        key = {"1": "home", "X": "draw", "2": "away",
+                               "home_win": "home", "draw_win": "draw", "away_win": "away"}.get(k, k)
+                        if key in ("home", "draw", "away"):
+                            result["h2h"][key] = max(result["h2h"].get(key, 0), float(p))
 
-            # Over/Under
             for k, v in obj.items():
                 k_low = str(k).lower()
                 m = re.match(r"(over|under)_?([\d.]+)", k_low)
-                if m and isinstance(v, (int, float)) and v > 1.01:
-                    result["totals"][f"{m.group(1)}_{m.group(2)}"] = float(v)
-                elif m and isinstance(v, dict):
-                    p = v.get("price") or v.get("odd")
-                    if isinstance(p, (int, float)) and p > 1.01:
-                        result["totals"][f"{m.group(1)}_{m.group(2)}"] = float(p)
+                if m:
+                    if isinstance(v, (int, float)) and v > 1.01:
+                        result["totals"][f"{m.group(1)}_{m.group(2)}"] = float(v)
+                    elif isinstance(v, dict):
+                        p = v.get("price") or v.get("odd") or v.get("value")
+                        if isinstance(p, (int, float)) and p > 1.01:
+                            result["totals"][f"{m.group(1)}_{m.group(2)}"] = float(p)
 
-                # BTTS
-                if k_low in ("btts_yes", "yes", "both_teams_yes", "gg"):
+                if k_low in ("btts_yes", "yes", "both_teams_yes", "gg", "btts.yes"):
                     if isinstance(v, (int, float)) and v > 1.01:
                         result["btts"]["yes"] = float(v)
                     elif isinstance(v, dict):
                         p = v.get("price") or v.get("odd")
                         if isinstance(p, (int, float)) and p > 1.01:
                             result["btts"]["yes"] = float(p)
-                if k_low in ("btts_no", "no", "both_teams_no", "ng"):
+                if k_low in ("btts_no", "no", "both_teams_no", "ng", "btts.no"):
                     if isinstance(v, (int, float)) and v > 1.01:
                         result["btts"]["no"] = float(v)
                     elif isinstance(v, dict):
@@ -525,7 +532,6 @@ def parse_odds(data: dict) -> dict:
                         if isinstance(p, (int, float)) and p > 1.01:
                             result["btts"]["no"] = float(p)
 
-            # Récursion
             for v in obj.values():
                 walk(v)
         elif isinstance(obj, list):
@@ -546,15 +552,21 @@ async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
     cache_key = f"{normalize_name(bb_home)}|{normalize_name(bb_away)}"
     if cache_key in AI_MATCH_CACHE:
         return AI_MATCH_CACHE[cache_key]
+
     candidates = candidates[:20]
     lignes = "\n".join(f"{i+1}. {h} vs {a}" for i, (_, h, a) in enumerate(candidates))
+
     prompt = (
         f"Match modèle : \"{bb_home} vs {bb_away}\".\n"
         f"Trouve le MÊME match dans la liste :\n\n"
         f"{lignes}\n\n"
         f"Réponds UNIQUEMENT par le numéro (1-{len(candidates)}) ou 0."
     )
-    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0, "maxOutputTokens": 20}}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 20},
+    }
+
     try:
         r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=15.0)
         if r.status_code >= 400:
@@ -664,7 +676,10 @@ VERDICT: ACCEPT
 ANALYSE: [3 phrases max]
 CONSEIL: [1 phrase]"""
 
-    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.3, "maxOutputTokens": 400}}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 400},
+    }
 
     try:
         r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=30.0)
