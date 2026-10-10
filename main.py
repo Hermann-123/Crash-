@@ -36,7 +36,7 @@ except Exception:
 # CONFIG
 # =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
@@ -53,25 +53,37 @@ NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.02"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.55"))
-MAX_FIXTURES_FOR_ODDS = int(os.getenv("MAX_FIXTURES_FOR_ODDS", "20"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
-if not FOOTBALL_API_KEY:
-    raise RuntimeError("FOOTBALL_API_KEY manquant")
+if not ODDS_API_KEY:
+    raise RuntimeError("ODDS_API_KEY manquant")
 if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
     raise RuntimeError("TELEGRAM_ADMIN_ID ou TELEGRAM_CHANNEL manquant")
 
 TZ = ZoneInfo(NOTIFY_TZ)
-FOOTBALL_API_BASE = "https://api.5dollarfootballapi.com/v1"
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
+
+# Championnats à scanner (1 requête par ligue)
+SOCCER_KEYS = [
+    "soccer_epl",
+    "soccer_spain_la_liga",
+    "soccer_italy_serie_a",
+    "soccer_germany_bundesliga",
+    "soccer_france_ligue_one",
+    "soccer_uefa_champs_league",
+    "soccer_uefa_europa_league",
+    "soccer_efl_champ",
+    "soccer_netherlands_eredivisie",
+    "soccer_portugal_primeira_liga",
+]
 
 BETBETTER_LEAGUES = [
     "soccer/epl", "soccer/la-liga", "soccer/serie-a",
     "soccer/bundesliga", "soccer/ligue-1",
 ]
 
-STRUCTURE_LOGGED = {"fixtures": False, "odds": False}
 MAX_LEGS_PER_COUPON = 9
 
 
@@ -144,7 +156,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 AI_MATCH_CACHE: dict = {}
 AI_REVIEW_CACHE: dict = {}
-ODDS_ENDPOINT_WORKING: dict = {"path": None}
 DC_MODEL: Optional["DixonColesModel"] = None
 
 STATE = {
@@ -249,10 +260,6 @@ def ai_verdict_emoji(v: str) -> str:
     return {"ACCEPT": "✅", "CAUTION": "⚠️", "REJECT": "❌"}.get(v.upper(), "❓")
 
 
-def auth_headers() -> dict:
-    return {"Authorization": f"Bearer {FOOTBALL_API_KEY}", "Accept": "application/json"}
-
-
 # =========================================================
 # TRACKER + ANTI-RÉPÉTITION
 # =========================================================
@@ -314,7 +321,7 @@ def record_coupons(coupons: list[Coupon], date_str: str):
 
 
 # =========================================================
-# DIXON-COLES INIT
+# DIXON-COLES
 # =========================================================
 async def init_dixon_coles():
     global DC_MODEL
@@ -363,168 +370,101 @@ def fetch_betbetter_picks() -> dict[str, dict]:
 
 
 # =========================================================
-# 5DOLLARFOOTBALLAPI — FIXTURES
+# THE ODDS API — FIXTURES + COTES (1 appel par ligue)
 # =========================================================
-async def fetch_fixtures(client: httpx.AsyncClient) -> list[dict]:
-    now = datetime.now(TZ)
-    windows = [
-        (int(now.timestamp()), int((now + timedelta(hours=23)).timestamp())),
-        (int((now + timedelta(hours=23)).timestamp()), int((now + timedelta(hours=47)).timestamp())),
-    ]
-    all_fixtures: list[dict] = []
-    seen_ids = set()
+async def fetch_odds_api_league(client: httpx.AsyncClient, sport_key: str) -> list[dict]:
+    """Récupère les matchs + cotes d'une ligue."""
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "eu",
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "decimal",
+    }
+    try:
+        r = await client.get(url, params=params, timeout=30.0)
 
-    for start, end in windows:
-        url = f"{FOOTBALL_API_BASE}/fixtures"
-        try:
-            r = await client.get(url, params={"start_time": start, "end_time": end},
-                                  headers=auth_headers(), timeout=30.0)
-            print(f"🌍 /fixtures [{start}..{end}] -> {r.status_code}")
-            if r.status_code >= 400:
-                continue
-            data = r.json()
-            fixtures = data if isinstance(data, list) else next(
-                (data[k] for k in ("data", "fixtures", "response", "matches", "results", "events")
-                 if isinstance(data.get(k), list)), [])
-            for fx in fixtures:
-                if not isinstance(fx, dict):
-                    continue
-                fid = str(fx.get("id") or "")
-                if fid and fid in seen_ids:
-                    continue
-                if fid:
-                    seen_ids.add(fid)
-                all_fixtures.append(fx)
-        except Exception as e:
-            print(f"⚠️ /fixtures crash: {e}")
+        remaining = r.headers.get("x-requests-remaining", "?")
+        used = r.headers.get("x-requests-used", "?")
+        print(f"🌍 {sport_key} -> {r.status_code} | used={used} remaining={remaining}")
 
-    upcoming = []
-    for fx in all_fixtures:
-        dt_val = fx.get("kickoff_utc") or fx.get("kickoff_ts") or fx.get("date") or ""
-        if is_upcoming(dt_val):
-            upcoming.append(fx)
-    print(f"📅 Fixtures J/J+1: {len(upcoming)}")
-    return upcoming
+        if r.status_code >= 400:
+            print(f"⚠️ Body: {r.text[:200]}")
+            return []
+
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"⚠️ {sport_key} crash: {e}")
+        return []
 
 
-def extract_fixture_fields(fx: dict) -> dict:
-    teams = fx.get("teams") or {}
-    home = ""
-    away = ""
-    if isinstance(teams, dict):
-        h = teams.get("home")
-        a = teams.get("away")
-        if isinstance(h, dict):
-            home = h.get("name") or ""
-        if isinstance(a, dict):
-            away = a.get("name") or ""
-    league = ""
-    lg = fx.get("league")
-    if isinstance(lg, dict):
-        league = lg.get("name") or ""
-    kickoff = fx.get("kickoff_utc") or fx.get("kickoff_ts") or fx.get("date") or ""
+async def fetch_all_events_with_odds() -> list[dict]:
+    """Récupère tous les matchs avec leurs cotes (10 requêtes max)."""
+    all_events: list[dict] = []
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        for key in SOCCER_KEYS:
+            events = await fetch_odds_api_league(client, key)
+            all_events.extend(events)
+            await asyncio.sleep(0.3)
+    print(f"📦 Total events The Odds API: {len(all_events)}")
+    return all_events
+
+
+def extract_event_fields(ev: dict) -> dict:
     return {
-        "event_id": str(fx.get("id") or ""),
-        "home": home, "away": away, "league": league,
-        "kickoff": kickoff, "raw": fx,
+        "event_id": ev.get("id", ""),
+        "home": ev.get("home_team", ""),
+        "away": ev.get("away_team", ""),
+        "league": ev.get("sport_title", "") or ev.get("sport_key", ""),
+        "kickoff": ev.get("commence_time", ""),
+        "raw": ev,
     }
 
 
-# =========================================================
-# 5DOLLARFOOTBALLAPI — ODDS
-# =========================================================
-async def fetch_odds(client: httpx.AsyncClient, fixture_id: str) -> dict:
-    paths = [f"/fixtures/{fixture_id}/odds", f"/odds/{fixture_id}"]
-    for path in paths:
-        if ODDS_ENDPOINT_WORKING["path"] and path != ODDS_ENDPOINT_WORKING["path"]:
-            continue
-        url = f"{FOOTBALL_API_BASE}{path}"
-        try:
-            r = await client.get(url, headers=auth_headers(), timeout=15.0)
-            if r.status_code >= 400:
-                continue
-            data = r.json()
-            test = parse_odds(data)
-            if test.get("h2h") or test.get("totals") or test.get("btts"):
-                ODDS_ENDPOINT_WORKING["path"] = path
-                if not STRUCTURE_LOGGED["odds"]:
-                    print("=" * 70)
-                    print(f"🔬 STRUCTURE BRUTE DES COTES ({path})")
-                    print(json.dumps(data, ensure_ascii=False, indent=2)[:2000])
-                    print("=" * 70)
-                    STRUCTURE_LOGGED["odds"] = True
-                return data
-        except Exception:
-            continue
-    return {}
-
-
-def parse_odds(data) -> dict:
-    """Parse la structure réelle de 5DollarFootballAPI."""
+def extract_odds_from_event(ev: dict) -> dict:
+    """
+    Extrait les meilleures cotes (meilleure cote = la plus haute)
+    pour h2h, totals et btts depuis les bookmakers.
+    """
     result = {"h2h": {}, "totals": {}, "btts": {}}
-    if not isinstance(data, dict):
-        return result
 
-    payload = data.get("data") or data
-    bookmakers = payload.get("bookmakers") if isinstance(payload, dict) else None
-    if not isinstance(bookmakers, list):
-        return result
+    home = ev.get("home_team", "")
+    away = ev.get("away_team", "")
 
-    for book in bookmakers:
-        if not isinstance(book, dict):
-            continue
-        odds = book.get("odds") or {}
-        if not isinstance(odds, dict):
-            continue
-
-        # 1X2
-        x2 = odds.get("1x2") or {}
-        block = x2.get("closing") or x2.get("opening") or {}
-        for k_src, k_dst in (("home", "home"), ("draw", "draw"), ("away", "away")):
-            v = block.get(k_src)
-            if isinstance(v, (int, float)) and v > 1.01:
-                result["h2h"][k_dst] = max(result["h2h"].get(k_dst, 0), float(v))
-
-        # BTTS
-        btts = odds.get("btts") or {}
-        bt = btts.get("closing") or btts.get("opening") or {}
-        for k_src, k_dst in (("yes", "yes"), ("no", "no")):
-            v = bt.get(k_src)
-            if isinstance(v, (int, float)) and v > 1.01:
-                result["btts"][k_dst] = max(result["btts"].get(k_dst, 0), float(v))
-
-        # Over/Under principal
-        gl = odds.get("goal_line") or {}
-        gl_block = gl.get("closing") or gl.get("opening") or {}
-        over_v = gl_block.get("over")
-        under_v = gl_block.get("under")
-        line_v = gl_block.get("line")
-        if line_v is not None:
-            try:
-                lf = float(line_v)
-                if isinstance(over_v, (int, float)) and over_v > 1.01:
-                    result["totals"][f"over_{lf}"] = float(over_v)
-                if isinstance(under_v, (int, float)) and under_v > 1.01:
-                    result["totals"][f"under_{lf}"] = float(under_v)
-            except (ValueError, TypeError):
-                pass
-
-        # goal_line_fixed (liste de lignes)
-        glf = odds.get("goal_line_fixed") or []
-        if isinstance(glf, list):
-            for entry in glf:
-                if not isinstance(entry, dict):
-                    continue
+    for book in ev.get("bookmakers", []) or []:
+        for market in book.get("markets", []) or []:
+            mk = market.get("key", "")
+            for out in market.get("outcomes", []) or []:
                 try:
-                    line_f = float(entry.get("line"))
+                    price = float(out.get("price", 0))
                 except (ValueError, TypeError):
                     continue
-                for key, prefix in (("over", "over"), ("under", "under")):
-                    v = entry.get(key)
-                    if isinstance(v, (int, float)) and v > 1.01:
-                        result["totals"][f"{prefix}_{line_f}"] = max(
-                            result["totals"].get(f"{prefix}_{line_f}", 0), float(v)
-                        )
+                if price <= 1.01:
+                    continue
+
+                name = out.get("name", "")
+
+                if mk == "h2h":
+                    if name == home:
+                        result["h2h"]["home"] = max(result["h2h"].get("home", 0), price)
+                    elif name == away:
+                        result["h2h"]["away"] = max(result["h2h"].get("away", 0), price)
+                    elif "draw" in name.lower():
+                        result["h2h"]["draw"] = max(result["h2h"].get("draw", 0), price)
+
+                elif mk == "totals":
+                    point = out.get("point")
+                    if point is None:
+                        continue
+                    is_over = "over" in name.lower()
+                    is_under = "under" in name.lower()
+                    if is_over or is_under:
+                        try:
+                            key = f"{'over' if is_over else 'under'}_{float(point)}"
+                        except (ValueError, TypeError):
+                            continue
+                        result["totals"][key] = max(result["totals"].get(key, 0), price)
 
     return result
 
@@ -629,29 +569,28 @@ async def ai_review_selection(client, sel: Selection) -> None:
 
     dc_line = ""
     if sel.dc_prob is not None:
-        dc_line = f"\nProba Dixon-Coles (modèle math) : {sel.dc_prob*100:.1f}%"
+        dc_line = f"\nProba Dixon-Coles : {sel.dc_prob*100:.1f}%"
 
-    prompt = f"""Tu es un analyste football INDÉPENDANT et CRITIQUE. Ton rôle est de VÉRIFIER le travail d'un bot qui peut se tromper.
+    prompt = f"""Tu es un analyste football INDÉPENDANT et CRITIQUE.
 
-📋 Données brutes :
 Match : {sel.home} vs {sel.away}
 Compétition : {sel.league}
 Heure : {kickoff_local(sel.kickoff)}
 Marché : {sel.market}
-Pari proposé : {sel.pick_label}
-Cote : {sel.odds}
+Pari : {sel.pick_label}
+Cote (vraie, chez bookmaker) : {sel.odds}
 Proba croisée du bot : {sel.model_prob*100:.1f}%{dc_line}
-Edge calculé : {sel.edge*100:+.1f}%
+Edge : {sel.edge*100:+.1f}%
 
-⚠️ Sois mesuré, pas excessivement prudent.
+⚠️ Sois mesuré. ACCEPT si cohérent, CAUTION si risque, REJECT si douteux.
 
 Réponds EXACTEMENT :
 
 VERDICT: ACCEPT
 PROBA: 72
-CRITIQUE_BOT: [1 phrase sur si le bot a raison ou tort]
-ANALYSE: [2 phrases sur le contexte réel]
-CONSEIL: [1 phrase d'action]"""
+CRITIQUE_BOT: [1 phrase]
+ANALYSE: [2 phrases]
+CONSEIL: [1 phrase]"""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -785,10 +724,10 @@ def pick_label_for(market, selection, home, away, line):
 # =========================================================
 # SELECTIONS
 # =========================================================
-def find_bb_for_fixture(fx, bb_data):
-    home = fx.get("home", "")
-    away = fx.get("away", "")
-    event_id = fx.get("event_id", "")
+def find_bb_for_event(ev_fields, bb_data):
+    home = ev_fields.get("home", "")
+    away = ev_fields.get("away", "")
+    event_id = ev_fields.get("event_id", "")
     key = f"{normalize_name(away)}|{normalize_name(home)}"
     if key in bb_data:
         return bb_data[key]
@@ -813,13 +752,14 @@ def find_bb_for_fixture(fx, bb_data):
     return None
 
 
-def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
+def build_selections(fixtures_norm, odds_by_id, bb_data, dc_verdicts=None):
     selections: list[Selection] = []
     seen = set()
     used_today = load_used_today()
     dc_verdicts = dc_verdicts or {}
     stats = {"total": 0, "skip_used": 0, "skip_prob": 0, "skip_label": 0,
-             "skip_odd": 0, "skip_edge": 0, "fallback": 0, "dc_used": 0, "dc_disagree": 0}
+             "skip_odd": 0, "skip_edge": 0, "dc_used": 0, "dc_disagree": 0,
+             "no_odds": 0}
 
     for fx in fixtures_norm:
         try:
@@ -834,10 +774,15 @@ def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
                 stats["skip_used"] += 1
                 continue
 
-            bb_match = find_bb_for_fixture(fx, bb_data)
+            bb_match = find_bb_for_event(fx, bb_data)
             if not bb_match:
                 continue
-            odds = odds_map.get(event_id, {})
+
+            odds = odds_by_id.get(event_id, {})
+            if not (odds.get("h2h") or odds.get("totals")):
+                stats["no_odds"] += 1
+                continue
+
             dc = dc_verdicts.get(event_id)
 
             for pick in bb_match["picks"]:
@@ -855,7 +800,6 @@ def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
                     stats["skip_label"] += 1
                     continue
 
-                # Croisement Dixon-Coles
                 dc_prob = None
                 if dc and market_label == "1X2":
                     if pick_label.startswith("Victoire "):
@@ -870,12 +814,12 @@ def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
                             stats["dc_disagree"] += 1
                         prob = (prob * 0.6) + (dc_prob * 0.4)
 
-                if prob < 0.55:
+                if prob < MIN_PROB:
                     stats["skip_prob"] += 1
                     continue
 
                 best_odd = None
-                bookmaker = "5DFootballAPI"
+                bookmaker = "The Odds API"
 
                 if market_label == "1X2":
                     if pick_label.startswith("Victoire "):
@@ -893,18 +837,6 @@ def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
                         lf = None
                     key = f"{'over' if 'Over' in pick_label else 'under'}_{lf}"
                     best_odd = odds.get("totals", {}).get(key)
-                elif market_label == "BTTS":
-                    best_odd = odds.get("btts", {}).get("yes") if "Oui" in pick_label else odds.get("btts", {}).get("no")
-
-                if best_odd is None or best_odd <= 1.01:
-                    try:
-                        ff = float(pick.get("fairOdds")) if pick.get("fairOdds") else None
-                    except (ValueError, TypeError):
-                        ff = None
-                    if ff and ff > 1.01:
-                        best_odd = ff
-                        bookmaker = "BetBetter (fair)"
-                        stats["fallback"] += 1
 
                 if best_odd is None or best_odd <= 1.01:
                     stats["skip_odd"] += 1
@@ -934,7 +866,7 @@ def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
     print(f"📊 STATS: total={stats['total']} skip_used={stats['skip_used']} "
           f"skip_prob={stats['skip_prob']} skip_label={stats['skip_label']} "
           f"skip_odd={stats['skip_odd']} skip_edge={stats['skip_edge']} "
-          f"fallback={stats['fallback']} dc_used={stats['dc_used']} "
+          f"no_odds={stats['no_odds']} dc_used={stats['dc_used']} "
           f"dc_disagree={stats['dc_disagree']}")
     return selections
 
@@ -943,13 +875,12 @@ def build_selections(fixtures_norm, odds_map, bb_data, dc_verdicts=None):
 # COUPONS
 # =========================================================
 def build_coupon_target(name, subtitle, emoji, pool, min_odds, max_odds,
-                        max_legs, globally_used, min_prob, allow_fair=False):
+                        max_legs, globally_used, min_prob):
     pool = [s for s in pool
             if s.odds and s.odds > 1.01
             and s.event_id not in globally_used
             and s.ai_verdict != "REJECT"
-            and s.final_prob() >= min_prob
-            and (allow_fair or "fair" not in s.bookmaker.lower())]
+            and s.final_prob() >= min_prob]
     if not pool:
         return None
 
@@ -1009,43 +940,36 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
 
-    # SÉCURISÉ : uniquement vraies cotes API
     pool_safe = [s for s in selections if s.final_prob() >= 0.65]
-    c = build_coupon_target("Ticket Sécurisé", "Cote ~2 • Vraies cotes",
-                            "🔒", pool_safe, 1.70, 2.30, 4, used, min_prob=0.65,
-                            allow_fair=False)
+    c = build_coupon_target("Ticket Sécurisé", "Cote ~2 • Proba ≥ 65%",
+                            "🔒", pool_safe, 1.70, 2.30, 4, used, min_prob=0.65)
     if c:
         coupons.append(c)
 
-    # ÉQUILIBRÉ : uniquement vraies cotes API
     pool_bal = [s for s in selections if s.final_prob() >= 0.58]
-    c = build_coupon_target("Ticket Équilibré", "Cote 3-4.5 • Vraies cotes",
-                            "⚖️", pool_bal, 2.80, 4.80, 6, used, min_prob=0.58,
-                            allow_fair=False)
+    c = build_coupon_target("Ticket Équilibré", "Cote 3-4.5 • Proba ≥ 58%",
+                            "⚖️", pool_bal, 2.80, 4.80, 6, used, min_prob=0.58)
     if c:
         coupons.append(c)
 
-    # VALUE : accepte les fairOdds si nécessaire
     pool_val = [s for s in selections if s.final_prob() >= 0.50]
-    c = build_coupon_target("Ticket Value", "Cote 9-10 • Toutes sources",
-                            "💎", pool_val, 7.50, 12.00, 9, used, min_prob=0.50,
-                            allow_fair=True)
+    c = build_coupon_target("Ticket Value", "Cote 9-10 • Proba ≥ 50%",
+                            "💎", pool_val, 7.50, 12.00, 9, used, min_prob=0.50)
     if c:
         coupons.append(c)
 
-    # Fallback : top 3
     if not coupons and selections:
-        top3 = sorted(selections, key=lambda s: s.final_prob(), reverse=True)[:3]
-        if top3:
-            top3.sort(key=lambda s: s.odds)
+        top = sorted(selections, key=lambda s: s.final_prob(), reverse=True)[:3]
+        if top:
+            top.sort(key=lambda s: s.odds)
             combined_odds = 1.0
             combined_prob = 1.0
-            for s in top3:
+            for s in top:
                 combined_odds *= s.odds
                 combined_prob *= s.final_prob()
             coupons.append(Coupon(
-                "Sélection du jour", "Top 3 (cotes BetBetter)",
-                "⭐", top3, round(combined_odds, 2), round(combined_prob, 4),
+                "Sélection du jour", "Top 3 meilleures probas",
+                "⭐", top, round(combined_odds, 2), round(combined_prob, 4),
                 round(combined_prob * combined_odds - 1, 4),
             ))
 
@@ -1084,11 +1008,6 @@ def format_selection_block(s: Selection, idx: int, show_ai=True):
     prob_display = s.final_prob() * 100
     prob_source = "IA" if s.ai_prob else "croisée"
 
-    # Marquer les cotes fair
-    fair_warning = ""
-    if "fair" in s.bookmaker.lower():
-        fair_warning = " ⚠️ <i>cote non réelle</i>"
-
     lines = [
         f"<b>┌─ Sélection #{idx}</b>",
         f"<b>│ 🏟 {s.home}  vs  {s.away}</b>",
@@ -1099,7 +1018,7 @@ def format_selection_block(s: Selection, idx: int, show_ai=True):
     if s.dc_prob is not None:
         lines.append(f"│ 🧮 Dixon-Coles : <b>{s.dc_prob*100:.1f}%</b>")
 
-    lines.append(f"│ 💰 Cote : <b>{s.odds}</b>  <i>({s.bookmaker})</i>{fair_warning}")
+    lines.append(f"│ 💰 Cote : <b>{s.odds}</b>  <i>({s.bookmaker})</i>")
     lines.append(f"│ ⚡ Edge : <b>{s.edge*100:+.1f}%</b>  {edge_bar(s.edge)}")
 
     if show_ai and s.ai_verdict:
@@ -1222,10 +1141,11 @@ async def debug_cmd(message):
         f"<b>🔍 DEBUG</b>\n\n"
         f"BetBetter matchs : <b>{d.get('bb_matches', 0)}</b>\n"
         f"Dixon-Coles prédictions : <b>{d.get('dc_predictions', 0)}</b>\n"
-        f"Fixtures J/J+1 : <b>{d.get('fixtures_upcoming', 0)}</b>\n"
+        f"Events Odds API : <b>{d.get('events_total', 0)}</b>\n"
+        f"Events J/J+1 : <b>{d.get('events_upcoming', 0)}</b>\n"
         f"Matchés fuzzy : <b>{d.get('matched_fuzzy', 0)}</b>\n"
         f"Matchés IA : <b>{d.get('matched_ai', 0)}</b>\n"
-        f"Cotes récupérées : <b>{d.get('odds_fetched', 0)}</b>\n"
+        f"Cotes extraites : <b>{d.get('odds_fetched', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"✅ ACCEPT : <b>{d.get('ai_accept', 0)}</b>\n"
         f"⚠️ CAUTION : <b>{d.get('ai_caution', 0)}</b>\n"
@@ -1277,49 +1197,43 @@ async def scan():
         bb = fetch_betbetter_picks()
         print(f"🧠 BetBetter matchs: {len(bb)}")
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            fixtures_raw = await fetch_fixtures(client)
-            fixtures_norm = [extract_fixture_fields(fx) for fx in fixtures_raw]
-            fixtures_norm = [f for f in fixtures_norm if f["event_id"] and f["home"] and f["away"]]
-            print(f"🎯 Fixtures normalisées: {len(fixtures_norm)}")
+        # 1. Récupérer tous les events avec cotes (10 requêtes)
+        events_raw = await fetch_all_events_with_odds()
+        print(f"📦 Events The Odds API: {len(events_raw)}")
 
-            # Dixon-Coles predictions
-            dc_verdicts = {}
-            if DC_MODEL:
-                for fx in fixtures_norm:
-                    pred = DC_MODEL.predict(fx["home"], fx["away"])
-                    if pred:
-                        dc_verdicts[fx["event_id"]] = pred
-                print(f"🧮 Dixon-Coles : {len(dc_verdicts)} prédictions")
+        # 2. Normaliser + filtrer J/J+1
+        events_norm = []
+        odds_by_id = {}
+        for ev in events_raw:
+            fields = extract_event_fields(ev)
+            if not fields["event_id"] or not fields["home"] or not fields["away"]:
+                continue
+            if not is_upcoming(fields["kickoff"]):
+                continue
+            events_norm.append(fields)
+            odds_by_id[fields["event_id"]] = extract_odds_from_event(ev)
+        print(f"🎯 Events J/J+1: {len(events_norm)}")
 
-            matched_fuzzy = sum(1 for fx in fixtures_norm if find_bb_for_fixture(fx, bb))
+        # 3. Dixon-Coles
+        dc_verdicts = {}
+        if DC_MODEL:
+            for fx in events_norm:
+                pred = DC_MODEL.predict(fx["home"], fx["away"])
+                if pred:
+                    dc_verdicts[fx["event_id"]] = pred
+            print(f"🧮 Dixon-Coles : {len(dc_verdicts)} prédictions")
 
-            matched_ai = 0
-            if GEMINI_API_KEY and fixtures_norm:
-                matched_ai = await ai_rematch_all(bb, fixtures_norm)
-                print(f"🤖 IA matchs ajoutés: {matched_ai}")
+        # 4. Matching fuzzy
+        matched_fuzzy = sum(1 for fx in events_norm if find_bb_for_event(fx, bb))
 
-            to_odds = [fx for fx in fixtures_norm if find_bb_for_fixture(fx, bb)][:MAX_FIXTURES_FOR_ODDS]
-            print(f"💰 Récupération cotes pour {len(to_odds)} matchs...")
+        # 5. Matching IA
+        matched_ai = 0
+        if GEMINI_API_KEY and events_norm:
+            matched_ai = await ai_rematch_all(bb, events_norm)
+            print(f"🤖 IA matchs ajoutés: {matched_ai}")
 
-            odds_map = {}
-            stats_api = {"empty": 0, "no_parse": 0, "ok": 0}
-            for fx in to_odds:
-                raw = await fetch_odds(client, fx["event_id"])
-                if not raw:
-                    stats_api["empty"] += 1
-                else:
-                    parsed = parse_odds(raw)
-                    if parsed.get("h2h") or parsed.get("totals") or parsed.get("btts"):
-                        odds_map[fx["event_id"]] = parsed
-                        stats_api["ok"] += 1
-                    else:
-                        stats_api["no_parse"] += 1
-                await asyncio.sleep(0.3)
-            print(f"💰 Cotes parsées: {len(odds_map)} | "
-                  f"API vide={stats_api['empty']} non-parsé={stats_api['no_parse']} ok={stats_api['ok']}")
-
-        selections = build_selections(fixtures_norm, odds_map, bb, dc_verdicts)
+        # 6. Construire les sélections
+        selections = build_selections(events_norm, odds_by_id, bb, dc_verdicts)
         print(f"🎯 Sélections: {len(selections)}")
 
         if GEMINI_API_KEY and selections:
@@ -1337,11 +1251,11 @@ async def scan():
         STATE["debug"] = {
             "bb_matches": len(bb),
             "dc_predictions": len(dc_verdicts),
-            "fixtures_raw": len(fixtures_raw),
-            "fixtures_upcoming": len(fixtures_norm),
+            "events_total": len(events_raw),
+            "events_upcoming": len(events_norm),
             "matched_fuzzy": matched_fuzzy,
             "matched_ai": matched_ai,
-            "odds_fetched": len(odds_map),
+            "odds_fetched": len(odds_by_id),
             "selections": len(selections),
             "ai_accept": sum(1 for s in selections if s.ai_verdict == "ACCEPT"),
             "ai_caution": sum(1 for s in selections if s.ai_verdict == "CAUTION"),
@@ -1350,13 +1264,14 @@ async def scan():
         }
 
         print("──────── RÉSUMÉ ────────")
-        print(f"Fixtures J/J+1     : {len(fixtures_norm)}")
-        print(f"Dixon-Coles        : {len(dc_verdicts)}")
-        print(f"Matchés fuzzy      : {matched_fuzzy}")
-        print(f"Matchés IA         : {matched_ai}")
-        print(f"Cotes récupérées   : {len(odds_map)}")
-        print(f"Sélections         : {len(selections)}")
-        print(f"Coupons            : {len(STATE['coupons'])}")
+        print(f"Events The Odds API : {len(events_raw)}")
+        print(f"Events J/J+1        : {len(events_norm)}")
+        print(f"Dixon-Coles         : {len(dc_verdicts)}")
+        print(f"Matchés fuzzy       : {matched_fuzzy}")
+        print(f"Matchés IA          : {matched_ai}")
+        print(f"Cotes extraites     : {len(odds_by_id)}")
+        print(f"Sélections          : {len(selections)}")
+        print(f"Coupons             : {len(STATE['coupons'])}")
         for c in STATE["coupons"]:
             print(f"  • {c.name} : {len(c.legs)} legs, cote {c.combined_odds}")
         print("────────────────────────")
@@ -1388,7 +1303,7 @@ async def bootstrap():
     STATE["tracker"] = load_tracker()
     await init_dixon_coles()
     STATE["ready"] = True
-    print("✅ Bot prêt.")
+    print("✅ Bot prêt (The Odds API).")
 
 
 # =========================================================
