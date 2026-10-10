@@ -43,9 +43,8 @@ PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue res
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.02"))
-MIN_PROB = float(os.getenv("MIN_PROB", "0.58"))
+MIN_PROB = float(os.getenv("MIN_PROB", "0.55"))
 MAX_FIXTURES_FOR_ODDS = int(os.getenv("MAX_FIXTURES_FOR_ODDS", "20"))
-USE_FAIR_ODDS_FALLBACK = os.getenv("USE_FAIR_ODDS_FALLBACK", "true").lower() == "true"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -64,7 +63,7 @@ BETBETTER_LEAGUES = [
 ]
 
 STRUCTURE_LOGGED = {"fixtures": False, "odds": False}
-MAX_LEGS_PER_COUPON = 9  # jamais 10 matchs
+MAX_LEGS_PER_COUPON = 9
 
 
 @dataclass
@@ -88,13 +87,11 @@ class Selection:
     ai_advice: str = ""
 
     def final_prob(self) -> float:
-        """Probabilité calibrée (IA si dispo, sinon modèle)."""
         if self.ai_prob and 0.30 <= self.ai_prob <= 0.92:
             return self.ai_prob
         return self.model_prob
 
     def score(self) -> float:
-        # Tri : priorité proba calibrée puis edge
         return self.final_prob() * 100 + self.edge * 10
 
 
@@ -319,8 +316,7 @@ async def fetch_fixtures(client: httpx.AsyncClient) -> list[dict]:
 
 def extract_fixture_fields(fx: dict) -> dict:
     teams = fx.get("teams") or {}
-    home = ""
-    away = ""
+    home = ""; away = ""
     if isinstance(teams, dict):
         h = teams.get("home"); a = teams.get("away")
         if isinstance(h, dict): home = h.get("name") or ""
@@ -349,6 +345,12 @@ async def fetch_odds(client: httpx.AsyncClient, fixture_id: str) -> dict:
             test = parse_odds(data)
             if test.get("h2h") or test.get("totals") or test.get("btts"):
                 ODDS_ENDPOINT_WORKING["path"] = path
+                if not STRUCTURE_LOGGED["odds"]:
+                    print("=" * 70)
+                    print(f"🔬 STRUCTURE BRUTE DES COTES ({path})")
+                    print(json.dumps(data, ensure_ascii=False, indent=2)[:2000])
+                    print("=" * 70)
+                    STRUCTURE_LOGGED["odds"] = True
                 return data
         except Exception:
             continue
@@ -461,6 +463,7 @@ async def ai_rematch_all(bb_data, fixtures_norm) -> int:
             mid = await ai_match_teams(client, bb_home, bb_away, unmatched)
             if mid:
                 count += 1
+                print(f"  🤖 Match IA : {bb_home} vs {bb_away} → {mid}")
                 unmatched = [c for c in unmatched if c[0] != mid]
             await asyncio.sleep(1.2)
     return count
@@ -489,10 +492,10 @@ Proba modèle brut : {sel.model_prob*100:.1f}%
 Edge calculé : {sel.edge*100:+.1f}%
 
 Ta mission :
-1. Donne ta PROPRE probabilité calibrée (entre 30 et 92) en tenant compte du contexte réel du match.
+1. Donne ta PROPRE probabilité calibrée (entre 30 et 92) du pari.
 2. Donne un verdict et un conseil.
 
-Réponds EXACTEMENT au format :
+Réponds EXACTEMENT :
 
 VERDICT: ACCEPT
 PROBA: 72
@@ -503,9 +506,9 @@ Règles :
 - ACCEPT = pari cohérent
 - CAUTION = risque réel, mise réduite
 - REJECT = pari douteux, ne pas jouer
-- PROBA = ton estimation honnête en %, pas celle du modèle
+- PROBA = ton estimation honnête en %
 - N'invente AUCUNE stat/blessure/compo
-- Si tu ne connais pas assez ce match, mets CAUTION et PROBA proche de 50"""
+- Si tu ne connais pas assez, mets CAUTION et PROBA proche de 50"""
 
     payload = {"contents":[{"parts":[{"text":prompt}]}],
                "generationConfig":{"temperature":0.2,"maxOutputTokens":400}}
@@ -560,6 +563,66 @@ async def ai_review_all(selections: list[Selection]) -> None:
     print(f"🧠 IA : {a} ACCEPT, {c} CAUTION, {r} REJECT")
 
 
+# ============================ PICK LABEL ============================
+def pick_label_for(market, selection, home, away, line):
+    """
+    Retourne (pick_label, market_label) ou (None, None) si inconnu.
+    Gère Moneyline, Spread/Handicap, Total, BTTS en anglais ET français.
+    """
+    sel_norm = normalize_name(selection)
+    market_lower = (market or "").strip().lower()
+    home_norm = normalize_name(home)
+    away_norm = normalize_name(away)
+
+    # Moneyline / 1X2
+    if market_lower in ("moneyline", "money line", "1x2", "winner", "match winner"):
+        if sel_norm == home_norm or (sel_norm and sel_norm in home_norm):
+            return f"Victoire {home}", "1X2"
+        if sel_norm == away_norm or (sel_norm and sel_norm in away_norm):
+            return f"Victoire {away}", "1X2"
+        if "draw" in sel_norm or "nul" in sel_norm or sel_norm == "x":
+            return "Match nul", "1X2"
+        return None, None
+
+    # Total / Over-Under
+    if (market_lower in ("total", "totals", "over/under", "goals", "goals over/under")
+        or "over" in sel_norm or "under" in sel_norm
+        or "plus" in sel_norm or "moins" in sel_norm):
+        is_over = ("over" in sel_norm or "plus" in sel_norm or "+" in sel_norm)
+        is_under = ("under" in sel_norm or "moins" in sel_norm or "-" in sel_norm)
+        if not (is_over or is_under):
+            return None, None
+        try:
+            line_f = float(line) if line is not None else None
+        except (ValueError, TypeError):
+            line_f = None
+        if line_f is None or line_f < 0.5 or line_f > 4.5:
+            return None, None
+        return f"{'Over' if is_over else 'Under'} {line_f} buts", "Over/Under"
+
+    # BTTS / Both Teams Score
+    if "btts" in market_lower or "both" in market_lower or "les 2" in market_lower:
+        if "yes" in sel_norm or "oui" in sel_norm or sel_norm == "gg":
+            return "Les 2 marquent : Oui", "BTTS"
+        if "no" in sel_norm or "non" in sel_norm or sel_norm == "ng":
+            return "Les 2 marquent : Non", "BTTS"
+        return None, None
+
+    # Spread / Handicap
+    if market_lower in ("spread", "handicap", "asian handicap", "handicap asiatique"):
+        try:
+            lf = float(line) if line is not None else 0.0
+        except (ValueError, TypeError):
+            lf = 0.0
+        if sel_norm == home_norm or (sel_norm and sel_norm in home_norm):
+            return f"{home} ({lf:+g})", "Handicap"
+        if sel_norm == away_norm or (sel_norm and sel_norm in away_norm):
+            return f"{away} ({lf:+g})", "Handicap"
+        return None, None
+
+    return None, None
+
+
 # ============================ SELECTIONS ============================
 def find_bb_for_fixture(fx, bb_data):
     home = fx.get("home",""); away = fx.get("away",""); event_id = fx.get("event_id","")
@@ -580,49 +643,10 @@ def find_bb_for_fixture(fx, bb_data):
     return None
 
 
-def pick_label_for(market, selection, home, away, line):
-    """Retourne (pick_label, market_label) pour un pick BetBetter, ou (None, None) si inconnu."""
-    sel_norm = normalize_name(selection)
-    market = (market or "").strip()
-
-    if market == "Moneyline":
-        if sel_norm == normalize_name(home):
-            return f"Victoire {home}", "1X2"
-        if sel_norm == normalize_name(away):
-            return f"Victoire {away}", "1X2"
-        if "draw" in sel_norm or "nul" in sel_norm or sel_norm == "x":
-            return "Match nul", "1X2"
-        # Fallback : matcher home/away par inclusion
-        if sel_norm in normalize_name(home):
-            return f"Victoire {home}", "1X2"
-        if sel_norm in normalize_name(away):
-            return f"Victoire {away}", "1X2"
-        return None, None
-
-    if market == "Total":
-        is_over = "over" in sel_norm or "plus" in sel_norm
-        is_under = "under" in sel_norm or "moins" in sel_norm
-        if not (is_over or is_under): return None, None
-        try: line_f = float(line) if line is not None else None
-        except (ValueError, TypeError): line_f = None
-        if line_f not in (0.5, 1.5, 2.5, 3.5): return None, None
-        return f"{'Over' if is_over else 'Under'} {line_f} buts", "Over/Under"
-
-    if market in ("BTTS", "Both Teams Score") or "both teams" in market.lower():
-        if "yes" in sel_norm or "oui" in sel_norm:
-            return "Les 2 marquent : Oui", "BTTS"
-        if "no" in sel_norm or "non" in sel_norm:
-            return "Les 2 marquent : Non", "BTTS"
-        return None, None
-
-    return None, None
-
-
 def build_selections(fixtures_norm, odds_map, bb_data):
     selections: list[Selection] = []
     seen = set()
-    fallback_used = 0
-    unknown_market = 0
+    stats = {"total_picks": 0, "skip_prob": 0, "skip_label": 0, "skip_odd": 0, "skip_edge": 0, "fallback": 0}
 
     for fx in fixtures_norm:
         try:
@@ -637,20 +661,22 @@ def build_selections(fixtures_norm, odds_map, bb_data):
             odds = odds_map.get(event_id, {})
 
             for pick in bb_match["picks"]:
+                stats["total_picks"] += 1
                 prob_pct = pick.get("modelProbabilityPct")
                 if prob_pct is None: continue
                 prob = float(prob_pct) / 100.0
-                if prob < MIN_PROB: continue
+                if prob < MIN_PROB:
+                    stats["skip_prob"] += 1
+                    continue
 
                 market = pick.get("market","")
                 selection = pick.get("selection","")
                 line = pick.get("line")
                 pick_label, market_label = pick_label_for(market, selection, home, away, line)
                 if not pick_label:
-                    unknown_market += 1
+                    stats["skip_label"] += 1
                     continue
 
-                # Cote API
                 best_odd = None
                 bookmaker = "5DFootballAPI"
 
@@ -669,25 +695,27 @@ def build_selections(fixtures_norm, odds_map, bb_data):
                     key = f"{'over' if 'Over' in pick_label else 'under'}_{lf}"
                     best_odd = odds.get("totals", {}).get(key)
                 elif market_label == "BTTS":
-                    if "Oui" in pick_label:
-                        best_odd = odds.get("btts", {}).get("yes")
-                    else:
-                        best_odd = odds.get("btts", {}).get("no")
+                    best_odd = odds.get("btts", {}).get("yes") if "Oui" in pick_label else odds.get("btts", {}).get("no")
+                # Handicap → pas d'API, on utilise fairOdds direct
 
                 # Fallback fairOdds
-                if (best_odd is None or best_odd <= 1.01) and USE_FAIR_ODDS_FALLBACK:
+                if best_odd is None or best_odd <= 1.01:
                     try:
                         ff = float(pick.get("fairOdds")) if pick.get("fairOdds") else None
                     except (ValueError, TypeError): ff = None
                     if ff and ff > 1.01:
                         best_odd = ff
                         bookmaker = "BetBetter (fair)"
-                        fallback_used += 1
+                        stats["fallback"] += 1
 
-                if best_odd is None or best_odd <= 1.01: continue
+                if best_odd is None or best_odd <= 1.01:
+                    stats["skip_odd"] += 1
+                    continue
 
                 edge = prob * best_odd - 1.0
-                if edge < MIN_EDGE: continue
+                if edge < MIN_EDGE:
+                    stats["skip_edge"] += 1
+                    continue
 
                 dedup = f"{event_id}|{market_label}|{pick_label}"
                 if dedup in seen: continue
@@ -703,21 +731,22 @@ def build_selections(fixtures_norm, odds_map, bb_data):
         except Exception as e:
             print(f"⚠️ build_selections crash: {e}")
 
-    if fallback_used: print(f"⚠️ Fallback fairOdds utilisé {fallback_used} fois")
-    if unknown_market: print(f"⚠️ Marchés inconnus ignorés : {unknown_market}")
+    print(f"📊 STATS picks: total={stats['total_picks']} "
+          f"skip_prob={stats['skip_prob']} skip_label={stats['skip_label']} "
+          f"skip_odd={stats['skip_odd']} skip_edge={stats['skip_edge']} "
+          f"fallback={stats['fallback']}")
     return selections
 
 
 # ============================ COUPONS ============================
 def build_coupon_target(name, subtitle, emoji, pool, min_odds, max_odds,
                         max_legs, globally_used):
-    """Construit un coupon qui atteint la cote cible, en priorisant la haute proba."""
     pool = [s for s in pool if s.odds and s.odds > 1.01
             and s.event_id not in globally_used
             and s.ai_verdict != "REJECT"]
     if not pool: return None
 
-    # Trie par proba calibrée décroissante (on veut maximiser la sûreté)
+    # Trie par proba calibrée décroissante (plus sûr en premier)
     pool.sort(key=lambda s: s.final_prob(), reverse=True)
 
     legs = []
@@ -730,26 +759,19 @@ def build_coupon_target(name, subtitle, emoji, pool, min_odds, max_odds,
         if len(legs) >= max_legs: break
         if s.event_id in used_events or s.league in used_leagues: continue
         next_odds = combined_odds * s.odds
-        # Si on dépasse max_odds et qu'on a déjà au moins 1 leg → stop
         if next_odds > max_odds and legs:
-            # Si on n'a pas encore atteint min_odds, on doit ajouter quand même (dernier recours)
             if combined_odds < min_odds:
-                legs.append(s)
-                used_events.add(s.event_id)
-                used_leagues.add(s.league)
-                combined_odds = next_odds
-                combined_prob *= s.final_prob()
+                legs.append(s); used_events.add(s.event_id); used_leagues.add(s.league)
+                combined_odds = next_odds; combined_prob *= s.final_prob()
             break
         legs.append(s)
-        used_events.add(s.event_id)
-        used_leagues.add(s.league)
-        combined_odds = next_odds
-        combined_prob *= s.final_prob()
+        used_events.add(s.event_id); used_leagues.add(s.league)
+        combined_odds = next_odds; combined_prob *= s.final_prob()
         if combined_odds >= min_odds: break
 
     if not legs: return None
-    if combined_odds < min_odds * 0.85: return None
-    if combined_odds > max_odds * 1.10: return None
+    if combined_odds < min_odds * 0.80: return None
+    if combined_odds > max_odds * 1.20: return None
 
     for s in legs: globally_used.add(s.event_id)
 
@@ -762,22 +784,22 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
 
-    # SÉCURISÉ : cote cible 2.0 (1.80 - 2.30)
-    pool_safe = [s for s in selections if s.final_prob() >= 0.60]
+    # SÉCURISÉ : cible ~2.0 (tolérance large)
+    pool_safe = [s for s in selections if s.final_prob() >= 0.55]
     c = build_coupon_target("Ticket Sécurisé", "Cote ~2 • Priorité sûreté",
-                            "🔒", pool_safe, 1.80, 2.30, MAX_LEGS_PER_COUPON, used)
+                            "🔒", pool_safe, 1.70, 2.40, MAX_LEGS_PER_COUPON, used)
     if c: coupons.append(c)
 
-    # ÉQUILIBRÉ : cote cible 3-4.5
-    pool_bal = [s for s in selections if s.final_prob() >= 0.55]
+    # ÉQUILIBRÉ : cible 3-4.5
+    pool_bal = [s for s in selections if s.final_prob() >= 0.50]
     c = build_coupon_target("Ticket Équilibré", "Cote 3-4.5 • Compromis",
-                            "⚖️", pool_bal, 2.80, 4.50, MAX_LEGS_PER_COUPON, used)
+                            "⚖️", pool_bal, 2.70, 4.80, MAX_LEGS_PER_COUPON, used)
     if c: coupons.append(c)
 
-    # VALUE : cote cible 9-10
+    # VALUE : cible 9-10 (tolérance large pour qu'il se construise)
     pool_val = sorted(selections, key=lambda s: s.edge, reverse=True)
     c = build_coupon_target("Ticket Value", "Cote 9-10 • Meilleurs edges",
-                            "💎", pool_val, 8.50, 10.50, MAX_LEGS_PER_COUPON, used)
+                            "💎", pool_val, 7.50, 12.00, MAX_LEGS_PER_COUPON, used)
     if c: coupons.append(c)
 
     return coupons
@@ -1001,7 +1023,6 @@ async def scan():
         if GEMINI_API_KEY and selections:
             await ai_review_all(selections)
 
-        # Tri : proba calibrée décroissante (plus sûr → moins sûr)
         selections.sort(key=lambda s: s.score(), reverse=True)
         STATE["selections"] = selections
         STATE["coupons"] = build_all_coupons(selections)
