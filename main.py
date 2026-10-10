@@ -63,10 +63,10 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1
 
 BETBETTER_LEAGUES = [
     "soccer/epl",
-    "soccer/spain_la_liga",
-    "soccer/italy_serie_a",
-    "soccer/germany_bundesliga",
-    "soccer/france_ligue_one",
+    "soccer/la-liga",
+    "soccer/serie-a",
+    "soccer/bundesliga",
+    "soccer/ligue-1",
 ]
 
 STRUCTURE_LOGGED = {"fixtures": False, "odds": False}
@@ -251,7 +251,6 @@ def ai_verdict_emoji(v: str) -> str:
 
 
 def auth_headers() -> dict:
-    """Header d'authentification 5DollarFootballAPI (Bearer)."""
     return {
         "Authorization": f"Bearer {FOOTBALL_API_KEY}",
         "Accept": "application/json",
@@ -332,69 +331,83 @@ def fetch_betbetter_picks() -> dict[str, dict]:
 
 
 # =========================================================
-# 5DOLLARFOOTBALLAPI — FIXTURES
+# 5DOLLARFOOTBALLAPI — FIXTURES (2 fenêtres de 24h)
 # =========================================================
 async def fetch_fixtures(client: httpx.AsyncClient) -> list[dict]:
-    """Récupère les fixtures (start_time/end_time en Unix, Bearer auth)."""
+    """Récupère les fixtures sur 48h en 2 fenêtres de 24h (limite API)."""
     now = datetime.now(TZ)
-    start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_dt = start_dt + timedelta(days=2)
 
-    start_unix = int(start_dt.timestamp())
-    end_unix = int(end_dt.timestamp())
+    start1 = int(now.timestamp())
+    end1 = int((now + timedelta(hours=24)).timestamp())
+    start2 = end1
+    end2 = int((now + timedelta(hours=48)).timestamp())
 
-    url = f"{FOOTBALL_API_BASE}/fixtures"
-    params = {"start_time": start_unix, "end_time": end_unix}
+    windows = [(start1, end1), (start2, end2)]
+    all_fixtures: list[dict] = []
+    seen_ids = set()
 
-    try:
-        r = await client.get(url, params=params, headers=auth_headers(), timeout=30.0)
-        print(f"🌍 /fixtures [{start_unix}..{end_unix}] -> {r.status_code}")
+    for start, end in windows:
+        url = f"{FOOTBALL_API_BASE}/fixtures"
+        params = {"start_time": start, "end_time": end}
+        try:
+            r = await client.get(url, params=params, headers=auth_headers(), timeout=30.0)
+            print(f"🌍 /fixtures [{start}..{end}] -> {r.status_code}")
 
-        if r.status_code >= 400:
-            print(f"⚠️ Body: {r.text[:400]}")
-            return []
-
-        data = r.json()
-
-        if not STRUCTURE_LOGGED["fixtures"]:
-            print("=" * 70)
-            print("🔬 STRUCTURE BRUTE DES FIXTURES")
-            print(json.dumps(data, ensure_ascii=False, indent=2)[:3000])
-            print("=" * 70)
-            STRUCTURE_LOGGED["fixtures"] = True
-
-        fixtures = []
-        if isinstance(data, list):
-            fixtures = data
-        elif isinstance(data, dict):
-            for key in ("data", "fixtures", "response", "matches", "results", "events"):
-                if isinstance(data.get(key), list):
-                    fixtures = data[key]
-                    break
-
-        print(f"📦 Fixtures brutes: {len(fixtures)}")
-
-        upcoming = []
-        for fx in fixtures:
-            if not isinstance(fx, dict):
+            if r.status_code >= 400:
+                print(f"⚠️ Body: {r.text[:400]}")
                 continue
-            dt_val = (
-                fx.get("date")
-                or fx.get("kickoff")
-                or fx.get("scheduled_at")
-                or fx.get("start_time")
-                or fx.get("commence_time")
-                or fx.get("time")
-                or ""
-            )
-            if is_upcoming(dt_val):
-                upcoming.append(fx)
 
-        print(f"📅 Fixtures J/J+1: {len(upcoming)}")
-        return upcoming
-    except Exception as e:
-        print(f"⚠️ /fixtures crash: {e}")
-        return []
+            data = r.json()
+
+            if not STRUCTURE_LOGGED["fixtures"]:
+                print("=" * 70)
+                print("🔬 STRUCTURE BRUTE DES FIXTURES")
+                print(json.dumps(data, ensure_ascii=False, indent=2)[:3000])
+                print("=" * 70)
+                STRUCTURE_LOGGED["fixtures"] = True
+
+            fixtures = []
+            if isinstance(data, list):
+                fixtures = data
+            elif isinstance(data, dict):
+                for key in ("data", "fixtures", "response", "matches", "results", "events"):
+                    if isinstance(data.get(key), list):
+                        fixtures = data[key]
+                        break
+
+            print(f"📦 Fenêtre [{start}..{end}] : {len(fixtures)} fixtures")
+
+            for fx in fixtures:
+                if not isinstance(fx, dict):
+                    continue
+                fid = str(fx.get("id") or fx.get("fixture_id") or "")
+                if fid and fid in seen_ids:
+                    continue
+                if fid:
+                    seen_ids.add(fid)
+                all_fixtures.append(fx)
+
+        except Exception as e:
+            print(f"⚠️ /fixtures crash [{start}..{end}]: {e}")
+
+    print(f"📦 Total fixtures uniques: {len(all_fixtures)}")
+
+    upcoming = []
+    for fx in all_fixtures:
+        dt_val = (
+            fx.get("date")
+            or fx.get("kickoff")
+            or fx.get("scheduled_at")
+            or fx.get("start_time")
+            or fx.get("commence_time")
+            or fx.get("time")
+            or ""
+        )
+        if is_upcoming(dt_val):
+            upcoming.append(fx)
+
+    print(f"📅 Fixtures J/J+1: {len(upcoming)}")
+    return upcoming
 
 
 def extract_fixture_fields(fx: dict) -> dict:
@@ -456,13 +469,10 @@ def extract_fixture_fields(fx: dict) -> dict:
 # 5DOLLARFOOTBALLAPI — ODDS
 # =========================================================
 async def fetch_odds(client: httpx.AsyncClient, fixture_id: str) -> dict:
-    """Récupère les cotes d'une fixture."""
     url = f"{FOOTBALL_API_BASE}/fixtures/{fixture_id}/odds"
-
     try:
         r = await client.get(url, headers=auth_headers(), timeout=20.0)
         if r.status_code >= 400:
-            # Essaie sans /odds à la fin (peut-être un endpoint différent)
             if r.status_code != 404:
                 print(f"⚠️ Odds {fixture_id} -> {r.status_code}: {r.text[:150]}")
             return {}
@@ -483,9 +493,7 @@ async def fetch_odds(client: httpx.AsyncClient, fixture_id: str) -> dict:
 
 
 def parse_odds(data) -> dict:
-    """Parse défensif : cherche 1X2, Over/Under, BTTS."""
     result = {"h2h": {}, "totals": {}, "btts": {}}
-
     if not isinstance(data, (dict, list)):
         return result
 
@@ -543,7 +551,7 @@ def parse_odds(data) -> dict:
 
 
 # =========================================================
-# GEMINI — MATCHING IA
+# GEMINI — MATCHING & REVIEW
 # =========================================================
 async def ai_match_teams(client: httpx.AsyncClient, bb_home: str, bb_away: str,
                           candidates: list[tuple[str, str, str]]) -> Optional[str]:
@@ -644,9 +652,6 @@ async def ai_rematch_all(bb_data: dict, fixtures_norm: list[dict]) -> int:
     return count
 
 
-# =========================================================
-# GEMINI — REVUE ANALYTIQUE
-# =========================================================
 async def ai_review_selection(client: httpx.AsyncClient, sel: Selection) -> None:
     if not GEMINI_API_KEY:
         return
