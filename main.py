@@ -88,19 +88,6 @@ SOCCER_KEYS = [
     "soccer_portugal_primeira_liga",
 ]
 
-LEAGUE_TITLE_TO_KEY = {
-    "premier league": "soccer_epl",
-    "la liga": "soccer_spain_la_liga",
-    "serie a": "soccer_italy_serie_a",
-    "bundesliga": "soccer_germany_bundesliga",
-    "ligue 1": "soccer_france_ligue_one",
-    "champions league": "soccer_uefa_champs_league",
-    "europa league": "soccer_uefa_europa_league",
-    "championship": "soccer_efl_champ",
-    "eredivisie": "soccer_netherlands_eredivisie",
-    "primeira liga": "soccer_portugal_primeira_liga",
-}
-
 
 # =========================================================
 # MODELS
@@ -204,21 +191,17 @@ def normalize_name(s: str) -> str:
 
 
 def team_names_match(a: str, b: str) -> bool:
-    """Match deux noms d'équipes avec fuzzy intelligent."""
     na = normalize_name(a)
     nb = normalize_name(b)
     if not na or not nb:
         return False
 
-    # Exact
     if na == nb:
         return True
 
-    # Inclusion
     if na in nb or nb in na:
         return True
 
-    # Premier mot identique (>= 4 chars) + reste proche
     wa, wb = na.split(), nb.split()
     if wa and wb and wa[0] == wb[0] and len(wa[0]) >= 4:
         if len(wa) >= 2 and len(wb) >= 2:
@@ -227,7 +210,6 @@ def team_names_match(a: str, b: str) -> bool:
         else:
             return True
 
-    # Similarité globale
     ratio = SequenceMatcher(None, na, nb).ratio()
     if ratio >= 0.80:
         return True
@@ -287,14 +269,6 @@ def confidence_bar(pct: int) -> str:
     if pct >= 60:
         return "🟢⚪⚪"
     return "⚪⚪⚪"
-
-
-def league_key_from_title(title: str) -> Optional[str]:
-    tl = (title or "").lower()
-    for k, v in LEAGUE_TITLE_TO_KEY.items():
-        if k in tl:
-            return v
-    return None
 
 
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
@@ -556,10 +530,8 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
         h_norm = normalize_name(fx["home"])
         a_norm = normalize_name(fx["away"])
 
-        # 1. Match exact
         ev = odds_index.get(f"{h_norm}|{a_norm}")
 
-        # 2. Fuzzy intelligent
         if not ev:
             for ok, oev in odds_index.items():
                 try:
@@ -591,7 +563,7 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
 
 
 # =========================================================
-# ENRICHISSEMENT
+# ENRICHISSEMENT (mapping dynamique)
 # =========================================================
 async def enrich_matches_with_context(matches: list[dict]) -> dict:
     if not enrich_match:
@@ -610,16 +582,18 @@ async def enrich_matches_with_context(matches: list[dict]) -> dict:
     for i, fx in enumerate(to_enrich):
         try:
             sport_key = fx.get("odds_sport_key") or ""
-            if not sport_key:
-                sport_key = league_key_from_title(fx.get("league", "")) or ""
-            if not sport_key:
-                sport_key = league_key_from_title(fx.get("odds_sport_title", "")) or ""
+            sport_title = fx.get("odds_sport_title") or ""
+            league_name = fx.get("league", "") or sport_title
 
-            if not sport_key:
-                print(f"  ⏭ {fx['home']} vs {fx['away']} : pas de league key")
+            if not league_name:
+                print(f"  ⏭ {fx['home']} vs {fx['away']} : pas de nom de ligue")
                 continue
 
-            ctx = await enrich_match(fx["home"], fx["away"], sport_key)
+            ctx = await enrich_match(
+                fx["home"], fx["away"],
+                sport_key=sport_key,
+                league_name=league_name,
+            )
             if ctx.get("available"):
                 contexts[fx["event_id"]] = ctx
                 hs = ctx.get("home_stats", {})
