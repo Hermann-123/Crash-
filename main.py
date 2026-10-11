@@ -23,8 +23,10 @@ from fastapi import FastAPI
 
 try:
     from gemini_predictor import predict_match_probas
-except Exception:
+    print("✅ gemini_predictor importé OK")
+except Exception as e:
     predict_match_probas = None
+    print(f"❌ ERREUR import gemini_predictor : {e}")
 
 try:
     from football_data import (
@@ -32,10 +34,12 @@ try:
         fetch_all_today_fixtures,
         enrich_match,
     )
-except Exception:
+    print("✅ football_data importé OK")
+except Exception as e:
     get_fixture_result = None
     fetch_all_today_fixtures = None
     enrich_match = None
+    print(f"❌ ERREUR import football_data : {e}")
 
 
 # =========================================================
@@ -523,6 +527,62 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
         key = f"{h}|{a}"
         odds_index[key] = ev
 
+    # ============ DIAGNOSTIC ============
+    print("=" * 70)
+    print("🔬 DIAGNOSTIC MATCHING")
+    print("=" * 70)
+
+    print(f"\n📡 API-Football : {len(fixtures)} matchs")
+    print("   5 exemples (nom brut → normalisé) :")
+    for fx in fixtures[:5]:
+        print(f"   '{fx['home']}' → '{normalize_name(fx['home'])}'")
+        print(f"   '{fx['away']}' → '{normalize_name(fx['away'])}'")
+        print(f"   [{fx.get('league', '')}]")
+        print()
+
+    print(f"\n💰 Odds API : {len(odds_events)} events")
+    print("   5 exemples (nom brut → normalisé) :")
+    for ev in odds_events[:5]:
+        print(f"   '{ev.get('home_team')}' → '{normalize_name(ev.get('home_team', ''))}'")
+        print(f"   '{ev.get('away_team')}' → '{normalize_name(ev.get('away_team', ''))}'")
+        print(f"   [{ev.get('sport_title', '')}]")
+        print()
+
+    print("\n🧪 TENTATIVES DE MATCHING (3 premiers) :")
+    for fx in fixtures[:3]:
+        h_norm = normalize_name(fx["home"])
+        a_norm = normalize_name(fx["away"])
+        key = f"{h_norm}|{a_norm}"
+        print(f"\n   Recherche : '{h_norm}' vs '{a_norm}'")
+
+        if key in odds_index:
+            print(f"   ✅ EXACT trouvé")
+            continue
+
+        best_match = None
+        best_ratio = 0
+        for ok in odds_index.keys():
+            try:
+                oh, oa = ok.split("|", 1)
+            except ValueError:
+                continue
+            r1 = SequenceMatcher(None, h_norm, oh).ratio()
+            r2 = SequenceMatcher(None, a_norm, oa).ratio()
+            avg = (r1 + r2) / 2
+            if avg > best_ratio:
+                best_ratio = avg
+                best_match = ok
+
+        if best_match:
+            oh, oa = best_match.split("|", 1)
+            print(f"   ❌ Pas exact. Meilleur candidat :")
+            print(f"      '{oh}' vs '{oa}' (score {best_ratio:.2f})")
+            print(f"      team_names_match home ? {team_names_match(h_norm, oh)}")
+            print(f"      team_names_match away ? {team_names_match(a_norm, oa)}")
+
+    print("\n" + "=" * 70)
+    # =====================================
+
     matched = []
     matched_count = 0
 
@@ -540,8 +600,6 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
                     continue
                 if team_names_match(h_norm, oh) and team_names_match(a_norm, oa):
                     ev = oev
-                    print(f"  🔗 Fuzzy : {fx['home']} vs {fx['away']} "
-                          f"→ {oev.get('home_team')} vs {oev.get('away_team')}")
                     break
 
         if ev:
@@ -563,7 +621,7 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
 
 
 # =========================================================
-# ENRICHISSEMENT (mapping dynamique)
+# ENRICHISSEMENT
 # =========================================================
 async def enrich_matches_with_context(matches: list[dict]) -> dict:
     if not enrich_match:
@@ -620,6 +678,7 @@ async def build_gemini_picks(matches, contexts, used_today):
     stats = {"ok": 0, "fail": 0, "kept": 0, "with_ctx": 0}
 
     if not predict_match_probas:
+        print("❌ predict_match_probas non disponible, arrêt")
         return selections
 
     with_odds = [m for m in matches if m.get("has_odds")]
@@ -1188,7 +1247,12 @@ async def scan():
         matches = [m for m in matches if is_today_upcoming(m["kickoff"])]
         print(f"📅 Matchs aujourd'hui : {len(matches)}")
 
-        contexts = await enrich_matches_with_context(matches)
+        # Enrichissement (avec garde-fou)
+        try:
+            contexts = await enrich_matches_with_context(matches)
+        except Exception as e:
+            print(f"⚠️ Enrichissement désactivé (crash) : {e}")
+            contexts = {}
 
         used_today = load_used_today()
         selections = await build_gemini_picks(matches, contexts, used_today)
