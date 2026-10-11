@@ -1,6 +1,6 @@
 """
 Prédicteur Gemini SANS Search grounding.
-Utilise les connaissances internes de Gemini pour estimer les probas.
+Modèle : gemini-3.8-flash
 """
 from __future__ import annotations
 
@@ -12,12 +12,14 @@ from typing import Optional
 import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_SEARCH_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
 
 async def predict_match_probas(client: httpx.AsyncClient, home: str, away: str,
                                 league: str, kickoff: str) -> Optional[dict]:
-    """Demande à Gemini les probas (sans Search, juste ses connaissances)."""
+    """Demande à Gemini les probas (sans Search)."""
+
     if not GEMINI_API_KEY:
+        print("⚠️ GEMINI_API_KEY manquante")
         return None
 
     prompt = f"""Tu es un analyste football. Estime les probas des marchés pour ce match :
@@ -26,16 +28,14 @@ Match : {home} vs {away}
 Compétition : {league}
 Date : {kickoff}
 
-Utilise tes connaissances sur ces équipes pour estimer les probabilités.
-
-Retourne UNIQUEMENT ce JSON (rien d'autre) :
+Retourne UNIQUEMENT ce JSON :
 
 {{
   "context": {{
     "home_form": "V,N,D,V,N",
     "away_form": "N,V,N,D,V",
-    "h2h": "2-3, 4-0, 2-2, 1-1, 0-2",
-    "injuries": "2 blessés côté {home}",
+    "h2h": "2-3, 4-0, 2-2",
+    "injuries": "aucun",
     "corners_avg": 10.0,
     "cards_avg": 4.0
   }},
@@ -61,9 +61,7 @@ Retourne UNIQUEMENT ce JSON (rien d'autre) :
 
 RÈGLES :
 - Probas entre 5 et 92
-- Cohérence : victoire_home + match_nul + victoire_away ≈ 100
-- Cohérence : over_0.5 > over_1.5 > over_2.5 > over_3.5
-- Basé sur ton estimation raisonnable, pas inventé
+- victoire_home + match_nul + victoire_away ≈ 100
 - Rien avant/après le JSON"""
 
     payload = {
@@ -75,10 +73,7 @@ RÈGLES :
     }
 
     try:
-        r = await client.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-            json=payload, timeout=45.0,
-        )
+        r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=45.0)
         if r.status_code >= 400:
             print(f"⚠️ Gemini {r.status_code}: {r.text[:200]}")
             return None
@@ -89,7 +84,6 @@ RÈGLES :
         except (KeyError, IndexError, TypeError):
             return None
 
-        # Extraire le JSON
         m = re.search(r"\{[\s\S]*\}", text)
         if not m:
             return None
