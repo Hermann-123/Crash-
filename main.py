@@ -27,9 +27,10 @@ except Exception:
     DixonColesModel = None
 
 try:
-    from football_data import enrich_match as fd_enrich
+    from football_data import enrich_match as fd_enrich, get_fixture_result
 except Exception:
     fd_enrich = None
+    get_fixture_result = None
 
 try:
     from markets_extra import compute_corners_probs, compute_cards_probs
@@ -314,18 +315,162 @@ def mark_picks_used(selections: list):
 
 
 def record_coupons(coupons: list[Coupon], date_str: str):
+    """Enregistre les coupons avec le détail des paris."""
     tracker = STATE["tracker"]
     existing = {c["id"] for c in tracker["coupons"]}
     for c in coupons:
         cid = f"{date_str}-{c.name}"
         if cid in existing:
             continue
+
+        legs_data = []
+        for s in c.legs:
+            legs_data.append({
+                "event_id": s.event_id,
+                "home": s.home,
+                "away": s.away,
+                "market": s.market,
+                "pick_label": s.pick_label,
+                "odds": s.odds,
+                "kickoff": s.kickoff,
+                "result": "pending",
+            })
+
         tracker["coupons"].append({
-            "id": cid, "date": date_str, "name": c.name,
-            "combined_odds": c.combined_odds, "status": "pending",
+            "id": cid,
+            "date": date_str,
+            "name": c.name,
+            "combined_odds": c.combined_odds,
+            "legs": legs_data,
+            "status": "pending",
         })
     tracker["coupons"] = tracker["coupons"][-500:]
     save_tracker(tracker)
+
+
+def evaluate_leg_result(leg: dict, home_goals: int, away_goals: int) -> str:
+    """Évalue un pari : 'won', 'lost', 'void' ou 'pending'."""
+    if home_goals is None or away_goals is None:
+        return "pending"
+
+    market = leg.get("market", "")
+    label = leg.get("pick_label", "").lower()
+    home = leg.get("home", "").lower()
+    away = leg.get("away", "").lower()
+    total_goals = home_goals + away_goals
+
+    if market == "1X2":
+        if "victoire" in label and home in label:
+            return "won" if home_goals > away_goals else "lost"
+        if "victoire" in label and away in label:
+            return "won" if away_goals > home_goals else "lost"
+        if "match nul" in label or ("nul" in label and "victoire" not in label):
+            return "won" if home_goals == away_goals else "lost"
+
+    if market == "Over/Under":
+        m = re.search(r"(over|under)\s+([\d.]+)", label)
+        if m:
+            prefix, line = m.group(1), float(m.group(2))
+            if prefix == "over":
+                return "won" if total_goals > line else "lost"
+            else:
+                return "won" if total_goals < line else "lost"
+
+    if market == "Handicap":
+        m = re.search(r"\(([-+]?[\d.]+)\)", leg.get("pick_label", ""))
+        if m:
+            hcp = float(m.group(1))
+            if home in label:
+                diff = (home_goals - away_goals) + hcp
+            elif away in label:
+                diff = (away_goals - home_goals) + hcp
+            else:
+                return "pending"
+            if diff > 0:
+                return "won"
+            elif diff < 0:
+                return "lost"
+            else:
+                return "void"
+
+    if market == "BTTS":
+        if "oui" in label:
+            return "won" if (home_goals >= 1 and away_goals >= 1) else "lost"
+        if "non" in label:
+            return "won" if not (home_goals >= 1 and away_goals >= 1) else "lost"
+
+    return "pending"
+
+
+async def settle_coupons():
+    """Vérifie et règle les coupons en attente."""
+    if not get_fixture_result:
+        print("⚠️ get_fixture_result non disponible")
+        return
+
+    tracker = STATE["tracker"]
+    coupons = tracker.get("coupons", [])
+    if not coupons:
+        return
+
+    now = datetime.now(TZ)
+    updated_count = 0
+
+    for coupon in coupons:
+        if coupon.get("status") != "pending":
+            continue
+
+        legs = coupon.get("legs", [])
+        all_resolved = True
+        any_lost = False
+        any_pending = False
+
+        for leg in legs:
+            if leg.get("result") != "pending":
+                if leg["result"] == "lost":
+                    any_lost = True
+                continue
+
+            kickoff_dt = parse_dt_safe(leg.get("kickoff", ""))
+            if not kickoff_dt:
+                all_resolved = False
+                any_pending = True
+                continue
+
+            # Match fini depuis au moins 2h30 ?
+            if (now - kickoff_dt).total_seconds() < 9000:
+                all_resolved = False
+                any_pending = True
+                continue
+
+            date_iso = kickoff_dt.strftime("%Y-%m-%d")
+            result = await get_fixture_result(leg["home"], leg["away"], date_iso)
+
+            if not result or result.get("home_goals") is None:
+                all_resolved = False
+                any_pending = True
+                continue
+
+            outcome = evaluate_leg_result(leg, result["home_goals"], result["away_goals"])
+            leg["result"] = outcome
+            if outcome == "lost":
+                any_lost = True
+            await asyncio.sleep(0.3)
+
+        if any_lost:
+            coupon["status"] = "lost"
+            updated_count += 1
+        elif all(leg.get("result") != "pending" for leg in legs):
+            coupon["status"] = "won"
+            updated_count += 1
+        elif any_pending:
+            pass
+
+    if updated_count:
+        save_tracker(tracker)
+        print(f"✅ {updated_count} coupon(s) réglé(s)")
+    else:
+        print(f"ℹ️ Aucun coupon à régler")
 
 
 async def init_dixon_coles():
@@ -600,8 +745,7 @@ def build_house_picks(events_norm, odds_by_id, used_today, contexts_by_id=None):
     selections: list[Selection] = []
     seen = set()
     contexts_by_id = contexts_by_id or {}
-    stats = {"1x2": 0, "ou": 0, "corners": 0, "cards": 0,
-             "rej_edge": 0, "rej_asym": 0}
+    stats = {"1x2": 0, "ou": 0, "rej_edge": 0, "rej_asym": 0}
 
     if not DC_MODEL:
         return selections
@@ -630,7 +774,7 @@ def build_house_picks(events_norm, odds_by_id, used_today, contexts_by_id=None):
 
             ctx = contexts_by_id.get(event_id, {})
 
-            # === 1X2 ===
+            # 1X2
             h2h = odds.get("h2h", {})
             for key, prob in (("home", p_home),
                               ("draw", pred.get("p_draw", 0)),
@@ -668,7 +812,7 @@ def build_house_picks(events_norm, odds_by_id, used_today, contexts_by_id=None):
                 ))
                 stats["1x2"] += 1
 
-            # === Over/Under ===
+            # Over/Under
             totals = odds.get("totals", {})
             for line in (1.5, 2.5, 3.5):
                 for prefix, prob_key in (("over", f"over_{line}"), ("under", f"under_{line}")):
@@ -702,50 +846,6 @@ def build_house_picks(events_norm, odds_by_id, used_today, contexts_by_id=None):
                         source="house", context=ctx,
                     ))
                     stats["ou"] += 1
-
-            # === Corners (Étape 2) ===
-            if compute_corners_probs and ctx and ctx.get("available"):
-                hs = ctx.get("home_stats", {})
-                aws = ctx.get("away_stats", {})
-                h_corners = hs.get("corners_for_avg", 0) or (LEAGUE_CORNERS_AVG * 0.55)
-                a_corners = aws.get("corners_for_avg", 0) or (LEAGUE_CORNERS_AVG * 0.45)
-
-                cp = compute_corners_probs(h_corners, a_corners, LEAGUE_CORNERS_AVG)
-
-                # On ne garde que si les équipes ont des moyennes fiables (>0)
-                if hs.get("corners_for_avg", 0) > 0 and aws.get("corners_for_avg", 0) > 0:
-                    for line in (8.5, 9.5, 10.5):
-                        for prefix in ("over", "under"):
-                            prob = cp.get(f"{prefix}_{line}")
-                            if not prob or prob < MIN_PROB:
-                                continue
-                            # Pas de cote The Odds API pour les corners → on skip
-                            # (à moins qu'on ajoute une estimation ~ fair odds)
-                            # Pour l'instant on n'ajoute pas, on log juste
-                            pass
-
-                    # Corners par équipe (favori uniquement)
-                    for line in (4.5, 5.5):
-                        prob = cp.get(f"home_over_{line}")
-                        if prob and prob >= MIN_PROB and p_home > 0.5:
-                            # Pas de cote API → skip pour l'instant
-                            pass
-
-                # Note : sans cote corners de The Odds API, on ne peut pas calculer d'edge.
-                # Le calcul est prêt pour quand on aura une source de cotes corners.
-
-            # === Cartons (Étape 2) ===
-            if compute_cards_probs and ctx and ctx.get("available"):
-                hs = ctx.get("home_stats", {})
-                aws = ctx.get("away_stats", {})
-                h_cards = hs.get("cards_yellow_avg", 0) or (LEAGUE_CARDS_AVG * 0.5)
-                a_cards = aws.get("cards_yellow_avg", 0) or (LEAGUE_CARDS_AVG * 0.5)
-
-                cdp = compute_cards_probs(h_cards, a_cards, LEAGUE_CARDS_AVG)
-
-                if hs.get("cards_yellow_avg", 0) > 0 and aws.get("cards_yellow_avg", 0) > 0:
-                    # Pas de cote cartons → skip pour l'instant
-                    pass
 
         except Exception as e:
             print(f"⚠️ build_house_picks crash: {e}")
@@ -889,7 +989,6 @@ def format_selection_block(s: Selection, idx: int, show_ai=True):
         f"│ ⚡ Edge : <b>{s.edge*100:+.1f}%</b>  {edge_bar(s.edge)}",
     ]
 
-    # Contexte (forme, H2H)
     if s.context and s.context.get("available"):
         hs = s.context.get("home_stats", {})
         aws = s.context.get("away_stats", {})
@@ -966,7 +1065,56 @@ def format_coupons_ready():
 
 def format_bilan(tracker):
     coupons = tracker.get("coupons", [])
-    return f"{format_header()}\n\n<b>📊 Bilan</b>\n🎫 Tickets : <b>{len(coupons)}</b>"
+    if not coupons:
+        return f"{format_header()}\n\n<b>📊 Bilan</b>\n<i>Aucun historique.</i>"
+
+    total = len(coupons)
+    won = sum(1 for c in coupons if c.get("status") == "won")
+    lost = sum(1 for c in coupons if c.get("status") == "lost")
+    pending = sum(1 for c in coupons if c.get("status") == "pending")
+    settled = won + lost
+
+    win_rate = (won / settled * 100) if settled > 0 else 0
+
+    total_staked = settled
+    total_returned = sum(c.get("combined_odds", 1.0) for c in coupons if c.get("status") == "won")
+    profit = total_returned - total_staked
+    roi = (profit / total_staked * 100) if total_staked > 0 else 0
+
+    by_cat = {}
+    for c in coupons:
+        name = c.get("name", "?")
+        if name not in by_cat:
+            by_cat[name] = {"w": 0, "l": 0, "p": 0}
+        st = c.get("status")
+        if st == "won":
+            by_cat[name]["w"] += 1
+        elif st == "lost":
+            by_cat[name]["l"] += 1
+        else:
+            by_cat[name]["p"] += 1
+
+    lines = [format_header(), "", "<b>📊 BILAN HONNÊTE</b>", "━━━━━━━━━━━━━━━━━━━━━━━"]
+    lines.append(f"🎫 Total : <b>{total}</b> coupons")
+    lines.append(f"✅ Gagnés : <b>{won}</b>")
+    lines.append(f"❌ Perdus : <b>{lost}</b>")
+    lines.append(f"⏳ En attente : <b>{pending}</b>")
+    lines.append("")
+    lines.append(f"📈 Taux réussite : <b>{win_rate:.1f}%</b>")
+    lines.append(f"💰 ROI : <b>{roi:+.1f}%</b>")
+    lines.append(f"💵 Profit net : <b>{profit:+.2f}u</b> (sur {settled}u misés)")
+    lines.append("")
+    lines.append("<b>━━━━━━━━━━━━━━━━━━━━━━━</b>")
+    lines.append("<b>Par catégorie</b>")
+    for name, s in by_cat.items():
+        w, l, p = s["w"], s["l"], s["p"]
+        s_total = w + l
+        wr = (w / s_total * 100) if s_total > 0 else 0
+        lines.append(f"• <b>{name}</b> : {w}W/{l}L ({wr:.0f}%) [{p} en attente]")
+
+    lines.append("")
+    lines.append("<i>⚠️ Bilan basé sur 1 unité misée par coupon.</i>")
+    return "\n".join(lines)
 
 
 # =========================================================
@@ -1007,6 +1155,13 @@ async def scan_cmd(message):
     await safe_answer(message, "⏳ Analyse en cours...")
     await scan()
     await broadcast_after_scan()
+
+
+@dp.message(Command("regler"))
+async def regler_cmd(message):
+    await safe_answer(message, "⏳ Vérification des résultats en cours...")
+    await settle_coupons()
+    await safe_answer(message, format_bilan(STATE["tracker"]))
 
 
 @dp.message(Command("debug"))
@@ -1091,7 +1246,6 @@ async def scan():
                     dc_verdicts[fx["event_id"]] = pred
             print(f"🧮 Dixon-Coles : {len(dc_verdicts)} prédictions")
 
-        # 🌐 Enrichissement contexte (API-Football)
         contexts_by_id = {}
         if fd_enrich and API_FOOTBALL_KEY and events_norm:
             print(f"🌐 Enrichissement contexte (max {MAX_ENRICH})...")
@@ -1106,12 +1260,10 @@ async def scan():
                 await asyncio.sleep(0.3)
             print(f"✅ Contextes enrichis : {len(contexts_by_id)}")
 
-        # 🏠 Picks maison
         used_today = load_used_today()
         selections = build_house_picks(events_norm, odds_by_id, used_today, contexts_by_id)
         print(f"🏠 Picks maison total : {len(selections)}")
 
-        # 🧠 Revue IA
         if GEMINI_API_KEY and selections:
             await ai_review_all(selections)
 
@@ -1177,7 +1329,7 @@ async def bootstrap():
     STATE["tracker"] = load_tracker()
     await init_dixon_coles()
     STATE["ready"] = True
-    print("✅ Bot prêt (Dixon-Coles + Contexte + Marchés).")
+    print("✅ Bot prêt (Dixon-Coles + Contexte + Règlement).")
 
 
 # =========================================================
@@ -1196,6 +1348,10 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(daily_broadcast,
                       CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ),
                       id="daily_broadcast", replace_existing=True,
+                      max_instances=1, coalesce=True)
+    scheduler.add_job(settle_coupons,
+                      CronTrigger(hour=10, minute=0, timezone=TZ),
+                      id="settle_coupons", replace_existing=True,
                       max_instances=1, coalesce=True)
     scheduler.start()
 
