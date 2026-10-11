@@ -46,12 +46,19 @@ NOTIFY_TZ = os.getenv("NOTIFY_TZ", "Africa/Abidjan")
 
 LOCAL_DB = os.getenv("LOCAL_DB", "/tmp/tracker.json")
 BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
-BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • Dixon-Coles + Gemini Search")
+BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • Dixon-Coles + Gemini")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-MIN_PROB = float(os.getenv("MIN_PROB", "0.65"))
-MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "15"))
+MIN_PROB = float(os.getenv("MIN_PROB", "0.62"))
+MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "20"))
+
+SAFE_MIN_ODDS = 2.0
+SAFE_MAX_ODDS = 2.5
+BAL_MIN_ODDS = 3.0
+BAL_MAX_ODDS = 5.0
+BAL_MIN_LEG_ODDS = 1.20
+VALUE_TOP_N = 20
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -91,14 +98,10 @@ class Selection:
     edge: float
     bookmaker: str
     source: str = "gemini"
-    context: Optional[dict] = None
     real_odd: Optional[float] = None
 
     def final_prob(self) -> float:
         return self.model_prob
-
-    def score(self) -> float:
-        return self.final_prob() * 100
 
 
 @dataclass
@@ -109,7 +112,7 @@ class Coupon:
     legs: list[Selection]
     combined_odds: float
     combined_prob: float
-    combined_ev: float
+    is_list: bool = False
 
 
 # =========================================================
@@ -120,7 +123,7 @@ dp = Dispatcher()
 
 BTN_SAFE = "🔒 Sécurisé"
 BTN_BAL = "⚖️ Équilibré"
-BTN_VAR = "💎 Varié"
+BTN_VAR = "💎 Value"
 BTN_SCAN = "🔄 Actualiser"
 BTN_BILAN = "📊 Bilan"
 
@@ -275,27 +278,17 @@ def record_coupons(coupons: list[Coupon], date_str: str):
         cid = f"{date_str}-{c.name}"
         if cid in existing:
             continue
-
         legs_data = []
         for s in c.legs:
             legs_data.append({
-                "event_id": s.event_id,
-                "home": s.home,
-                "away": s.away,
-                "market": s.market,
-                "pick_label": s.pick_label,
-                "odds": s.odds,
-                "kickoff": s.kickoff,
-                "result": "pending",
+                "event_id": s.event_id, "home": s.home, "away": s.away,
+                "market": s.market, "pick_label": s.pick_label,
+                "odds": s.odds, "kickoff": s.kickoff, "result": "pending",
             })
-
         tracker["coupons"].append({
-            "id": cid,
-            "date": date_str,
-            "name": c.name,
+            "id": cid, "date": date_str, "name": c.name,
             "combined_odds": c.combined_odds,
-            "legs": legs_data,
-            "status": "pending",
+            "legs": legs_data, "status": "pending",
         })
     tracker["coupons"] = tracker["coupons"][-500:]
     save_tracker(tracker)
@@ -304,25 +297,24 @@ def record_coupons(coupons: list[Coupon], date_str: str):
 def evaluate_leg_result(leg: dict, home_goals: int, away_goals: int) -> str:
     if home_goals is None or away_goals is None:
         return "pending"
-
     market = leg.get("market", "")
     label = leg.get("pick_label", "").lower()
     home = leg.get("home", "").lower()
     away = leg.get("away", "").lower()
-    total_goals = home_goals + away_goals
+    total = home_goals + away_goals
 
     if market == "1X2":
         if "victoire" in label and home in label:
             return "won" if home_goals > away_goals else "lost"
         if "victoire" in label and away in label:
             return "won" if away_goals > home_goals else "lost"
-        if "match nul" in label or ("nul" in label and "victoire" not in label):
+        if "match nul" in label:
             return "won" if home_goals == away_goals else "lost"
 
     if market == "Double Chance":
-        if "1x" in label or ("ou nul" in label and home in label):
+        if "1x" in label:
             return "won" if home_goals >= away_goals else "lost"
-        if "x2" in label or ("nul" in label and away in label):
+        if "x2" in label:
             return "won" if away_goals >= home_goals else "lost"
         if "12" in label or "pas de nul" in label:
             return "won" if home_goals != away_goals else "lost"
@@ -332,9 +324,9 @@ def evaluate_leg_result(leg: dict, home_goals: int, away_goals: int) -> str:
         if m:
             prefix, line = m.group(1), float(m.group(2))
             if prefix == "over":
-                return "won" if total_goals > line else "lost"
+                return "won" if total > line else "lost"
             else:
-                return "won" if total_goals < line else "lost"
+                return "won" if total < line else "lost"
 
     if market == "BTTS":
         if "oui" in label:
@@ -342,32 +334,23 @@ def evaluate_leg_result(leg: dict, home_goals: int, away_goals: int) -> str:
         if "non" in label:
             return "won" if not (home_goals >= 1 and away_goals >= 1) else "lost"
 
-    # Corners / Cartons : on ne peut pas régler sans données
-    if market in ("Corners", "Cartons"):
-        return "pending"
-
     return "pending"
 
 
 async def settle_coupons():
     if not get_fixture_result:
-        print("⚠️ get_fixture_result non disponible")
         return
-
     tracker = STATE["tracker"]
     coupons = tracker.get("coupons", [])
     if not coupons:
         return
-
     now = datetime.now(TZ)
     updated = 0
 
     for coupon in coupons:
         if coupon.get("status") != "pending":
             continue
-
         legs = coupon.get("legs", [])
-        all_resolved = True
         any_lost = False
         any_pending = False
 
@@ -376,26 +359,14 @@ async def settle_coupons():
                 if leg["result"] == "lost":
                     any_lost = True
                 continue
-
             kickoff_dt = parse_dt_safe(leg.get("kickoff", ""))
-            if not kickoff_dt:
-                all_resolved = False
+            if not kickoff_dt or (now - kickoff_dt).total_seconds() < 9000:
                 any_pending = True
                 continue
-
-            if (now - kickoff_dt).total_seconds() < 9000:
-                all_resolved = False
-                any_pending = True
-                continue
-
-            date_iso = kickoff_dt.strftime("%Y-%m-%d")
-            result = await get_fixture_result(leg["home"], leg["away"], date_iso)
-
+            result = await get_fixture_result(leg["home"], leg["away"], kickoff_dt.strftime("%Y-%m-%d"))
             if not result or result.get("home_goals") is None:
-                all_resolved = False
                 any_pending = True
                 continue
-
             outcome = evaluate_leg_result(leg, result["home_goals"], result["away_goals"])
             leg["result"] = outcome
             if outcome == "lost":
@@ -408,37 +379,27 @@ async def settle_coupons():
         elif all(leg.get("result") != "pending" for leg in legs):
             coupon["status"] = "won"
             updated += 1
-        elif any_pending:
-            pass
-
     if updated:
         save_tracker(tracker)
         print(f"✅ {updated} coupon(s) réglé(s)")
-    else:
-        print(f"ℹ️ Aucun coupon à régler")
 
 
 # =========================================================
-# THE ODDS API (fixtures only)
+# THE ODDS API
 # =========================================================
 async def fetch_odds_api_league(client: httpx.AsyncClient, sport_key: str) -> list[dict]:
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "eu",
-        "markets": "h2h,totals",
-        "oddsFormat": "decimal",
-    }
+    params = {"apiKey": ODDS_API_KEY, "regions": "eu",
+              "markets": "h2h,totals", "oddsFormat": "decimal"}
     try:
         r = await client.get(url, params=params, timeout=30.0)
-        remaining = r.headers.get("x-requests-remaining", "?")
-        print(f"🌍 {sport_key} -> {r.status_code} | remaining={remaining}")
+        print(f"🌍 {sport_key} -> {r.status_code}")
         if r.status_code >= 400:
             return []
         data = r.json()
         return data if isinstance(data, list) else []
     except Exception as e:
-        print(f"⚠️ {sport_key} crash: {e}")
+        print(f"⚠️ {sport_key}: {e}")
         return []
 
 
@@ -460,13 +421,13 @@ def extract_event_fields(ev: dict) -> dict:
         "away": ev.get("away_team", ""),
         "league": ev.get("sport_title", "") or ev.get("sport_key", ""),
         "kickoff": ev.get("commence_time", ""),
-        "raw": ev,
     }
 
 
 def extract_real_odds(ev: dict) -> dict:
-    """Extrait les vraies cotes pour comparer (facultatif)."""
-    result = {"home": None, "draw": None, "away": None, "over_2.5": None, "under_2.5": None}
+    result = {"home": None, "draw": None, "away": None,
+              "over_2.5": None, "under_2.5": None,
+              "btts_yes": None, "btts_no": None}
     home = ev.get("home_team", "")
     away = ev.get("away_team", "")
     for book in ev.get("bookmakers", []) or []:
@@ -487,29 +448,31 @@ def extract_real_odds(ev: dict) -> dict:
                         result["away"] = price
                     elif "draw" in name.lower() and result["draw"] is None:
                         result["draw"] = price
-                elif mk == "totals":
-                    if out.get("point") == 2.5:
-                        if "over" in name.lower() and result["over_2.5"] is None:
-                            result["over_2.5"] = price
-                        elif "under" in name.lower() and result["under_2.5"] is None:
-                            result["under_2.5"] = price
+                elif mk == "totals" and out.get("point") == 2.5:
+                    if "over" in name.lower() and result["over_2.5"] is None:
+                        result["over_2.5"] = price
+                    elif "under" in name.lower() and result["under_2.5"] is None:
+                        result["under_2.5"] = price
+                elif mk == "btts":
+                    if "yes" in name.lower() and result["btts_yes"] is None:
+                        result["btts_yes"] = price
+                    elif "no" in name.lower() and result["btts_no"] is None:
+                        result["btts_no"] = price
     return result
 
 
 # =========================================================
-# BUILD PICKS (Gemini Search)
+# BUILD PICKS
 # =========================================================
 async def build_gemini_picks(events_norm, used_today):
-    """Interroge Gemini pour chaque match et génère les probas."""
     selections: list[Selection] = []
     seen = set()
     stats = {"ok": 0, "fail": 0, "markets": 0}
 
     if not predict_match_probas:
-        print("⚠️ gemini_predictor non disponible")
         return selections
 
-    async with httpx.AsyncClient(timeout=50.0) as client:
+    async with httpx.AsyncClient(timeout=40.0) as client:
         for fx in events_norm[:MAX_MATCHES_TO_ANALYZE]:
             try:
                 home, away = fx["home"], fx["away"]
@@ -526,7 +489,7 @@ async def build_gemini_picks(events_norm, used_today):
 
                 stats["ok"] += 1
                 markets = pred.get("markets", {})
-                context = pred.get("context", {})
+                real_odds = extract_real_odds(fx.get("raw", {}))
 
                 market_map = {
                     "double_chance_1X": (f"Double Chance 1X ({home} ou nul)", "Double Chance"),
@@ -541,14 +504,7 @@ async def build_gemini_picks(events_norm, used_today):
                     "over_3.5": ("Over 3.5 buts", "Over/Under"),
                     "btts_yes": ("Les 2 marquent : Oui", "BTTS"),
                     "btts_no": ("Les 2 marquent : Non", "BTTS"),
-                    "over_8.5_corners": ("Plus de 8.5 corners", "Corners"),
-                    "over_9.5_corners": ("Plus de 9.5 corners", "Corners"),
-                    "over_2.5_cartons": ("Plus de 2.5 cartons", "Cartons"),
-                    "over_3.5_cartons": ("Plus de 3.5 cartons", "Cartons"),
                 }
-
-                # Extraire les cotes réelles pour info
-                real_odds = extract_real_odds(fx.get("raw", {}))
 
                 for key, (label, mkt) in market_map.items():
                     prob_pct = markets.get(key)
@@ -558,9 +514,7 @@ async def build_gemini_picks(events_norm, used_today):
                         prob = float(prob_pct) / 100.0
                     except (ValueError, TypeError):
                         continue
-                    if prob < MIN_PROB:
-                        continue
-                    if prob > 0.92:
+                    if prob < MIN_PROB or prob > 0.92:
                         continue
 
                     dedup = f"{event_id}|{mkt}|{label}"
@@ -568,10 +522,7 @@ async def build_gemini_picks(events_norm, used_today):
                         continue
                     seen.add(dedup)
 
-                    # Cote fair (théorique)
                     fair_odd = round(1.0 / prob, 2)
-
-                    # Cote réelle si dispo
                     real_odd = None
                     if mkt == "1X2":
                         if "victoire" in label.lower() and home.lower() in label.lower():
@@ -585,34 +536,38 @@ async def build_gemini_picks(events_norm, used_today):
                             real_odd = real_odds.get("over_2.5")
                         elif "under 2.5" in label.lower():
                             real_odd = real_odds.get("under_2.5")
+                    elif mkt == "BTTS":
+                        if "oui" in label.lower():
+                            real_odd = real_odds.get("btts_yes")
+                        elif "non" in label.lower():
+                            real_odd = real_odds.get("btts_no")
 
                     selections.append(Selection(
                         event_id=event_id, league=league, home=home, away=away,
                         kickoff=kickoff, market=mkt, pick_label=label,
                         odds=fair_odd, model_prob=round(prob, 4),
-                        edge=0.0, bookmaker="Gemini Search",
-                        source="gemini",
-                        context={"available": True, **context},
+                        edge=0.0, bookmaker="Gemini",
                         real_odd=real_odd,
                     ))
                     stats["markets"] += 1
 
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(1.0)
 
             except Exception as e:
-                print(f"⚠️ build_gemini_picks crash: {e}")
+                print(f"⚠️ build_gemini_picks: {e}")
 
-    print(f"🏠 Picks Gemini : matchs_ok={stats['ok']} échec={stats['fail']} marchés={stats['markets']}")
+    print(f"🏠 Picks : matchs_ok={stats['ok']} échec={stats['fail']} marchés={stats['markets']}")
     return selections
 
 
 # =========================================================
 # COUPONS
 # =========================================================
-def build_coupon_target(name, subtitle, emoji, pool, min_prob, max_legs, used_events_global):
+def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
+                        max_legs, globally_used, min_leg_odds=1.01):
     pool = [s for s in pool
-            if s.event_id not in used_events_global
-            and s.final_prob() >= min_prob]
+            if s.odds >= min_leg_odds
+            and s.event_id not in globally_used]
     if not pool:
         return None
 
@@ -622,6 +577,8 @@ def build_coupon_target(name, subtitle, emoji, pool, min_prob, max_legs, used_ev
     used_events = set()
     used_leagues = set()
     used_markets = set()
+    combined_odds = 1.0
+    combined_prob = 1.0
 
     for s in pool:
         if len(legs) >= max_legs:
@@ -631,50 +588,96 @@ def build_coupon_target(name, subtitle, emoji, pool, min_prob, max_legs, used_ev
         if s.market in used_markets:
             continue
 
+        next_odds = combined_odds * s.odds
+        if next_odds > target_max and legs:
+            continue
+
         legs.append(s)
         used_events.add(s.event_id)
         used_leagues.add(s.league)
         used_markets.add(s.market)
+        combined_odds = next_odds
+        combined_prob *= s.final_prob()
+
+        if combined_odds >= target_min:
+            break
 
     if not legs:
         return None
+    if combined_odds < target_min or combined_odds > target_max:
+        return None
 
-    combined_prob = 1.0
-    combined_odds = 1.0
+    legs.sort(key=lambda s: s.odds)
     for s in legs:
-        combined_prob *= s.final_prob()
-        combined_odds *= s.odds
-
-    for s in legs:
-        used_events_global.add(s.event_id)
+        globally_used.add(s.event_id)
 
     return Coupon(name, subtitle, emoji, legs,
-                  round(combined_odds, 2), round(combined_prob, 4),
-                  round(combined_prob * combined_odds - 1, 4))
+                  round(combined_odds, 2), round(combined_prob, 4))
+
+
+def build_value_list(selections, top_n=20, globally_used=None):
+    if globally_used is None:
+        globally_used = set()
+
+    pool = [s for s in selections if s.event_id not in globally_used]
+    if not pool:
+        return None
+
+    pool.sort(key=lambda s: s.final_prob(), reverse=True)
+
+    top_list = []
+    seen_events = set()
+    for s in pool:
+        if s.event_id in seen_events:
+            continue
+        top_list.append(s)
+        seen_events.add(s.event_id)
+        if len(top_list) >= top_n:
+            break
+
+    if not top_list:
+        return None
+
+    combined_odds = 1.0
+    combined_prob = 1.0
+    for s in top_list:
+        combined_odds *= s.odds
+        combined_prob *= s.final_prob()
+
+    for s in top_list:
+        globally_used.add(s.event_id)
+
+    return Coupon(
+        "Ticket Value", f"Top {len(top_list)} pronostics les plus probables",
+        "💎", top_list,
+        round(combined_odds, 2), round(combined_prob, 4),
+        is_list=True,
+    )
 
 
 def build_all_coupons(selections):
     coupons = []
     used = set()
 
-    # SÉCURISÉ : probas très hautes (>= 78%), 3 legs
-    pool_safe = [s for s in selections if s.final_prob() >= 0.78]
-    c = build_coupon_target("Ticket Sécurisé", "3 paris à très forte proba (≥ 78%)",
-                            "🔒", pool_safe, 0.78, 3, used)
+    pool_safe = [s for s in selections if s.final_prob() >= 0.70]
+    c = build_coupon_target(
+        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Priorité sûreté",
+        "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 5, used,
+        min_leg_odds=1.20,
+    )
     if c:
         coupons.append(c)
 
-    # ÉQUILIBRÉ : probas hautes (>= 72%), 4 legs
-    pool_bal = [s for s in selections if s.final_prob() >= 0.72]
-    c = build_coupon_target("Ticket Équilibré", "4 paris solides (≥ 72%)",
-                            "⚖️", pool_bal, 0.72, 4, used)
+    pool_bal = [s for s in selections if s.final_prob() >= 0.62]
+    c = build_coupon_target(
+        "Ticket Équilibré", "Cote 3 - 5 • Cote mini 1.20/leg",
+        "⚖️", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
+        min_leg_odds=BAL_MIN_LEG_ODDS,
+    )
     if c:
         coupons.append(c)
 
-    # VARIÉ : mixte marchés (>= 65%), 5-6 legs
-    pool_var = [s for s in selections if s.final_prob() >= 0.65]
-    c = build_coupon_target("Ticket Varié", "5-6 paris, marchés diversifiés (≥ 65%)",
-                            "💎", pool_var, 0.65, 6, used)
+    c = build_value_list(selections, top_n=VALUE_TOP_N, globally_used=set())
     if c:
         coupons.append(c)
 
@@ -707,41 +710,34 @@ def format_selection_block(s: Selection, idx: int):
     prob_pct = s.final_prob() * 100
 
     lines = [
-        f"<b>┌─ Sélection #{idx}</b>",
-        f"<b>│ 🏟 {s.home}  vs  {s.away}</b>",
-        f"│ {day_tag}🕐 <b>{kickoff_local(s.kickoff)}</b>  •  {s.league}",
-        f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>",
-        f"│ 📊 Proba IA : <b>{prob_pct:.1f}%</b>  {prob_bar(s.final_prob())}",
+        f"<b>┌─ #{idx} {s.home} vs {s.away}</b>",
+        f"│ {day_tag}🕐 <b>{kickoff_local(s.kickoff)}</b> • {s.league}",
+        f"│ 🎯 <b>{s.pick_label}</b>",
+        f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}",
     ]
-
     if s.real_odd:
         lines.append(f"│ 💰 Cote réelle : <b>{s.real_odd}</b>")
     else:
         lines.append(f"│ 💰 Cote théorique : {s.odds}")
-
-    # Contexte (forme, H2H)
-    ctx = s.context or {}
-    if ctx.get("available"):
-        h_form = ctx.get("home_form", "?")
-        a_form = ctx.get("away_form", "?")
-        if h_form and a_form:
-            lines.append(f"│")
-            lines.append(f"│ 📈 Forme : {s.home} <b>{h_form}</b>")
-            lines.append(f"│             {s.away} <b>{a_form}</b>")
-
-        h2h = ctx.get("h2h", "")
-        if h2h and h2h != "?":
-            lines.append(f"│ 🤝 H2H : <i>{h2h[:80]}</i>")
-
-        injuries = ctx.get("injuries", "")
-        if injuries and injuries != "?" and "aucun" not in injuries.lower():
-            lines.append(f"│ 🏥 Absents : <i>{injuries[:80]}</i>")
-
-    lines.append(f"<b>└───────────────</b>")
+    lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
 
 def format_coupon(c: Coupon):
+    if c.is_list:
+        lines = [
+            format_header(), "",
+            f"<b>{c.emoji} {c.name.upper()}</b>",
+            f"<i>{c.subtitle}</i>", "",
+            f"<b>🎯 {len(c.legs)} pronostics classés par probabilité</b>",
+            "",
+        ]
+        for i, s in enumerate(c.legs, 1):
+            lines.append(format_selection_block(s, i))
+            lines.append("")
+        lines.append(f"<i>{PUBLIC_FOOTER}</i>")
+        return "\n".join(lines)
+
     prob_level = "🟢 Faible risque" if c.combined_prob >= 0.40 else \
                  "🟡 Risque modéré" if c.combined_prob >= 0.20 else "🔴 Risque élevé"
     lines = [
@@ -774,23 +770,24 @@ def format_summary():
 
 def format_coupons_ready():
     if not STATE["coupons"]:
-        return (
-            f"{format_header()}\n\n"
-            f"<b>📭 Aucun coupon aujourd'hui</b>\n"
-            f"<i>Pas assez de paris à haute proba (≥ 65%).</i>"
-        )
+        return (f"{format_header()}\n\n<b>📭 Aucun coupon aujourd'hui</b>\n"
+                f"<i>Pas assez de paris à haute proba.</i>")
     lignes = []
     for c in STATE["coupons"]:
         n = len(c.legs)
-        lignes.append(
-            f"{c.emoji} <b>{c.name}</b>\n"
-            f"   • {n} paris\n"
-            f"   • Cote totale <b>{c.combined_odds}</b> • Proba <b>{c.combined_prob*100:.0f}%</b>"
-        )
+        if c.is_list:
+            lignes.append(f"{c.emoji} <b>{c.name}</b>\n   • {n} pronostics (liste)")
+        else:
+            lignes.append(
+                f"{c.emoji} <b>{c.name}</b>\n"
+                f"   • {n} paris • Cote <b>{c.combined_odds}</b> • Proba <b>{c.combined_prob*100:.0f}%</b>"
+            )
     return (
         f"{format_header()}\n\n"
         f"<b>🔔 COUPONS DU JOUR PRÊTS !</b>\n\n"
-        f"<b>{len(STATE['coupons'])} coupons :</b>\n\n" + "\n\n".join(lignes)
+        f"<b>{len(STATE['coupons'])} coupon(s) disponible(s) :</b>\n\n"
+        + "\n\n".join(lignes)
+        + "\n\n<i>👇 Clique sur le bouton du ticket qui t'intéresse</i>"
     )
 
 
@@ -798,75 +795,67 @@ def format_bilan(tracker):
     coupons = tracker.get("coupons", [])
     if not coupons:
         return f"{format_header()}\n\n<b>📊 Bilan</b>\n<i>Aucun historique.</i>"
-
     total = len(coupons)
     won = sum(1 for c in coupons if c.get("status") == "won")
     lost = sum(1 for c in coupons if c.get("status") == "lost")
     pending = sum(1 for c in coupons if c.get("status") == "pending")
     settled = won + lost
-
-    win_rate = (won / settled * 100) if settled > 0 else 0
+    wr = (won / settled * 100) if settled > 0 else 0
     total_returned = sum(c.get("combined_odds", 1.0) for c in coupons if c.get("status") == "won")
     profit = total_returned - settled
     roi = (profit / settled * 100) if settled > 0 else 0
-
-    lines = [format_header(), "", "<b>📊 BILAN</b>", "━━━━━━━━━━━━━━━━━━━━━━━"]
-    lines.append(f"🎫 Total : <b>{total}</b> coupons")
-    lines.append(f"✅ Gagnés : <b>{won}</b>")
-    lines.append(f"❌ Perdus : <b>{lost}</b>")
-    lines.append(f"⏳ En attente : <b>{pending}</b>")
-    lines.append("")
-    lines.append(f"📈 Taux réussite : <b>{win_rate:.1f}%</b>")
-    lines.append(f"💰 ROI : <b>{roi:+.1f}%</b>")
-    lines.append(f"💵 Profit net : <b>{profit:+.2f}u</b>")
-    lines.append("")
-    lines.append("<i>⚠️ Bilan basé sur 1 unité par coupon.</i>")
-    return "\n".join(lines)
+    return (
+        f"{format_header()}\n\n"
+        f"<b>📊 BILAN</b>\n"
+        f"🎫 Total : <b>{total}</b>\n"
+        f"✅ Gagnés : <b>{won}</b>\n"
+        f"❌ Perdus : <b>{lost}</b>\n"
+        f"⏳ En attente : <b>{pending}</b>\n\n"
+        f"📈 Taux réussite : <b>{wr:.1f}%</b>\n"
+        f"💰 ROI : <b>{roi:+.1f}%</b>\n"
+        f"💵 Profit : <b>{profit:+.2f}u</b>"
+    )
 
 
 # =========================================================
-# TELEGRAM HANDLERS
+# TELEGRAM
 # =========================================================
 async def safe_answer(message, text):
     try:
         await message.answer(text, parse_mode="HTML", reply_markup=MAIN_KEYBOARD)
     except Exception as e:
-        print(f"⚠️ Answer crash: {e}")
+        print(f"⚠️ Answer: {e}")
 
 
 async def safe_send(chat_id, text):
     try:
         await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
     except Exception as e:
-        print(f"⚠️ Send crash {chat_id}: {e}")
+        print(f"⚠️ Send {chat_id}: {e}")
 
 
 async def broadcast_after_scan():
+    """Envoie uniquement le message d'annonce (pas les détails)."""
     for chat_id in TARGETS:
         await safe_send(chat_id, format_coupons_ready())
-        await asyncio.sleep(1)
-        await safe_send(chat_id, format_summary())
         await asyncio.sleep(0.5)
-        for c in STATE["coupons"]:
-            await safe_send(chat_id, format_coupon(c))
-            await asyncio.sleep(0.5)
 
 
 @dp.message(Command("start"))
 async def start_cmd(message):
-    await safe_answer(message, f"{format_header()}\n\n<b>👋 Bienvenue !</b>\n\nTape /scan pour lancer l'analyse.")
+    await safe_answer(message, f"{format_header()}\n\n<b>👋 Bienvenue !</b>\n\nTape /scan.")
 
 
 @dp.message(Command("scan"))
 async def scan_cmd(message):
-    await safe_answer(message, "⏳ Analyse en cours... (peut prendre 2-3 min)")
+    await safe_answer(message, "⏳ Analyse en cours (2-3 min)...")
     await scan()
     await broadcast_after_scan()
 
 
 @dp.message(Command("regler"))
 async def regler_cmd(message):
-    await safe_answer(message, "⏳ Vérification des résultats...")
+    await safe_answer(message, "⏳ Vérification...")
     await settle_coupons()
     await safe_answer(message, format_bilan(STATE["tracker"]))
 
@@ -877,7 +866,7 @@ async def debug_cmd(message):
     txt = (
         f"<b>🔍 DEBUG</b>\n\n"
         f"Events : <b>{d.get('events_total', 0)}</b>\n"
-        f"Matchs analysés Gemini : <b>{d.get('gemini_ok', 0)}</b>\n"
+        f"Matchs Gemini : <b>{d.get('gemini_ok', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>\n"
         f"Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
@@ -905,7 +894,7 @@ async def btn_bal(message):
 
 @dp.message(F.text == BTN_VAR)
 async def btn_var(message):
-    await send_coupon(message, "Ticket Varié")
+    await send_coupon(message, "Ticket Value")
 
 
 @dp.message(F.text == BTN_BILAN)
@@ -924,7 +913,7 @@ async def btn_scan(message):
 async def scan():
     async with STATE["scan_lock"]:
         events_raw = await fetch_all_events()
-        print(f"📦 Events récupérés: {len(events_raw)}")
+        print(f"📦 Events: {len(events_raw)}")
 
         events_norm = []
         for ev in events_raw:
@@ -933,12 +922,13 @@ async def scan():
                 continue
             if not is_upcoming(fields["kickoff"]):
                 continue
+            fields["raw"] = ev
             events_norm.append(fields)
         print(f"🎯 Events J/J+1: {len(events_norm)}")
 
         used_today = load_used_today()
         selections = await build_gemini_picks(events_norm, used_today)
-        print(f"🎯 Sélections : {len(selections)}")
+        print(f"🎯 Sélections: {len(selections)}")
 
         STATE["selections"] = selections
         STATE["coupons"] = build_all_coupons(selections)
@@ -947,30 +937,25 @@ async def scan():
         mark_picks_used(used_picks)
 
         STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
-
-        # Stats pour debug
         gemini_ok = sum(1 for s in selections if s.source == "gemini")
 
         STATE["debug"] = {
             "events_total": len(events_raw),
-            "events_upcoming": len(events_norm),
             "gemini_ok": gemini_ok,
             "selections": len(selections),
             "coupons": len(STATE["coupons"]),
         }
 
         print("──────── RÉSUMÉ ────────")
-        print(f"Events           : {len(events_raw)}")
-        print(f"Events J/J+1     : {len(events_norm)}")
-        print(f"Sélections       : {len(selections)}")
-        print(f"Coupons          : {len(STATE['coupons'])}")
+        print(f"Sélections : {len(selections)}")
+        print(f"Coupons    : {len(STATE['coupons'])}")
         for c in STATE["coupons"]:
-            print(f"  • {c.name} : {len(c.legs)} paris, proba {c.combined_prob*100:.1f}%")
+            print(f"  • {c.name} : {len(c.legs)} paris, cote {c.combined_odds}")
         print("────────────────────────")
 
 
 # =========================================================
-# BROADCAST
+# BROADCAST / LIFESPAN
 # =========================================================
 async def daily_broadcast():
     await scan()
@@ -988,36 +973,28 @@ async def startup_scan_and_notify():
         record_coupons(STATE["coupons"], datetime.now(TZ).strftime("%Y-%m-%d"))
         await broadcast_after_scan()
     except Exception as e:
-        print(f"⚠️ startup_scan crash: {e}")
+        print(f"⚠️ startup crash: {e}")
 
 
 async def bootstrap():
     STATE["tracker"] = load_tracker()
     STATE["ready"] = True
-    print("✅ Bot prêt (Gemini + Search).")
+    print("✅ Bot prêt.")
 
 
-# =========================================================
-# APP
-# =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-
     await bootstrap()
 
     scheduler = AsyncIOScheduler(timezone=TZ)
-    scheduler.add_job(daily_broadcast,
-                      CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ),
-                      id="daily_broadcast", replace_existing=True,
-                      max_instances=1, coalesce=True)
-    scheduler.add_job(settle_coupons,
-                      CronTrigger(hour=10, minute=0, timezone=TZ),
-                      id="settle_coupons", replace_existing=True,
-                      max_instances=1, coalesce=True)
+    scheduler.add_job(daily_broadcast, CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ),
+                      id="daily_broadcast", replace_existing=True, max_instances=1, coalesce=True)
+    scheduler.add_job(settle_coupons, CronTrigger(hour=10, minute=0, timezone=TZ),
+                      id="settle_coupons", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.start()
 
     bot_task = asyncio.create_task(dp.start_polling(bot))
@@ -1038,12 +1015,10 @@ app = FastAPI(title="Value Bot", lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return {
-        "status": "ok", "ready": STATE["ready"],
-        "selections": len(STATE["selections"]),
-        "coupons": [c.name for c in STATE["coupons"]],
-        "last_scan": STATE["last_scan"],
-    }
+    return {"status": "ok", "ready": STATE["ready"],
+            "selections": len(STATE["selections"]),
+            "coupons": [c.name for c in STATE["coupons"]],
+            "last_scan": STATE["last_scan"]}
 
 
 @app.get("/debug")
