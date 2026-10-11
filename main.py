@@ -26,12 +26,24 @@ except Exception:
     dc_train = None
     DixonColesModel = None
 
+try:
+    from football_data import enrich_match as fd_enrich
+except Exception:
+    fd_enrich = None
+
+try:
+    from markets_extra import compute_corners_probs, compute_cards_probs
+except Exception:
+    compute_corners_probs = None
+    compute_cards_probs = None
+
 
 # =========================================================
 # CONFIG
 # =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
@@ -42,12 +54,13 @@ NOTIFY_TZ = os.getenv("NOTIFY_TZ", "Africa/Abidjan")
 
 LOCAL_DB = os.getenv("LOCAL_DB", "/tmp/tracker.json")
 BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
-BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Value betting • Dixon-Coles + Marché")
+BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Value betting • Dixon-Coles + Contexte")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.55"))
+MAX_ENRICH = int(os.getenv("MAX_ENRICH", "12"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -61,19 +74,16 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
 
 SOCCER_KEYS = [
-    "soccer_epl",
-    "soccer_spain_la_liga",
-    "soccer_italy_serie_a",
-    "soccer_germany_bundesliga",
-    "soccer_france_ligue_one",
-    "soccer_uefa_champs_league",
-    "soccer_uefa_europa_league",
-    "soccer_efl_champ",
-    "soccer_netherlands_eredivisie",
+    "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
+    "soccer_germany_bundesliga", "soccer_france_ligue_one",
+    "soccer_uefa_champs_league", "soccer_uefa_europa_league",
+    "soccer_efl_champ", "soccer_netherlands_eredivisie",
     "soccer_portugal_primeira_liga",
 ]
 
 MAX_LEGS_PER_COUPON = 9
+LEAGUE_CORNERS_AVG = 10.5
+LEAGUE_CARDS_AVG = 3.8
 
 
 # =========================================================
@@ -93,13 +103,12 @@ class Selection:
     edge: float
     bookmaker: str
     source: str = "house"
-    dc_prob: Optional[float] = None
     ai_prob: Optional[float] = None
-    fair_odds: Optional[float] = None
     ai_verdict: str = ""
     ai_analysis: str = ""
     ai_advice: str = ""
     ai_critique: str = ""
+    context: Optional[dict] = None
 
     def final_prob(self) -> float:
         if self.ai_prob and 0.30 <= self.ai_prob <= 0.92:
@@ -181,8 +190,8 @@ def normalize_name(s: str) -> str:
         return ""
     s = str(s).lower().strip()
     s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    for suffix in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
-        s = s.replace(suffix, "")
+    for sfx in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
+        s = s.replace(sfx, "")
     s = re.sub(r"[^a-z0-9 ]", "", s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -237,6 +246,26 @@ def edge_bar(edge: float) -> str:
 
 def ai_verdict_emoji(v: str) -> str:
     return {"ACCEPT": "✅", "CAUTION": "⚠️", "REJECT": "❌"}.get(v.upper(), "❓")
+
+
+def league_key_from_title(title: str) -> Optional[str]:
+    mapping = {
+        "premier league": "soccer_epl",
+        "la liga": "soccer_spain_la_liga",
+        "serie a": "soccer_italy_serie_a",
+        "bundesliga": "soccer_germany_bundesliga",
+        "ligue 1": "soccer_france_ligue_one",
+        "champions league": "soccer_uefa_champs_league",
+        "europa league": "soccer_uefa_europa_league",
+        "championship": "soccer_efl_champ",
+        "eredivisie": "soccer_netherlands_eredivisie",
+        "primeira liga": "soccer_portugal_primeira_liga",
+    }
+    tl = (title or "").lower()
+    for k, v in mapping.items():
+        if k in tl:
+            return v
+    return None
 
 
 # =========================================================
@@ -313,7 +342,7 @@ async def init_dixon_coles():
 
 
 # =========================================================
-# THE ODDS API (markets: h2h, spreads, totals uniquement)
+# THE ODDS API
 # =========================================================
 async def fetch_odds_api_league(client: httpx.AsyncClient, sport_key: str) -> list[dict]:
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
@@ -355,13 +384,13 @@ def extract_event_fields(ev: dict) -> dict:
         "home": ev.get("home_team", ""),
         "away": ev.get("away_team", ""),
         "league": ev.get("sport_title", "") or ev.get("sport_key", ""),
+        "sport_key": ev.get("sport_key", ""),
         "kickoff": ev.get("commence_time", ""),
         "raw": ev,
     }
 
 
 def extract_odds_from_event(ev: dict) -> dict:
-    """Extrait h2h + spreads + totals (sans btts)."""
     result = {"h2h": {}, "spreads": {}, "totals": {}}
     home = ev.get("home_team", "")
     away = ev.get("away_team", "")
@@ -436,6 +465,34 @@ async def ai_review_selection(client, sel: Selection) -> None:
         sel.ai_critique = c.get("critique", "")
         return
 
+    ctx_block = ""
+    if sel.context and sel.context.get("available"):
+        hs = sel.context.get("home_stats", {})
+        aws = sel.context.get("away_stats", {})
+        h2h = sel.context.get("h2h", [])
+        h_inj = sel.context.get("home_injuries", [])
+        a_inj = sel.context.get("away_injuries", [])
+
+        h2h_str = "; ".join(f"{x['home']} {x['home_goals']}-{x['away_goals']} {x['away']}" for x in h2h[:5]) or "aucun"
+
+        ctx_block = f"""
+
+📊 CONTEXTE RÉEL (API-Football) :
+
+Forme {sel.home} : {hs.get('form', '?')}
+Forme {sel.away} : {aws.get('form', '?')}
+
+{sel.home} : {hs.get('goals_for_avg', 0):.2f} buts/m, {hs.get('goals_against_avg', 0):.2f} encaissés/m
+{sel.away} : {aws.get('goals_for_avg', 0):.2f} buts/m, {aws.get('goals_against_avg', 0):.2f} encaissés/m
+
+Corners/m : {sel.home} {hs.get('corners_for_avg', 0):.1f} • {sel.away} {aws.get('corners_for_avg', 0):.1f}
+Cartons/m : {sel.home} {hs.get('cards_yellow_avg', 0):.1f} • {sel.away} {aws.get('cards_yellow_avg', 0):.1f}
+
+H2H : {h2h_str}
+Absents {sel.home} : {', '.join(x['player'] for x in h_inj) or 'aucun'}
+Absents {sel.away} : {', '.join(x['player'] for x in a_inj) or 'aucun'}
+"""
+
     prompt = f"""Tu es un analyste football INDÉPENDANT et CRITIQUE.
 
 Match : {sel.home} vs {sel.away}
@@ -443,26 +500,28 @@ Compétition : {sel.league}
 Heure : {kickoff_local(sel.kickoff)}
 Marché : {sel.market}
 Pari (généré par Dixon-Coles) : {sel.pick_label}
-Cote (vraie, bookmaker) : {sel.odds}
+Cote (vraie) : {sel.odds}
 Proba Dixon-Coles : {sel.model_prob*100:.1f}%
-Edge : {sel.edge*100:+.1f}%
+Edge : {sel.edge*100:+.1f}%{ctx_block}
 
-⚠️ Sois mesuré. ACCEPT si cohérent, CAUTION si risque, REJECT si douteux.
+⚠️ Analyse avec le CONTEXTE RÉEL ci-dessus.
+Sois honnête, n'invente rien. Si données manquantes → dis-le.
 
 Réponds EXACTEMENT :
 
 VERDICT: ACCEPT
 PROBA: 72
 CRITIQUE_BOT: [1 phrase]
-ANALYSE: [2 phrases]
+ANALYSE: [2 phrases basées sur les données]
 CONSEIL: [1 phrase]"""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 500},
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 600},
     }
+
     try:
-        r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=30.0)
+        r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=35.0)
         if r.status_code >= 400:
             return
         text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -516,6 +575,15 @@ async def ai_review_all(selections: list[Selection]) -> None:
     async with httpx.AsyncClient(timeout=30.0) as client:
         for i, s in enumerate(selections):
             await ai_review_selection(client, s)
+
+            if s.ai_critique:
+                c_low = s.ai_critique.lower()
+                bad = ["sous-estime", "surestime", "se trompe", "à côté",
+                       "douteux", "erreur", "faux", "aberrant", "massif",
+                       "suspect", "incohérent"]
+                if any(w in c_low for w in bad):
+                    s.ai_verdict = "REJECT"
+
             if (i + 1) % 5 == 0:
                 print(f"  ... {i+1}/{len(selections)}")
             await asyncio.sleep(1.2)
@@ -528,10 +596,12 @@ async def ai_review_all(selections: list[Selection]) -> None:
 # =========================================================
 # HOUSE PICKS
 # =========================================================
-def build_house_picks(events_norm, odds_by_id, used_today):
+def build_house_picks(events_norm, odds_by_id, used_today, contexts_by_id=None):
     selections: list[Selection] = []
     seen = set()
-    stats = {"1x2": 0, "ou": 0, "handicap": 0}
+    contexts_by_id = contexts_by_id or {}
+    stats = {"1x2": 0, "ou": 0, "corners": 0, "cards": 0,
+             "rej_edge": 0, "rej_asym": 0}
 
     if not DC_MODEL:
         return selections
@@ -553,11 +623,18 @@ def build_house_picks(events_norm, odds_by_id, used_today):
             if not odds:
                 continue
 
-            # 1X2
+            p_home = pred.get("p_home", 0)
+            p_away = pred.get("p_away", 0)
+            is_asymmetric = (p_home > 0.65 and p_away < 0.20) or \
+                            (p_away > 0.65 and p_home < 0.20)
+
+            ctx = contexts_by_id.get(event_id, {})
+
+            # === 1X2 ===
             h2h = odds.get("h2h", {})
-            for key, prob in (("home", pred["p_home"]),
-                              ("draw", pred["p_draw"]),
-                              ("away", pred["p_away"])):
+            for key, prob in (("home", p_home),
+                              ("draw", pred.get("p_draw", 0)),
+                              ("away", p_away)):
                 odd = h2h.get(key)
                 if not odd or odd <= 1.01:
                     continue
@@ -565,6 +642,9 @@ def build_house_picks(events_norm, odds_by_id, used_today):
                     continue
                 edge = prob * odd - 1.0
                 if edge < MIN_EDGE:
+                    continue
+                if edge > 0.15:
+                    stats["rej_edge"] += 1
                     continue
 
                 if key == "home":
@@ -584,22 +664,28 @@ def build_house_picks(events_norm, odds_by_id, used_today):
                     kickoff=kickoff, market="1X2", pick_label=label,
                     odds=round(odd, 2), model_prob=round(prob, 4),
                     edge=round(edge, 4), bookmaker="The Odds API",
-                    source="house",
+                    source="house", context=ctx,
                 ))
                 stats["1x2"] += 1
 
-            # Over/Under
+            # === Over/Under ===
             totals = odds.get("totals", {})
             for line in (1.5, 2.5, 3.5):
                 for prefix, prob_key in (("over", f"over_{line}"), ("under", f"under_{line}")):
                     prob = pred.get(prob_key)
                     if prob is None or prob < MIN_PROB:
                         continue
+                    if prefix == "under" and is_asymmetric:
+                        stats["rej_asym"] += 1
+                        continue
                     odd = totals.get(f"{prefix}_{line}")
                     if not odd or odd <= 1.01:
                         continue
                     edge = prob * odd - 1.0
                     if edge < MIN_EDGE:
+                        continue
+                    if edge > 0.15:
+                        stats["rej_edge"] += 1
                         continue
 
                     label = f"{'Over' if prefix == 'over' else 'Under'} {line} buts"
@@ -613,14 +699,59 @@ def build_house_picks(events_norm, odds_by_id, used_today):
                         kickoff=kickoff, market="Over/Under", pick_label=label,
                         odds=round(odd, 2), model_prob=round(prob, 4),
                         edge=round(edge, 4), bookmaker="The Odds API",
-                        source="house",
+                        source="house", context=ctx,
                     ))
                     stats["ou"] += 1
+
+            # === Corners (Étape 2) ===
+            if compute_corners_probs and ctx and ctx.get("available"):
+                hs = ctx.get("home_stats", {})
+                aws = ctx.get("away_stats", {})
+                h_corners = hs.get("corners_for_avg", 0) or (LEAGUE_CORNERS_AVG * 0.55)
+                a_corners = aws.get("corners_for_avg", 0) or (LEAGUE_CORNERS_AVG * 0.45)
+
+                cp = compute_corners_probs(h_corners, a_corners, LEAGUE_CORNERS_AVG)
+
+                # On ne garde que si les équipes ont des moyennes fiables (>0)
+                if hs.get("corners_for_avg", 0) > 0 and aws.get("corners_for_avg", 0) > 0:
+                    for line in (8.5, 9.5, 10.5):
+                        for prefix in ("over", "under"):
+                            prob = cp.get(f"{prefix}_{line}")
+                            if not prob or prob < MIN_PROB:
+                                continue
+                            # Pas de cote The Odds API pour les corners → on skip
+                            # (à moins qu'on ajoute une estimation ~ fair odds)
+                            # Pour l'instant on n'ajoute pas, on log juste
+                            pass
+
+                    # Corners par équipe (favori uniquement)
+                    for line in (4.5, 5.5):
+                        prob = cp.get(f"home_over_{line}")
+                        if prob and prob >= MIN_PROB and p_home > 0.5:
+                            # Pas de cote API → skip pour l'instant
+                            pass
+
+                # Note : sans cote corners de The Odds API, on ne peut pas calculer d'edge.
+                # Le calcul est prêt pour quand on aura une source de cotes corners.
+
+            # === Cartons (Étape 2) ===
+            if compute_cards_probs and ctx and ctx.get("available"):
+                hs = ctx.get("home_stats", {})
+                aws = ctx.get("away_stats", {})
+                h_cards = hs.get("cards_yellow_avg", 0) or (LEAGUE_CARDS_AVG * 0.5)
+                a_cards = aws.get("cards_yellow_avg", 0) or (LEAGUE_CARDS_AVG * 0.5)
+
+                cdp = compute_cards_probs(h_cards, a_cards, LEAGUE_CARDS_AVG)
+
+                if hs.get("cards_yellow_avg", 0) > 0 and aws.get("cards_yellow_avg", 0) > 0:
+                    # Pas de cote cartons → skip pour l'instant
+                    pass
 
         except Exception as e:
             print(f"⚠️ build_house_picks crash: {e}")
 
-    print(f"🏠 Picks maison : 1X2={stats['1x2']} O/U={stats['ou']}")
+    print(f"🏠 Picks maison : 1X2={stats['1x2']} O/U={stats['ou']} "
+          f"edge_rej={stats['rej_edge']} asym_rej={stats['rej_asym']}")
     return selections
 
 
@@ -632,7 +763,7 @@ def build_coupon_target(name, subtitle, emoji, pool, min_odds, max_odds,
     pool = [s for s in pool
             if s.odds and s.odds > 1.01
             and s.event_id not in globally_used
-            and s.ai_verdict != "REJECT"
+            and s.ai_verdict == "ACCEPT"
             and s.final_prob() >= min_prob]
     if not pool:
         return None
@@ -654,14 +785,7 @@ def build_coupon_target(name, subtitle, emoji, pool, min_odds, max_odds,
         if s.market in used_markets and len(legs) >= 2:
             continue
         next_odds = combined_odds * s.odds
-        if next_odds > max_odds and legs:
-            if combined_odds < min_odds:
-                legs.append(s)
-                used_events.add(s.event_id)
-                used_leagues.add(s.league)
-                used_markets.add(s.market)
-                combined_odds = next_odds
-                combined_prob *= s.final_prob()
+        if next_odds > max_odds:
             break
         legs.append(s)
         used_events.add(s.event_id)
@@ -674,9 +798,9 @@ def build_coupon_target(name, subtitle, emoji, pool, min_odds, max_odds,
 
     if not legs:
         return None
-    if combined_odds < min_odds * 0.65:
+    if combined_odds < min_odds * 0.90:
         return None
-    if combined_odds > max_odds * 1.30:
+    if combined_odds > max_odds:
         return None
 
     legs.sort(key=lambda s: s.odds)
@@ -764,6 +888,14 @@ def format_selection_block(s: Selection, idx: int, show_ai=True):
         f"│ 💰 Cote : <b>{s.odds}</b>  <i>({s.bookmaker})</i>",
         f"│ ⚡ Edge : <b>{s.edge*100:+.1f}%</b>  {edge_bar(s.edge)}",
     ]
+
+    # Contexte (forme, H2H)
+    if s.context and s.context.get("available"):
+        hs = s.context.get("home_stats", {})
+        aws = s.context.get("away_stats", {})
+        lines.append(f"│")
+        lines.append(f"│ 📈 Forme : {s.home} <b>{hs.get('form', '?')}</b> • {s.away} <b>{aws.get('form', '?')}</b>")
+
     if show_ai and s.ai_verdict:
         lines.append(f"│")
         lines.append(f"│ 🧠 <b>AVIS IA</b> : {ai_verdict_emoji(s.ai_verdict)} <b>{s.ai_verdict}</b>")
@@ -882,10 +1014,11 @@ async def debug_cmd(message):
     d = STATE["debug"]
     txt = (
         f"<b>🔍 DEBUG</b>\n\n"
-        f"Dixon-Coles prédictions : <b>{d.get('dc_predictions', 0)}</b>\n"
+        f"Dixon-Coles : <b>{d.get('dc_predictions', 0)}</b>\n"
         f"Events Odds API : <b>{d.get('events_total', 0)}</b>\n"
         f"Events J/J+1 : <b>{d.get('events_upcoming', 0)}</b>\n"
         f"Cotes extraites : <b>{d.get('odds_fetched', 0)}</b>\n"
+        f"Contextes enrichis : <b>{d.get('ctx_enriched', 0)}</b>\n"
         f"Picks maison : <b>{d.get('house_picks', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"✅ ACCEPT : <b>{d.get('ai_accept', 0)}</b>\n"
@@ -958,10 +1091,27 @@ async def scan():
                     dc_verdicts[fx["event_id"]] = pred
             print(f"🧮 Dixon-Coles : {len(dc_verdicts)} prédictions")
 
+        # 🌐 Enrichissement contexte (API-Football)
+        contexts_by_id = {}
+        if fd_enrich and API_FOOTBALL_KEY and events_norm:
+            print(f"🌐 Enrichissement contexte (max {MAX_ENRICH})...")
+            to_enrich = events_norm[:MAX_ENRICH]
+            for fx in to_enrich:
+                sport_key = fx.get("sport_key") or league_key_from_title(fx.get("league", ""))
+                if not sport_key:
+                    continue
+                ctx = await fd_enrich(fx["home"], fx["away"], sport_key)
+                if ctx.get("available"):
+                    contexts_by_id[fx["event_id"]] = ctx
+                await asyncio.sleep(0.3)
+            print(f"✅ Contextes enrichis : {len(contexts_by_id)}")
+
+        # 🏠 Picks maison
         used_today = load_used_today()
-        selections = build_house_picks(events_norm, odds_by_id, used_today)
+        selections = build_house_picks(events_norm, odds_by_id, used_today, contexts_by_id)
         print(f"🏠 Picks maison total : {len(selections)}")
 
+        # 🧠 Revue IA
         if GEMINI_API_KEY and selections:
             await ai_review_all(selections)
 
@@ -979,6 +1129,7 @@ async def scan():
             "events_total": len(events_raw),
             "events_upcoming": len(events_norm),
             "odds_fetched": len(odds_by_id),
+            "ctx_enriched": len(contexts_by_id),
             "house_picks": len(selections),
             "selections": len(selections),
             "ai_accept": sum(1 for s in selections if s.ai_verdict == "ACCEPT"),
@@ -992,6 +1143,7 @@ async def scan():
         print(f"Events J/J+1        : {len(events_norm)}")
         print(f"Dixon-Coles         : {len(dc_verdicts)}")
         print(f"Cotes extraites     : {len(odds_by_id)}")
+        print(f"Contextes enrichis  : {len(contexts_by_id)}")
         print(f"Picks maison        : {len(selections)}")
         print(f"Coupons             : {len(STATE['coupons'])}")
         for c in STATE["coupons"]:
@@ -1025,7 +1177,7 @@ async def bootstrap():
     STATE["tracker"] = load_tracker()
     await init_dixon_coles()
     STATE["ready"] = True
-    print("✅ Bot prêt (Dixon-Coles + The Odds API).")
+    print("✅ Bot prêt (Dixon-Coles + Contexte + Marchés).")
 
 
 # =========================================================
