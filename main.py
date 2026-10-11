@@ -50,14 +50,15 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • Dixon-Coles + Gemini"
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-MIN_PROB = float(os.getenv("MIN_PROB", "0.62"))
+MIN_PROB = float(os.getenv("MIN_PROB", "0.60"))
+MIN_ODD = float(os.getenv("MIN_ODD", "1.35"))
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "20"))
 
 SAFE_MIN_ODDS = 2.0
 SAFE_MAX_ODDS = 2.5
 BAL_MIN_ODDS = 3.0
 BAL_MAX_ODDS = 5.0
-BAL_MIN_LEG_ODDS = 1.20
+BAL_MIN_LEG_ODDS = 1.35
 VALUE_TOP_N = 20
 
 if not BOT_TOKEN:
@@ -316,8 +317,6 @@ def evaluate_leg_result(leg: dict, home_goals: int, away_goals: int) -> str:
             return "won" if home_goals >= away_goals else "lost"
         if "x2" in label:
             return "won" if away_goals >= home_goals else "lost"
-        if "12" in label or "pas de nul" in label:
-            return "won" if home_goals != away_goals else "lost"
 
     if market == "Over/Under":
         m = re.search(r"(over|under)\s+([\d.]+)", label)
@@ -352,7 +351,6 @@ async def settle_coupons():
             continue
         legs = coupon.get("legs", [])
         any_lost = False
-        any_pending = False
 
         for leg in legs:
             if leg.get("result") != "pending":
@@ -361,11 +359,9 @@ async def settle_coupons():
                 continue
             kickoff_dt = parse_dt_safe(leg.get("kickoff", ""))
             if not kickoff_dt or (now - kickoff_dt).total_seconds() < 9000:
-                any_pending = True
                 continue
             result = await get_fixture_result(leg["home"], leg["away"], kickoff_dt.strftime("%Y-%m-%d"))
             if not result or result.get("home_goals") is None:
-                any_pending = True
                 continue
             outcome = evaluate_leg_result(leg, result["home_goals"], result["away_goals"])
             leg["result"] = outcome
@@ -467,7 +463,7 @@ def extract_real_odds(ev: dict) -> dict:
 async def build_gemini_picks(events_norm, used_today):
     selections: list[Selection] = []
     seen = set()
-    stats = {"ok": 0, "fail": 0, "markets": 0}
+    stats = {"ok": 0, "fail": 0, "kept": 0}
 
     if not predict_match_probas:
         return selections
@@ -493,18 +489,21 @@ async def build_gemini_picks(events_norm, used_today):
 
                 market_map = {
                     "double_chance_1X": (f"Double Chance 1X ({home} ou nul)", "Double Chance"),
-                    "double_chance_12": (f"Double Chance 12 (Pas de nul)", "Double Chance"),
                     "double_chance_X2": (f"Double Chance X2 (Nul ou {away})", "Double Chance"),
                     "victoire_home": (f"Victoire {home}", "1X2"),
                     "match_nul": ("Match nul", "1X2"),
                     "victoire_away": (f"Victoire {away}", "1X2"),
-                    "over_0.5": ("Over 0.5 buts", "Over/Under"),
-                    "over_1.5": ("Over 1.5 buts", "Over/Under"),
                     "over_2.5": ("Over 2.5 buts", "Over/Under"),
+                    "under_2.5": ("Under 2.5 buts", "Over/Under"),
                     "over_3.5": ("Over 3.5 buts", "Over/Under"),
                     "btts_yes": ("Les 2 marquent : Oui", "BTTS"),
                     "btts_no": ("Les 2 marquent : Non", "BTTS"),
                 }
+
+                # Une seule sélection par match (la meilleure proba avec cote >= MIN_ODD)
+                best_pick = None
+                best_prob = 0
+                best_key = None
 
                 for key, (label, mkt) in market_map.items():
                     prob_pct = markets.get(key)
@@ -514,49 +513,60 @@ async def build_gemini_picks(events_norm, used_today):
                         prob = float(prob_pct) / 100.0
                     except (ValueError, TypeError):
                         continue
-                    if prob < MIN_PROB or prob > 0.92:
+                    if prob < MIN_PROB or prob > 0.85:
                         continue
-
-                    dedup = f"{event_id}|{mkt}|{label}"
-                    if dedup in seen:
+                    fair_odd = 1.0 / prob
+                    if fair_odd < MIN_ODD:
                         continue
-                    seen.add(dedup)
+                    if prob > best_prob:
+                        best_prob = prob
+                        best_pick = (key, label, mkt, fair_odd)
+                        best_key = key
 
-                    fair_odd = round(1.0 / prob, 2)
-                    real_odd = None
-                    if mkt == "1X2":
-                        if "victoire" in label.lower() and home.lower() in label.lower():
-                            real_odd = real_odds.get("home")
-                        elif "victoire" in label.lower() and away.lower() in label.lower():
-                            real_odd = real_odds.get("away")
-                        elif "nul" in label.lower():
-                            real_odd = real_odds.get("draw")
-                    elif mkt == "Over/Under":
-                        if "over 2.5" in label.lower():
-                            real_odd = real_odds.get("over_2.5")
-                        elif "under 2.5" in label.lower():
-                            real_odd = real_odds.get("under_2.5")
-                    elif mkt == "BTTS":
-                        if "oui" in label.lower():
-                            real_odd = real_odds.get("btts_yes")
-                        elif "non" in label.lower():
-                            real_odd = real_odds.get("btts_no")
+                if not best_pick:
+                    continue
 
-                    selections.append(Selection(
-                        event_id=event_id, league=league, home=home, away=away,
-                        kickoff=kickoff, market=mkt, pick_label=label,
-                        odds=fair_odd, model_prob=round(prob, 4),
-                        edge=0.0, bookmaker="Gemini",
-                        real_odd=real_odd,
-                    ))
-                    stats["markets"] += 1
+                key, label, mkt, fair_odd = best_pick
+
+                dedup = f"{event_id}|{mkt}|{label}"
+                if dedup in seen:
+                    continue
+                seen.add(dedup)
+
+                real_odd = None
+                if mkt == "1X2":
+                    if "victoire" in label.lower() and home.lower() in label.lower():
+                        real_odd = real_odds.get("home")
+                    elif "victoire" in label.lower() and away.lower() in label.lower():
+                        real_odd = real_odds.get("away")
+                    elif "nul" in label.lower():
+                        real_odd = real_odds.get("draw")
+                elif mkt == "Over/Under":
+                    if "over 2.5" in label.lower():
+                        real_odd = real_odds.get("over_2.5")
+                    elif "under 2.5" in label.lower():
+                        real_odd = real_odds.get("under_2.5")
+                elif mkt == "BTTS":
+                    if "oui" in label.lower():
+                        real_odd = real_odds.get("btts_yes")
+                    elif "non" in label.lower():
+                        real_odd = real_odds.get("btts_no")
+
+                selections.append(Selection(
+                    event_id=event_id, league=league, home=home, away=away,
+                    kickoff=kickoff, market=mkt, pick_label=label,
+                    odds=round(fair_odd, 2), model_prob=round(best_prob, 4),
+                    edge=0.0, bookmaker="Gemini",
+                    real_odd=real_odd,
+                ))
+                stats["kept"] += 1
 
                 await asyncio.sleep(1.0)
 
             except Exception as e:
                 print(f"⚠️ build_gemini_picks: {e}")
 
-    print(f"🏠 Picks : matchs_ok={stats['ok']} échec={stats['fail']} marchés={stats['markets']}")
+    print(f"🏠 Picks : matchs_ok={stats['ok']} échec={stats['fail']} gardés={stats['kept']}")
     return selections
 
 
@@ -619,7 +629,8 @@ def build_value_list(selections, top_n=20, globally_used=None):
     if globally_used is None:
         globally_used = set()
 
-    pool = [s for s in selections if s.event_id not in globally_used]
+    pool = [s for s in selections
+            if s.event_id not in globally_used and s.odds >= MIN_ODD]
     if not pool:
         return None
 
@@ -648,7 +659,7 @@ def build_value_list(selections, top_n=20, globally_used=None):
         globally_used.add(s.event_id)
 
     return Coupon(
-        "Ticket Value", f"Top {len(top_list)} pronostics les plus probables",
+        "Ticket Value", f"Top {len(top_list)} pronostics (cote ≥ {MIN_ODD})",
         "💎", top_list,
         round(combined_odds, 2), round(combined_prob, 4),
         is_list=True,
@@ -663,14 +674,14 @@ def build_all_coupons(selections):
     c = build_coupon_target(
         "Ticket Sécurisé", "Cote 2.0 - 2.5 • Priorité sûreté",
         "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 5, used,
-        min_leg_odds=1.20,
+        min_leg_odds=1.35,
     )
     if c:
         coupons.append(c)
 
     pool_bal = [s for s in selections if s.final_prob() >= 0.62]
     c = build_coupon_target(
-        "Ticket Équilibré", "Cote 3 - 5 • Cote mini 1.20/leg",
+        "Ticket Équilibré", "Cote 3 - 5 • Cote mini 1.35/leg",
         "⚖️", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
         min_leg_odds=BAL_MIN_LEG_ODDS,
     )
@@ -718,7 +729,7 @@ def format_selection_block(s: Selection, idx: int):
     if s.real_odd:
         lines.append(f"│ 💰 Cote réelle : <b>{s.real_odd}</b>")
     else:
-        lines.append(f"│ 💰 Cote théorique : {s.odds}")
+        lines.append(f"│ 💰 Cote estimée : <b>{s.odds}</b>")
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
@@ -771,7 +782,7 @@ def format_summary():
 def format_coupons_ready():
     if not STATE["coupons"]:
         return (f"{format_header()}\n\n<b>📭 Aucun coupon aujourd'hui</b>\n"
-                f"<i>Pas assez de paris à haute proba.</i>")
+                f"<i>Pas assez de paris à haute proba (cote ≥ {MIN_ODD}).</i>")
     lignes = []
     for c in STATE["coupons"]:
         n = len(c.legs)
@@ -835,7 +846,6 @@ async def safe_send(chat_id, text):
 
 
 async def broadcast_after_scan():
-    """Envoie uniquement le message d'annonce (pas les détails)."""
     for chat_id in TARGETS:
         await safe_send(chat_id, format_coupons_ready())
         await asyncio.sleep(0.5)
