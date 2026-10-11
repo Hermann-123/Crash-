@@ -1,8 +1,6 @@
 """
-Récupère les données contextuelles via API-Football :
-- Tous les matchs du jour (fixtures)
-- Forme, H2H, blessés, stats équipes (contexte)
-- Résultats de matchs (règlement des coupons)
+API-Football : fixtures du jour, stats équipes (corners/cartons),
+résultats de matchs, H2H, blessés.
 """
 from __future__ import annotations
 
@@ -30,6 +28,11 @@ LEAGUE_MAP = {
     "soccer_efl_champ": 40,
     "soccer_netherlands_eredivisie": 88,
     "soccer_portugal_primeira_liga": 94,
+    "soccer_turkey_super_league": 203,
+    "soccer_belgium_first_div": 144,
+    "soccer_scotland_premiership": 179,
+    "soccer_brazil_campeonato": 71,
+    "soccer_argentina_primera_division": 128,
 }
 
 _TEAM_ID_CACHE: dict = {}
@@ -68,13 +71,9 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
 
 
 # =========================================================
-# FIXTURES DU JOUR (NOUVEAU — 1 seule requête)
+# FIXTURES DU JOUR
 # =========================================================
 async def fetch_all_today_fixtures() -> list[dict]:
-    """
-    Récupère TOUS les matchs du jour via API-Football.
-    1 seule requête → couvre 1200+ ligues.
-    """
     if not API_FOOTBALL_KEY:
         return []
 
@@ -102,7 +101,6 @@ async def fetch_all_today_fixtures() -> list[dict]:
                     if not home or not away or not date_str:
                         continue
 
-                    # Uniquement matchs pas encore commencés
                     if status not in ("NS", "TBD", ""):
                         continue
 
@@ -263,10 +261,59 @@ async def get_injuries(client: httpx.AsyncClient, team_id: int, season: int = 20
 
 
 # =========================================================
-# ENRICHISSEMENT CONTEXTE
+# CORNERS / CARTONS (stats équipes)
+# =========================================================
+async def get_corners_cards(home: str, away: str, odds_sport_key: str = "") -> dict:
+    """
+    Récupère les stats corners/cartons des 2 équipes via API-Football.
+    Nécessite que les 2 équipes soient dans la même ligue mappée.
+    """
+    if not API_FOOTBALL_KEY:
+        return {"available": False}
+
+    league_id = LEAGUE_MAP.get(odds_sport_key) if odds_sport_key else None
+
+    # Si pas de sport_key, on cherche dynamiquement dans les 5 grandes ligues
+    if not league_id:
+        # On ne peut pas chercher sans league_id, on renvoie indisponible
+        return {"available": False}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            home_id, away_id = await asyncio.gather(
+                find_team_id(client, home),
+                find_team_id(client, away),
+            )
+            if not home_id or not away_id:
+                return {"available": False}
+
+            home_stats, away_stats = await asyncio.gather(
+                get_team_stats(client, home_id, league_id),
+                get_team_stats(client, away_id, league_id),
+            )
+
+            if not home_stats and not away_stats:
+                return {"available": False}
+
+            return {
+                "available": True,
+                "home_corners_for": home_stats.get("corners_for_avg", 0),
+                "home_corners_against": home_stats.get("corners_against_avg", 0),
+                "away_corners_for": away_stats.get("corners_for_avg", 0),
+                "away_corners_against": away_stats.get("corners_against_avg", 0),
+                "home_cards_avg": home_stats.get("cards_yellow_avg", 0),
+                "away_cards_avg": away_stats.get("cards_yellow_avg", 0),
+            }
+        except Exception as e:
+            print(f"⚠️ corners/cards crash {home}-{away}: {e}")
+            return {"available": False}
+
+
+# =========================================================
+# ENRICHISSEMENT CONTEXTE (H2H + blessés + stats)
 # =========================================================
 async def enrich_match(home: str, away: str, odds_api_sport_key: str) -> dict:
-    """Retourne le contexte d'un match (forme, H2H, blessés, stats)."""
+    """Retourne le contexte d'un match via API-Football."""
     if not API_FOOTBALL_KEY:
         return {"available": False}
 
@@ -309,10 +356,9 @@ async def enrich_match(home: str, away: str, odds_api_sport_key: str) -> dict:
 
 
 # =========================================================
-# RÉSULTAT D'UN MATCH (pour règlement)
+# RÉSULTAT D'UN MATCH (règlement)
 # =========================================================
 async def get_fixture_result(home: str, away: str, date_iso: str) -> Optional[dict]:
-    """Cherche le résultat d'un match passé."""
     if not API_FOOTBALL_KEY:
         return None
 
