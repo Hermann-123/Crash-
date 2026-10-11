@@ -1,5 +1,5 @@
 """
-Prédicteur Gemini avec tous les marchés demandés.
+Prédicteur Gemini avec pourcentage de réussite sur les conseils.
 """
 from __future__ import annotations
 
@@ -50,7 +50,8 @@ Retourne UNIQUEMENT ce JSON :
     "over_3.5_cartons": 0
   }},
   "analysis": "2 phrases d'analyse sur le match : niveau des équipes, forme, enjeu.",
-  "advice": "1 phrase de conseil pour le parieur."
+  "advice": "1 phrase de conseil alternatif pour le parieur.",
+  "advice_confidence": 0
 }}
 
 RÈGLES STRICTES :
@@ -59,13 +60,12 @@ RÈGLES STRICTES :
 - double_chance_1X = victoire_home + match_nul
 - double_chance_X2 = match_nul + victoire_away
 - double_chance_12 = victoire_home + victoire_away
-- handicap_home_plus_05 = double_chance_1X (même pari)
-- handicap_away_plus_05 = double_chance_X2 (même pari)
+- handicap_home_plus_05 = double_chance_1X
+- handicap_away_plus_05 = double_chance_X2
 - over_2.5 + under_2.5 = 100
-- Corners : match entre 2 équipes offensives → 8-12 corners en moyenne
-- Cartons : match tendu → 4-6 cartons, match amical → 2-3
 - "analysis" : 2 phrases max, factuelles
-- "advice" : 1 phrase, directive
+- "advice" : 1 phrase, conseil concret (peut proposer un autre pari)
+- "advice_confidence" : pourcentage de réussite estimé de CE conseil (entre 40 et 90)
 - Rien avant/après le JSON"""
 
     payload = {
