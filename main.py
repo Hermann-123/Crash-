@@ -8,7 +8,6 @@ import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from difflib import SequenceMatcher
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -23,23 +22,14 @@ from fastapi import FastAPI
 
 try:
     from gemini_predictor import predict_match_probas
-    print("✅ gemini_predictor importé OK")
-except Exception as e:
+except Exception:
     predict_match_probas = None
-    print(f"❌ ERREUR import gemini_predictor : {e}")
 
 try:
-    from football_data import (
-        get_fixture_result,
-        fetch_all_today_fixtures,
-        enrich_match,
-    )
-    print("✅ football_data importé OK")
-except Exception as e:
+    from football_data import get_fixture_result, fetch_all_today_fixtures
+except Exception:
     get_fixture_result = None
     fetch_all_today_fixtures = None
-    enrich_match = None
-    print(f"❌ ERREUR import football_data : {e}")
 
 
 # =========================================================
@@ -64,7 +54,6 @@ NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 MIN_PROB = float(os.getenv("MIN_PROB", "0.60"))
 MIN_ODD = float(os.getenv("MIN_ODD", "1.35"))
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "25"))
-MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "10"))
 
 SAFE_MIN_ODDS = 2.0
 SAFE_MAX_ODDS = 2.5
@@ -114,7 +103,6 @@ class Selection:
     analysis: str = ""
     advice: str = ""
     advice_confidence: int = 0
-    has_context: bool = False
 
     def final_prob(self) -> float:
         return self.model_prob
@@ -192,33 +180,6 @@ def normalize_name(s: str) -> str:
         s = s.replace(sfx, "")
     s = re.sub(r"[^a-z0-9 ]", "", s)
     return re.sub(r"\s+", " ", s).strip()
-
-
-def team_names_match(a: str, b: str) -> bool:
-    na = normalize_name(a)
-    nb = normalize_name(b)
-    if not na or not nb:
-        return False
-
-    if na == nb:
-        return True
-
-    if na in nb or nb in na:
-        return True
-
-    wa, wb = na.split(), nb.split()
-    if wa and wb and wa[0] == wb[0] and len(wa[0]) >= 4:
-        if len(wa) >= 2 and len(wb) >= 2:
-            if wa[1][:3] == wb[1][:3]:
-                return True
-        else:
-            return True
-
-    ratio = SequenceMatcher(None, na, nb).ratio()
-    if ratio >= 0.80:
-        return True
-
-    return False
 
 
 def parse_dt_safe(s) -> Optional[datetime]:
@@ -527,158 +488,43 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
         key = f"{h}|{a}"
         odds_index[key] = ev
 
-    # ============ DIAGNOSTIC ============
-    print("=" * 70)
-    print("🔬 DIAGNOSTIC MATCHING")
-    print("=" * 70)
-
-    print(f"\n📡 API-Football : {len(fixtures)} matchs")
-    print("   5 exemples (nom brut → normalisé) :")
-    for fx in fixtures[:5]:
-        print(f"   '{fx['home']}' → '{normalize_name(fx['home'])}'")
-        print(f"   '{fx['away']}' → '{normalize_name(fx['away'])}'")
-        print(f"   [{fx.get('league', '')}]")
-        print()
-
-    print(f"\n💰 Odds API : {len(odds_events)} events")
-    print("   5 exemples (nom brut → normalisé) :")
-    for ev in odds_events[:5]:
-        print(f"   '{ev.get('home_team')}' → '{normalize_name(ev.get('home_team', ''))}'")
-        print(f"   '{ev.get('away_team')}' → '{normalize_name(ev.get('away_team', ''))}'")
-        print(f"   [{ev.get('sport_title', '')}]")
-        print()
-
-    print("\n🧪 TENTATIVES DE MATCHING (3 premiers) :")
-    for fx in fixtures[:3]:
-        h_norm = normalize_name(fx["home"])
-        a_norm = normalize_name(fx["away"])
-        key = f"{h_norm}|{a_norm}"
-        print(f"\n   Recherche : '{h_norm}' vs '{a_norm}'")
-
-        if key in odds_index:
-            print(f"   ✅ EXACT trouvé")
-            continue
-
-        best_match = None
-        best_ratio = 0
-        for ok in odds_index.keys():
-            try:
-                oh, oa = ok.split("|", 1)
-            except ValueError:
-                continue
-            r1 = SequenceMatcher(None, h_norm, oh).ratio()
-            r2 = SequenceMatcher(None, a_norm, oa).ratio()
-            avg = (r1 + r2) / 2
-            if avg > best_ratio:
-                best_ratio = avg
-                best_match = ok
-
-        if best_match:
-            oh, oa = best_match.split("|", 1)
-            print(f"   ❌ Pas exact. Meilleur candidat :")
-            print(f"      '{oh}' vs '{oa}' (score {best_ratio:.2f})")
-            print(f"      team_names_match home ? {team_names_match(h_norm, oh)}")
-            print(f"      team_names_match away ? {team_names_match(a_norm, oa)}")
-
-    print("\n" + "=" * 70)
-    # =====================================
-
     matched = []
-    matched_count = 0
-
     for fx in fixtures:
         h_norm = normalize_name(fx["home"])
         a_norm = normalize_name(fx["away"])
+        key = f"{h_norm}|{a_norm}"
 
-        ev = odds_index.get(f"{h_norm}|{a_norm}")
-
+        ev = odds_index.get(key)
         if not ev:
             for ok, oev in odds_index.items():
-                try:
-                    oh, oa = ok.split("|", 1)
-                except ValueError:
-                    continue
-                if team_names_match(h_norm, oh) and team_names_match(a_norm, oa):
+                oh, oa = ok.split("|", 1)
+                if (h_norm in oh or oh in h_norm) and (a_norm in oa or oa in a_norm):
                     ev = oev
                     break
 
         if ev:
             fx["real_odds"] = extract_real_odds(ev)
             fx["has_odds"] = True
-            fx["odds_sport_key"] = ev.get("sport_key", "")
-            fx["odds_sport_title"] = ev.get("sport_title", "")
-            matched_count += 1
         else:
             fx["real_odds"] = {}
             fx["has_odds"] = False
-            fx["odds_sport_key"] = ""
-            fx["odds_sport_title"] = ""
 
         matched.append(fx)
 
-    print(f"🔗 Croisement : {matched_count}/{len(matched)} matchs avec cotes")
+    with_odds = sum(1 for f in matched if f["has_odds"])
+    print(f"🔗 Croisement : {with_odds}/{len(matched)} matchs avec cotes")
     return matched
-
-
-# =========================================================
-# ENRICHISSEMENT
-# =========================================================
-async def enrich_matches_with_context(matches: list[dict]) -> dict:
-    if not enrich_match:
-        return {}
-
-    with_odds = [m for m in matches if m.get("has_odds")]
-    to_enrich = with_odds[:MAX_MATCHES_TO_ENRICH]
-
-    if not to_enrich:
-        print("⚠️ Aucun match avec cotes à enrichir")
-        return {}
-
-    print(f"🌐 Enrichissement contexte (max {MAX_MATCHES_TO_ENRICH})...")
-    contexts = {}
-
-    for i, fx in enumerate(to_enrich):
-        try:
-            sport_key = fx.get("odds_sport_key") or ""
-            sport_title = fx.get("odds_sport_title") or ""
-            league_name = fx.get("league", "") or sport_title
-
-            if not league_name:
-                print(f"  ⏭ {fx['home']} vs {fx['away']} : pas de nom de ligue")
-                continue
-
-            ctx = await enrich_match(
-                fx["home"], fx["away"],
-                sport_key=sport_key,
-                league_name=league_name,
-            )
-            if ctx.get("available"):
-                contexts[fx["event_id"]] = ctx
-                hs = ctx.get("home_stats", {})
-                aws = ctx.get("away_stats", {})
-                print(f"  ✅ {fx['home']} vs {fx['away']} — "
-                      f"forme {hs.get('form', '?')} / {aws.get('form', '?')}")
-            else:
-                print(f"  ❌ {fx['home']} vs {fx['away']} : pas de contexte")
-
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            print(f"  ⚠️ Enrich crash {fx.get('home')}: {e}")
-
-    print(f"✅ Contextes enrichis : {len(contexts)}/{len(to_enrich)}")
-    return contexts
 
 
 # =========================================================
 # BUILD PICKS
 # =========================================================
-async def build_gemini_picks(matches, contexts, used_today):
+async def build_gemini_picks(matches, used_today):
     selections: list[Selection] = []
     seen = set()
-    stats = {"ok": 0, "fail": 0, "kept": 0, "with_ctx": 0}
+    stats = {"ok": 0, "fail": 0, "kept": 0}
 
     if not predict_match_probas:
-        print("❌ predict_match_probas non disponible, arrêt")
         return selections
 
     with_odds = [m for m in matches if m.get("has_odds")]
@@ -695,20 +541,12 @@ async def build_gemini_picks(matches, contexts, used_today):
                 if event_id in used_today:
                     continue
 
-                ctx = contexts.get(event_id)
-                has_ctx = ctx is not None and ctx.get("available", False)
-
-                pred = await predict_match_probas(
-                    client, home, away, league, kickoff, context=ctx
-                )
+                pred = await predict_match_probas(client, home, away, league, kickoff)
                 if not pred or "markets" not in pred:
                     stats["fail"] += 1
                     continue
 
                 stats["ok"] += 1
-                if has_ctx:
-                    stats["with_ctx"] += 1
-
                 markets = pred.get("markets", {})
                 analysis = pred.get("analysis", "")
                 advice = pred.get("advice", "")
@@ -783,8 +621,6 @@ async def build_gemini_picks(matches, contexts, used_today):
                     score = prob
                     if real_odd:
                         score += 0.5
-                    if has_ctx:
-                        score += 0.3
 
                     candidates.append((score, label, mkt, used_odd, real_odd, prob))
 
@@ -811,20 +647,18 @@ async def build_gemini_picks(matches, contexts, used_today):
                         analysis=analysis,
                         advice=advice,
                         advice_confidence=advice_conf,
-                        has_context=has_ctx,
                     ))
                     stats["kept"] += 1
                     kept += 1
                     if kept >= 3:
                         break
 
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(1.0)
 
             except Exception as e:
                 print(f"⚠️ build_gemini_picks: {e}")
 
-    print(f"🏠 Picks : ok={stats['ok']} échec={stats['fail']} "
-          f"gardés={stats['kept']} avec_contexte={stats['with_ctx']}")
+    print(f"🏠 Picks : ok={stats['ok']} échec={stats['fail']} gardés={stats['kept']}")
     return selections
 
 
@@ -993,13 +827,12 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False):
             day_tag = "📅 <b>Demain</b> "
 
     prob_pct = s.final_prob() * 100
-    ctx_badge = " ✅ <i>données réelles</i>" if s.has_context else ""
 
     lines = [
         f"<b>┌─ #{idx} {s.home} vs {s.away}</b>",
         f"│ {day_tag}🕐 <b>{kickoff_local(s.kickoff)}</b> • {s.league}",
         f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>",
-        f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}{ctx_badge}",
+        f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}",
     ]
 
     if s.real_odd:
@@ -1146,7 +979,7 @@ async def start_cmd(message):
 
 @dp.message(Command("scan"))
 async def scan_cmd(message):
-    await safe_answer(message, "⏳ Analyse en cours (3-5 min)...")
+    await safe_answer(message, "⏳ Analyse en cours (2-3 min)...")
     await scan()
     await broadcast_after_scan()
 
@@ -1166,9 +999,7 @@ async def debug_cmd(message):
         f"Matchs API-Football : <b>{d.get('af_fixtures', 0)}</b>\n"
         f"Events avec cotes : <b>{d.get('odds_events', 0)}</b>\n"
         f"Matchs croisés : <b>{d.get('matched', 0)}</b>\n"
-        f"Contextes enrichis : <b>{d.get('enriched', 0)}</b>\n"
         f"Matchs Gemini : <b>{d.get('gemini_ok', 0)}</b>\n"
-        f"  • avec contexte : <b>{d.get('with_ctx', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>"
     )
@@ -1239,23 +1070,14 @@ async def scan():
                     "kickoff": kick,
                     "has_odds": True,
                     "real_odds": extract_real_odds(ev),
-                    "odds_sport_key": ev.get("sport_key", ""),
-                    "odds_sport_title": ev.get("sport_title", ""),
                 })
         print(f"📊 Matchs après croisement : {len(matches)}")
 
         matches = [m for m in matches if is_today_upcoming(m["kickoff"])]
         print(f"📅 Matchs aujourd'hui : {len(matches)}")
 
-        # Enrichissement (avec garde-fou)
-        try:
-            contexts = await enrich_matches_with_context(matches)
-        except Exception as e:
-            print(f"⚠️ Enrichissement désactivé (crash) : {e}")
-            contexts = {}
-
         used_today = load_used_today()
-        selections = await build_gemini_picks(matches, contexts, used_today)
+        selections = await build_gemini_picks(matches, used_today)
         print(f"🎯 Sélections : {len(selections)}")
 
         STATE["selections"] = selections
@@ -1266,15 +1088,12 @@ async def scan():
 
         STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
         gemini_ok = sum(1 for s in selections if s.source == "gemini")
-        with_ctx = sum(1 for s in selections if s.has_context)
 
         STATE["debug"] = {
             "af_fixtures": len(af_fixtures),
             "odds_events": len(odds_events),
             "matched": len(matches),
-            "enriched": len(contexts),
             "gemini_ok": gemini_ok,
-            "with_ctx": with_ctx,
             "selections": len(selections),
             "coupons": len(STATE["coupons"]),
         }
@@ -1283,9 +1102,7 @@ async def scan():
         print(f"AF fixtures   : {len(af_fixtures)}")
         print(f"Odds events   : {len(odds_events)}")
         print(f"Matchs croisés: {len(matches)}")
-        print(f"Contextes     : {len(contexts)}")
         print(f"Sélections    : {len(selections)}")
-        print(f"Avec contexte : {with_ctx}")
         print(f"Coupons       : {len(STATE['coupons'])}")
         for c in STATE["coupons"]:
             print(f"  • {c.name} : {len(c.legs)} paris, cote {c.combined_odds}")
