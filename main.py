@@ -314,6 +314,15 @@ def evaluate_leg_result(leg: dict, home_goals: int, away_goals: int) -> str:
             return "won" if home_goals >= away_goals else "lost"
         if "x2" in label:
             return "won" if away_goals >= home_goals else "lost"
+        if "12" in label or "pas de nul" in label:
+            return "won" if home_goals != away_goals else "lost"
+
+    if market == "Handicap":
+        if "+0.5" in label:
+            if home in label:
+                return "won" if home_goals >= away_goals else "lost"
+            if away in label:
+                return "won" if away_goals >= home_goals else "lost"
 
     if market == "Over/Under":
         m = re.search(r"(over|under)\s+([\d.]+)", label)
@@ -378,7 +387,7 @@ async def settle_coupons():
 
 
 # =========================================================
-# THE ODDS API (cotes)
+# THE ODDS API
 # =========================================================
 async def fetch_odds_api_league(client: httpx.AsyncClient, sport_key: str) -> list[dict]:
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
@@ -443,8 +452,6 @@ def extract_real_odds(ev: dict) -> dict:
 
 
 def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> list[dict]:
-    """Croise les matchs API-Football avec les cotes Odds API."""
-    # Index des cotes par nom normalisé
     odds_index = {}
     for ev in odds_events:
         h = normalize_name(ev.get("home_team", ""))
@@ -458,10 +465,7 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
         a_norm = normalize_name(fx["away"])
         key = f"{h_norm}|{a_norm}"
 
-        # Match exact
         ev = odds_index.get(key)
-
-        # Match fuzzy si pas trouvé
         if not ev:
             for ok, oev in odds_index.items():
                 oh, oa = ok.split("|", 1)
@@ -494,7 +498,6 @@ async def build_gemini_picks(matches, used_today):
     if not predict_match_probas:
         return selections
 
-    # Priorité : matchs avec cotes réelles d'abord
     with_odds = [m for m in matches if m.get("has_odds")]
     without_odds = [m for m in matches if not m.get("has_odds")]
     ordered = with_odds + without_odds
@@ -521,22 +524,29 @@ async def build_gemini_picks(matches, used_today):
                 real_odds = fx.get("real_odds", {})
 
                 market_map = {
-                    "double_chance_1X": (f"Double Chance 1X ({home} ou nul)", "Double Chance"),
-                    "double_chance_X2": (f"Double Chance X2 (Nul ou {away})", "Double Chance"),
                     "victoire_home": (f"Victoire {home}", "1X2"),
                     "match_nul": ("Match nul", "1X2"),
                     "victoire_away": (f"Victoire {away}", "1X2"),
+                    "double_chance_1X": (f"Double Chance 1X ({home} ou nul)", "Double Chance"),
+                    "double_chance_12": ("Double Chance 12 (Pas de nul)", "Double Chance"),
+                    "double_chance_X2": (f"Double Chance X2 (Nul ou {away})", "Double Chance"),
+                    "handicap_home_plus_05": (f"{home} +0.5", "Handicap"),
+                    "handicap_away_plus_05": (f"{away} +0.5", "Handicap"),
                     "over_2.5": ("Over 2.5 buts", "Over/Under"),
                     "under_2.5": ("Under 2.5 buts", "Over/Under"),
                     "over_3.5": ("Over 3.5 buts", "Over/Under"),
                     "btts_yes": ("Les 2 marquent : Oui", "BTTS"),
                     "btts_no": ("Les 2 marquent : Non", "BTTS"),
+                    "over_6.5_corners": ("Plus de 6.5 corners", "Corners"),
+                    "over_8.5_corners": ("Plus de 8.5 corners", "Corners"),
+                    "over_10.5_corners": ("Plus de 10.5 corners", "Corners"),
+                    "home_over_2.5_corners": (f"Plus de 2.5 corners ({home})", "Corners"),
+                    "away_over_2.5_corners": (f"Plus de 2.5 corners ({away})", "Corners"),
+                    "over_2.5_cartons": ("Plus de 2.5 cartons", "Cartons"),
+                    "over_3.5_cartons": ("Plus de 3.5 cartons", "Cartons"),
                 }
 
-                # Choix : on privilégie les paris avec VRAIE cote
-                best_pick = None
-                best_score = 0
-
+                candidates = []
                 for key, (label, mkt) in market_map.items():
                     prob_pct = markets.get(key)
                     if prob_pct is None:
@@ -548,7 +558,6 @@ async def build_gemini_picks(matches, used_today):
                     if prob < MIN_PROB or prob > 0.85:
                         continue
 
-                    # Cote réelle si dispo
                     real_odd = None
                     if mkt == "1X2":
                         if "victoire" in label.lower() and home.lower() in label.lower():
@@ -568,53 +577,43 @@ async def build_gemini_picks(matches, used_today):
                         elif "non" in label.lower():
                             real_odd = real_odds.get("btts_no")
 
-                    # Cote utilisée : réelle en priorité, sinon fair odds
                     used_odd = real_odd if real_odd else 1.0 / prob
-
                     if used_odd < MIN_ODD:
                         continue
 
-                    # Score : bonus si vraie cote
                     score = prob
                     if real_odd:
                         score += 0.5
 
-                    if score > best_score:
-                        best_score = score
-                        best_pick = (label, mkt, used_odd, real_odd)
+                    candidates.append((score, label, mkt, used_odd, real_odd, prob))
 
-                if not best_pick:
-                    continue
+                candidates.sort(reverse=True, key=lambda x: x[0])
+                used_markets = set()
+                kept = 0
+                for score, label, mkt, used_odd, real_odd, prob in candidates:
+                    if mkt in used_markets:
+                        continue
+                    used_markets.add(mkt)
 
-                label, mkt, used_odd, real_odd = best_pick
-                prob = markets.get(
-                    {"Double Chance": None}.get(mkt, ""),
-                )
+                    dedup = f"{event_id}|{mkt}|{label}"
+                    if dedup in seen:
+                        continue
+                    seen.add(dedup)
 
-                # Récupérer la proba correcte
-                for key, (l, m) in market_map.items():
-                    if l == label and m == mkt:
-                        try:
-                            prob = float(markets.get(key, 0)) / 100.0
-                        except (ValueError, TypeError):
-                            prob = 0.0
+                    selections.append(Selection(
+                        event_id=event_id, league=league, home=home, away=away,
+                        kickoff=kickoff, market=mkt, pick_label=label,
+                        odds=round(used_odd, 2), model_prob=round(prob, 4),
+                        edge=0.0,
+                        bookmaker="The Odds API" if real_odd else "Gemini",
+                        real_odd=real_odd,
+                        analysis=analysis,
+                        advice=advice,
+                    ))
+                    stats["kept"] += 1
+                    kept += 1
+                    if kept >= 3:
                         break
-
-                dedup = f"{event_id}|{mkt}|{label}"
-                if dedup in seen:
-                    continue
-                seen.add(dedup)
-
-                selections.append(Selection(
-                    event_id=event_id, league=league, home=home, away=away,
-                    kickoff=kickoff, market=mkt, pick_label=label,
-                    odds=round(used_odd, 2), model_prob=round(prob, 4),
-                    edge=0.0, bookmaker="The Odds API" if real_odd else "Gemini",
-                    real_odd=real_odd,
-                    analysis=analysis,
-                    advice=advice,
-                ))
-                stats["kept"] += 1
 
                 await asyncio.sleep(1.0)
 
@@ -730,16 +729,20 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
 
-    pool_safe = [s for s in selections if s.final_prob() >= 0.68]
+    pool_safe = [s for s in selections
+                 if s.final_prob() >= 0.68
+                 and s.market in ("1X2", "Double Chance", "Over/Under", "BTTS")]
     c = build_coupon_target(
-        "Ticket Sécurisé", "Cote 2.0 - 2.5",
+        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Priorité sûreté",
         "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 5, used,
         min_leg_odds=1.35,
     )
     if c:
         coupons.append(c)
 
-    pool_bal = [s for s in selections if s.final_prob() >= 0.60]
+    pool_bal = [s for s in selections
+                if s.final_prob() >= 0.60
+                and s.market not in ("Corners", "Cartons")]
     c = build_coupon_target(
         "Ticket Équilibré", "Cote 2.5 - 5.0",
         "⚖️", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
@@ -783,7 +786,7 @@ def format_selection_block(s: Selection, idx: int):
     lines = [
         f"<b>┌─ #{idx} {s.home} vs {s.away}</b>",
         f"│ {day_tag}🕐 <b>{kickoff_local(s.kickoff)}</b> • {s.league}",
-        f"│ 🎯 <b>{s.pick_label}</b>",
+        f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>",
         f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}",
     ]
     if s.real_odd:
@@ -839,23 +842,24 @@ def format_coupon(c: Coupon):
 
 def format_coupons_ready():
     if not STATE["coupons"]:
-        return (f"{format_header()}\n\n<b>📭 Aucun coupon aujourd'hui</b>")
+        return (f"{format_header()}\n\n<b>📭 Aucun coupon aujourd'hui</b>\n"
+                f"<i>Pas assez de paris à haute proba (cote ≥ {MIN_ODD}).</i>")
     lignes = []
     for c in STATE["coupons"]:
         n = len(c.legs)
         if c.is_list:
-            lignes.append(f"{c.emoji} <b>{c.name}</b>\n   • {n} pronostics")
+            lignes.append(f"{c.emoji} <b>{c.name}</b>\n   • {n} pronostics (liste)")
         else:
             lignes.append(
                 f"{c.emoji} <b>{c.name}</b>\n"
-                f"   • {n} paris • Cote <b>{c.combined_odds}</b>"
+                f"   • {n} paris • Cote <b>{c.combined_odds}</b> • Proba <b>{c.combined_prob*100:.0f}%</b>"
             )
     return (
         f"{format_header()}\n\n"
         f"<b>🔔 COUPONS DU JOUR PRÊTS !</b>\n\n"
-        f"<b>{len(STATE['coupons'])} coupon(s) :</b>\n\n"
+        f"<b>{len(STATE['coupons'])} coupon(s) disponible(s) :</b>\n\n"
         + "\n\n".join(lignes)
-        + "\n\n<i>👇 Clique sur le bouton du ticket</i>"
+        + "\n\n<i>👇 Clique sur le bouton du ticket qui t'intéresse</i>"
     )
 
 
@@ -935,7 +939,7 @@ async def debug_cmd(message):
         f"Matchs API-Football : <b>{d.get('af_fixtures', 0)}</b>\n"
         f"Events avec cotes : <b>{d.get('odds_events', 0)}</b>\n"
         f"Matchs croisés : <b>{d.get('matched', 0)}</b>\n"
-        f"Matchs analysés Gemini : <b>{d.get('gemini_ok', 0)}</b>\n"
+        f"Matchs Gemini : <b>{d.get('gemini_ok', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>"
     )
@@ -980,19 +984,15 @@ async def btn_scan(message):
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
-        # 1. Tous les matchs du jour via API-Football
         af_fixtures = []
         if fetch_all_today_fixtures:
             af_fixtures = await fetch_all_today_fixtures()
 
-        # 2. Cotes via The Odds API
         odds_events = await fetch_all_odds_events()
 
-        # 3. Croiser
         if af_fixtures:
             matches = match_fixtures_with_odds(af_fixtures, odds_events)
         else:
-            # Fallback : utiliser uniquement The Odds API
             print("⚠️ Fallback : utilisation de The Odds API seul")
             matches = []
             for ev in odds_events:
@@ -1013,11 +1013,9 @@ async def scan():
                 })
         print(f"📊 Matchs après croisement : {len(matches)}")
 
-        # Filtre aujourd'hui
         matches = [m for m in matches if is_today_upcoming(m["kickoff"])]
         print(f"📅 Matchs aujourd'hui : {len(matches)}")
 
-        # 4. Gemini analyse
         used_today = load_used_today()
         selections = await build_gemini_picks(matches, used_today)
         print(f"🎯 Sélections : {len(selections)}")
