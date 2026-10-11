@@ -61,6 +61,7 @@ BAL_MIN_ODDS = 2.5
 BAL_MAX_ODDS = 5.0
 BAL_MIN_LEG_ODDS = 1.35
 VALUE_TOP_N = 20
+TELEGRAM_MAX_LEN = 3800  # pour split
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -222,6 +223,24 @@ def prob_bar(p: float) -> str:
     if p >= 0.65:
         return "🟢⚪⚪"
     return "⚪⚪⚪"
+
+
+def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
+    """Découpe un long message en plusieurs morceaux."""
+    if len(text) <= max_len:
+        return [text]
+    parts = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > max_len:
+            if current:
+                parts.append(current.rstrip())
+            current = line + "\n"
+        else:
+            current += line + "\n"
+    if current.strip():
+        parts.append(current.rstrip())
+    return parts
 
 
 # =========================================================
@@ -628,7 +647,13 @@ async def build_gemini_picks(matches, used_today):
 # COUPONS
 # =========================================================
 def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
-                        max_legs, globally_used, min_leg_odds=1.01):
+                        max_legs, globally_used, min_leg_odds=1.01,
+                        strict=True):
+    """
+    Construit un coupon dont la cote totale tombe dans [target_min, target_max].
+    Si strict=True : la cote doit être >= target_min EXACTEMENT.
+    Si strict=False : tolérance 15%.
+    """
     pool = [s for s in pool
             if s.odds >= min_leg_odds
             and s.event_id not in globally_used]
@@ -671,8 +696,16 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
 
     if not legs:
         return None
-    if combined_odds < target_min * 0.85:
-        return None
+
+    # === FIX 1 : contrôle strict de la cote minimum ===
+    if strict:
+        if combined_odds < target_min:
+            print(f"  ⛔ {name} rejeté : cote {combined_odds:.2f} < {target_min}")
+            return None
+    else:
+        if combined_odds < target_min * 0.85:
+            return None
+
     if combined_odds > target_max * 1.25:
         return None
 
@@ -729,28 +762,31 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
 
+    # Sécurisé STRICT : cote min 2.0 obligatoire
     pool_safe = [s for s in selections
                  if s.final_prob() >= 0.68
                  and s.market in ("1X2", "Double Chance", "Over/Under", "BTTS")]
     c = build_coupon_target(
         "Ticket Sécurisé", "Cote 2.0 - 2.5 • Priorité sûreté",
         "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 5, used,
-        min_leg_odds=1.35,
+        min_leg_odds=1.35, strict=True,
     )
     if c:
         coupons.append(c)
 
+    # Équilibré
     pool_bal = [s for s in selections
                 if s.final_prob() >= 0.60
                 and s.market not in ("Corners", "Cartons")]
     c = build_coupon_target(
         "Ticket Équilibré", "Cote 2.5 - 5.0",
         "⚖️", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
-        min_leg_odds=BAL_MIN_LEG_ODDS,
+        min_leg_odds=BAL_MIN_LEG_ODDS, strict=False,
     )
     if c:
         coupons.append(c)
 
+    # Value
     c = build_value_list(selections, top_n=VALUE_TOP_N, globally_used=set())
     if c:
         coupons.append(c)
@@ -771,7 +807,8 @@ def format_header():
     )
 
 
-def format_selection_block(s: Selection, idx: int):
+def format_selection_block(s: Selection, idx: int, compact: bool = False):
+    """compact=True : version courte pour la liste Value."""
     dt = parse_dt_safe(s.kickoff)
     day_tag = ""
     if dt:
@@ -789,24 +826,27 @@ def format_selection_block(s: Selection, idx: int):
         f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>",
         f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}",
     ]
+
     if s.real_odd:
         lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b> <i>(réelle)</i>")
     else:
         lines.append(f"│ 💰 Cote : <b>{s.odds}</b> <i>(estimée)</i>")
 
-    if s.analysis:
+    # Analyse seulement si non compact
+    if not compact and s.analysis:
         lines.append(f"│")
         lines.append(f"│ 🧠 <b>Avis IA</b> :")
         lines.append(f"│ 💬 <i>{s.analysis}</i>")
-    if s.advice:
-        lines.append(f"│ 💡 <b>{s.advice}</b>")
+        if s.advice:
+            lines.append(f"│ 💡 <b>{s.advice}</b>")
 
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
 
-def format_coupon(c: Coupon):
+def format_coupon(c: Coupon) -> str:
     if c.is_list:
+        # Version COMPACTE pour Value (pas d'analyse, sinon trop long)
         lines = [
             format_header(), "",
             f"<b>{c.emoji} {c.name.upper()}</b>",
@@ -815,7 +855,7 @@ def format_coupon(c: Coupon):
             "",
         ]
         for i, s in enumerate(c.legs, 1):
-            lines.append(format_selection_block(s, i))
+            lines.append(format_selection_block(s, i, compact=True))
             lines.append("")
         lines.append(f"<i>{PUBLIC_FOOTER}</i>")
         return "\n".join(lines)
@@ -826,15 +866,15 @@ def format_coupon(c: Coupon):
         format_header(), "",
         f"<b>{c.emoji} {c.name.upper()}</b>",
         f"<i>{c.subtitle}</i>", "",
-        f"<b>┏━━━━━━━━━━━━━━━━━┓</b>",
+        f"<b>┏━━━━━━━━━━━━━━━┓</b>",
         f"<b>┃ 📊 RÉCAP TICKET</b>",
         f"<b>┃ 🎫 Cote totale : {c.combined_odds}</b>",
         f"<b>┃ 📈 Proba combinée : {c.combined_prob*100:.1f}%</b>",
         f"<b>┃ 🎯 {prob_level}</b>",
-        f"<b>┗━━━━━━━━━━━━━━━━━┛</b>", "",
+        f"<b>┗━━━━━━━━━━━━━━━┛</b>", "",
     ]
     for i, s in enumerate(c.legs, 1):
-        lines.append(format_selection_block(s, i))
+        lines.append(format_selection_block(s, i, compact=False))
         lines.append("")
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
@@ -893,17 +933,28 @@ def format_bilan(tracker):
 # TELEGRAM
 # =========================================================
 async def safe_answer(message, text):
-    try:
-        await message.answer(text, parse_mode="HTML", reply_markup=MAIN_KEYBOARD)
-    except Exception as e:
-        print(f"⚠️ Answer: {e}")
+    """Envoie un message, split si trop long."""
+    parts = split_message(text)
+    for i, part in enumerate(parts):
+        try:
+            if i == 0:
+                await message.answer(part, parse_mode="HTML", reply_markup=MAIN_KEYBOARD)
+            else:
+                await message.answer(part, parse_mode="HTML")
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            print(f"⚠️ Answer part {i}: {e}")
 
 
 async def safe_send(chat_id, text):
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-    except Exception as e:
-        print(f"⚠️ Send {chat_id}: {e}")
+    """Envoie un message, split si trop long."""
+    parts = split_message(text)
+    for part in parts:
+        try:
+            await bot.send_message(chat_id=chat_id, text=part, parse_mode="HTML")
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            print(f"⚠️ Send {chat_id}: {e}")
 
 
 async def broadcast_after_scan():
