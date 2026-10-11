@@ -1,6 +1,7 @@
 """
 API-Football : fixtures du jour, stats équipes, corners/cartons,
 H2H, blessés, contexte complet, résultats de matchs.
+Avec debug des IDs.
 """
 from __future__ import annotations
 
@@ -60,13 +61,16 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
     try:
         r = await client.get(f"{API_BASE}{path}", headers=_headers(), params=params, timeout=15.0)
         if r.status_code >= 400:
+            print(f"  ⚠️ API-Football {path} HTTP {r.status_code}")
             return {}
         data = r.json()
         errors = data.get("errors", {})
         if errors and errors != []:
+            print(f"  ⚠️ API-Football {path} errors: {errors}")
             return {}
         return data
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠️ API-Football {path} crash: {e}")
         return {}
 
 
@@ -134,17 +138,36 @@ async def find_team_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
     data = await _get(client, "/teams", {"search": name})
     teams = data.get("response", [])
     if not teams:
+        print(f"  ❌ Aucune équipe trouvée pour '{name}'")
         _TEAM_ID_CACHE[key] = None
         return None
 
+    # Log les candidats pour debug
+    candidates = []
+    for t in teams[:5]:
+        team = t.get("team", {})
+        candidates.append(f"{team.get('name', '?')}(id={team.get('id')})")
+    print(f"  🔎 Recherche '{name}' → candidats : {', '.join(candidates)}")
+
+    # Match exact
     for t in teams:
         team = t.get("team", {})
         tid = team.get("id")
         tname = team.get("name", "")
-        if tid and (_norm(tname) == key or key in _norm(tname) or _norm(tname) in key):
+        if tid and _norm(tname) == key:
             _TEAM_ID_CACHE[key] = tid
             return tid
 
+    # Match par inclusion
+    for t in teams:
+        team = t.get("team", {})
+        tid = team.get("id")
+        tname = team.get("name", "")
+        if tid and (key in _norm(tname) or _norm(tname) in key):
+            _TEAM_ID_CACHE[key] = tid
+            return tid
+
+    # Fallback : premier résultat
     tid = teams[0].get("team", {}).get("id")
     _TEAM_ID_CACHE[key] = tid
     return tid
@@ -195,7 +218,7 @@ async def get_team_stats(client: httpx.AsyncClient, team_id: int, league_id: int
 
 
 # =========================================================
-# H2H
+# H2H (brut)
 # =========================================================
 async def get_h2h(client: httpx.AsyncClient, team1_id: int, team2_id: int,
                    last: int = 5) -> list[dict]:
@@ -260,7 +283,7 @@ async def get_injuries(client: httpx.AsyncClient, team_id: int, season: int = 20
 
 
 # =========================================================
-# CORNERS / CARTONS (grandes ligues)
+# CORNERS / CARTONS
 # =========================================================
 async def get_corners_cards(home: str, away: str, odds_sport_key: str = "") -> dict:
     if not API_FOOTBALL_KEY:
@@ -302,10 +325,9 @@ async def get_corners_cards(home: str, away: str, odds_sport_key: str = "") -> d
 
 
 # =========================================================
-# H2H + FORME par NOMS (fallback Bzzoiro)
+# H2H par NOMS
 # =========================================================
 async def get_h2h_by_names(home: str, away: str) -> dict:
-    """Récupère H2H via API-Football, retourne un dict Bzzoiro-compatible."""
     if not API_FOOTBALL_KEY:
         return {"available": False}
 
@@ -374,8 +396,11 @@ async def get_h2h_by_names(home: str, away: str) -> dict:
             return {"available": False}
 
 
+# =========================================================
+# CONTEXTE COMPLET (avec debug IDs)
+# =========================================================
 async def get_full_context_api_football(home: str, away: str, league_name: str = "") -> dict:
-    """Contexte complet via API-Football (fallback Bzzoiro)."""
+    """Contexte complet via API-Football avec logs de debug."""
     if not API_FOOTBALL_KEY:
         return {"available": False}
 
@@ -385,8 +410,17 @@ async def get_full_context_api_football(home: str, away: str, league_name: str =
                 find_team_id(client, home),
                 find_team_id(client, away),
             )
+
+            # === DEBUG ===
+            print(f"  🆔 '{home}' → team_id={home_id}")
+            print(f"  🆔 '{away}' → team_id={away_id}")
+
             if not home_id or not away_id:
+                print(f"  ❌ ID manquant, on abandonne")
                 return {"available": False}
+
+            h2h_raw = await get_h2h(client, home_id, away_id, last=5)
+            print(f"  📊 H2H brut : {len(h2h_raw)} matchs via /fixtures/headtohead")
 
             h2h = await get_h2h_by_names(home, away)
 
@@ -411,7 +445,7 @@ async def get_full_context_api_football(home: str, away: str, league_name: str =
 
 
 # =========================================================
-# ENRICHISSEMENT CONTEXTE (legacy)
+# ENRICHISSEMENT LEGACY
 # =========================================================
 async def enrich_match(home: str, away: str, odds_api_sport_key: str) -> dict:
     if not API_FOOTBALL_KEY:
