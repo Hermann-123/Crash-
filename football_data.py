@@ -1,9 +1,7 @@
 """
 Récupère les données contextuelles via API-Football :
-- Forme (5 derniers matchs)
-- H2H (face-à-face)
-- Blessés / suspendus
-- Stats équipes (moyennes buts, corners, cartons)
+- Forme, H2H, blessés, stats équipes (corners, cartons)
+- Résultats de matchs (pour le règlement des coupons)
 """
 from __future__ import annotations
 
@@ -20,7 +18,6 @@ import httpx
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_BASE = "https://v3.football.api-sports.io"
 
-# Mapping league The Odds API -> API-Football
 LEAGUE_MAP = {
     "soccer_epl": 39,
     "soccer_spain_la_liga": 140,
@@ -34,11 +31,10 @@ LEAGUE_MAP = {
     "soccer_portugal_primeira_liga": 94,
 }
 
-# Cache global
-_TEAM_ID_CACHE: dict = {}       # {norm_name: team_id}
-_STATS_CACHE: dict = {}         # {team_id_league: stats}
-_H2H_CACHE: dict = {}           # {(id1,id2): h2h}
-_INJ_CACHE: dict = {}           # {team_id: injuries}
+_TEAM_ID_CACHE: dict = {}
+_STATS_CACHE: dict = {}
+_H2H_CACHE: dict = {}
+_INJ_CACHE: dict = {}
 
 
 def _norm(s: str) -> str:
@@ -71,7 +67,6 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
 
 
 async def find_team_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
-    """Cherche l'ID API-Football d'une équipe."""
     key = _norm(name)
     if not key:
         return None
@@ -84,7 +79,6 @@ async def find_team_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
         _TEAM_ID_CACHE[key] = None
         return None
 
-    # Prendre le premier (le plus populaire)
     for t in teams:
         team = t.get("team", {})
         tid = team.get("id")
@@ -93,7 +87,6 @@ async def find_team_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
             _TEAM_ID_CACHE[key] = tid
             return tid
 
-    # Sinon, prendre le premier résultat
     tid = teams[0].get("team", {}).get("id")
     _TEAM_ID_CACHE[key] = tid
     return tid
@@ -101,7 +94,6 @@ async def find_team_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
 
 async def get_team_stats(client: httpx.AsyncClient, team_id: int, league_id: int,
                           season: int = 2025) -> dict:
-    """Stats équipe : buts, corners, cartons, forme."""
     key = f"{team_id}_{league_id}_{season}"
     if key in _STATS_CACHE:
         return _STATS_CACHE[key]
@@ -143,7 +135,6 @@ async def get_team_stats(client: httpx.AsyncClient, team_id: int, league_id: int
 
 async def get_h2h(client: httpx.AsyncClient, team1_id: int, team2_id: int,
                    last: int = 5) -> list[dict]:
-    """5 derniers face-à-face."""
     key = (team1_id, team2_id)
     if key in _H2H_CACHE:
         return _H2H_CACHE[key]
@@ -173,7 +164,6 @@ async def get_h2h(client: httpx.AsyncClient, team1_id: int, team2_id: int,
 
 
 async def get_injuries(client: httpx.AsyncClient, team_id: int, season: int = 2025) -> list[dict]:
-    """Blessés et suspendus de l'équipe."""
     key = team_id
     if key in _INJ_CACHE:
         return _INJ_CACHE[key]
@@ -203,14 +193,7 @@ async def get_injuries(client: httpx.AsyncClient, team_id: int, season: int = 20
 
 
 async def enrich_match(home: str, away: str, odds_api_sport_key: str) -> dict:
-    """
-    Retourne un dict avec contexte pour un match :
-    {
-      "home_stats": {...}, "away_stats": {...},
-      "h2h": [...], "home_injuries": [...], "away_injuries": [...],
-      "available": bool
-    }
-    """
+    """Retourne le contexte d'un match (forme, H2H, blessés, stats)."""
     if not API_FOOTBALL_KEY:
         return {"available": False}
 
@@ -250,3 +233,50 @@ async def enrich_match(home: str, away: str, odds_api_sport_key: str) -> dict:
         except Exception as e:
             print(f"⚠️ enrich_match crash {home}-{away}: {e}")
             return {"available": False}
+
+
+async def get_fixture_result(home: str, away: str, date_iso: str) -> Optional[dict]:
+    """
+    Cherche le résultat d'un match.
+    Retourne {"home_goals": X, "away_goals": Y, "status": "FT"} ou None.
+    """
+    if not API_FOOTBALL_KEY:
+        return None
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            data = await _get(client, "/fixtures", {
+                "date": date_iso,
+                "timezone": "Africa/Abidjan",
+            })
+            fixtures = data.get("response", [])
+            if not fixtures:
+                return None
+
+            h_norm = _norm(home)
+            a_norm = _norm(away)
+
+            for fx in fixtures:
+                teams = fx.get("teams", {})
+                hn = _norm(teams.get("home", {}).get("name", ""))
+                an = _norm(teams.get("away", {}).get("name", ""))
+
+                if not ((h_norm in hn or hn in h_norm) and (a_norm in an or an in a_norm)):
+                    continue
+
+                fixture_info = fx.get("fixture", {})
+                status = fixture_info.get("status", {}).get("short", "")
+                goals = fx.get("goals", {})
+
+                if status not in ("FT", "AET", "PEN"):
+                    return None
+
+                return {
+                    "home_goals": goals.get("home"),
+                    "away_goals": goals.get("away"),
+                    "status": status,
+                }
+            return None
+        except Exception as e:
+            print(f"⚠️ get_fixture_result crash: {e}")
+            return None
