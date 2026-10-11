@@ -31,11 +31,13 @@ try:
         get_fixture_result,
         fetch_all_today_fixtures,
         get_corners_cards,
+        get_full_context_api_football,
     )
 except Exception as e:
     get_fixture_result = None
     fetch_all_today_fixtures = None
     get_corners_cards = None
+    get_full_context_api_football = None
     print(f"❌ Import football_data: {e}")
 
 try:
@@ -539,14 +541,15 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
 
 
 # =========================================================
-# ENRICHISSEMENT
+# ENRICHISSEMENT (cascade : Bzzoiro → API-Football)
 # =========================================================
 async def enrich_matches(matches: list[dict]) -> dict:
-    """Enrichit les matchs avec Bzzoiro (H2H, ML) + API-Football (corners/cartons)."""
-    if not enrich_match_with_bzzoiro:
-        print("⚠️ Bzzoiro non disponible, enrichissement désactivé")
-        return {}
-
+    """
+    Enrichit les matchs en cascade :
+    1. Bzzoiro (H2H + prédictions ML)
+    2. Si Bzzoiro échoue → API-Football (H2H + blessés)
+    3. Corners/cartons API-Football (grandes ligues)
+    """
     to_enrich = matches[:MAX_MATCHES_TO_ENRICH]
     if not to_enrich:
         return {}
@@ -559,27 +562,41 @@ async def enrich_matches(matches: list[dict]) -> dict:
             home = fx.get("home", "")
             away = fx.get("away", "")
             kickoff = fx.get("kickoff", "")
+            league = fx.get("league", "")
             sport_key = fx.get("odds_sport_key", "")
 
             dt = parse_dt_safe(kickoff)
             date_iso = dt.strftime("%Y-%m-%d") if dt else datetime.now(TZ).strftime("%Y-%m-%d")
 
-            # Bzzoiro (H2H + prédictions ML)
-            ctx = await enrich_match_with_bzzoiro(home, away, date_iso)
+            ctx = None
+            source = None
 
-            # API-Football (corners/cartons) — seulement grandes ligues
-            if ctx.get("available") and get_corners_cards and sport_key:
+            # === 1. Essayer Bzzoiro ===
+            if enrich_match_with_bzzoiro:
+                ctx = await enrich_match_with_bzzoiro(home, away, date_iso)
+                if ctx.get("available"):
+                    source = "bzzoiro"
+
+            # === 2. Fallback API-Football ===
+            if (not ctx or not ctx.get("available")) and get_full_context_api_football:
+                print(f"  🔄 Fallback API-Football pour {home} vs {away}...")
+                ctx = await get_full_context_api_football(home, away, league)
+                if ctx.get("available"):
+                    source = "api-football"
+
+            # === 3. Corners/cartons (grandes ligues) ===
+            if ctx and ctx.get("available") and get_corners_cards and sport_key:
                 cc = await get_corners_cards(home, away, sport_key)
                 if cc.get("available"):
                     ctx["corners_cards"] = cc
 
-            if ctx.get("available"):
+            if ctx and ctx.get("available"):
                 contexts[fx["event_id"]] = ctx
                 h2h_total = ctx.get("h2h", {}).get("total_matches", 0)
-                has_cc = "✅" if ctx.get("corners_cards") else "⚠️"
-                print(f"  ✅ {home} vs {away} — H2H:{h2h_total} • Corners/Cartons: {has_cc}")
+                has_cc = "✅" if ctx.get("corners_cards") else "—"
+                print(f"  ✅ {home} vs {away} — source:{source} • H2H:{h2h_total} • C/C:{has_cc}")
             else:
-                print(f"  ❌ {home} vs {away} : pas de contexte")
+                print(f"  ❌ {home} vs {away} : aucun contexte")
 
             await asyncio.sleep(0.3)
         except Exception as e:
@@ -1165,7 +1182,6 @@ async def scan():
         matches = [m for m in matches if is_today_upcoming(m["kickoff"])]
         print(f"📅 Matchs aujourd'hui : {len(matches)}")
 
-        # 🌐 Enrichissement
         contexts = {}
         try:
             contexts = await enrich_matches(matches)
