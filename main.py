@@ -61,7 +61,7 @@ BAL_MIN_ODDS = 2.5
 BAL_MAX_ODDS = 5.0
 BAL_MIN_LEG_ODDS = 1.35
 VALUE_TOP_N = 20
-TELEGRAM_MAX_LEN = 3800  # pour split
+TELEGRAM_MAX_LEN = 3800
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
@@ -102,6 +102,7 @@ class Selection:
     real_odd: Optional[float] = None
     analysis: str = ""
     advice: str = ""
+    advice_confidence: int = 0
 
     def final_prob(self) -> float:
         return self.model_prob
@@ -225,8 +226,17 @@ def prob_bar(p: float) -> str:
     return "⚪⚪⚪"
 
 
+def confidence_bar(pct: int) -> str:
+    if pct >= 80:
+        return "🟢🟢🟢"
+    if pct >= 70:
+        return "🟢🟢⚪"
+    if pct >= 60:
+        return "🟢⚪⚪"
+    return "⚪⚪⚪"
+
+
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
-    """Découpe un long message en plusieurs morceaux."""
     if len(text) <= max_len:
         return [text]
     parts = []
@@ -540,6 +550,14 @@ async def build_gemini_picks(matches, used_today):
                 markets = pred.get("markets", {})
                 analysis = pred.get("analysis", "")
                 advice = pred.get("advice", "")
+                advice_conf = pred.get("advice_confidence", 0)
+                try:
+                    advice_conf = int(advice_conf)
+                    if advice_conf < 0 or advice_conf > 100:
+                        advice_conf = 0
+                except (ValueError, TypeError):
+                    advice_conf = 0
+
                 real_odds = fx.get("real_odds", {})
 
                 market_map = {
@@ -628,6 +646,7 @@ async def build_gemini_picks(matches, used_today):
                         real_odd=real_odd,
                         analysis=analysis,
                         advice=advice,
+                        advice_confidence=advice_conf,
                     ))
                     stats["kept"] += 1
                     kept += 1
@@ -647,13 +666,7 @@ async def build_gemini_picks(matches, used_today):
 # COUPONS
 # =========================================================
 def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
-                        max_legs, globally_used, min_leg_odds=1.01,
-                        strict=True):
-    """
-    Construit un coupon dont la cote totale tombe dans [target_min, target_max].
-    Si strict=True : la cote doit être >= target_min EXACTEMENT.
-    Si strict=False : tolérance 15%.
-    """
+                        max_legs, globally_used, min_leg_odds=1.01, strict=True):
     pool = [s for s in pool
             if s.odds >= min_leg_odds
             and s.event_id not in globally_used]
@@ -697,7 +710,6 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
     if not legs:
         return None
 
-    # === FIX 1 : contrôle strict de la cote minimum ===
     if strict:
         if combined_odds < target_min:
             print(f"  ⛔ {name} rejeté : cote {combined_odds:.2f} < {target_min}")
@@ -762,7 +774,6 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
 
-    # Sécurisé STRICT : cote min 2.0 obligatoire
     pool_safe = [s for s in selections
                  if s.final_prob() >= 0.68
                  and s.market in ("1X2", "Double Chance", "Over/Under", "BTTS")]
@@ -774,7 +785,6 @@ def build_all_coupons(selections):
     if c:
         coupons.append(c)
 
-    # Équilibré
     pool_bal = [s for s in selections
                 if s.final_prob() >= 0.60
                 and s.market not in ("Corners", "Cartons")]
@@ -786,7 +796,6 @@ def build_all_coupons(selections):
     if c:
         coupons.append(c)
 
-    # Value
     c = build_value_list(selections, top_n=VALUE_TOP_N, globally_used=set())
     if c:
         coupons.append(c)
@@ -808,7 +817,6 @@ def format_header():
 
 
 def format_selection_block(s: Selection, idx: int, compact: bool = False):
-    """compact=True : version courte pour la liste Value."""
     dt = parse_dt_safe(s.kickoff)
     day_tag = ""
     if dt:
@@ -832,13 +840,17 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False):
     else:
         lines.append(f"│ 💰 Cote : <b>{s.odds}</b> <i>(estimée)</i>")
 
-    # Analyse seulement si non compact
     if not compact and s.analysis:
         lines.append(f"│")
         lines.append(f"│ 🧠 <b>Avis IA</b> :")
         lines.append(f"│ 💬 <i>{s.analysis}</i>")
         if s.advice:
-            lines.append(f"│ 💡 <b>{s.advice}</b>")
+            if s.advice_confidence > 0:
+                conf_bar = confidence_bar(s.advice_confidence)
+                lines.append(f"│ 💡 <b>Conseil IA</b> ({conf_bar} <b>{s.advice_confidence}%</b>) :")
+                lines.append(f"│    {s.advice}")
+            else:
+                lines.append(f"│ 💡 <b>Conseil IA</b> : {s.advice}")
 
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
@@ -846,7 +858,6 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False):
 
 def format_coupon(c: Coupon) -> str:
     if c.is_list:
-        # Version COMPACTE pour Value (pas d'analyse, sinon trop long)
         lines = [
             format_header(), "",
             f"<b>{c.emoji} {c.name.upper()}</b>",
@@ -933,7 +944,6 @@ def format_bilan(tracker):
 # TELEGRAM
 # =========================================================
 async def safe_answer(message, text):
-    """Envoie un message, split si trop long."""
     parts = split_message(text)
     for i, part in enumerate(parts):
         try:
@@ -947,7 +957,6 @@ async def safe_answer(message, text):
 
 
 async def safe_send(chat_id, text):
-    """Envoie un message, split si trop long."""
     parts = split_message(text)
     for part in parts:
         try:
