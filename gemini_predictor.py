@@ -1,6 +1,5 @@
 """
-Prédicteur Gemini SANS Search grounding.
-Ne demande QUE les marchés à valeur ajoutée (pas de Over 0.5/1.5).
+Prédicteur Gemini avec avis personnel.
 """
 from __future__ import annotations
 
@@ -20,12 +19,10 @@ async def predict_match_probas(client: httpx.AsyncClient, home: str, away: str,
     if not GEMINI_API_KEY:
         return None
 
-    prompt = f"""Tu es un analyste football expert. Estime les probas pour ce match :
+    prompt = f"""Tu es un analyste football expert. Analyse ce match et estime les probas.
 
 Match : {home} vs {away}
 Compétition : {league}
-
-Analyse le niveau des 2 équipes et donne des probas RÉALISTES.
 
 Retourne UNIQUEMENT ce JSON :
 
@@ -41,23 +38,22 @@ Retourne UNIQUEMENT ce JSON :
     "over_3.5": 0,
     "btts_yes": 0,
     "btts_no": 0
-  }}
+  }},
+  "analysis": "2 phrases d'analyse sur le match : niveau des équipes, forme, enjeu.",
+  "advice": "1 phrase de conseil pour le parieur."
 }}
 
-RÈGLES STRICTES :
+RÈGLES :
 - Toutes les probas entre 15 et 85
 - victoire_home + match_nul + victoire_away = 100
-- double_chance_1X = victoire_home + match_nul
-- double_chance_X2 = match_nul + victoire_away
 - over_2.5 + under_2.5 = 100
-- PAS de proba supérieure à 85 (aucun match n'est "sûr")
-- Sois PRÉCIS : un gros favori à domicile → victoire_home = 65-75
-- Un match équilibré → 30/35/35
+- "analysis" : 2 phrases max, factuelles
+- "advice" : 1 phrase, directive
 - Rien avant/après le JSON"""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.5, "maxOutputTokens": 800},
+        "generationConfig": {"temperature": 0.5, "maxOutputTokens": 900},
     }
 
     try:
