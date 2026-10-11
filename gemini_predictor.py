@@ -1,8 +1,10 @@
 """
 Prédicteur Gemini enrichi avec les vraies données API-Football.
+Avec retry automatique sur 503/429.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -37,13 +39,13 @@ def format_context(context: Optional[dict]) -> str:
 
 📊 DONNÉES RÉELLES (API-Football) — utilise-les en priorité :
 
-Forme {hs.get('form', '?')} (5 derniers)
+Forme équipe A : {hs.get('form', '?')} (5 derniers)
 Buts pour/m : {hs.get('goals_for_avg', 0):.2f}
 Buts contre/m : {hs.get('goals_against_avg', 0):.2f}
 Corners/m : {hs.get('corners_for_avg', 0):.1f}
 Cartons/m : {hs.get('cards_yellow_avg', 0):.1f}
 
-Forme {aws.get('form', '?')} (5 derniers)
+Forme équipe B : {aws.get('form', '?')} (5 derniers)
 Buts pour/m : {aws.get('goals_for_avg', 0):.2f}
 Buts contre/m : {aws.get('goals_against_avg', 0):.2f}
 Corners/m : {aws.get('corners_for_avg', 0):.1f}
@@ -109,7 +111,6 @@ RÈGLES STRICTES :
 - handicap_away_plus_05 = double_chance_X2
 - over_2.5 + under_2.5 = 100
 - Si tu as des stats réelles : base tes probas dessus
-- Si tu n'as pas de stats : utilise ton estimation
 - "analysis" : mentionne la forme, les buts moyens, le H2H si dispo
 - "advice_confidence" : % de réussite estimé (40-90)
 - Rien avant/après le JSON"""
@@ -119,28 +120,50 @@ RÈGLES STRICTES :
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1200},
     }
 
-    try:
-        r = await client.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=35.0)
-        if r.status_code >= 400:
-            print(f"⚠️ Gemini {r.status_code}")
-            return None
-        data = r.json()
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError, TypeError):
-            return None
+    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
 
-        m = re.search(r"\{[\s\S]*\}", text)
-        if not m:
-            return None
+    # Retry sur 503 / 429
+    for attempt in range(4):
         try:
-            return json.loads(m.group())
-        except json.JSONDecodeError:
-            raw = m.group().replace("\n", " ").replace("  ", " ")
-            try:
-                return json.loads(raw)
-            except Exception:
+            r = await client.post(url, json=payload, timeout=35.0)
+
+            if r.status_code == 503:
+                wait = 2 ** attempt
+                print(f"  ⏳ Gemini 503, retry dans {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+
+            if r.status_code == 429:
+                wait = 5 * (attempt + 1)
+                print(f"  ⏳ Gemini 429, retry dans {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+
+            if r.status_code >= 400:
+                print(f"⚠️ Gemini {r.status_code}: {r.text[:150]}")
                 return None
-    except Exception as e:
-        print(f"⚠️ Gemini crash: {e}")
-        return None
+
+            data = r.json()
+            try:
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError, TypeError):
+                return None
+
+            m = re.search(r"\{[\s\S]*\}", text)
+            if not m:
+                return None
+            try:
+                return json.loads(m.group())
+            except json.JSONDecodeError:
+                raw = m.group().replace("\n", " ").replace("  ", " ")
+                try:
+                    return json.loads(raw)
+                except Exception:
+                    return None
+
+        except Exception as e:
+            print(f"⚠️ Gemini crash (attempt {attempt}): {e}")
+            await asyncio.sleep(2 ** attempt)
+
+    print(f"❌ Gemini échec définitif pour {home} vs {away}")
+    return None
