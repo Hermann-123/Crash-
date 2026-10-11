@@ -8,6 +8,7 @@ import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -200,6 +201,38 @@ def normalize_name(s: str) -> str:
         s = s.replace(sfx, "")
     s = re.sub(r"[^a-z0-9 ]", "", s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def team_names_match(a: str, b: str) -> bool:
+    """Match deux noms d'équipes avec fuzzy intelligent."""
+    na = normalize_name(a)
+    nb = normalize_name(b)
+    if not na or not nb:
+        return False
+
+    # Exact
+    if na == nb:
+        return True
+
+    # Inclusion
+    if na in nb or nb in na:
+        return True
+
+    # Premier mot identique (>= 4 chars) + reste proche
+    wa, wb = na.split(), nb.split()
+    if wa and wb and wa[0] == wb[0] and len(wa[0]) >= 4:
+        if len(wa) >= 2 and len(wb) >= 2:
+            if wa[1][:3] == wb[1][:3]:
+                return True
+        else:
+            return True
+
+    # Similarité globale
+    ratio = SequenceMatcher(None, na, nb).ratio()
+    if ratio >= 0.80:
+        return True
+
+    return False
 
 
 def parse_dt_safe(s) -> Optional[datetime]:
@@ -517,17 +550,26 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
         odds_index[key] = ev
 
     matched = []
+    matched_count = 0
+
     for fx in fixtures:
         h_norm = normalize_name(fx["home"])
         a_norm = normalize_name(fx["away"])
-        key = f"{h_norm}|{a_norm}"
 
-        ev = odds_index.get(key)
+        # 1. Match exact
+        ev = odds_index.get(f"{h_norm}|{a_norm}")
+
+        # 2. Fuzzy intelligent
         if not ev:
             for ok, oev in odds_index.items():
-                oh, oa = ok.split("|", 1)
-                if (h_norm in oh or oh in h_norm) and (a_norm in oa or oa in a_norm):
+                try:
+                    oh, oa = ok.split("|", 1)
+                except ValueError:
+                    continue
+                if team_names_match(h_norm, oh) and team_names_match(a_norm, oa):
                     ev = oev
+                    print(f"  🔗 Fuzzy : {fx['home']} vs {fx['away']} "
+                          f"→ {oev.get('home_team')} vs {oev.get('away_team')}")
                     break
 
         if ev:
@@ -535,6 +577,7 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
             fx["has_odds"] = True
             fx["odds_sport_key"] = ev.get("sport_key", "")
             fx["odds_sport_title"] = ev.get("sport_title", "")
+            matched_count += 1
         else:
             fx["real_odds"] = {}
             fx["has_odds"] = False
@@ -543,20 +586,17 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
 
         matched.append(fx)
 
-    with_odds = sum(1 for f in matched if f["has_odds"])
-    print(f"🔗 Croisement : {with_odds}/{len(matched)} matchs avec cotes")
+    print(f"🔗 Croisement : {matched_count}/{len(matched)} matchs avec cotes")
     return matched
 
 
 # =========================================================
-# ENRICHISSEMENT (API-Football)
+# ENRICHISSEMENT
 # =========================================================
 async def enrich_matches_with_context(matches: list[dict]) -> dict:
-    """Enrichit les matchs avec contexte API-Football."""
     if not enrich_match:
         return {}
 
-    # Priorité : matchs avec cotes réelles
     with_odds = [m for m in matches if m.get("has_odds")]
     to_enrich = with_odds[:MAX_MATCHES_TO_ENRICH]
 
@@ -569,7 +609,6 @@ async def enrich_matches_with_context(matches: list[dict]) -> dict:
 
     for i, fx in enumerate(to_enrich):
         try:
-            # Détermine le league key
             sport_key = fx.get("odds_sport_key") or ""
             if not sport_key:
                 sport_key = league_key_from_title(fx.get("league", "")) or ""
@@ -746,7 +785,7 @@ async def build_gemini_picks(matches, contexts, used_today):
                     if kept >= 3:
                         break
 
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(2.5)
 
             except Exception as e:
                 print(f"⚠️ build_gemini_picks: {e}")
@@ -921,8 +960,6 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False):
             day_tag = "📅 <b>Demain</b> "
 
     prob_pct = s.final_prob() * 100
-
-    # Badge contexte
     ctx_badge = " ✅ <i>données réelles</i>" if s.has_context else ""
 
     lines = [
@@ -1076,7 +1113,7 @@ async def start_cmd(message):
 
 @dp.message(Command("scan"))
 async def scan_cmd(message):
-    await safe_answer(message, "⏳ Analyse en cours (2-4 min)...")
+    await safe_answer(message, "⏳ Analyse en cours (3-5 min)...")
     await scan()
     await broadcast_after_scan()
 
@@ -1177,7 +1214,6 @@ async def scan():
         matches = [m for m in matches if is_today_upcoming(m["kickoff"])]
         print(f"📅 Matchs aujourd'hui : {len(matches)}")
 
-        # 🌐 Enrichissement contexte API-Football
         contexts = await enrich_matches_with_context(matches)
 
         used_today = load_used_today()
