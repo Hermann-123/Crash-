@@ -1,7 +1,8 @@
 """
 Récupère les données contextuelles via API-Football :
-- Forme, H2H, blessés, stats équipes (corners, cartons)
-- Résultats de matchs (pour le règlement des coupons)
+- Tous les matchs du jour (fixtures)
+- Forme, H2H, blessés, stats équipes (contexte)
+- Résultats de matchs (règlement des coupons)
 """
 from __future__ import annotations
 
@@ -66,6 +67,66 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
         return {}
 
 
+# =========================================================
+# FIXTURES DU JOUR (NOUVEAU — 1 seule requête)
+# =========================================================
+async def fetch_all_today_fixtures() -> list[dict]:
+    """
+    Récupère TOUS les matchs du jour via API-Football.
+    1 seule requête → couvre 1200+ ligues.
+    """
+    if not API_FOOTBALL_KEY:
+        return []
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        try:
+            data = await _get(client, "/fixtures", {
+                "date": today,
+                "timezone": "Africa/Abidjan",
+            })
+            fixtures = data.get("response", [])
+            result = []
+
+            for fx in fixtures:
+                try:
+                    info = fx.get("fixture", {})
+                    teams = fx.get("teams", {})
+                    league = fx.get("league", {})
+
+                    home = teams.get("home", {}).get("name", "")
+                    away = teams.get("away", {}).get("name", "")
+                    date_str = info.get("date", "")
+                    status = info.get("status", {}).get("short", "")
+
+                    if not home or not away or not date_str:
+                        continue
+
+                    # Uniquement matchs pas encore commencés
+                    if status not in ("NS", "TBD", ""):
+                        continue
+
+                    result.append({
+                        "event_id": f"af_{info.get('id')}",
+                        "home": home,
+                        "away": away,
+                        "league": league.get("name", ""),
+                        "kickoff": date_str,
+                        "af_id": info.get("id"),
+                    })
+                except Exception:
+                    continue
+
+            print(f"📡 API-Football : {len(fixtures)} bruts → {len(result)} à venir")
+            return result
+        except Exception as e:
+            print(f"⚠️ API-Football fixtures crash: {e}")
+            return []
+
+
+# =========================================================
+# RECHERCHE D'ÉQUIPE
+# =========================================================
 async def find_team_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
     key = _norm(name)
     if not key:
@@ -92,6 +153,9 @@ async def find_team_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
     return tid
 
 
+# =========================================================
+# STATS ÉQUIPE
+# =========================================================
 async def get_team_stats(client: httpx.AsyncClient, team_id: int, league_id: int,
                           season: int = 2025) -> dict:
     key = f"{team_id}_{league_id}_{season}"
@@ -133,6 +197,9 @@ async def get_team_stats(client: httpx.AsyncClient, team_id: int, league_id: int
     return result
 
 
+# =========================================================
+# H2H
+# =========================================================
 async def get_h2h(client: httpx.AsyncClient, team1_id: int, team2_id: int,
                    last: int = 5) -> list[dict]:
     key = (team1_id, team2_id)
@@ -163,6 +230,9 @@ async def get_h2h(client: httpx.AsyncClient, team1_id: int, team2_id: int,
     return results
 
 
+# =========================================================
+# BLESSÉS
+# =========================================================
 async def get_injuries(client: httpx.AsyncClient, team_id: int, season: int = 2025) -> list[dict]:
     key = team_id
     if key in _INJ_CACHE:
@@ -192,6 +262,9 @@ async def get_injuries(client: httpx.AsyncClient, team_id: int, season: int = 20
     return result[:10]
 
 
+# =========================================================
+# ENRICHISSEMENT CONTEXTE
+# =========================================================
 async def enrich_match(home: str, away: str, odds_api_sport_key: str) -> dict:
     """Retourne le contexte d'un match (forme, H2H, blessés, stats)."""
     if not API_FOOTBALL_KEY:
@@ -235,11 +308,11 @@ async def enrich_match(home: str, away: str, odds_api_sport_key: str) -> dict:
             return {"available": False}
 
 
+# =========================================================
+# RÉSULTAT D'UN MATCH (pour règlement)
+# =========================================================
 async def get_fixture_result(home: str, away: str, date_iso: str) -> Optional[dict]:
-    """
-    Cherche le résultat d'un match.
-    Retourne {"home_goals": X, "away_goals": Y, "status": "FT"} ou None.
-    """
+    """Cherche le résultat d'un match passé."""
     if not API_FOOTBALL_KEY:
         return None
 
