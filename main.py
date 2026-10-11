@@ -100,6 +100,8 @@ class Selection:
     bookmaker: str
     source: str = "gemini"
     real_odd: Optional[float] = None
+    analysis: str = ""
+    advice: str = ""
 
     def final_prob(self) -> float:
         return self.model_prob
@@ -203,18 +205,17 @@ def kickoff_local(iso_str) -> str:
     return dt.strftime("%H:%M") if dt else "?"
 
 
-def is_upcoming(iso_str) -> bool:
+def is_today_upcoming(iso_str) -> bool:
+    """⚠️ CORRIGÉ : uniquement AUJOURD'HUI et pas encore commencé."""
     dt = parse_dt_safe(iso_str)
     if not dt:
         return False
     now = datetime.now(TZ)
-    today = now.date()
-    tomorrow = today + timedelta(days=1)
-    if dt.date() == today and dt > now + timedelta(minutes=15):
-        return True
-    if dt.date() == tomorrow:
-        return True
-    return False
+    # Uniquement aujourd'hui
+    if dt.date() != now.date():
+        return False
+    # Pas encore commencé (buffer 15 min)
+    return dt > now + timedelta(minutes=15)
 
 
 def prob_bar(p: float) -> str:
@@ -485,6 +486,8 @@ async def build_gemini_picks(events_norm, used_today):
 
                 stats["ok"] += 1
                 markets = pred.get("markets", {})
+                analysis = pred.get("analysis", "")
+                advice = pred.get("advice", "")
                 real_odds = extract_real_odds(fx.get("raw", {}))
 
                 market_map = {
@@ -500,10 +503,9 @@ async def build_gemini_picks(events_norm, used_today):
                     "btts_no": ("Les 2 marquent : Non", "BTTS"),
                 }
 
-                # Une seule sélection par match (la meilleure proba avec cote >= MIN_ODD)
+                # Meilleure sélection par match
                 best_pick = None
                 best_prob = 0
-                best_key = None
 
                 for key, (label, mkt) in market_map.items():
                     prob_pct = markets.get(key)
@@ -520,13 +522,12 @@ async def build_gemini_picks(events_norm, used_today):
                         continue
                     if prob > best_prob:
                         best_prob = prob
-                        best_pick = (key, label, mkt, fair_odd)
-                        best_key = key
+                        best_pick = (label, mkt, fair_odd)
 
                 if not best_pick:
                     continue
 
-                key, label, mkt, fair_odd = best_pick
+                label, mkt, fair_odd = best_pick
 
                 dedup = f"{event_id}|{mkt}|{label}"
                 if dedup in seen:
@@ -558,6 +559,8 @@ async def build_gemini_picks(events_norm, used_today):
                     odds=round(fair_odd, 2), model_prob=round(best_prob, 4),
                     edge=0.0, bookmaker="Gemini",
                     real_odd=real_odd,
+                    analysis=analysis,
+                    advice=advice,
                 ))
                 stats["kept"] += 1
 
@@ -578,6 +581,7 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
     pool = [s for s in pool
             if s.odds >= min_leg_odds
             and s.event_id not in globally_used]
+    print(f"  → {name}: {len(pool)} sélections candidates")
     if not pool:
         return None
 
@@ -595,11 +599,12 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
             break
         if s.event_id in used_events or s.league in used_leagues:
             continue
-        if s.market in used_markets:
+        if s.market in used_markets and len(legs) >= 2:
             continue
 
         next_odds = combined_odds * s.odds
-        if next_odds > target_max and legs:
+        # On accepte même si on dépasse un peu, pour atteindre la cible
+        if next_odds > target_max * 1.15 and legs:
             continue
 
         legs.append(s)
@@ -612,9 +617,14 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
         if combined_odds >= target_min:
             break
 
+    print(f"  → {name}: {len(legs)} legs, cote {combined_odds:.2f}")
+
     if not legs:
         return None
-    if combined_odds < target_min or combined_odds > target_max:
+    # Assoupli : on accepte un peu en dessous de la cible min
+    if combined_odds < target_min * 0.80:
+        return None
+    if combined_odds > target_max * 1.20:
         return None
 
     legs.sort(key=lambda s: s.odds)
@@ -670,7 +680,8 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
 
-    pool_safe = [s for s in selections if s.final_prob() >= 0.70]
+    # Sécurisé
+    pool_safe = [s for s in selections if s.final_prob() >= 0.68]
     c = build_coupon_target(
         "Ticket Sécurisé", "Cote 2.0 - 2.5 • Priorité sûreté",
         "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 5, used,
@@ -679,7 +690,8 @@ def build_all_coupons(selections):
     if c:
         coupons.append(c)
 
-    pool_bal = [s for s in selections if s.final_prob() >= 0.62]
+    # Équilibré
+    pool_bal = [s for s in selections if s.final_prob() >= 0.60]
     c = build_coupon_target(
         "Ticket Équilibré", "Cote 3 - 5 • Cote mini 1.35/leg",
         "⚖️", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
@@ -688,6 +700,7 @@ def build_all_coupons(selections):
     if c:
         coupons.append(c)
 
+    # Value
     c = build_value_list(selections, top_n=VALUE_TOP_N, globally_used=set())
     if c:
         coupons.append(c)
@@ -730,6 +743,15 @@ def format_selection_block(s: Selection, idx: int):
         lines.append(f"│ 💰 Cote réelle : <b>{s.real_odd}</b>")
     else:
         lines.append(f"│ 💰 Cote estimée : <b>{s.odds}</b>")
+
+    # Avis IA
+    if s.analysis:
+        lines.append(f"│")
+        lines.append(f"│ 🧠 <b>Avis IA</b> :")
+        lines.append(f"│ 💬 <i>{s.analysis}</i>")
+    if s.advice:
+        lines.append(f"│ 💡 <b>{s.advice}</b>")
+
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
@@ -767,16 +789,6 @@ def format_coupon(c: Coupon):
         lines.append("")
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
-
-
-def format_summary():
-    return (
-        f"{format_header()}\n\n"
-        f"<b>✅ ANALYSE IA PRÊTE</b>\n"
-        f"🎯 Sélections : <b>{len(STATE['selections'])}</b>\n"
-        f"🎫 Coupons : <b>{len(STATE['coupons'])}</b>\n"
-        f"🔄 Dernier scan : <b>{STATE['last_scan'] or 'jamais'}</b>"
-    )
 
 
 def format_coupons_ready():
@@ -876,6 +888,7 @@ async def debug_cmd(message):
     txt = (
         f"<b>🔍 DEBUG</b>\n\n"
         f"Events : <b>{d.get('events_total', 0)}</b>\n"
+        f"Events J/J+1 : <b>{d.get('events_upcoming', 0)}</b>\n"
         f"Matchs Gemini : <b>{d.get('gemini_ok', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>\n"
@@ -930,11 +943,12 @@ async def scan():
             fields = extract_event_fields(ev)
             if not fields["event_id"] or not fields["home"] or not fields["away"]:
                 continue
-            if not is_upcoming(fields["kickoff"]):
+            # ⚠️ Uniquement aujourd'hui
+            if not is_today_upcoming(fields["kickoff"]):
                 continue
             fields["raw"] = ev
             events_norm.append(fields)
-        print(f"🎯 Events J/J+1: {len(events_norm)}")
+        print(f"🎯 Events AUJOURD'HUI: {len(events_norm)}")
 
         used_today = load_used_today()
         selections = await build_gemini_picks(events_norm, used_today)
@@ -951,6 +965,7 @@ async def scan():
 
         STATE["debug"] = {
             "events_total": len(events_raw),
+            "events_upcoming": len(events_norm),
             "gemini_ok": gemini_ok,
             "selections": len(selections),
             "coupons": len(STATE["coupons"]),
