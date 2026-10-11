@@ -12,8 +12,7 @@ from typing import Optional
 import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-
+GEMINI_SEARCH_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
 
 async def predict_match_probas(client: httpx.AsyncClient, home: str, away: str,
                                 league: str, kickoff: str) -> Optional[dict]:
