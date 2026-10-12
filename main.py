@@ -110,6 +110,115 @@ SOCCER_KEYS = [
 
 
 # =========================================================
+# MATCH QUALITY SCORING SYSTEM (HIGH-END)
+# =========================================================
+
+WEIGHT_LEAGUE = 10.0
+WEIGHT_ODDS_COUNT = 2.0
+WEIGHT_FAVORITE_CLARITY = 8.0
+WEIGHT_TIME_PROXIMITY = 3.0
+
+# Seuil minimal pour qu'un match soit analysé (ajuste selon tes besoins)
+MIN_MATCH_SCORE = 12.0
+
+def get_league_score(league_name: str) -> int:
+    """Retourne un score de 0 à 10 selon la qualité de la ligue."""
+    if not league_name:
+        return 0
+    lname = league_name.lower()
+
+    # Top 5 championnats européens + compétitions majeures
+    elite = ["champions league", "europa league", "conference league",
+             "premier league", "la liga", "serie a", "bundesliga", "ligue 1"]
+    for key in elite:
+        if key in lname:
+            return 10
+
+    # Championnats secondaires mais fiables
+    strong = ["eredivisie", "primeira liga", "championship", "brasileirao",
+              "mls", "liga mx", "super lig", "jupiler", "scottish premiership"]
+    for key in strong:
+        if key in lname:
+            return 7
+
+    # Championnats moyens
+    medium = ["liga", "division", "championship", "cup", "copa", "coupe"]
+    for key in medium:
+        if key in lname:
+            return 4
+
+    # Le reste (jeunes, féminines, amicaux, obscure)
+    return 1
+
+
+def calculate_match_score(fx: dict) -> float:
+    """
+    Calcule un score de qualité pour un match.
+    Plus le score est élevé, plus le match mérite une analyse poussée.
+    """
+    score = 0.0
+    real_odds = fx.get("real_odds", {}) or {}
+    has_odds = fx.get("has_odds", False)
+
+    # 1. Priorité de la ligue (0-10 pts)
+    score += get_league_score(fx.get("league", "")) * (WEIGHT_LEAGUE / 10.0)
+
+    # 2. Présence de cotes réelles (crucial) - éliminatoire
+    if not has_odds:
+        return -1.0
+
+    # 3. Nombre de marchés avec cotes dispo (0-7 pts)
+    markets_count = sum(1 for v in real_odds.values() if v is not None)
+    score += markets_count * WEIGHT_ODDS_COUNT
+
+    # 4. Clarté du favori (0-8 pts)
+    home = real_odds.get("home")
+    draw = real_odds.get("draw")
+    away = real_odds.get("away")
+    if home and away:
+        min_odd = min(home, away, draw or 999)
+        if min_odd < 1.60:
+            score += WEIGHT_FAVORITE_CLARITY         # Favori très clair
+        elif min_odd < 1.90:
+            score += WEIGHT_FAVORITE_CLARITY * 0.6   # Favori modéré
+        elif min_odd < 2.30:
+            score += WEIGHT_FAVORITE_CLARITY * 0.3   # Léger favori
+
+    # 5. Proximité temporelle (0-3 pts)
+    dt = parse_dt_safe(fx.get("kickoff", ""))
+    if dt:
+        hours_until = (dt - datetime.now(TZ)).total_seconds() / 3600
+        if 1 <= hours_until <= 6:
+            score += WEIGHT_TIME_PROXIMITY
+        elif hours_until <= 12:
+            score += WEIGHT_TIME_PROXIMITY * 0.7
+        elif hours_until <= 24:
+            score += WEIGHT_TIME_PROXIMITY * 0.3
+
+    return score
+
+
+def filter_and_rank_matches(matches: list[dict]) -> list[dict]:
+    """
+    Filtre les matchs non analysables et les trie par score de qualité.
+    """
+    scored = []
+    for fx in matches:
+        s = calculate_match_score(fx)
+        fx["_score"] = s
+        if s >= MIN_MATCH_SCORE:
+            scored.append(fx)
+
+    scored.sort(key=lambda m: m["_score"], reverse=True)
+
+    print(f"🎯 Matchs qualifiés : {len(scored)}/{len(matches)} (seuil {MIN_MATCH_SCORE})")
+    for fx in scored[:10]:
+        print(f"  ⭐ [{fx['_score']:.1f}] {fx.get('league','')[:30]} | {fx['home']} vs {fx['away']}")
+
+    return scored
+
+
+# =========================================================
 # MODELS
 # =========================================================
 @dataclass
@@ -1358,7 +1467,7 @@ async def btn_debug(message: Message):
 
 
 # =========================================================
-# SCAN (Logique inchangée)
+# SCAN (Logique modifiée avec le Filtre Intelligent)
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
@@ -1394,6 +1503,10 @@ async def scan():
 
         matches = [m for m in matches if is_today_upcoming(m["kickoff"])]
         print(f"📅 Matchs aujourd'hui : {len(matches)}")
+
+        # --- NOUVEAU : FILTRE ET CLASSEMENT INTELLIGENT ---
+        matches = filter_and_rank_matches(matches)
+        # --------------------------------------------------
 
         contexts = {}
         try:
