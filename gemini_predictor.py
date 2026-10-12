@@ -13,6 +13,8 @@ from typing import Optional
 import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# ⚠️ Vérifie que ce nom de modèle est bien valide sur ton compte API.
+# Les modèles standards actuels sont : gemini-1.5-flash, gemini-1.5-pro, gemini-2.0-flash.
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
 
 
@@ -86,11 +88,13 @@ def format_context(context: Optional[dict]) -> str:
     if home_inj or away_inj:
         parts.append("\n🏥 Blessés/suspendus :")
         if home_inj:
-            names = ", ".join(x.get("player", "?") for x in home_inj[:5])
-            parts.append(f"  Équipe A : {names}")
+            names = ", ".join(str(x.get("player", "?")) for x in home_inj[:5] if x.get("player"))
+            if names:
+                parts.append(f"  Équipe A : {names}")
         if away_inj:
-            names = ", ".join(x.get("player", "?") for x in away_inj[:5])
-            parts.append(f"  Équipe B : {names}")
+            names = ", ".join(str(x.get("player", "?")) for x in away_inj[:5] if x.get("player"))
+            if names:
+                parts.append(f"  Équipe B : {names}")
 
     # Corners/Cartons (API-Football)
     if cc and cc.get("available"):
