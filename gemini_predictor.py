@@ -13,8 +13,6 @@ from typing import Optional
 import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-# ⚠️ Vérifie que ce nom de modèle est bien valide sur ton compte API.
-# Les modèles standards actuels sont : gemini-1.5-flash, gemini-1.5-pro, gemini-2.0-flash.
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
 
 
@@ -36,13 +34,11 @@ def format_context(context: Optional[dict]) -> str:
     if source:
         parts.append(f"(source : {source})")
 
-    # Formes
     if home_form and home_form != "?":
         parts.append(f"Forme équipe A : {home_form}")
     if away_form and away_form != "?":
         parts.append(f"Forme équipe B : {away_form}")
 
-    # H2H
     if h2h:
         total = h2h.get("total_matches", 0)
         hw = h2h.get("home_wins", 0)
@@ -62,7 +58,6 @@ def format_context(context: Optional[dict]) -> str:
                 s = m.get("score", m.get("result", "?"))
                 parts.append(f"  - {h} {s} {a}")
 
-    # Prédictions ML (Bzzoiro uniquement)
     if pred:
         parts.append("\nPrédictions ML CatBoost :")
         keys_to_try = [
@@ -84,7 +79,6 @@ def format_context(context: Optional[dict]) -> str:
                 if isinstance(v, (int, float)) and 0 <= v <= 1:
                     parts.append(f"  - {k} : {float(v)*100:.1f}%")
 
-    # Blessés (API-Football)
     if home_inj or away_inj:
         parts.append("\n🏥 Blessés/suspendus :")
         if home_inj:
@@ -96,7 +90,6 @@ def format_context(context: Optional[dict]) -> str:
             if names:
                 parts.append(f"  Équipe B : {names}")
 
-    # Corners/Cartons (API-Football)
     if cc and cc.get("available"):
         parts.append("\n📐 Corners/Cartons (moyennes réelles) :")
         hcf = cc.get("home_corners_for", 0)
@@ -155,8 +148,10 @@ Retourne UNIQUEMENT ce JSON :
     "over_3.5_cartons": 0
   }},
   "analysis": "2 phrases d'analyse basées sur les données réelles ci-dessus.",
-  "advice": "1 phrase de conseil concret pour le parieur.",
-  "advice_confidence": 0
+  "advices": [
+    {{"text": "Nom du 1er pronostic conseillé", "confidence": 0}},
+    {{"text": "Nom du 2ème pronostic conseillé (optionnel)", "confidence": 0}}
+  ]
 }}
 
 RÈGLES :
@@ -169,12 +164,13 @@ RÈGLES :
 - Si tu as des corners/cartons réels, BASE tes probas dessus
 - Si tu as un H2H réel, mentionne-le dans analysis
 - "analysis" : 2 phrases max
-- "advice_confidence" : 40-90
+- "advices" : DONNE 1 OU 2 CONSEILS MAXIMUM. Chaque conseil doit être un marché précis (ex: "Victoire domicile", "Over 2.5 buts", "Double Chance 1X", "BTTS Oui", "Plus de 8.5 corners"...). La "confidence" est la probabilité de réussite du conseil en pourcentage (40-90). Sois honnête : si tu n'es pas sûr, mets une confidence basse.
+- N'inclus PAS de conseils combinés (ex: "1X + Over 2.5") : chaque conseil doit être un pari simple et indépendant.
 - Rien avant/après le JSON"""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1200},
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1500},
     }
 
     url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
@@ -205,13 +201,22 @@ RÈGLES :
             if not m:
                 return None
             try:
-                return json.loads(m.group())
+                parsed = json.loads(m.group())
             except json.JSONDecodeError:
                 raw = m.group().replace("\n", " ").replace("  ", " ")
                 try:
-                    return json.loads(raw)
+                    parsed = json.loads(raw)
                 except Exception:
                     return None
+
+            # Fallback : si Gemini n'a pas renvoyé "advices", on convertit l'ancien format
+            if "advices" not in parsed and "advice" in parsed:
+                parsed["advices"] = [{
+                    "text": parsed.get("advice", ""),
+                    "confidence": parsed.get("advice_confidence", 0),
+                }]
+
+            return parsed
 
         except Exception as e:
             print(f"⚠️ Gemini crash (attempt {attempt}): {e}")
