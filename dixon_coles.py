@@ -11,12 +11,20 @@ from typing import Optional
 import httpx
 
 LEAGUES = {
-    "England Premier League": "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
-    "England Championship":    "https://www.football-data.co.uk/mmz4281/2526/E1.csv",
-    "Spain La Liga":           "https://www.football-data.co.uk/mmz4281/2526/SP1.csv",
-    "Italy Serie A":           "https://www.football-data.co.uk/mmz4281/2526/I1.csv",
-    "Germany Bundesliga":      "https://www.football-data.co.uk/mmz4281/2526/D1.csv",
-    "France Ligue 1":          "https://www.football-data.co.uk/mmz4281/2526/F1.csv",
+    # Saison 2025-2026 (données complètes, base stable)
+    "England Premier League 25/26": "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
+    "England Championship 25/26":    "https://www.football-data.co.uk/mmz4281/2526/E1.csv",
+    "Spain La Liga 25/26":           "https://www.football-data.co.uk/mmz4281/2526/SP1.csv",
+    "Italy Serie A 25/26":           "https://www.football-data.co.uk/mmz4281/2526/I1.csv",
+    "Germany Bundesliga 25/26":      "https://www.football-data.co.uk/mmz4281/2526/D1.csv",
+    "France Ligue 1 25/26":          "https://www.football-data.co.uk/mmz4281/2526/F1.csv",
+    # Saison 2026-2027 (données fraîches, plus pertinentes)
+    "England Premier League 26/27": "https://www.football-data.co.uk/mmz4281/2627/E0.csv",
+    "England Championship 26/27":    "https://www.football-data.co.uk/mmz4281/2627/E1.csv",
+    "Spain La Liga 26/27":           "https://www.football-data.co.uk/mmz4281/2627/SP1.csv",
+    "Italy Serie A 26/27":           "https://www.football-data.co.uk/mmz4281/2627/I1.csv",
+    "Germany Bundesliga 26/27":      "https://www.football-data.co.uk/mmz4281/2627/D1.csv",
+    "France Ligue 1 26/27":          "https://www.football-data.co.uk/mmz4281/2627/F1.csv",
 }
 
 
@@ -160,8 +168,10 @@ async def download_and_train() -> Optional[DixonColesModel]:
             try:
                 r = await client.get(url)
                 if r.status_code != 200:
+                    print(f"  ⚠️ {league}: HTTP {r.status_code}")
                     continue
                 rows = list(csv.DictReader(io.StringIO(r.text)))
+                added = 0
                 for row in rows:
                     try:
                         hg = int(row.get("FTHG", ""))
@@ -177,7 +187,8 @@ async def download_and_train() -> Optional[DixonColesModel]:
                         "home_goals": hg, "away_goals": ag,
                         "league": league,
                     })
-                print(f"📊 Dixon-Coles : {league} → {len(rows)} matchs")
+                    added += 1
+                print(f"📊 Dixon-Coles : {league} → {added} matchs")
             except Exception as e:
                 print(f"⚠️ Dixon-Coles {league}: {e}")
 
