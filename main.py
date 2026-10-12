@@ -22,14 +22,29 @@ from fastapi import FastAPI
 
 try:
     from gemini_predictor import predict_match_probas
-except Exception:
+except Exception as e:
     predict_match_probas = None
+    print(f"❌ Import gemini_predictor: {e}")
 
 try:
-    from football_data import get_fixture_result, fetch_all_today_fixtures
-except Exception:
+    from football_data import (
+        get_fixture_result,
+        fetch_all_today_fixtures,
+        get_corners_cards,
+        get_full_context_api_football,
+    )
+except Exception as e:
     get_fixture_result = None
     fetch_all_today_fixtures = None
+    get_corners_cards = None
+    get_full_context_api_football = None
+    print(f"❌ Import football_data: {e}")
+
+try:
+    from bzzoiro_data import enrich_match_with_bzzoiro
+except Exception as e:
+    enrich_match_with_bzzoiro = None
+    print(f"❌ Import bzzoiro_data: {e}")
 
 
 # =========================================================
@@ -47,13 +62,14 @@ NOTIFY_TZ = os.getenv("NOTIFY_TZ", "Africa/Abidjan")
 
 LOCAL_DB = os.getenv("LOCAL_DB", "/tmp/tracker.json")
 BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
-BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA â€¢ API-Football + Gemini")
-PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "âš ï¸ Analyse statistique. Joue responsable.")
+BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • H2H + Gemini")
+PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
 MIN_PROB = float(os.getenv("MIN_PROB", "0.60"))
 MIN_ODD = float(os.getenv("MIN_ODD", "1.35"))
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "25"))
+MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "8"))
 
 SAFE_MIN_ODDS = 2.0
 SAFE_MAX_ODDS = 2.5
@@ -103,6 +119,7 @@ class Selection:
     analysis: str = ""
     advice: str = ""
     advice_confidence: int = 0
+    has_context: bool = False
 
     def final_prob(self) -> float:
         return self.model_prob
@@ -125,11 +142,11 @@ class Coupon:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-BTN_SAFE = "ðŸ”’ SÃ©curisÃ©"
-BTN_BAL = "âš–ï¸ Ã‰quilibrÃ©"
-BTN_VAR = "ðŸ’Ž Value"
-BTN_SCAN = "ðŸ”„ Actualiser"
-BTN_BILAN = "ðŸ“Š Bilan"
+BTN_SAFE = "🔒 Sécurisé"
+BTN_BAL = "⚖️ Équilibré"
+BTN_VAR = "💎 Value"
+BTN_SCAN = "🔄 Actualiser"
+BTN_BILAN = "📊 Bilan"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -138,7 +155,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_SCAN)],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Choisis un ticketâ€¦",
+    input_field_placeholder="Choisis un ticket…",
 )
 
 STATE = {
@@ -164,9 +181,9 @@ for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
 # HELPERS
 # =========================================================
 def today_pretty():
-    months = {1: "janvier", 2: "fÃ©vrier", 3: "mars", 4: "avril", 5: "mai", 6: "juin",
-              7: "juillet", 8: "aoÃ»t", 9: "septembre", 10: "octobre",
-              11: "novembre", 12: "dÃ©cembre"}
+    months = {1: "janvier", 2: "février", 3: "mars", 4: "avril", 5: "mai", 6: "juin",
+              7: "juillet", 8: "août", 9: "septembre", 10: "octobre",
+              11: "novembre", 12: "décembre"}
     d = datetime.now(TZ)
     return f"{d.day} {months[d.month]} {d.year}"
 
@@ -218,22 +235,22 @@ def is_today_upcoming(iso_str) -> bool:
 
 def prob_bar(p: float) -> str:
     if p >= 0.80:
-        return "ðŸŸ¢ðŸŸ¢ðŸŸ¢"
+        return "🟢🟢🟢"
     if p >= 0.72:
-        return "ðŸŸ¢ðŸŸ¢âšª"
+        return "🟢🟢⚪"
     if p >= 0.65:
-        return "ðŸŸ¢âšªâšª"
-    return "âšªâšªâšª"
+        return "🟢⚪⚪"
+    return "⚪⚪⚪"
 
 
 def confidence_bar(pct: int) -> str:
     if pct >= 80:
-        return "ðŸŸ¢ðŸŸ¢ðŸŸ¢"
+        return "🟢🟢🟢"
     if pct >= 70:
-        return "ðŸŸ¢ðŸŸ¢âšª"
+        return "🟢🟢⚪"
     if pct >= 60:
-        return "ðŸŸ¢âšªâšª"
-    return "âšªâšªâšª"
+        return "🟢⚪⚪"
+    return "⚪⚪⚪"
 
 
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
@@ -412,7 +429,7 @@ async def settle_coupons():
             updated += 1
     if updated:
         save_tracker(tracker)
-        print(f"âœ… {updated} coupon(s) rÃ©glÃ©(s)")
+        print(f"✅ {updated} coupon(s) réglé(s)")
 
 
 # =========================================================
@@ -439,7 +456,7 @@ async def fetch_all_odds_events() -> list[dict]:
             events = await fetch_odds_api_league(client, key)
             all_events.extend(events)
             await asyncio.sleep(0.3)
-    print(f"ðŸ’° Odds API : {len(all_events)} events avec cotes")
+    print(f"💰 Odds API : {len(all_events)} events")
     return all_events
 
 
@@ -489,6 +506,8 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
         odds_index[key] = ev
 
     matched = []
+    with_odds = 0
+
     for fx in fixtures:
         h_norm = normalize_name(fx["home"])
         a_norm = normalize_name(fx["away"])
@@ -497,7 +516,10 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
         ev = odds_index.get(key)
         if not ev:
             for ok, oev in odds_index.items():
-                oh, oa = ok.split("|", 1)
+                try:
+                    oh, oa = ok.split("|", 1)
+                except ValueError:
+                    continue
                 if (h_norm in oh or oh in h_norm) and (a_norm in oa or oa in a_norm):
                     ev = oev
                     break
@@ -505,28 +527,98 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
         if ev:
             fx["real_odds"] = extract_real_odds(ev)
             fx["has_odds"] = True
+            fx["odds_sport_key"] = ev.get("sport_key", "")
+            with_odds += 1
         else:
             fx["real_odds"] = {}
             fx["has_odds"] = False
+            fx["odds_sport_key"] = ""
 
         matched.append(fx)
 
-    with_odds = sum(1 for f in matched if f["has_odds"])
-    print(f"ðŸ”— Croisement : {with_odds}/{len(matched)} matchs avec cotes")
+    print(f"🔗 Croisement : {with_odds}/{len(matched)} matchs avec cotes")
     return matched
+
+
+# =========================================================
+# ENRICHISSEMENT (cascade : Bzzoiro → API-Football)
+# =========================================================
+async def enrich_matches(matches: list[dict]) -> dict:
+    """
+    Enrichit les matchs en cascade :
+    1. Bzzoiro (H2H + prédictions ML)
+    2. Si Bzzoiro échoue → API-Football (H2H + blessés)
+    3. Corners/cartons API-Football (grandes ligues)
+    """
+    to_enrich = matches[:MAX_MATCHES_TO_ENRICH]
+    if not to_enrich:
+        return {}
+
+    print(f"🌐 Enrichissement (max {MAX_MATCHES_TO_ENRICH})...")
+    contexts = {}
+
+    for fx in to_enrich:
+        try:
+            home = fx.get("home", "")
+            away = fx.get("away", "")
+            kickoff = fx.get("kickoff", "")
+            league = fx.get("league", "")
+            sport_key = fx.get("odds_sport_key", "")
+
+            dt = parse_dt_safe(kickoff)
+            date_iso = dt.strftime("%Y-%m-%d") if dt else datetime.now(TZ).strftime("%Y-%m-%d")
+
+            ctx = None
+            source = None
+
+            # === 1. Essayer Bzzoiro ===
+            if enrich_match_with_bzzoiro:
+                ctx = await enrich_match_with_bzzoiro(home, away, date_iso)
+                if ctx.get("available"):
+                    source = "bzzoiro"
+
+            # === 2. Fallback API-Football ===
+            if (not ctx or not ctx.get("available")) and get_full_context_api_football:
+                print(f"  🔄 Fallback API-Football pour {home} vs {away}...")
+                ctx = await get_full_context_api_football(home, away, league)
+                if ctx.get("available"):
+                    source = "api-football"
+
+            # === 3. Corners/cartons (grandes ligues) ===
+            if ctx and ctx.get("available") and get_corners_cards and sport_key:
+                cc = await get_corners_cards(home, away, sport_key)
+                if cc.get("available"):
+                    ctx["corners_cards"] = cc
+
+            if ctx and ctx.get("available"):
+                contexts[fx["event_id"]] = ctx
+                h2h_total = ctx.get("h2h", {}).get("total_matches", 0)
+                has_cc = "✅" if ctx.get("corners_cards") else "—"
+                print(f"  ✅ {home} vs {away} — source:{source} • H2H:{h2h_total} • C/C:{has_cc}")
+            else:
+                print(f"  ❌ {home} vs {away} : aucun contexte")
+
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            print(f"  ⚠️ Enrich crash {fx.get('home')}: {e}")
+
+    print(f"✅ Contextes enrichis : {len(contexts)}/{len(to_enrich)}")
+    return contexts
 
 
 # =========================================================
 # BUILD PICKS
 # =========================================================
-async def build_gemini_picks(matches, used_today):
+async def build_gemini_picks(matches, used_today, contexts=None):
     selections: list[Selection] = []
     seen = set()
-    stats = {"ok": 0, "fail": 0, "kept": 0}
+    stats = {"ok": 0, "fail": 0, "kept": 0, "with_ctx": 0}
 
     if not predict_match_probas:
+        print("❌ predict_match_probas non disponible")
         return selections
 
+    contexts = contexts or {}
     with_odds = [m for m in matches if m.get("has_odds")]
     without_odds = [m for m in matches if not m.get("has_odds")]
     ordered = with_odds + without_odds
@@ -541,12 +633,18 @@ async def build_gemini_picks(matches, used_today):
                 if event_id in used_today:
                     continue
 
-                pred = await predict_match_probas(client, home, away, league, kickoff)
+                ctx = contexts.get(event_id)
+                has_ctx = ctx is not None and ctx.get("available", False)
+
+                pred = await predict_match_probas(client, home, away, league, kickoff, context=ctx)
                 if not pred or "markets" not in pred:
                     stats["fail"] += 1
                     continue
 
                 stats["ok"] += 1
+                if has_ctx:
+                    stats["with_ctx"] += 1
+
                 markets = pred.get("markets", {})
                 analysis = pred.get("analysis", "")
                 advice = pred.get("advice", "")
@@ -621,6 +719,8 @@ async def build_gemini_picks(matches, used_today):
                     score = prob
                     if real_odd:
                         score += 0.5
+                    if has_ctx:
+                        score += 0.3
 
                     candidates.append((score, label, mkt, used_odd, real_odd, prob))
 
@@ -647,18 +747,20 @@ async def build_gemini_picks(matches, used_today):
                         analysis=analysis,
                         advice=advice,
                         advice_confidence=advice_conf,
+                        has_context=has_ctx,
                     ))
                     stats["kept"] += 1
                     kept += 1
                     if kept >= 3:
                         break
 
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(2.5)
 
             except Exception as e:
-                print(f"âš ï¸ build_gemini_picks: {e}")
+                print(f"⚠️ build_gemini_picks: {e}")
 
-    print(f"ðŸ  Picks : ok={stats['ok']} Ã©chec={stats['fail']} gardÃ©s={stats['kept']}")
+    print(f"🏠 Picks : ok={stats['ok']} échec={stats['fail']} "
+          f"gardés={stats['kept']} avec_contexte={stats['with_ctx']}")
     return selections
 
 
@@ -670,7 +772,7 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
     pool = [s for s in pool
             if s.odds >= min_leg_odds
             and s.event_id not in globally_used]
-    print(f"  â†’ {name}: {len(pool)} candidates")
+    print(f"  → {name}: {len(pool)} candidates")
     if not pool:
         return None
 
@@ -705,14 +807,14 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
         if combined_odds >= target_min:
             break
 
-    print(f"  â†’ {name}: {len(legs)} legs, cote {combined_odds:.2f}")
+    print(f"  → {name}: {len(legs)} legs, cote {combined_odds:.2f}")
 
     if not legs:
         return None
 
     if strict:
         if combined_odds < target_min:
-            print(f"  â›” {name} rejetÃ© : cote {combined_odds:.2f} < {target_min}")
+            print(f"  ⛔ {name} rejeté : cote {combined_odds:.2f} < {target_min}")
             return None
     else:
         if combined_odds < target_min * 0.85:
@@ -764,7 +866,7 @@ def build_value_list(selections, top_n=20, globally_used=None):
 
     return Coupon(
         "Ticket Value", f"Top {len(top_list)} pronostics",
-        "ðŸ’Ž", top_list,
+        "💎", top_list,
         round(combined_odds, 2), round(combined_prob, 4),
         is_list=True,
     )
@@ -778,8 +880,8 @@ def build_all_coupons(selections):
                  if s.final_prob() >= 0.68
                  and s.market in ("1X2", "Double Chance", "Over/Under", "BTTS")]
     c = build_coupon_target(
-        "Ticket SÃ©curisÃ©", "Cote 2.0 - 2.5 â€¢ PrioritÃ© sÃ»retÃ©",
-        "ðŸ”’", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 5, used,
+        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Priorité sûreté",
+        "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 5, used,
         min_leg_odds=1.35, strict=True,
     )
     if c:
@@ -789,8 +891,8 @@ def build_all_coupons(selections):
                 if s.final_prob() >= 0.60
                 and s.market not in ("Corners", "Cartons")]
     c = build_coupon_target(
-        "Ticket Ã‰quilibrÃ©", "Cote 2.5 - 5.0",
-        "âš–ï¸", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
+        "Ticket Équilibré", "Cote 2.5 - 5.0",
+        "⚖️", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
         min_leg_odds=BAL_MIN_LEG_ODDS, strict=False,
     )
     if c:
@@ -808,11 +910,11 @@ def build_all_coupons(selections):
 # =========================================================
 def format_header():
     return (
-        f"<b>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</b>\n"
-        f"     <b>âš¡ {BRAND_NAME.upper()} âš¡</b>\n"
-        f"<b>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</b>\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"     <b>⚡ {BRAND_NAME.upper()} ⚡</b>\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
         f"<i>{BRAND_TAGLINE}</i>\n"
-        f"<i>ðŸ“… {today_pretty()} â€¢ ðŸ‡¨ðŸ‡® CÃ´te dâ€™Ivoire</i>"
+        f"<i>📅 {today_pretty()} • 🇨🇮 Côte d’Ivoire</i>"
     )
 
 
@@ -822,37 +924,38 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False):
     if dt:
         today = datetime.now(TZ).date()
         if dt.date() == today:
-            day_tag = "ðŸ“ <b>Aujourd'hui</b> "
+            day_tag = "📍 <b>Aujourd'hui</b> "
         elif dt.date() == today + timedelta(days=1):
-            day_tag = "ðŸ“… <b>Demain</b> "
+            day_tag = "📅 <b>Demain</b> "
 
     prob_pct = s.final_prob() * 100
+    ctx_badge = " ✅ <i>données réelles</i>" if s.has_context else ""
 
     lines = [
-        f"<b>â”Œâ”€ #{idx} {s.home} vs {s.away}</b>",
-        f"â”‚ {day_tag}ðŸ• <b>{kickoff_local(s.kickoff)}</b> â€¢ {s.league}",
-        f"â”‚ ðŸŽ¯ <b>{s.pick_label}</b>  <i>({s.market})</i>",
-        f"â”‚ ðŸ“Š Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}",
+        f"<b>┌─ #{idx} {s.home} vs {s.away}</b>",
+        f"│ {day_tag}🕐 <b>{kickoff_local(s.kickoff)}</b> • {s.league}",
+        f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>",
+        f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}{ctx_badge}",
     ]
 
     if s.real_odd:
-        lines.append(f"â”‚ ðŸ’° Cote : <b>{s.real_odd}</b> <i>(rÃ©elle)</i>")
+        lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b> <i>(réelle)</i>")
     else:
-        lines.append(f"â”‚ ðŸ’° Cote : <b>{s.odds}</b> <i>(estimÃ©e)</i>")
+        lines.append(f"│ 💰 Cote : <b>{s.odds}</b> <i>(estimée)</i>")
 
     if not compact and s.analysis:
-        lines.append(f"â”‚")
-        lines.append(f"â”‚ ðŸ§  <b>Avis IA</b> :")
-        lines.append(f"â”‚ ðŸ’¬ <i>{s.analysis}</i>")
+        lines.append(f"│")
+        lines.append(f"│ 🧠 <b>Avis IA</b> :")
+        lines.append(f"│ 💬 <i>{s.analysis}</i>")
         if s.advice:
             if s.advice_confidence > 0:
                 conf_bar = confidence_bar(s.advice_confidence)
-                lines.append(f"â”‚ ðŸ’¡ <b>Conseil IA</b> ({conf_bar} <b>{s.advice_confidence}%</b>) :")
-                lines.append(f"â”‚    {s.advice}")
+                lines.append(f"│ 💡 <b>Conseil IA</b> ({conf_bar} <b>{s.advice_confidence}%</b>) :")
+                lines.append(f"│    {s.advice}")
             else:
-                lines.append(f"â”‚ ðŸ’¡ <b>Conseil IA</b> : {s.advice}")
+                lines.append(f"│ 💡 <b>Conseil IA</b> : {s.advice}")
 
-    lines.append(f"<b>â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€</b>")
+    lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
 
@@ -862,7 +965,7 @@ def format_coupon(c: Coupon) -> str:
             format_header(), "",
             f"<b>{c.emoji} {c.name.upper()}</b>",
             f"<i>{c.subtitle}</i>", "",
-            f"<b>ðŸŽ¯ {len(c.legs)} pronostics classÃ©s par probabilitÃ©</b>",
+            f"<b>🎯 {len(c.legs)} pronostics classés par probabilité</b>",
             "",
         ]
         for i, s in enumerate(c.legs, 1):
@@ -871,18 +974,18 @@ def format_coupon(c: Coupon) -> str:
         lines.append(f"<i>{PUBLIC_FOOTER}</i>")
         return "\n".join(lines)
 
-    prob_level = "ðŸŸ¢ Faible risque" if c.combined_prob >= 0.40 else \
-                 "ðŸŸ¡ Risque modÃ©rÃ©" if c.combined_prob >= 0.20 else "ðŸ”´ Risque Ã©levÃ©"
+    prob_level = "🟢 Faible risque" if c.combined_prob >= 0.40 else \
+                 "🟡 Risque modéré" if c.combined_prob >= 0.20 else "🔴 Risque élevé"
     lines = [
         format_header(), "",
         f"<b>{c.emoji} {c.name.upper()}</b>",
         f"<i>{c.subtitle}</i>", "",
-        f"<b>â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”“</b>",
-        f"<b>â”ƒ ðŸ“Š RÃ‰CAP TICKET</b>",
-        f"<b>â”ƒ ðŸŽ« Cote totale : {c.combined_odds}</b>",
-        f"<b>â”ƒ ðŸ“ˆ Proba combinÃ©e : {c.combined_prob*100:.1f}%</b>",
-        f"<b>â”ƒ ðŸŽ¯ {prob_level}</b>",
-        f"<b>â”—â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”›</b>", "",
+        f"<b>┏━━━━━━━━━━━━━━━┓</b>",
+        f"<b>┃ 📊 RÉCAP TICKET</b>",
+        f"<b>┃ 🎫 Cote totale : {c.combined_odds}</b>",
+        f"<b>┃ 📈 Proba combinée : {c.combined_prob*100:.1f}%</b>",
+        f"<b>┃ 🎯 {prob_level}</b>",
+        f"<b>┗━━━━━━━━━━━━━━━┛</b>", "",
     ]
     for i, s in enumerate(c.legs, 1):
         lines.append(format_selection_block(s, i, compact=False))
@@ -893,31 +996,31 @@ def format_coupon(c: Coupon) -> str:
 
 def format_coupons_ready():
     if not STATE["coupons"]:
-        return (f"{format_header()}\n\n<b>ðŸ“­ Aucun coupon aujourd'hui</b>\n"
-                f"<i>Pas assez de paris Ã  haute proba (cote â‰¥ {MIN_ODD}).</i>")
+        return (f"{format_header()}\n\n<b>📭 Aucun coupon aujourd'hui</b>\n"
+                f"<i>Pas assez de paris à haute proba (cote ≥ {MIN_ODD}).</i>")
     lignes = []
     for c in STATE["coupons"]:
         n = len(c.legs)
         if c.is_list:
-            lignes.append(f"{c.emoji} <b>{c.name}</b>\n   â€¢ {n} pronostics (liste)")
+            lignes.append(f"{c.emoji} <b>{c.name}</b>\n   • {n} pronostics (liste)")
         else:
             lignes.append(
                 f"{c.emoji} <b>{c.name}</b>\n"
-                f"   â€¢ {n} paris â€¢ Cote <b>{c.combined_odds}</b> â€¢ Proba <b>{c.combined_prob*100:.0f}%</b>"
+                f"   • {n} paris • Cote <b>{c.combined_odds}</b> • Proba <b>{c.combined_prob*100:.0f}%</b>"
             )
     return (
         f"{format_header()}\n\n"
-        f"<b>ðŸ”” COUPONS DU JOUR PRÃŠTS !</b>\n\n"
+        f"<b>🔔 COUPONS DU JOUR PRÊTS !</b>\n\n"
         f"<b>{len(STATE['coupons'])} coupon(s) disponible(s) :</b>\n\n"
         + "\n\n".join(lignes)
-        + "\n\n<i>ðŸ‘‡ Clique sur le bouton du ticket qui t'intÃ©resse</i>"
+        + "\n\n<i>👇 Clique sur le bouton du ticket qui t'intéresse</i>"
     )
 
 
 def format_bilan(tracker):
     coupons = tracker.get("coupons", [])
     if not coupons:
-        return f"{format_header()}\n\n<b>ðŸ“Š Bilan</b>\n<i>Aucun historique.</i>"
+        return f"{format_header()}\n\n<b>📊 Bilan</b>\n<i>Aucun historique.</i>"
     total = len(coupons)
     won = sum(1 for c in coupons if c.get("status") == "won")
     lost = sum(1 for c in coupons if c.get("status") == "lost")
@@ -929,14 +1032,14 @@ def format_bilan(tracker):
     roi = (profit / settled * 100) if settled > 0 else 0
     return (
         f"{format_header()}\n\n"
-        f"<b>ðŸ“Š BILAN</b>\n"
-        f"ðŸŽ« Total : <b>{total}</b>\n"
-        f"âœ… GagnÃ©s : <b>{won}</b>\n"
-        f"âŒ Perdus : <b>{lost}</b>\n"
-        f"â³ En attente : <b>{pending}</b>\n\n"
-        f"ðŸ“ˆ Taux rÃ©ussite : <b>{wr:.1f}%</b>\n"
-        f"ðŸ’° ROI : <b>{roi:+.1f}%</b>\n"
-        f"ðŸ’µ Profit : <b>{profit:+.2f}u</b>"
+        f"<b>📊 BILAN</b>\n"
+        f"🎫 Total : <b>{total}</b>\n"
+        f"✅ Gagnés : <b>{won}</b>\n"
+        f"❌ Perdus : <b>{lost}</b>\n"
+        f"⏳ En attente : <b>{pending}</b>\n\n"
+        f"📈 Taux réussite : <b>{wr:.1f}%</b>\n"
+        f"💰 ROI : <b>{roi:+.1f}%</b>\n"
+        f"💵 Profit : <b>{profit:+.2f}u</b>"
     )
 
 
@@ -953,7 +1056,7 @@ async def safe_answer(message, text):
                 await message.answer(part, parse_mode="HTML")
             await asyncio.sleep(0.3)
         except Exception as e:
-            print(f"âš ï¸ Answer part {i}: {e}")
+            print(f"⚠️ Answer part {i}: {e}")
 
 
 async def safe_send(chat_id, text):
@@ -963,7 +1066,7 @@ async def safe_send(chat_id, text):
             await bot.send_message(chat_id=chat_id, text=part, parse_mode="HTML")
             await asyncio.sleep(0.3)
         except Exception as e:
-            print(f"âš ï¸ Send {chat_id}: {e}")
+            print(f"⚠️ Send {chat_id}: {e}")
 
 
 async def broadcast_after_scan():
@@ -974,19 +1077,19 @@ async def broadcast_after_scan():
 
 @dp.message(Command("start"))
 async def start_cmd(message):
-    await safe_answer(message, f"{format_header()}\n\n<b>ðŸ‘‹ Bienvenue !</b>\n\nTape /scan.")
+    await safe_answer(message, f"{format_header()}\n\n<b>👋 Bienvenue !</b>\n\nTape /scan.")
 
 
 @dp.message(Command("scan"))
 async def scan_cmd(message):
-    await safe_answer(message, "â³ Analyse en cours (2-3 min)...")
+    await safe_answer(message, "⏳ Analyse en cours (2-3 min)...")
     await scan()
     await broadcast_after_scan()
 
 
 @dp.message(Command("regler"))
 async def regler_cmd(message):
-    await safe_answer(message, "â³ VÃ©rification...")
+    await safe_answer(message, "⏳ Vérification...")
     await settle_coupons()
     await safe_answer(message, format_bilan(STATE["tracker"]))
 
@@ -995,12 +1098,14 @@ async def regler_cmd(message):
 async def debug_cmd(message):
     d = STATE["debug"]
     txt = (
-        f"<b>ðŸ” DEBUG</b>\n\n"
+        f"<b>🔍 DEBUG</b>\n\n"
         f"Matchs API-Football : <b>{d.get('af_fixtures', 0)}</b>\n"
         f"Events avec cotes : <b>{d.get('odds_events', 0)}</b>\n"
-        f"Matchs croisÃ©s : <b>{d.get('matched', 0)}</b>\n"
+        f"Matchs croisés : <b>{d.get('matched', 0)}</b>\n"
+        f"Contextes enrichis : <b>{d.get('enriched', 0)}</b>\n"
         f"Matchs Gemini : <b>{d.get('gemini_ok', 0)}</b>\n"
-        f"SÃ©lections : <b>{d.get('selections', 0)}</b>\n"
+        f"  • avec contexte : <b>{d.get('with_ctx', 0)}</b>\n"
+        f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>"
     )
     await safe_answer(message, txt)
@@ -1016,12 +1121,12 @@ async def send_coupon(message, name):
 
 @dp.message(F.text == BTN_SAFE)
 async def btn_safe(message):
-    await send_coupon(message, "Ticket SÃ©curisÃ©")
+    await send_coupon(message, "Ticket Sécurisé")
 
 
 @dp.message(F.text == BTN_BAL)
 async def btn_bal(message):
-    await send_coupon(message, "Ticket Ã‰quilibrÃ©")
+    await send_coupon(message, "Ticket Équilibré")
 
 
 @dp.message(F.text == BTN_VAR)
@@ -1053,7 +1158,7 @@ async def scan():
         if af_fixtures:
             matches = match_fixtures_with_odds(af_fixtures, odds_events)
         else:
-            print("âš ï¸ Fallback : utilisation de The Odds API seul")
+            print("⚠️ Fallback : utilisation de The Odds API seul")
             matches = []
             for ev in odds_events:
                 h = ev.get("home_team", "")
@@ -1070,15 +1175,22 @@ async def scan():
                     "kickoff": kick,
                     "has_odds": True,
                     "real_odds": extract_real_odds(ev),
+                    "odds_sport_key": ev.get("sport_key", ""),
                 })
-        print(f"ðŸ“Š Matchs aprÃ¨s croisement : {len(matches)}")
+        print(f"📊 Matchs après croisement : {len(matches)}")
 
         matches = [m for m in matches if is_today_upcoming(m["kickoff"])]
-        print(f"ðŸ“… Matchs aujourd'hui : {len(matches)}")
+        print(f"📅 Matchs aujourd'hui : {len(matches)}")
+
+        contexts = {}
+        try:
+            contexts = await enrich_matches(matches)
+        except Exception as e:
+            print(f"⚠️ Enrichissement désactivé : {e}")
 
         used_today = load_used_today()
-        selections = await build_gemini_picks(matches, used_today)
-        print(f"ðŸŽ¯ SÃ©lections : {len(selections)}")
+        selections = await build_gemini_picks(matches, used_today, contexts)
+        print(f"🎯 Sélections : {len(selections)}")
 
         STATE["selections"] = selections
         STATE["coupons"] = build_all_coupons(selections)
@@ -1088,25 +1200,30 @@ async def scan():
 
         STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
         gemini_ok = sum(1 for s in selections if s.source == "gemini")
+        with_ctx = sum(1 for s in selections if s.has_context)
 
         STATE["debug"] = {
             "af_fixtures": len(af_fixtures),
             "odds_events": len(odds_events),
             "matched": len(matches),
+            "enriched": len(contexts),
             "gemini_ok": gemini_ok,
+            "with_ctx": with_ctx,
             "selections": len(selections),
             "coupons": len(STATE["coupons"]),
         }
 
-        print("â”€â”€â”€â”€â”€â”€â”€â”€ RÃ‰SUMÃ‰ â”€â”€â”€â”€â”€â”€â”€â”€")
+        print("──────── RÉSUMÉ ────────")
         print(f"AF fixtures   : {len(af_fixtures)}")
         print(f"Odds events   : {len(odds_events)}")
-        print(f"Matchs croisÃ©s: {len(matches)}")
-        print(f"SÃ©lections    : {len(selections)}")
+        print(f"Matchs croisés: {len(matches)}")
+        print(f"Contextes     : {len(contexts)}")
+        print(f"Sélections    : {len(selections)}")
+        print(f"Avec contexte : {with_ctx}")
         print(f"Coupons       : {len(STATE['coupons'])}")
         for c in STATE["coupons"]:
-            print(f"  â€¢ {c.name} : {len(c.legs)} paris, cote {c.combined_odds}")
-        print("â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+            print(f"  • {c.name} : {len(c.legs)} paris, cote {c.combined_odds}")
+        print("────────────────────────")
 
 
 # =========================================================
@@ -1123,18 +1240,18 @@ async def startup_scan_and_notify():
         await asyncio.sleep(10)
         if NOTIFY_ON_STARTUP:
             for chat_id in TARGETS:
-                await safe_send(chat_id, f"{format_header()}\n\nâ³ <b>Bot dÃ©marrÃ©, analyse en cours...</b>")
+                await safe_send(chat_id, f"{format_header()}\n\n⏳ <b>Bot démarré, analyse en cours...</b>")
         await scan()
         record_coupons(STATE["coupons"], datetime.now(TZ).strftime("%Y-%m-%d"))
         await broadcast_after_scan()
     except Exception as e:
-        print(f"âš ï¸ startup crash: {e}")
+        print(f"⚠️ startup crash: {e}")
 
 
 async def bootstrap():
     STATE["tracker"] = load_tracker()
     STATE["ready"] = True
-    print("âœ… Bot prÃªt.")
+    print("✅ Bot prêt.")
 
 
 @asynccontextmanager
