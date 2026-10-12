@@ -158,9 +158,9 @@ BTN_BAL = "⚖️ Équilibré"
 BTN_VAR = "💎 Value"
 BTN_SCAN = "🔄 Actualiser"
 BTN_BILAN = "📊 Bilan"
-BTN_ACTIVATE = "🔑 Activer une clé"
+BTN_ACTIVATE = "🔑 Activer mon abonnement"
 
-# Clavier pour les abonnés (pas de bouton Scan, pas de commandes admin)
+# Clavier pour les abonnés (pas de bouton Scan)
 USER_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_SAFE), KeyboardButton(text=BTN_BAL)],
@@ -1153,7 +1153,15 @@ async def start_cmd(message: Message):
         await safe_answer(message, f"{format_header()}\n\n<b>👋 Bienvenue Admin !</b>\n\nUtilise /scan pour lancer une analyse.", reply_markup=ADMIN_KEYBOARD)
     else:
         status = get_subscription_message(message.from_user.id)
-        await safe_answer(message, f"{format_header()}\n\n<b>👋 Bienvenue !</b>\n\n{status}\n\nTape /activate <clé> pour activer ton abonnement.", reply_markup=USER_KEYBOARD)
+        msg = (
+            f"{format_header()}\n\n"
+            f"<b>👋 Bienvenue sur le bot de pronostics !</b>\n\n"
+            f"{status}\n\n"
+            f"<b>🔑 Pour activer votre accès :</b>\n"
+            f"Envoyez simplement la commande <code>/activate VOTRE_CLE</code>\n"
+            f"<i>ou cliquez sur le bouton ci-dessous et envoyez votre clé.</i>"
+        )
+        await safe_answer(message, msg, reply_markup=USER_KEYBOARD)
 
 
 @dp.message(Command("keygen"))
@@ -1198,23 +1206,32 @@ async def keygen_cmd(message: Message):
                          f"Envoyez cette clé à l'abonné.", parse_mode="HTML")
 
 
-@dp.message(Command("activate"))
+@dp.message(Command("activate", "vip", "cle", "key"))
 async def activate_cmd(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("Usage: /activate <votre_clé>")
+        await message.answer("Usage: /activate <votre_clé>\nExemple: /activate MTJ8XWUZ")
         return
 
     key = args[1].strip().upper()
+    await process_activation(message, key)
+
+# Permet d'activer la clé en l'envoyant directement (ex: MTJ8XWUZ)
+@dp.message(F.text.regexp(r"^[A-Z0-9]{8}$"))
+async def raw_key_cmd(message: Message):
+    key = message.text.strip().upper()
+    await process_activation(message, key)
+
+async def process_activation(message: Message, key: str):
     user_id = message.from_user.id
 
     if key not in STATE["keys"]:
-        await message.answer("❌ Clé invalide.")
+        await message.answer("❌ Clé invalide. Vérifiez que vous avez bien copié la clé à 8 caractères.")
         return
 
     key_data = STATE["keys"][key]
     if key_data.get("used"):
-        await message.answer("❌ Cette clé a déjà été utilisée.")
+        await message.answer("❌ Cette clé a déjà été utilisée. Contactez l'administrateur : @hermann1123")
         return
 
     # Activation de l'abonnement
@@ -1234,7 +1251,9 @@ async def activate_cmd(message: Message):
 
     await message.answer(f"✅ <b>Abonnement activé avec succès !</b>\n\n"
                          f"Vous avez accès au bot pendant <b>{days} jours</b>.\n"
-                         f"Expiration : <b>{expires_at.strftime('%d/%m/%Y à %H:%M')}</b>", parse_mode="HTML")
+                         f"Expiration : <b>{expires_at.strftime('%d/%m/%Y à %H:%M')}</b>\n\n"
+                         f"👇 Utilisez les boutons ci-dessous pour voir les tickets.", 
+                         parse_mode="HTML", reply_markup=USER_KEYBOARD)
 
 
 @dp.message(Command("scan"))
@@ -1323,7 +1342,12 @@ async def btn_scan(message: Message):
 
 @dp.message(F.text == BTN_ACTIVATE)
 async def btn_activate(message: Message):
-    await message.answer("🔑 Pour activer votre abonnement, envoyez la commande :\n<code>/activate VOTRE_CLE</code>", parse_mode="HTML")
+    await message.answer(
+        "🔑 <b>Pour activer votre abonnement :</b>\n\n"
+        "Envoyez la commande <code>/activate VOTRE_CLE</code>\n"
+        "Ou envoyez simplement votre clé à 8 caractères (ex: <code>MTJ8XWUZ</code>).",
+        parse_mode="HTML"
+    )
 
 
 @dp.message(F.text == "⚙️ Debug")
