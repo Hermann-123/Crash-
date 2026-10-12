@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -19,6 +21,18 @@ _CACHE: dict = {}
 
 def _headers() -> dict:
     return {"Authorization": f"Token {BZZOIRO_API_KEY}"}
+
+
+def _norm(s: str) -> str:
+    """Normalisation avancée des noms d'équipes pour un meilleur matching."""
+    if not s:
+        return ""
+    s = str(s).lower().strip()
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+    for sfx in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
+        s = s.replace(sfx, "")
+    s = re.sub(r"[^a-z0-9 ]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
@@ -56,13 +70,17 @@ async def test_connection() -> bool:
 # =========================================================
 async def get_h2h(client: httpx.AsyncClient, event_id: int) -> dict:
     """Récupère le H2H d'un match."""
+    cache_key = f"h2h_{event_id}"
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
+
     data = await _get(client, f"/events/{event_id}/h2h/")
     if not data:
         return {}
 
     # On essaie de parser plusieurs formats possibles
     if isinstance(data, dict):
-        return {
+        result = {
             "total_matches": data.get("total_matches", len(data.get("matches", []))),
             "home_wins": data.get("home_wins", data.get("team_a_wins", 0)),
             "draws": data.get("draws", 0),
@@ -71,7 +89,11 @@ async def get_h2h(client: httpx.AsyncClient, event_id: int) -> dict:
             "recent_matches": data.get("matches", data.get("recent_matches", []))[:5],
             "raw": data,
         }
-    return {"raw": data}
+    else:
+        result = {"raw": data}
+        
+    _CACHE[cache_key] = result
+    return result
 
 
 # =========================================================
@@ -79,7 +101,13 @@ async def get_h2h(client: httpx.AsyncClient, event_id: int) -> dict:
 # =========================================================
 async def get_prediction(client: httpx.AsyncClient, event_id: int) -> dict:
     """Récupère les prédictions ML CatBoost."""
+    cache_key = f"pred_{event_id}"
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
+
     data = await _get(client, f"/events/{event_id}/prediction/")
+    if data:
+        _CACHE[cache_key] = data
     return data if data else {}
 
 
@@ -89,15 +117,16 @@ async def get_prediction(client: httpx.AsyncClient, event_id: int) -> dict:
 async def find_bzzoiro_event(client: httpx.AsyncClient, home: str, away: str,
                                 date_iso: str) -> Optional[dict]:
     """Cherche un match par nom d'équipes + date."""
+    cache_key = f"event_{_norm(home)}_{_norm(away)}_{date_iso}"
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
+
     data = await _get(client, "/events/", {
         "date_from": date_iso,
         "date_to": date_iso,
         "limit": "200",
     })
     events = data.get("results", []) or data.get("data", []) or []
-
-    def _norm(s):
-        return "".join(c for c in str(s).lower() if c.isalnum() or c == " ").strip()
 
     h_norm = _norm(home)
     a_norm = _norm(away)
@@ -110,7 +139,10 @@ async def find_bzzoiro_event(client: httpx.AsyncClient, home: str, away: str,
         hn = _norm(h)
         an = _norm(a)
         if (h_norm in hn or hn in h_norm) and (a_norm in an or an in a_norm):
+            _CACHE[cache_key] = ev
             return ev
+            
+    _CACHE[cache_key] = None
     return None
 
 
@@ -147,6 +179,7 @@ async def enrich_match_with_bzzoiro(home: str, away: str,
                 "bzzoiro_id": event_id,
                 "h2h": h2h,
                 "prediction": prediction,
+                "source": "bzzoiro"
             }
         except Exception as e:
             print(f"⚠️ Bzzoiro enrich crash {home}-{away}: {e}")
