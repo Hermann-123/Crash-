@@ -154,7 +154,10 @@ async def find_team_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
 # STATS ÉQUIPE
 # =========================================================
 async def get_team_stats(client: httpx.AsyncClient, team_id: int, league_id: int,
-                          season: int = 2025) -> dict:
+                          season: int = None) -> dict:
+    if season is None:
+        season = datetime.now().year
+        
     key = f"{team_id}_{league_id}_{season}"
     if key in _STATS_CACHE:
         return _STATS_CACHE[key]
@@ -230,7 +233,10 @@ async def get_h2h(client: httpx.AsyncClient, team1_id: int, team2_id: int,
 # =========================================================
 # BLESSÉS
 # =========================================================
-async def get_injuries(client: httpx.AsyncClient, team_id: int, season: int = 2025) -> list[dict]:
+async def get_injuries(client: httpx.AsyncClient, team_id: int, season: int = None) -> list[dict]:
+    if season is None:
+        season = datetime.now().year
+        
     key = team_id
     if key in _INJ_CACHE:
         return _INJ_CACHE[key]
