@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import re
+import secrets
+import string
 import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -56,11 +58,20 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 
+# Convertir l'ID admin en entier pour les vérifications de sécurité
+try:
+    ADMIN_ID = int(TELEGRAM_ADMIN_ID)
+except ValueError:
+    ADMIN_ID = 0
+
 NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "0"))
 NOTIFY_MINUTE = int(os.getenv("NOTIFY_MINUTE", "0"))
 NOTIFY_TZ = os.getenv("NOTIFY_TZ", "Africa/Abidjan")
 
 LOCAL_DB = os.getenv("LOCAL_DB", "/tmp/tracker.json")
+KEYS_DB = os.getenv("KEYS_DB", "/tmp/keys.json")
+USERS_DB = os.getenv("USERS_DB", "/tmp/users.json")
+
 BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
 BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • H2H + Gemini")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
@@ -83,8 +94,8 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN manquant")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY manquant")
-if not TELEGRAM_ADMIN_ID and not TELEGRAM_CHANNEL:
-    raise RuntimeError("TELEGRAM_ADMIN_ID ou TELEGRAM_CHANNEL manquant")
+if not ADMIN_ID:
+    raise RuntimeError("TELEGRAM_ADMIN_ID manquant ou invalide")
 
 TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -137,7 +148,7 @@ class Coupon:
 
 
 # =========================================================
-# GLOBALS
+# GLOBALS & KEYBOARDS
 # =========================================================
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -147,15 +158,28 @@ BTN_BAL = "⚖️ Équilibré"
 BTN_VAR = "💎 Value"
 BTN_SCAN = "🔄 Actualiser"
 BTN_BILAN = "📊 Bilan"
+BTN_ACTIVATE = "🔑 Activer une clé"
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
+# Clavier pour les abonnés (pas de bouton Scan, pas de commandes admin)
+USER_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_SAFE), KeyboardButton(text=BTN_BAL)],
         [KeyboardButton(text=BTN_VAR), KeyboardButton(text=BTN_BILAN)],
-        [KeyboardButton(text=BTN_SCAN)],
+        [KeyboardButton(text=BTN_ACTIVATE)],
     ],
     resize_keyboard=True,
     input_field_placeholder="Choisis un ticket…",
+)
+
+# Clavier pour l'administrateur (avec Scan et Debug)
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_SAFE), KeyboardButton(text=BTN_BAL)],
+        [KeyboardButton(text=BTN_VAR), KeyboardButton(text=BTN_BILAN)],
+        [KeyboardButton(text=BTN_SCAN), KeyboardButton(text="⚙️ Debug")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Admin: Choisis une action…",
 )
 
 STATE = {
@@ -165,6 +189,8 @@ STATE = {
     "last_scan": None,
     "debug": {},
     "tracker": {"coupons": []},
+    "keys": {},
+    "users": {},
     "scan_lock": asyncio.Lock(),
 }
 
@@ -268,6 +294,50 @@ def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
     if current.strip():
         parts.append(current.rstrip())
     return parts
+
+
+# =========================================================
+# GESTION DES CLÉS ET ABONNEMENTS
+# =========================================================
+def load_json(path, default=None):
+    if default is None:
+        default = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def is_subscribed(user_id: int) -> bool:
+    uid = str(user_id)
+    if uid not in STATE["users"]:
+        return False
+    exp = STATE["users"][uid].get("expires_at")
+    if not exp:
+        return False
+    try:
+        exp_dt = datetime.fromisoformat(exp)
+        return datetime.now(TZ) < exp_dt
+    except Exception:
+        return False
+
+
+def get_subscription_message(user_id: int) -> str:
+    if is_subscribed(user_id):
+        exp = STATE["users"][str(user_id)]["expires_at"]
+        exp_dt = datetime.fromisoformat(exp)
+        return f"✅ Votre abonnement est actif jusqu'au {exp_dt.strftime('%d/%m/%Y à %H:%M')}."
+    else:
+        return "❌ Votre abonnement est expiré ou inexistant.\nContactez l'administrateur : @hermann1123"
 
 
 # =========================================================
@@ -544,12 +614,6 @@ def match_fixtures_with_odds(fixtures: list[dict], odds_events: list[dict]) -> l
 # ENRICHISSEMENT (cascade : Bzzoiro → API-Football)
 # =========================================================
 async def enrich_matches(matches: list[dict]) -> dict:
-    """
-    Enrichit les matchs en cascade :
-    1. Bzzoiro (H2H + prédictions ML)
-    2. Si Bzzoiro échoue → API-Football (H2H + blessés)
-    3. Corners/cartons API-Football (grandes ligues)
-    """
     to_enrich = matches[:MAX_MATCHES_TO_ENRICH]
     if not to_enrich:
         return {}
@@ -571,20 +635,17 @@ async def enrich_matches(matches: list[dict]) -> dict:
             ctx = None
             source = None
 
-            # === 1. Essayer Bzzoiro ===
             if enrich_match_with_bzzoiro:
                 ctx = await enrich_match_with_bzzoiro(home, away, date_iso)
                 if ctx.get("available"):
                     source = "bzzoiro"
 
-            # === 2. Fallback API-Football ===
             if (not ctx or not ctx.get("available")) and get_full_context_api_football:
                 print(f"  🔄 Fallback API-Football pour {home} vs {away}...")
                 ctx = await get_full_context_api_football(home, away, league)
                 if ctx.get("available"):
                     source = "api-football"
 
-            # === 3. Corners/cartons (grandes ligues) ===
             if ctx and ctx.get("available") and get_corners_cards and sport_key:
                 cc = await get_corners_cards(home, away, sport_key)
                 if cc.get("available"):
@@ -1046,12 +1107,12 @@ def format_bilan(tracker):
 # =========================================================
 # TELEGRAM
 # =========================================================
-async def safe_answer(message, text):
+async def safe_answer(message, text, reply_markup=None):
     parts = split_message(text)
     for i, part in enumerate(parts):
         try:
             if i == 0:
-                await message.answer(part, parse_mode="HTML", reply_markup=MAIN_KEYBOARD)
+                await message.answer(part, parse_mode="HTML", reply_markup=reply_markup)
             else:
                 await message.answer(part, parse_mode="HTML")
             await asyncio.sleep(0.3)
@@ -1070,32 +1131,134 @@ async def safe_send(chat_id, text):
 
 
 async def broadcast_after_scan():
+    # Envoi aux admins et à la chaîne
     for chat_id in TARGETS:
         await safe_send(chat_id, format_coupons_ready())
         await asyncio.sleep(0.5)
 
+    # Envoi aux abonnés actifs
+    for user_id_str, data in STATE["users"].items():
+        try:
+            uid = int(user_id_str)
+            if is_subscribed(uid):
+                await safe_send(uid, format_coupons_ready())
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            print(f"⚠️ Erreur envoi abonné {user_id_str}: {e}")
+
 
 @dp.message(Command("start"))
-async def start_cmd(message):
-    await safe_answer(message, f"{format_header()}\n\n<b>👋 Bienvenue !</b>\n\nTape /scan.")
+async def start_cmd(message: Message):
+    if message.from_user.id == ADMIN_ID:
+        await safe_answer(message, f"{format_header()}\n\n<b>👋 Bienvenue Admin !</b>\n\nUtilise /scan pour lancer une analyse.", reply_markup=ADMIN_KEYBOARD)
+    else:
+        status = get_subscription_message(message.from_user.id)
+        await safe_answer(message, f"{format_header()}\n\n<b>👋 Bienvenue !</b>\n\n{status}\n\nTape /activate <clé> pour activer ton abonnement.", reply_markup=USER_KEYBOARD)
+
+
+@dp.message(Command("keygen"))
+async def keygen_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return  # Sécurité : seul l'admin peut générer des clés
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /keygen [1m | 1s | 60]")
+        return
+
+    duration_str = args[1].lower()
+    days = 0
+    if duration_str.endswith("m"):
+        try:
+            days = int(duration_str[:-1]) * 30
+        except ValueError:
+            pass
+    elif duration_str.endswith("s"):
+        try:
+            days = int(duration_str[:-1]) * 7
+        except ValueError:
+            pass
+    else:
+        try:
+            days = int(duration_str)
+        except ValueError:
+            pass
+
+    if days <= 0:
+        await message.answer("❌ Durée invalide. Utilisez 1m, 1s, ou un nombre de jours (ex: 60).")
+        return
+
+    key = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+    STATE["keys"][key] = {"days": days, "used": False, "created_at": datetime.now(TZ).isoformat()}
+    save_json(KEYS_DB, STATE["keys"])
+
+    await message.answer(f"🔑 <b>Clé générée avec succès !</b>\n\n"
+                         f"Clé : <code>{key}</code>\n"
+                         f"Durée : <b>{days} jours</b>\n\n"
+                         f"Envoyez cette clé à l'abonné.", parse_mode="HTML")
+
+
+@dp.message(Command("activate"))
+async def activate_cmd(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Usage: /activate <votre_clé>")
+        return
+
+    key = args[1].strip().upper()
+    user_id = message.from_user.id
+
+    if key not in STATE["keys"]:
+        await message.answer("❌ Clé invalide.")
+        return
+
+    key_data = STATE["keys"][key]
+    if key_data.get("used"):
+        await message.answer("❌ Cette clé a déjà été utilisée.")
+        return
+
+    # Activation de l'abonnement
+    days = key_data["days"]
+    expires_at = datetime.now(TZ) + timedelta(days=days)
+
+    STATE["users"][str(user_id)] = {
+        "expires_at": expires_at.isoformat(),
+        "key_used": key
+    }
+    key_data["used"] = True
+    key_data["used_by"] = str(user_id)
+    key_data["used_at"] = datetime.now(TZ).isoformat()
+
+    save_json(KEYS_DB, STATE["keys"])
+    save_json(USERS_DB, STATE["users"])
+
+    await message.answer(f"✅ <b>Abonnement activé avec succès !</b>\n\n"
+                         f"Vous avez accès au bot pendant <b>{days} jours</b>.\n"
+                         f"Expiration : <b>{expires_at.strftime('%d/%m/%Y à %H:%M')}</b>", parse_mode="HTML")
 
 
 @dp.message(Command("scan"))
-async def scan_cmd(message):
+async def scan_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return  # Sécurité : seul l'admin peut lancer un scan
     await safe_answer(message, "⏳ Analyse en cours (2-3 min)...")
     await scan()
     await broadcast_after_scan()
 
 
 @dp.message(Command("regler"))
-async def regler_cmd(message):
+async def regler_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return  # Sécurité : seul l'admin peut régler les coupons
     await safe_answer(message, "⏳ Vérification...")
     await settle_coupons()
     await safe_answer(message, format_bilan(STATE["tracker"]))
 
 
 @dp.message(Command("debug"))
-async def debug_cmd(message):
+async def debug_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return  # Sécurité : seul l'admin peut voir le debug
     d = STATE["debug"]
     txt = (
         f"<b>🔍 DEBUG</b>\n\n"
@@ -1120,32 +1283,58 @@ async def send_coupon(message, name):
 
 
 @dp.message(F.text == BTN_SAFE)
-async def btn_safe(message):
+async def btn_safe(message: Message):
+    if message.from_user.id != ADMIN_ID and not is_subscribed(message.from_user.id):
+        await message.answer(f"❌ {get_subscription_message(message.from_user.id)}")
+        return
     await send_coupon(message, "Ticket Sécurisé")
 
 
 @dp.message(F.text == BTN_BAL)
-async def btn_bal(message):
+async def btn_bal(message: Message):
+    if message.from_user.id != ADMIN_ID and not is_subscribed(message.from_user.id):
+        await message.answer(f"❌ {get_subscription_message(message.from_user.id)}")
+        return
     await send_coupon(message, "Ticket Équilibré")
 
 
 @dp.message(F.text == BTN_VAR)
-async def btn_var(message):
+async def btn_var(message: Message):
+    if message.from_user.id != ADMIN_ID and not is_subscribed(message.from_user.id):
+        await message.answer(f"❌ {get_subscription_message(message.from_user.id)}")
+        return
     await send_coupon(message, "Ticket Value")
 
 
 @dp.message(F.text == BTN_BILAN)
-async def btn_bilan(message):
+async def btn_bilan(message: Message):
+    if message.from_user.id != ADMIN_ID and not is_subscribed(message.from_user.id):
+        await message.answer(f"❌ {get_subscription_message(message.from_user.id)}")
+        return
     await safe_answer(message, format_bilan(STATE["tracker"]))
 
 
 @dp.message(F.text == BTN_SCAN)
-async def btn_scan(message):
+async def btn_scan(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return  # Sécurité : le bouton scan ne fait rien pour les non-admins
     await scan_cmd(message)
 
 
+@dp.message(F.text == BTN_ACTIVATE)
+async def btn_activate(message: Message):
+    await message.answer("🔑 Pour activer votre abonnement, envoyez la commande :\n<code>/activate VOTRE_CLE</code>", parse_mode="HTML")
+
+
+@dp.message(F.text == "⚙️ Debug")
+async def btn_debug(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await debug_cmd(message)
+
+
 # =========================================================
-# SCAN
+# SCAN (Logique inchangée)
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
@@ -1250,6 +1439,8 @@ async def startup_scan_and_notify():
 
 async def bootstrap():
     STATE["tracker"] = load_tracker()
+    STATE["keys"] = load_json(KEYS_DB)
+    STATE["users"] = load_json(USERS_DB)
     STATE["ready"] = True
     print("✅ Bot prêt.")
 
