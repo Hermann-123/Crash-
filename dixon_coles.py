@@ -11,14 +11,14 @@ from typing import Optional
 import httpx
 
 LEAGUES = {
-    # Saison 2025-2026 (données complètes, base stable)
+    # Saison 2025-2026
     "England Premier League 25/26": "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
     "England Championship 25/26":    "https://www.football-data.co.uk/mmz4281/2526/E1.csv",
     "Spain La Liga 25/26":           "https://www.football-data.co.uk/mmz4281/2526/SP1.csv",
     "Italy Serie A 25/26":           "https://www.football-data.co.uk/mmz4281/2526/I1.csv",
     "Germany Bundesliga 25/26":      "https://www.football-data.co.uk/mmz4281/2526/D1.csv",
     "France Ligue 1 25/26":          "https://www.football-data.co.uk/mmz4281/2526/F1.csv",
-    # Saison 2026-2027 (données fraîches, plus pertinentes)
+    # Saison 2026-2027
     "England Premier League 26/27": "https://www.football-data.co.uk/mmz4281/2627/E0.csv",
     "England Championship 26/27":    "https://www.football-data.co.uk/mmz4281/2627/E1.csv",
     "Spain La Liga 26/27":           "https://www.football-data.co.uk/mmz4281/2627/SP1.csv",
@@ -73,7 +73,6 @@ class DixonColesModel:
         return (lam ** k) * math.exp(-lam) / math.factorial(k)
 
     def predict(self, home: str, away: str, max_goals: int = 6) -> Optional[dict]:
-        """Retourne 1X2 uniquement (compatibilité)."""
         full = self.predict_all(home, away, max_goals)
         if not full:
             return None
@@ -86,7 +85,6 @@ class DixonColesModel:
         }
 
     def predict_all(self, home: str, away: str, max_goals: int = 8) -> Optional[dict]:
-        """Retourne toutes les probas : 1X2 + O/U 1.5/2.5/3.5 + BTTS."""
         h_key = self._find_team(home)
         a_key = self._find_team(away)
         if not h_key or not a_key:
@@ -98,7 +96,6 @@ class DixonColesModel:
         lambda_home = h_data["att"] * a_data["def"] * self.avg_goals * self.home_advantage
         lambda_away = a_data["att"] * h_data["def"] * self.avg_goals
 
-        # Distribution complète des scores
         p_home = p_draw = p_away = 0.0
         p_over_15 = p_over_25 = p_over_35 = 0.0
         p_btts_yes = 0.0
