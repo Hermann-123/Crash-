@@ -11,20 +11,33 @@ from typing import Optional
 import httpx
 
 LEAGUES = {
-    # Saison 2025-2026
-    "England Premier League 25/26": "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
-    "England Championship 25/26":    "https://www.football-data.co.uk/mmz4281/2526/E1.csv",
-    "Spain La Liga 25/26":           "https://www.football-data.co.uk/mmz4281/2526/SP1.csv",
-    "Italy Serie A 25/26":           "https://www.football-data.co.uk/mmz4281/2526/I1.csv",
-    "Germany Bundesliga 25/26":      "https://www.football-data.co.uk/mmz4281/2526/D1.csv",
-    "France Ligue 1 25/26":          "https://www.football-data.co.uk/mmz4281/2526/F1.csv",
-    # Saison 2026-2027
-    "England Premier League 26/27": "https://www.football-data.co.uk/mmz4281/2627/E0.csv",
-    "England Championship 26/27":    "https://www.football-data.co.uk/mmz4281/2627/E1.csv",
-    "Spain La Liga 26/27":           "https://www.football-data.co.uk/mmz4281/2627/SP1.csv",
-    "Italy Serie A 26/27":           "https://www.football-data.co.uk/mmz4281/2627/I1.csv",
-    "Germany Bundesliga 26/27":      "https://www.football-data.co.uk/mmz4281/2627/D1.csv",
-    "France Ligue 1 26/27":          "https://www.football-data.co.uk/mmz4281/2627/F1.csv",
+    # ===== SAISON 2025-2026 (base stable) =====
+    "England Premier League 25/26":    "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
+    "England Championship 25/26":       "https://www.football-data.co.uk/mmz4281/2526/E1.csv",
+    "Spain La Liga 25/26":              "https://www.football-data.co.uk/mmz4281/2526/SP1.csv",
+    "Italy Serie A 25/26":              "https://www.football-data.co.uk/mmz4281/2526/I1.csv",
+    "Germany Bundesliga 25/26":         "https://www.football-data.co.uk/mmz4281/2526/D1.csv",
+    "France Ligue 1 25/26":             "https://www.football-data.co.uk/mmz4281/2526/F1.csv",
+    "Netherlands Eredivisie 25/26":     "https://www.football-data.co.uk/mmz4281/2526/N1.csv",
+    "Portugal Primeira Liga 25/26":     "https://www.football-data.co.uk/mmz4281/2526/P1.csv",
+    "Belgium Jupiler Pro League 25/26": "https://www.football-data.co.uk/mmz4281/2526/B1.csv",
+    "Turkey Super Lig 25/26":           "https://www.football-data.co.uk/mmz4281/2526/T1.csv",
+    "Greece Super League 25/26":        "https://www.football-data.co.uk/mmz4281/2526/G1.csv",
+    "Scotland Premiership 25/26":       "https://www.football-data.co.uk/mmz4281/2526/SC0.csv",
+
+    # ===== SAISON 2026-2027 (données fraîches) =====
+    "England Premier League 26/27":    "https://www.football-data.co.uk/mmz4281/2627/E0.csv",
+    "England Championship 26/27":       "https://www.football-data.co.uk/mmz4281/2627/E1.csv",
+    "Spain La Liga 26/27":              "https://www.football-data.co.uk/mmz4281/2627/SP1.csv",
+    "Italy Serie A 26/27":              "https://www.football-data.co.uk/mmz4281/2627/I1.csv",
+    "Germany Bundesliga 26/27":         "https://www.football-data.co.uk/mmz4281/2627/D1.csv",
+    "France Ligue 1 26/27":             "https://www.football-data.co.uk/mmz4281/2627/F1.csv",
+    "Netherlands Eredivisie 26/27":     "https://www.football-data.co.uk/mmz4281/2627/N1.csv",
+    "Portugal Primeira Liga 26/27":     "https://www.football-data.co.uk/mmz4281/2627/P1.csv",
+    "Belgium Jupiler Pro League 26/27": "https://www.football-data.co.uk/mmz4281/2627/B1.csv",
+    "Turkey Super Lig 26/27":           "https://www.football-data.co.uk/mmz4281/2627/T1.csv",
+    "Greece Super League 26/27":        "https://www.football-data.co.uk/mmz4281/2627/G1.csv",
+    "Scotland Premiership 26/27":       "https://www.football-data.co.uk/mmz4281/2627/SC0.csv",
 }
 
 
