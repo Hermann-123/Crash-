@@ -91,7 +91,7 @@ NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
 MIN_PROB = float(os.getenv("MIN_PROB", "0.60"))
 MIN_ODD = float(os.getenv("MIN_ODD", "1.35"))
-MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "25"))
+MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
 MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "8"))
 
 SAFE_MIN_ODDS = 2.0
@@ -181,6 +181,23 @@ def calculate_match_score(fx: dict) -> float:
             score += WEIGHT_TIME_PROXIMITY * 0.7
         elif hours_until <= 24:
             score += WEIGHT_TIME_PROXIMITY * 0.3
+
+    # Bonus si Dixon-Coles connaît les deux équipes
+    if STATE.get("dixon_model"):
+        try:
+            h_key = STATE["dixon_model"]._find_team(fx.get("home", ""))
+            a_key = STATE["dixon_model"]._find_team(fx.get("away", ""))
+            if h_key and a_key:
+                score += 15.0
+                fx["dixon_available"] = True
+            elif h_key or a_key:
+                score += 5.0
+                fx["dixon_available"] = False
+            else:
+                fx["dixon_available"] = False
+        except Exception:
+            fx["dixon_available"] = False
+
     return score
 
 
@@ -194,7 +211,8 @@ def filter_and_rank_matches(matches: list[dict]) -> list[dict]:
     scored.sort(key=lambda m: m["_score"], reverse=True)
     print(f"🎯 Matchs qualifiés : {len(scored)}/{len(matches)} (seuil {MIN_MATCH_SCORE})")
     for fx in scored[:10]:
-        print(f"  ⭐ [{fx['_score']:.1f}] {fx.get('league','')[:30]} | {fx['home']} vs {fx['away']}")
+        dixon_tag = "✅D" if fx.get("dixon_available") else "  "
+        print(f"  ⭐ [{fx['_score']:.1f}] {dixon_tag} {fx.get('league','')[:30]} | {fx['home']} vs {fx['away']}")
     return scored
 
 
@@ -963,13 +981,8 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     edge = 0.0
                     if real_odd and real_odd > 1.01:
                         edge = (prob * real_odd) - 1.0
-                    score = prob
-                    if real_odd:
-                        score += 0.5
-                    if has_ctx:
-                        score += 0.3
-                    if edge > 0.05:
-                        score += 0.4
+
+                    # --- Calculs préalables au score ---
                     pg_raw = gemini_markets.get(key)
                     try:
                         prob_gemini = float(pg_raw) / 100.0 if pg_raw is not None else 0.0
@@ -986,6 +999,31 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                         if dk:
                             prob_dixon = dixon_pred.get(dk, 0.0)
                     agr_emoji, agr_delta = compute_agreement(gemini_markets, dixon_pred, key)
+
+                    # --- Score avec bonus de consensus G × D ---
+                    score = prob
+                    if real_odd:
+                        score += 0.5
+                    if has_ctx:
+                        score += 0.3
+                    if edge > 0.05:
+                        score += 0.4
+
+                    if agr_emoji == "🤝":
+                        score += 0.8
+                    elif agr_emoji == "⚠️":
+                        score -= 0.6
+                    elif prob_dixon > 0:
+                        score += 0.4
+                    elif prob_dixon == 0 and prob_gemini > 0:
+                        score -= 0.3
+
+                    # --- Filtres de rejet ---
+                    if agr_emoji == "⚠️" and prob < 0.70:
+                        continue
+                    if prob_dixon == 0 and prob_gemini > 0 and prob < 0.72:
+                        continue
+
                     candidates.append({
                         "score": score, "label": label, "mkt": mkt,
                         "used_odd": used_odd, "real_odd": real_odd, "prob": prob,
@@ -1044,48 +1082,34 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
     print(f"  → {name}: {len(pool)} candidates")
     if not pool:
         return None
-
     pool.sort(key=lambda s: s.final_prob(), reverse=True)
-
     legs = []
     used_events = set()
     league_count = {}
     used_markets = set()
     combined_odds = 1.0
     combined_prob = 1.0
-
-    # Premier passage : on prend les meilleurs en respectant les contraintes
     for s in pool:
         if len(legs) >= max_legs:
             break
-
         if s.event_id in used_events:
             continue
-
-        # Max 2 paris par championnat (au lieu de 1)
         if league_count.get(s.league, 0) >= 2:
             continue
-
-        # Max 3 paris du même marché (au lieu de 2)
         market_count = sum(1 for leg in legs if leg.market == s.market)
         if market_count >= 3:
             continue
-
         next_odds = combined_odds * s.odds
         if next_odds > target_max * 1.15 and legs:
             continue
-
         legs.append(s)
         used_events.add(s.event_id)
         league_count[s.league] = league_count.get(s.league, 0) + 1
         used_markets.add(s.market)
         combined_odds = next_odds
         combined_prob *= s.final_prob()
-
         if combined_odds >= target_min:
             break
-
-    # Si on n'a pas atteint la cote cible, on continue à chercher
     if combined_odds < target_min and len(legs) < max_legs:
         for s in pool:
             if len(legs) >= max_legs:
@@ -1107,12 +1131,9 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
             combined_prob *= s.final_prob()
             if combined_odds >= target_min:
                 break
-
     print(f"  → {name}: {len(legs)} legs, cote {combined_odds:.2f}")
-
     if not legs:
         return None
-
     if strict:
         if combined_odds < target_min:
             print(f"  ⛔ {name} rejeté : cote {combined_odds:.2f} < {target_min}")
@@ -1120,14 +1141,11 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
     else:
         if combined_odds < target_min * 0.85:
             return None
-
     if combined_odds > target_max * 1.25:
         return None
-
     legs.sort(key=lambda s: s.odds)
     for s in legs:
         globally_used.add(s.event_id)
-
     return Coupon(name, subtitle, emoji, legs,
                   round(combined_odds, 2), round(combined_prob, 4))
 
@@ -1135,14 +1153,11 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
 def build_value_list(selections, top_n=20, globally_used=None):
     if globally_used is None:
         globally_used = set()
-
     pool = [s for s in selections
             if s.event_id not in globally_used and s.odds >= MIN_ODD]
     if not pool:
         return None
-
     pool.sort(key=lambda s: s.final_prob(), reverse=True)
-
     top_list = []
     seen_events = set()
     for s in pool:
@@ -1152,19 +1167,15 @@ def build_value_list(selections, top_n=20, globally_used=None):
         seen_events.add(s.event_id)
         if len(top_list) >= top_n:
             break
-
     if not top_list:
         return None
-
     combined_odds = 1.0
     combined_prob = 1.0
     for s in top_list:
         combined_odds *= s.odds
         combined_prob *= s.final_prob()
-
     for s in top_list:
         globally_used.add(s.event_id)
-
     return Coupon(
         "Ticket Value", f"Top {len(top_list)} pronostics",
         "💎", top_list,
@@ -1699,7 +1710,7 @@ async def bootstrap():
     print("✅ Bot prêt.")
     if download_and_train:
         try:
-            print("🧠 Entraînement Dixon-Coles en cours (peut prendre 30s)...")
+            print("🧠 Entraînement Dixon-Coles en cours (peut prendre 60s)...")
             STATE["dixon_model"] = await download_and_train()
             if STATE["dixon_model"]:
                 print(f"✅ Dixon-Coles actif ({len(STATE['dixon_model'].teams)} équipes)")
