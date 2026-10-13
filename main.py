@@ -1044,34 +1044,75 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
     print(f"  → {name}: {len(pool)} candidates")
     if not pool:
         return None
+
     pool.sort(key=lambda s: s.final_prob(), reverse=True)
+
     legs = []
     used_events = set()
-    used_leagues = set()
+    league_count = {}
     used_markets = set()
     combined_odds = 1.0
     combined_prob = 1.0
+
+    # Premier passage : on prend les meilleurs en respectant les contraintes
     for s in pool:
         if len(legs) >= max_legs:
             break
-        if s.event_id in used_events or s.league in used_leagues:
+
+        if s.event_id in used_events:
             continue
-        if s.market in used_markets and len(legs) >= 2:
+
+        # Max 2 paris par championnat (au lieu de 1)
+        if league_count.get(s.league, 0) >= 2:
             continue
+
+        # Max 3 paris du même marché (au lieu de 2)
+        market_count = sum(1 for leg in legs if leg.market == s.market)
+        if market_count >= 3:
+            continue
+
         next_odds = combined_odds * s.odds
         if next_odds > target_max * 1.15 and legs:
             continue
+
         legs.append(s)
         used_events.add(s.event_id)
-        used_leagues.add(s.league)
+        league_count[s.league] = league_count.get(s.league, 0) + 1
         used_markets.add(s.market)
         combined_odds = next_odds
         combined_prob *= s.final_prob()
+
         if combined_odds >= target_min:
             break
+
+    # Si on n'a pas atteint la cote cible, on continue à chercher
+    if combined_odds < target_min and len(legs) < max_legs:
+        for s in pool:
+            if len(legs) >= max_legs:
+                break
+            if s.event_id in used_events:
+                continue
+            if league_count.get(s.league, 0) >= 2:
+                continue
+            market_count = sum(1 for leg in legs if leg.market == s.market)
+            if market_count >= 3:
+                continue
+            next_odds = combined_odds * s.odds
+            if next_odds > target_max * 1.3 and legs:
+                continue
+            legs.append(s)
+            used_events.add(s.event_id)
+            league_count[s.league] = league_count.get(s.league, 0) + 1
+            combined_odds = next_odds
+            combined_prob *= s.final_prob()
+            if combined_odds >= target_min:
+                break
+
     print(f"  → {name}: {len(legs)} legs, cote {combined_odds:.2f}")
+
     if not legs:
         return None
+
     if strict:
         if combined_odds < target_min:
             print(f"  ⛔ {name} rejeté : cote {combined_odds:.2f} < {target_min}")
@@ -1079,11 +1120,14 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
     else:
         if combined_odds < target_min * 0.85:
             return None
+
     if combined_odds > target_max * 1.25:
         return None
+
     legs.sort(key=lambda s: s.odds)
     for s in legs:
         globally_used.add(s.event_id)
+
     return Coupon(name, subtitle, emoji, legs,
                   round(combined_odds, 2), round(combined_prob, 4))
 
@@ -1091,11 +1135,14 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
 def build_value_list(selections, top_n=20, globally_used=None):
     if globally_used is None:
         globally_used = set()
+
     pool = [s for s in selections
             if s.event_id not in globally_used and s.odds >= MIN_ODD]
     if not pool:
         return None
+
     pool.sort(key=lambda s: s.final_prob(), reverse=True)
+
     top_list = []
     seen_events = set()
     for s in pool:
@@ -1105,15 +1152,19 @@ def build_value_list(selections, top_n=20, globally_used=None):
         seen_events.add(s.event_id)
         if len(top_list) >= top_n:
             break
+
     if not top_list:
         return None
+
     combined_odds = 1.0
     combined_prob = 1.0
     for s in top_list:
         combined_odds *= s.odds
         combined_prob *= s.final_prob()
+
     for s in top_list:
         globally_used.add(s.event_id)
+
     return Coupon(
         "Ticket Value", f"Top {len(top_list)} pronostics",
         "💎", top_list,
@@ -1130,7 +1181,7 @@ def build_all_coupons(selections):
                  and s.market in ("1X2", "Double Chance", "Over/Under", "BTTS")]
     c = build_coupon_target(
         "Ticket Sécurisé", "Cote 2.0 - 2.5 • Priorité sûreté",
-        "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 5, used,
+        "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 6, used,
         min_leg_odds=1.35, strict=True,
     )
     if c:
