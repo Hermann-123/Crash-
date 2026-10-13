@@ -1,14 +1,12 @@
 """
-Moteur Dixon-Coles avec matching d'équipes ULTRA-ROBUSTE.
-Gère toutes les variations de noms d'équipes entre les APIs.
+Moteur Dixon-Coles + marchés dérivés (1X2, O/U, BTTS).
+Avec 20 championnats et mapping d'alias pour les noms d'équipes.
 """
 from __future__ import annotations
 
 import csv
 import io
 import math
-import re
-import unicodedata
 from typing import Optional
 
 import httpx
@@ -61,285 +59,205 @@ LEAGUES = {
 
 
 # =========================================================
-# MOTS À IGNORER dans le matching (préfixes/suffixes communs)
-# =========================================================
-IGNORE_WORDS = {
-    # Types de clubs
-    "fc", "cf", "sc", "ac", "afc", "as", "ss", "ssc", "rc", "cd", "fk",
-    "sk", "jk", "sd", "ud", "ca", "cs", "us", "sv", "bv", "bsc", "fsv",
-    "vfb", "vfl", "tsg", "spvgg", "kfc", "krc", "kv", "kaa",
-    "club", "de", "futbol", "futebol", "calcio", "voetbal",
-    # Suffixes génériques
-    "united", "utd", "city", "town", "albion", "rovers", "wanderers",
-    "athletic", "sporting", "sport", "deportivo",
-    # Chiffres/années
-    "1", "2", "3", "04", "05", "07", "09", "1899", "1900", "1919", "1927",
-    # Anglais
-    "the", "and", "of",
-}
-
-
-# =========================================================
-# DICTIONNAIRE D'ALIAS — Mapping API → CSV
+# MAPPING D'ALIAS — noms API → noms football-data.co.uk
 # =========================================================
 TEAM_ALIASES = {
-    # === Espagne ===
-    "atletico madrid": "ath madrid", "atletico de madrid": "ath madrid",
-    "atlético madrid": "ath madrid", "atletico": "ath madrid",
-    "athletic bilbao": "ath bilbao", "athletic club": "ath bilbao", "athletic": "ath bilbao",
-    "real betis": "betis", "betis": "betis",
-    "celta vigo": "celta", "celta de vigo": "celta",
-    "real sociedad": "sociedad", "sociedad": "sociedad",
-    "deportivo alaves": "alaves", "deportivo alavés": "alaves",
+    # Espagne
+    "atletico madrid": "ath madrid",
+    "atlético madrid": "ath madrid",
+    "athletic bilbao": "ath bilbao",
+    "athletic club": "ath bilbao",
+    "real betis": "betis",
+    "celta vigo": "celta",
+    "real sociedad": "sociedad",
+    "deportivo alaves": "alaves",
+    "deportivo alavés": "alaves",
     "rayo vallecano": "vallecano",
-    "cadiz cf": "cadiz", "cadiz": "cadiz",
-    "ud las palmas": "las palmas", "las palmas": "las palmas",
-    "girona fc": "girona", "girona": "girona",
-    "valencia cf": "valencia", "valencia": "valencia",
-    "villarreal cf": "villarreal", "villarreal": "villarreal",
-    "sevilla fc": "sevilla", "sevilla": "sevilla",
-    "fc barcelona": "barcelona", "barcelona": "barcelona", "barca": "barcelona",
-    "real madrid": "real madrid", "madrid": "real madrid",
-    "osasuna": "osasuna", "ca osasuna": "osasuna",
-    "mallorca": "mallorca", "rcd mallorca": "mallorca",
-    "getafe": "getafe", "getafe cf": "getafe",
-    
-    # === Allemagne ===
-    "bayern munich": "bayern munich", "bayern munchen": "bayern munich",
-    "bayern münchen": "bayern munich", "fc bayern": "bayern munich",
-    "fc bayern munich": "bayern munich", "fc bayern munchen": "bayern munich",
-    "borussia dortmund": "dortmund", "bvb dortmund": "dortmund", "dortmund": "dortmund",
-    "borussia monchengladbach": "m'gladbach", "b. monchengladbach": "m'gladbach",
-    "monchengladbach": "m'gladbach", "mönchengladbach": "m'gladbach",
-    "bayer leverkusen": "leverkusen", "bayer 04 leverkusen": "leverkusen",
-    "eintracht frankfurt": "eintracht", "frankfurt": "eintracht",
-    "rb leipzig": "rb leipzig", "rasenballsport leipzig": "rb leipzig", "leipzig": "rb leipzig",
-    "vfb stuttgart": "stuttgart", "stuttgart": "stuttgart",
-    "sc freiburg": "freiburg", "sport club freiburg": "freiburg",
-    "mainz 05": "mainz", "1. fsv mainz 05": "mainz", "mainz": "mainz",
-    "vfl wolfsburg": "wolfsburg", "wolfsburg": "wolfsburg",
-    "fc augsburg": "augsburg", "augsburg": "augsburg",
-    "werder bremen": "werder", "sv werder bremen": "werder",
-    "union berlin": "union berlin", "1. fc union berlin": "union berlin",
-    "vfl bochum": "bochum", "bochum": "bochum",
-    "tsg hoffenheim": "hoffenheim", "1899 hoffenheim": "hoffenheim", "hoffenheim": "hoffenheim",
-    
-    # === Italie ===
-    "inter milan": "inter", "internazionale": "inter", "fc internazionale": "inter",
-    "inter": "inter", "internazionale milano": "inter",
-    "ac milan": "milan", "milan": "milan", "acmilan": "milan",
-    "as roma": "roma", "roma": "roma",
-    "ss lazio": "lazio", "lazio": "lazio",
-    "ssc napoli": "napoli", "napoli": "napoli",
-    "juventus fc": "juventus", "juventus": "juventus", "juve": "juventus",
-    "atalanta bc": "atalanta", "atalanta": "atalanta",
-    "fiorentina": "fiorentina", "acf fiorentina": "fiorentina", "ac fiorentina": "fiorentina",
-    "bologna": "bologna", "bologna fc": "bologna",
-    "torino fc": "torino", "torino": "torino",
-    "udinese": "udinese", "udinese calcio": "udinese",
-    "genoa": "genoa", "genoa cfc": "genoa",
-    "cagliari": "cagliari", "cagliari calcio": "cagliari",
-    "verona": "verona", "hellas verona": "verona",
-    "lecce": "lecce", "us lecce": "lecce",
-    "empoli": "empoli", "empoli fc": "empoli",
-    "monza": "monza", "ac monza": "monza",
-    "como": "como", "como 1907": "como",
-    "parma": "parma", "parma calcio": "parma",
-    "venezia": "venezia", "venezia fc": "venezia",
-    
-    # === Angleterre ===
-    "manchester city": "man city", "man city": "man city",
-    "manchester united": "man united", "man united": "man united",
-    "man utd": "man united", "manchester utd": "man united",
-    "newcastle united": "newcastle", "newcastle": "newcastle", "newcastle utd": "newcastle",
-    "tottenham hotspur": "tottenham", "tottenham": "tottenham", "spurs": "tottenham",
-    "brighton hove albion": "brighton", "brighton & hove albion": "brighton", "brighton": "brighton",
-    "nottingham forest": "nott'm forest", "nottm forest": "nott'm forest", "forest": "nott'm forest",
-    "wolverhampton wanderers": "wolves", "wolves": "wolves",
-    "west ham united": "west ham", "west ham": "west ham",
-    "crystal palace": "crystal palace", "palace": "crystal palace",
-    "leicester city": "leicester", "leicester": "leicester",
-    "everton fc": "everton", "everton": "everton",
-    "aston villa": "aston villa", "villa": "aston villa",
-    "afc bournemouth": "bournemouth", "fc bournemouth": "bournemouth", "bournemouth": "bournemouth",
-    "brentford fc": "brentford", "brentford": "brentford",
-    "fulham fc": "fulham", "fulham": "fulham",
-    "ipswich town": "ipswich", "ipswich": "ipswich",
-    "southampton fc": "southampton", "southampton": "southampton",
-    "luton town": "luton", "luton": "luton",
-    "sheffield united": "sheffield utd", "sheffield utd": "sheffield utd",
-    "sheffield wednesday": "sheffield weds", "sheffield weds": "sheffield weds",
-    "queens park rangers": "qpr", "qpr": "qpr",
-    "west bromwich albion": "west brom", "west brom": "west brom", "west bromwich": "west brom",
-    "norwich city": "norwich", "norwich": "norwich",
-    "swansea city": "swansea", "swansea": "swansea",
-    "cardiff city": "cardiff", "cardiff": "cardiff",
-    "hull city": "hull", "hull": "hull",
-    "coventry city": "coventry", "coventry": "coventry",
-    "stoke city": "stoke", "stoke": "stoke",
-    "preston north end": "preston", "preston": "preston",
-    "blackburn rovers": "blackburn", "blackburn": "blackburn",
-    "bristol city": "bristol city", "bristol": "bristol city",
-    "millwall": "millwall", "millwall fc": "millwall",
-    "watford fc": "watford", "watford": "watford",
-    "sunderland afc": "sunderland", "sunderland": "sunderland",
-    "burnley fc": "burnley", "burnley": "burnley",
-    "charlton athletic": "charlton", "charlton": "charlton",
-    "birmingham city": "birmingham", "birmingham": "birmingham",
-    
-    # === France ===
-    "paris saint germain": "paris sg", "paris saint-germain": "paris sg", "psg": "paris sg",
-    "olympique de marseille": "marseille", "olympique marseille": "marseille", "marseille": "marseille",
-    "olympique lyonnais": "lyon", "lyon": "lyon", "olympique lyon": "lyon",
-    "as monaco": "monaco", "monaco": "monaco",
-    "as saint-etienne": "saint-etienne", "as saint etienne": "saint-etienne", "saint-etienne": "saint-etienne",
-    "rc lens": "lens", "lens": "lens",
-    "losc lille": "lille", "lille osc": "lille", "lille": "lille",
-    "stade rennais": "rennes", "rennes": "rennes",
-    "stade brestois": "brest", "brest": "brest",
-    "rc strasbourg": "strasbourg", "rc strasbourg alsace": "strasbourg", "strasbourg": "strasbourg",
-    "fc nantes": "nantes", "nantes": "nantes",
-    "toulouse fc": "toulouse", "toulouse": "toulouse",
-    "montpellier hsc": "montpellier", "montpellier": "montpellier",
-    "le havre": "le havre", "le havre ac": "le havre",
-    "fc metz": "metz", "metz": "metz",
-    "stade de reims": "reims", "reims": "reims",
-    "aj auxerre": "auxerre", "auxerre": "auxerre",
-    "angers sco": "angers", "angers": "angers",
-    
-    # === Pays-Bas ===
-    "ajax amsterdam": "ajax", "afc ajax": "ajax", "ajax": "ajax",
-    "psv eindhoven": "psv", "psv": "psv",
-    "feyenoord rotterdam": "feyenoord", "feyenoord": "feyenoord",
-    "az alkmaar": "az alkmaar", "az": "az alkmaar",
-    "fc utrecht": "utrecht", "utrecht": "utrecht",
-    "fc twente": "twente", "twente": "twente",
-    "sc heerenveen": "heerenveen", "heerenveen": "heerenveen",
-    "vitesse arnhem": "vitesse", "vitesse": "vitesse",
-    "fc groningen": "groningen", "groningen": "groningen",
-    
-    # === Portugal ===
-    "fc porto": "porto", "porto": "porto",
-    "sl benfica": "benfica", "benfica": "benfica",
-    "sporting cp": "sp lisbon", "sporting lisbon": "sp lisbon",
-    "sporting clube de portugal": "sp lisbon", "sporting": "sp lisbon",
-    "sc braga": "braga", "braga": "braga",
-    "vitoria guimaraes": "vitoria", "vitoria sc": "vitoria", "vitoria": "vitoria",
-    "boavista fc": "boavista", "boavista": "boavista",
-    "rio ave": "rio ave", "rio ave fc": "rio ave",
-    "famalicao": "famalicao", "fc famalicao": "famalicao",
-    
-    # === Turquie ===
-    "galatasaray sk": "galatasaray", "galatasaray": "galatasaray",
-    "fenerbahce sk": "fenerbahce", "fenerbahce": "fenerbahce",
-    "besiktas jk": "besiktas", "besiktas": "besiktas",
-    "trabzonspor": "trabzonspor", "trabzonspor k": "trabzonspor",
-    "basaksehir": "istanbul bb", "istanbul basaksehir": "istanbul bb",
-    "istanbul bb": "istanbul bb",
-    
-    # === Grèce ===
-    "olympiacos": "olympiacos", "olympiacos piraeus": "olympiacos",
-    "panathinaikos": "panathinaikos", "panathinaikos fc": "panathinaikos",
-    "aek athens": "aek", "aek": "aek",
-    "paok thessaloniki": "paok", "paok": "paok",
-    
-    # === Écosse ===
-    "celtic fc": "celtic", "celtic": "celtic",
-    "rangers fc": "rangers", "rangers": "rangers",
-    "aberdeen fc": "aberdeen", "aberdeen": "aberdeen",
-    "heart of midlothian": "hearts", "hearts": "hearts",
-    "hibernian": "hibernian", "hibernian fc": "hibernian",
+    "cadiz cf": "cadiz",
+    "ud las palmas": "las palmas",
+    "girona fc": "girona",
+    "osasuna": "osasuna",
+    "mallorca": "mallorca",
+    "getafe": "getafe",
+    "valencia cf": "valencia",
+    "villarreal cf": "villarreal",
+    "sevilla fc": "sevilla",
+    # Allemagne
+    "bayern munich": "bayern munich",
+    "bayern munchen": "bayern munich",
+    "bayern münchen": "bayern munich",
+    "borussia dortmund": "dortmund",
+    "borussia monchengladbach": "m'gladbach",
+    "borussia mönchengladbach": "m'gladbach",
+    "bayer leverkusen": "leverkusen",
+    "bayer 04 leverkusen": "leverkusen",
+    "eintracht frankfurt": "eintracht",
+    "rb leipzig": "rb leipzig",
+    "rasenballsport leipzig": "rb leipzig",
+    "vfb stuttgart": "stuttgart",
+    "sc freiburg": "freiburg",
+    "mainz 05": "mainz",
+    "1. fsv mainz 05": "mainz",
+    "vfl wolfsburg": "wolfsburg",
+    "fc augsburg": "augsburg",
+    "werder bremen": "werder",
+    "union berlin": "union berlin",
+    "vfl bochum": "bochum",
+    "tsg hoffenheim": "hoffenheim",
+    "1899 hoffenheim": "hoffenheim",
+    # Italie
+    "inter milan": "inter",
+    "internazionale": "inter",
+    "fc internazionale": "inter",
+    "ac milan": "milan",
+    "as roma": "roma",
+    "ss lazio": "lazio",
+    "ssc napoli": "napoli",
+    "juventus fc": "juventus",
+    "atalanta bc": "atalanta",
+    "fiorentina": "fiorentina",
+    "acf fiorentina": "fiorentina",
+    "bologna": "bologna",
+    "torino fc": "torino",
+    "udinese": "udinese",
+    "genoa": "genoa",
+    "cagliari": "cagliari",
+    "verona": "verona",
+    "hellas verona": "verona",
+    "lecce": "lecce",
+    "empoli": "empoli",
+    "monza": "monza",
+    "como": "como",
+    "parma": "parma",
+    "venezia": "venezia",
+    # Angleterre
+    "manchester city": "man city",
+    "manchester united": "man united",
+    "man utd": "man united",
+    "newcastle united": "newcastle",
+    "tottenham hotspur": "tottenham",
+    "spurs": "tottenham",
+    "brighton hove albion": "brighton",
+    "brighton & hove albion": "brighton",
+    "nottingham forest": "nott'm forest",
+    "nottm forest": "nott'm forest",
+    "wolverhampton wanderers": "wolves",
+    "west ham united": "west ham",
+    "crystal palace": "crystal palace",
+    "leicester city": "leicester",
+    "everton fc": "everton",
+    "aston villa": "aston villa",
+    "afc bournemouth": "bournemouth",
+    "fc bournemouth": "bournemouth",
+    "brentford fc": "brentford",
+    "fulham fc": "fulham",
+    "ipswich town": "ipswich",
+    "southampton fc": "southampton",
+    "luton town": "luton",
+    "sheffield united": "sheffield utd",
+    "sheffield wednesday": "sheffield weds",
+    "queens park rangers": "qpr",
+    "west bromwich albion": "west brom",
+    "norwich city": "norwich",
+    "swansea city": "swansea",
+    "cardiff city": "cardiff",
+    "hull city": "hull",
+    "coventry city": "coventry",
+    "stoke city": "stoke",
+    "preston north end": "preston",
+    "blackburn rovers": "blackburn",
+    "bristol city": "bristol city",
+    "millwall": "millwall",
+    "watford fc": "watford",
+    "sunderland afc": "sunderland",
+    # France
+    "paris saint germain": "paris sg",
+    "paris saint-germain": "paris sg",
+    "psg": "paris sg",
+    "olympique de marseille": "marseille",
+    "olympique marseille": "marseille",
+    "olympique lyonnais": "lyon",
+    "as monaco": "monaco",
+    "as saint-etienne": "saint-etienne",
+    "as saint etienne": "saint-etienne",
+    "rc lens": "lens",
+    "losc lille": "lille",
+    "lille osc": "lille",
+    "stade rennais": "rennes",
+    "stade brestois": "brest",
+    "rc strasbourg": "strasbourg",
+    "rc strasbourg alsace": "strasbourg",
+    "fc nantes": "nantes",
+    "toulouse fc": "toulouse",
+    "montpellier hsc": "montpellier",
+    "le havre": "le havre",
+    "fc metz": "metz",
+    "reims": "reims",
+    "stade de reims": "reims",
+    "auxerre": "auxerre",
+    "aj auxerre": "auxerre",
+    "angers sco": "angers",
+    # Pays-Bas
+    "ajax amsterdam": "ajax",
+    "afc ajax": "ajax",
+    "psv eindhoven": "psv",
+    "psv": "psv",
+    "feyenoord rotterdam": "feyenoord",
+    "feyenoord": "feyenoord",
+    "az alkmaar": "az alkmaar",
+    "az": "az alkmaar",
+    "fc utrecht": "utrecht",
+    "fc twente": "twente",
+    "sc heerenveen": "heerenveen",
+    "vitesse arnhem": "vitesse",
+    "fc groningen": "groningen",
+    "sparta rotterdam": "sparta rotterdam",
+    # Portugal
+    "fc porto": "porto",
+    "sl benfica": "benfica",
+    "sporting cp": "sp lisbon",
+    "sporting lisbon": "sp lisbon",
+    "sporting clube de portugal": "sp lisbon",
+    "sc braga": "braga",
+    "vitoria guimaraes": "vitoria",
+    "vitoria sc": "vitoria",
+    "boavista fc": "boavista",
+    "rio ave": "rio ave",
+    "famalicao": "famalicao",
+    "fc famalicao": "famalicao",
+    # Turquie
+    "galatasaray sk": "galatasaray",
+    "galatasaray": "galatasaray",
+    "fenerbahce sk": "fenerbahce",
+    "fenerbahce": "fenerbahce",
+    "besiktas jk": "besiktas",
+    "besiktas": "besiktas",
+    "trabzonspor": "trabzonspor",
+    "basaksehir": "istanbul bb",
+    "istanbul basaksehir": "istanbul bb",
+    # Grèce
+    "olympiacos": "olympiacos",
+    "olympiacos piraeus": "olympiacos",
+    "panathinaikos": "panathinaikos",
+    "aek athens": "aek",
+    "paok thessaloniki": "paok",
+    "paok": "paok",
+    # Écosse
+    "celtic fc": "celtic",
+    "rangers fc": "rangers",
+    "aberdeen fc": "aberdeen",
+    "heart of midlothian": "hearts",
+    "hearts": "hearts",
+    "hibernian": "hibernian",
 }
 
 
-# =========================================================
-# NORMALISATION ULTRA-ROBUSTE
-# =========================================================
-def _normalize_team_name(s: str) -> str:
-    """
-    Normalise un nom d'équipe : enlève accents, ponctuation, 
-    préfixes/suffixes communs, chiffres d'année.
-    """
-    if not s:
-        return ""
-    s = str(s).lower().strip()
-    # Accents
-    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    # Ponctuation
-    s = re.sub(r"[^a-z0-9 ]", " ", s)
-    # Découpe en mots
-    words = s.split()
-    # Filtre les mots à ignorer
-    filtered = []
-    for w in words:
-        if w in IGNORE_WORDS:
-            continue
-        if len(w) <= 1:  # ignore "a", "b", "1", etc.
-            continue
-        filtered.append(w)
-    if not filtered:
-        # Si tout est filtré, on garde les mots originaux
-        return " ".join(words).strip()
-    return " ".join(filtered).strip()
-
-
-def _similarity_score(name_a: str, name_b: str) -> float:
-    """
-    Score de similarité entre deux noms d'équipes (0.0 à 1.0).
-    Combine plusieurs métriques : exact, containment, Jaccard, first-word.
-    """
-    a = _normalize_team_name(name_a)
-    b = _normalize_team_name(name_b)
-    
-    if not a or not b:
-        return 0.0
-    
-    # Match exact après normalisation
-    if a == b:
-        return 1.0
-    
-    # Containment : l'un contient l'autre en entier
-    if a in b or b in a:
-        shorter = min(len(a), len(b))
-        longer = max(len(a), len(b))
-        ratio = shorter / longer if longer > 0 else 0
-        return 0.70 + 0.25 * ratio  # Entre 0.70 et 0.95
-    
-    # Token Jaccard
-    tokens_a = set(a.split())
-    tokens_b = set(b.split())
-    
-    if not tokens_a or not tokens_b:
-        return 0.0
-    
-    inter = tokens_a & tokens_b
-    union = tokens_a | tokens_b
-    jaccard = len(inter) / len(union) if union else 0.0
-    
-    # Premier mot identique (souvent le plus significatif)
-    first_a = a.split()[0] if a.split() else ""
-    first_b = b.split()[0] if b.split() else ""
-    first_match = 0.20 if (first_a and first_a == first_b) else 0.0
-    
-    # Dernier mot identique
-    last_a = a.split()[-1] if a.split() else ""
-    last_b = b.split()[-1] if b.split() else ""
-    last_match = 0.10 if (last_a and last_a == last_b and last_a != first_a) else 0.0
-    
-    return min(1.0, jaccard * 0.70 + first_match + last_match)
-
-
-# =========================================================
-# MODÈLE DIXON-COLES
-# =========================================================
 class DixonColesModel:
     def __init__(self):
         self.teams: dict = {}
         self.home_advantage = 1.15
         self.avg_goals = 1.35
         self._trained = False
-        self._normalized_index: dict = {}  # cache {normalized_name: csv_name}
-        self._alias_index: dict = {}       # cache {alias: csv_name}
 
     def train(self, results: list[dict]) -> bool:
         if len(results) < 100:
@@ -373,29 +291,7 @@ class DixonColesModel:
                 "league": s["league"],
             }
         self._trained = len(self.teams) >= 20
-        
-        # Pré-calcul des index pour accélérer le matching
-        self._build_indexes()
         return self._trained
-
-    def _build_indexes(self):
-        """Pré-calcule les indexes de normalisation et d'alias pour perf."""
-        self._normalized_index = {}
-        self._alias_index = {}
-        
-        # Index normalisé : "barcelona" → "Barcelona"
-        for csv_name in self.teams:
-            n = _normalize_team_name(csv_name)
-            if n:
-                self._normalized_index[n] = csv_name
-        
-        # Index alias : "fc barcelona" → "Barcelona"
-        for alias, target in TEAM_ALIASES.items():
-            target_norm = _normalize_team_name(target)
-            for csv_name in self.teams:
-                if _normalize_team_name(csv_name) == target_norm:
-                    self._alias_index[alias] = csv_name
-                    break
 
     def _poisson(self, lam: float, k: int) -> float:
         return (lam ** k) * math.exp(-lam) / math.factorial(k)
@@ -468,53 +364,30 @@ class DixonColesModel:
         }
 
     def _find_team(self, name: str) -> Optional[str]:
-        """
-        Trouve une équipe CSV à partir d'un nom d'API.
-        Utilise 5 niveaux de matching, du plus strict au plus permissif.
-        """
-        if not name or not self.teams:
+        if not name:
             return None
+        n = name.lower().strip()
         
-        raw = str(name).lower().strip()
-        
-        # === Niveau 1 : Alias direct ===
-        alias = TEAM_ALIASES.get(raw)
+        # Vérifier les alias en premier
+        alias = TEAM_ALIASES.get(n)
         if alias:
-            target_norm = _normalize_team_name(alias)
-            for csv_name in self.teams:
-                if _normalize_team_name(csv_name) == target_norm:
-                    return csv_name
-        
-        # === Niveau 2 : Match exact après normalisation ===
-        n_norm = _normalize_team_name(name)
-        if n_norm and n_norm in self._normalized_index:
-            return self._normalized_index[n_norm]
-        
-        # === Niveau 3 : Containment (l'un contient l'autre) ===
-        if n_norm:
-            for csv_name in self.teams:
-                csv_norm = _normalize_team_name(csv_name)
-                if csv_norm and (n_norm in csv_norm or csv_norm in n_norm):
-                    # Vérifie que la longueur est raisonnable
-                    if min(len(n_norm), len(csv_norm)) >= 4:
-                        return csv_name
-        
-        # === Niveau 4 : Scoring de similarité ===
-        best_team = None
-        best_score = 0.0
-        THRESHOLD = 0.60
-        
-        for csv_name in self.teams:
-            score = _similarity_score(name, csv_name)
-            if score > best_score:
-                best_score = score
-                best_team = csv_name
-                if score >= 0.95:  # Optimisation : on arrête si match quasi-parfait
-                    break
-        
-        if best_team and best_score >= THRESHOLD:
-            return best_team
-        
+            n = alias
+
+        # Match exact
+        for t in self.teams:
+            if t.lower().strip() == n:
+                return t
+        # Match partiel
+        for t in self.teams:
+            tl = t.lower().strip()
+            if n in tl or tl in n:
+                return t
+        # Match par premier mot
+        first = n.split()[0] if n.split() else ""
+        if len(first) > 3:
+            for t in self.teams:
+                if t.lower().startswith(first):
+                    return t
         return None
 
 
