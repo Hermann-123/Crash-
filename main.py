@@ -89,10 +89,11 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • H2H + Gemini")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-MIN_PROB = float(os.getenv("MIN_PROB", "0.60"))
-MIN_ODD = float(os.getenv("MIN_ODD", "1.35"))
+# === SEUIL 70% + cote min 1.45 ===
+MIN_PROB = float(os.getenv("MIN_PROB", "0.70"))
+MIN_ODD = float(os.getenv("MIN_ODD", "1.45"))
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
-MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "8"))
+MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "15"))
 
 SAFE_MIN_ODDS = 2.0
 SAFE_MAX_ODDS = 2.5
@@ -128,28 +129,12 @@ WEIGHT_LEAGUE = 10.0
 WEIGHT_ODDS_COUNT = 2.0
 WEIGHT_FAVORITE_CLARITY = 8.0
 WEIGHT_TIME_PROXIMITY = 3.0
-MIN_MATCH_SCORE = 12.0
+MIN_MATCH_SCORE = 3.0  # Seuil abaissé
 
 
 def get_league_score(league_name: str) -> int:
-    if not league_name:
-        return 0
-    lname = league_name.lower()
-    elite = ["champions league", "europa league", "conference league",
-             "premier league", "la liga", "serie a", "bundesliga", "ligue 1"]
-    for key in elite:
-        if key in lname:
-            return 10
-    strong = ["eredivisie", "primeira liga", "championship", "brasileirao",
-              "mls", "liga mx", "super lig", "jupiler", "scottish premiership"]
-    for key in strong:
-        if key in lname:
-            return 7
-    medium = ["liga", "division", "championship", "cup", "copa", "coupe"]
-    for key in medium:
-        if key in lname:
-            return 4
-    return 1
+    """Toutes les ligues ont le MÊME poids (5)."""
+    return 5
 
 
 def calculate_match_score(fx: dict) -> float:
@@ -182,7 +167,6 @@ def calculate_match_score(fx: dict) -> float:
         elif hours_until <= 24:
             score += WEIGHT_TIME_PROXIMITY * 0.3
 
-    # Bonus si Dixon-Coles connaît les deux équipes
     if STATE.get("dixon_model"):
         try:
             h_key = STATE["dixon_model"]._find_team(fx.get("home", ""))
@@ -482,9 +466,9 @@ def is_today_upcoming(iso_str) -> bool:
 def prob_bar(p: float) -> str:
     if p >= 0.80:
         return "🟢🟢🟢"
-    if p >= 0.72:
+    if p >= 0.75:
         return "🟢🟢⚪"
-    if p >= 0.65:
+    if p >= 0.70:
         return "🟢⚪⚪"
     return "⚪⚪⚪"
 
@@ -868,7 +852,8 @@ async def enrich_matches(matches: list[dict]) -> dict:
 async def build_gemini_picks(matches, used_today, contexts=None):
     selections: list[Selection] = []
     seen = set()
-    stats = {"ok": 0, "fail": 0, "kept": 0, "with_ctx": 0}
+    stats = {"ok": 0, "fail": 0, "kept": 0, "with_ctx": 0,
+             "rejected_no_ctx": 0, "rejected_no_odds": 0, "rejected_low_prob": 0}
     if not predict_match_probas:
         print("❌ predict_match_probas non disponible")
         return selections
@@ -884,15 +869,25 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                 kickoff = fx["kickoff"]
                 if event_id in used_today:
                     continue
+
+                # === FILTRE 1 : EXCLURE LES MATCHS SANS COTES ===
+                if not fx.get("has_odds"):
+                    stats["rejected_no_odds"] += 1
+                    continue
+
+                # === FILTRE 2 : CONTEXTE ENRICHI OBLIGATOIRE ===
                 ctx = contexts.get(event_id)
                 has_ctx = ctx is not None and ctx.get("available", False)
+                if not has_ctx:
+                    stats["rejected_no_ctx"] += 1
+                    continue
+
                 pred = await predict_match_probas(client, home, away, league, kickoff, context=ctx)
                 if not pred or "markets" not in pred:
                     stats["fail"] += 1
                     continue
                 stats["ok"] += 1
-                if has_ctx:
-                    stats["with_ctx"] += 1
+                stats["with_ctx"] += 1
                 gemini_markets = pred.get("markets", {})
                 analysis = pred.get("analysis", "")
                 advice = pred.get("advice", "")
@@ -955,8 +950,15 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     prob = combined_probs.get(key)
                     if prob is None:
                         continue
-                    if prob < MIN_PROB or prob > 0.85:
+
+                    # === FILTRE 3 : SEUIL 70% STRICT ===
+                    if prob < 0.70:
+                        stats["rejected_low_prob"] += 1
                         continue
+                    if prob > 0.90:
+                        continue
+                    # ====================================
+
                     real_odd = None
                     if mkt == "1X2":
                         if "victoire" in label.lower() and home.lower() in label.lower():
@@ -982,7 +984,7 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     if real_odd and real_odd > 1.01:
                         edge = (prob * real_odd) - 1.0
 
-                    # --- Calculs préalables au score ---
+                    # === CALCULS PRÉALABLES AU SCORE ===
                     pg_raw = gemini_markets.get(key)
                     try:
                         prob_gemini = float(pg_raw) / 100.0 if pg_raw is not None else 0.0
@@ -1000,7 +1002,7 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                             prob_dixon = dixon_pred.get(dk, 0.0)
                     agr_emoji, agr_delta = compute_agreement(gemini_markets, dixon_pred, key)
 
-                    # --- Score avec bonus de consensus G × D ---
+                    # === SCORE AVEC BONUS CONSENSUS ===
                     score = prob
                     if real_odd:
                         score += 0.5
@@ -1018,12 +1020,6 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     elif prob_dixon == 0 and prob_gemini > 0:
                         score -= 0.3
 
-                    # --- Filtres de rejet ---
-                    if agr_emoji == "⚠️" and prob < 0.70:
-                        continue
-                    if prob_dixon == 0 and prob_gemini > 0 and prob < 0.72:
-                        continue
-
                     candidates.append({
                         "score": score, "label": label, "mkt": mkt,
                         "used_odd": used_odd, "real_odd": real_odd, "prob": prob,
@@ -1031,43 +1027,41 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                         "agr_emoji": agr_emoji, "agr_delta": agr_delta,
                     })
                 candidates.sort(reverse=True, key=lambda x: x["score"])
-                used_markets = set()
-                kept = 0
-                for c in candidates:
-                    mkt = c["mkt"]
-                    if mkt in used_markets:
-                        continue
-                    used_markets.add(mkt)
-                    dedup = f"{event_id}|{mkt}|{c['label']}"
-                    if dedup in seen:
-                        continue
-                    seen.add(dedup)
-                    selections.append(Selection(
-                        event_id=event_id, league=league, home=home, away=away,
-                        kickoff=kickoff, market=mkt, pick_label=c["label"],
-                        odds=round(c["used_odd"], 2), model_prob=round(c["prob"], 4),
-                        edge=round(c["edge"], 4),
-                        bookmaker="The Odds API" if c["real_odd"] else "Gemini+Dixon",
-                        real_odd=c["real_odd"],
-                        analysis=analysis,
-                        advice=advice,
-                        advice_confidence=advice_conf,
-                        advices=advices_clean,
-                        has_context=has_ctx,
-                        prob_gemini=round(c["prob_gemini"], 4),
-                        prob_dixon=round(c["prob_dixon"], 4),
-                        agreement_emoji=c["agr_emoji"],
-                        agreement_delta=round(c["agr_delta"], 4),
-                    ))
-                    stats["kept"] += 1
-                    kept += 1
-                    if kept >= 3:
-                        break
+
+                # === 1 SEUL PICK PAR MATCH (le meilleur) ===
+                if candidates:
+                    c = candidates[0]
+                    dedup = f"{event_id}|{c['mkt']}|{c['label']}"
+                    if dedup not in seen:
+                        seen.add(dedup)
+                        selections.append(Selection(
+                            event_id=event_id, league=league, home=home, away=away,
+                            kickoff=kickoff, market=c["mkt"], pick_label=c["label"],
+                            odds=round(c["used_odd"], 2), model_prob=round(c["prob"], 4),
+                            edge=round(c["edge"], 4),
+                            bookmaker="The Odds API" if c["real_odd"] else "Gemini+Dixon",
+                            real_odd=c["real_odd"],
+                            analysis=analysis,
+                            advice=advice,
+                            advice_confidence=advice_conf,
+                            advices=advices_clean,
+                            has_context=has_ctx,
+                            prob_gemini=round(c["prob_gemini"], 4),
+                            prob_dixon=round(c["prob_dixon"], 4),
+                            agreement_emoji=c["agr_emoji"],
+                            agreement_delta=round(c["agr_delta"], 4),
+                        ))
+                        stats["kept"] += 1
+                # ========================================
+
                 await asyncio.sleep(2.5)
             except Exception as e:
                 print(f"⚠️ build_gemini_picks: {e}")
     print(f"🏠 Picks : ok={stats['ok']} échec={stats['fail']} "
-          f"gardés={stats['kept']} avec_contexte={stats['with_ctx']}")
+          f"gardés={stats['kept']} avec_contexte={stats['with_ctx']} "
+          f"rejetés_sans_ctx={stats['rejected_no_ctx']} "
+          f"rejetés_sans_cotes={stats['rejected_no_odds']} "
+          f"rejetés_proba_faible={stats['rejected_low_prob']}")
     return selections
 
 
@@ -1085,7 +1079,6 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
     pool.sort(key=lambda s: s.final_prob(), reverse=True)
     legs = []
     used_events = set()
-    league_count = {}
     used_markets = set()
     combined_odds = 1.0
     combined_prob = 1.0
@@ -1094,8 +1087,7 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
             break
         if s.event_id in used_events:
             continue
-        if league_count.get(s.league, 0) >= 2:
-            continue
+        # Plus de limite "2 matchs par championnat"
         market_count = sum(1 for leg in legs if leg.market == s.market)
         if market_count >= 3:
             continue
@@ -1104,7 +1096,6 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
             continue
         legs.append(s)
         used_events.add(s.event_id)
-        league_count[s.league] = league_count.get(s.league, 0) + 1
         used_markets.add(s.market)
         combined_odds = next_odds
         combined_prob *= s.final_prob()
@@ -1116,8 +1107,6 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
                 break
             if s.event_id in used_events:
                 continue
-            if league_count.get(s.league, 0) >= 2:
-                continue
             market_count = sum(1 for leg in legs if leg.market == s.market)
             if market_count >= 3:
                 continue
@@ -1126,7 +1115,6 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
                 continue
             legs.append(s)
             used_events.add(s.event_id)
-            league_count[s.league] = league_count.get(s.league, 0) + 1
             combined_odds = next_odds
             combined_prob *= s.final_prob()
             if combined_odds >= target_min:
@@ -1153,11 +1141,31 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
 def build_value_list(selections, top_n=20, globally_used=None):
     if globally_used is None:
         globally_used = set()
+
     pool = [s for s in selections
             if s.event_id not in globally_used and s.odds >= MIN_ODD]
     if not pool:
         return None
-    pool.sort(key=lambda s: s.final_prob(), reverse=True)
+
+    # === TRI PAR FIABILITÉ (consensus Gemini × Dixon) ===
+    def value_score(s):
+        score = s.final_prob()
+        if s.agreement_emoji == "🤝":
+            score += 0.20
+        elif s.prob_dixon > 0:
+            score += 0.10
+        elif s.prob_dixon == 0 and s.prob_gemini > 0:
+            score -= 0.15
+        if s.edge > 0.05:
+            score += 0.05
+        if s.edge > 0.10:
+            score += 0.05
+        if s.has_context:
+            score += 0.03
+        return score
+
+    pool.sort(key=value_score, reverse=True)
+
     top_list = []
     seen_events = set()
     for s in pool:
@@ -1177,7 +1185,7 @@ def build_value_list(selections, top_n=20, globally_used=None):
     for s in top_list:
         globally_used.add(s.event_id)
     return Coupon(
-        "Ticket Value", f"Top {len(top_list)} pronostics",
+        "Ticket Value", f"Top {len(top_list)} pronostics (fiabilité)",
         "💎", top_list,
         round(combined_odds, 2), round(combined_prob, 4),
         is_list=True,
@@ -1188,20 +1196,20 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
     pool_safe = [s for s in selections
-                 if s.final_prob() >= 0.68
+                 if s.final_prob() >= 0.70
                  and s.market in ("1X2", "Double Chance", "Over/Under", "BTTS")]
     c = build_coupon_target(
-        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Priorité sûreté",
+        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Proba > 70%",
         "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 6, used,
         min_leg_odds=1.35, strict=True,
     )
     if c:
         coupons.append(c)
     pool_bal = [s for s in selections
-                if s.final_prob() >= 0.60
+                if s.final_prob() >= 0.70
                 and s.market not in ("Corners", "Cartons")]
     c = build_coupon_target(
-        "Ticket Équilibré", "Cote 2.5 - 5.0",
+        "Ticket Équilibré", "Cote 2.5 - 5.0 • Proba > 70%",
         "⚖️", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
         min_leg_odds=BAL_MIN_LEG_ODDS, strict=False,
     )
@@ -1290,7 +1298,7 @@ def format_coupon(c: Coupon) -> str:
             format_header(), "",
             f"<b>{c.emoji} {c.name.upper()}</b>",
             f"<i>{c.subtitle}</i>", "",
-            f"<b>🎯 {len(c.legs)} pronostics classés par probabilité</b>",
+            f"<b>🎯 {len(c.legs)} pronostics classés par fiabilité</b>",
             "",
         ]
         for i, s in enumerate(c.legs, 1):
@@ -1321,7 +1329,7 @@ def format_coupon(c: Coupon) -> str:
 def format_coupons_ready():
     if not STATE["coupons"]:
         return (f"{format_header()}\n\n<b>📭 Aucun coupon aujourd'hui</b>\n"
-                f"<i>Pas assez de paris à haute proba (cote ≥ {MIN_ODD}).</i>")
+                f"<i>Pas assez de paris qualifiés (proba > 70% + données complètes + cotes réelles).</i>")
     lignes = []
     for c in STATE["coupons"]:
         n = len(c.legs)
@@ -1702,42 +1710,58 @@ async def startup_scan_and_notify():
         print(f"⚠️ startup crash: {e}")
 
 
-async def bootstrap():
-    STATE["tracker"] = load_tracker()
-    STATE["keys"] = load_json(KEYS_DB)
-    STATE["users"] = load_json(USERS_DB)
-    STATE["ready"] = True
-    print("✅ Bot prêt.")
-    if download_and_train:
-        try:
-            print("🧠 Entraînement Dixon-Coles en cours (peut prendre 60s)...")
-            STATE["dixon_model"] = await download_and_train()
-            if STATE["dixon_model"]:
-                print(f"✅ Dixon-Coles actif ({len(STATE['dixon_model'].teams)} équipes)")
-            else:
-                print("⚠️ Dixon-Coles indisponible — le bot utilisera Gemini seul.")
-        except Exception as e:
-            print(f"⚠️ Dixon-Coles crash: {e}")
-    else:
-        print("⚠️ Module Dixon-Coles non importé.")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-    await bootstrap()
+
+    # === ÉTAPE 1 : Bind immédiat du port ===
+    STATE["tracker"] = load_tracker()
+    STATE["keys"] = load_json(KEYS_DB)
+    STATE["users"] = load_json(USERS_DB)
+    STATE["ready"] = True
+    print("✅ Bot prêt.")
+
+    # === ÉTAPE 2 : Démarrage immédiat Telegram + scheduler ===
     scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(daily_broadcast, CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ),
                       id="daily_broadcast", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(settle_coupons, CronTrigger(hour=10, minute=0, timezone=TZ),
                       id="settle_coupons", replace_existing=True, max_instances=1, coalesce=True)
     scheduler.start()
+
     bot_task = asyncio.create_task(dp.start_polling(bot))
-    asyncio.create_task(startup_scan_and_notify())
+    print("✅ Bot Telegram démarré.")
+
+    # === ÉTAPE 3 : Dixon-Coles + premier scan EN ARRIÈRE-PLAN ===
+    async def background_bootstrap():
+        try:
+            if download_and_train:
+                print("🧠 Entraînement Dixon-Coles en cours (peut prendre 60s)...")
+                STATE["dixon_model"] = await download_and_train()
+                if STATE["dixon_model"]:
+                    print(f"✅ Dixon-Coles actif ({len(STATE['dixon_model'].teams)} équipes)")
+                else:
+                    print("⚠️ Dixon-Coles indisponible — le bot utilisera Gemini seul.")
+            else:
+                print("⚠️ Module Dixon-Coles non importé.")
+
+            await asyncio.sleep(5)
+            if NOTIFY_ON_STARTUP:
+                for chat_id in TARGETS:
+                    await safe_send(chat_id, f"{format_header()}\n\n⏳ <b>Bot démarré, analyse en cours...</b>")
+            await scan()
+            record_coupons(STATE["coupons"], datetime.now(TZ).strftime("%Y-%m-%d"))
+            await broadcast_after_scan()
+        except Exception as e:
+            print(f"⚠️ background_bootstrap crash: {e}")
+
+    asyncio.create_task(background_bootstrap())
+
     yield
+
     scheduler.shutdown(wait=False)
     bot_task.cancel()
     try:
