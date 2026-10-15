@@ -28,7 +28,6 @@ except Exception as e:
     predict_match_probas = None
     print(f"❌ Import gemini_predictor: {e}")
 
-# === API-Football DÉSACTIVÉ (comptes suspendus) ===
 try:
     from football_data import get_fixture_result
 except Exception as e:
@@ -44,6 +43,12 @@ try:
 except Exception as e:
     enrich_match_with_bzzoiro = None
     print(f"❌ Import bzzoiro_data: {e}")
+
+try:
+    from bzzoiro_predictions import get_bzzoiro_best_matches
+except Exception as e:
+    get_bzzoiro_best_matches = None
+    print(f"❌ Import bzzoiro_predictions: {e}")
 
 try:
     from dixon_coles import download_and_train
@@ -87,6 +92,8 @@ MIN_PROB = float(os.getenv("MIN_PROB", "0.70"))
 MIN_ODD = float(os.getenv("MIN_ODD", "1.45"))
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
 MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "15"))
+BZZ_MIN_CONFIDENCE = float(os.getenv("BZZ_MIN_CONFIDENCE", "60.0"))
+BZZ_MAX_MATCHES = int(os.getenv("BZZ_MAX_MATCHES", "15"))
 
 SAFE_MIN_ODDS = 2.0
 SAFE_MAX_ODDS = 2.5
@@ -106,25 +113,18 @@ if not ADMIN_ID:
 TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-# === 21 LIGUES ===
 SOCCER_KEYS = [
-    # === TOP 5 EUROPÉENS ===
     "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
     "soccer_germany_bundesliga", "soccer_france_ligue_one",
-    # === COUPES EUROPÉENNES ===
     "soccer_uefa_champs_league", "soccer_uefa_europa_league",
     "soccer_uefa_europa_conference_league",
-    # === CHAMPIONNATS SECONDAIRES EUROPE ===
     "soccer_efl_champ", "soccer_netherlands_eredivisie",
     "soccer_portugal_primeira_liga", "soccer_belgium_first_div",
     "soccer_turkey_super_league", "soccer_greece_super_league",
     "soccer_scotland_premiership",
-    # === AMÉRIQUE DU SUD ===
     "soccer_brazil_campeonato", "soccer_argentina_primera_division",
     "soccer_chile_campeonato", "soccer_colombia_primera_a",
-    # === AMÉRIQUE DU NORD ===
     "soccer_usa_mls", "soccer_mexico_ligamx",
-    # === ASIE ===
     "soccer_japan_j_league",
 ]
 
@@ -188,6 +188,11 @@ def calculate_match_score(fx: dict) -> float:
         except Exception:
             fx["dixon_available"] = False
 
+    # Bonus massif si Bzzoiro a confiance
+    bzz_conf = fx.get("bzz_confidence", 0)
+    if bzz_conf > 0:
+        score += bzz_conf * 0.3  # Ex: 80 conf → +24 pts
+
     return score
 
 
@@ -202,19 +207,22 @@ def filter_and_rank_matches(matches: list[dict]) -> list[dict]:
     print(f"🎯 Matchs qualifiés : {len(scored)}/{len(matches)} (seuil {MIN_MATCH_SCORE})")
     for fx in scored[:10]:
         dixon_tag = "✅D" if fx.get("dixon_available") else "  "
-        print(f"  ⭐ [{fx['_score']:.1f}] {dixon_tag} {fx.get('league','')[:30]} | {fx['home']} vs {fx['away']}")
+        bzz_tag = f"🔮{fx.get('bzz_confidence', 0):.0f}" if fx.get("bzz_confidence") else "  "
+        print(f"  ⭐ [{fx['_score']:.1f}] {dixon_tag} {bzz_tag} {fx.get('league','')[:25]} | {fx['home']} vs {fx['away']}")
     return scored
 
 
 # =========================================================
-# FUSION GEMINI × DIXON-COLES
+# FUSION À 3 MOTEURS
 # =========================================================
-W_GEMINI = 0.55
-W_DIXON = 0.45
+W_GEMINI = 0.35
+W_DIXON = 0.25
+W_BZZOIRO = 0.40
 
 
-def combine_gemini_dixon(gemini_markets: dict, dixon_pred: Optional[dict]) -> dict:
+def combine_three_sources(gemini_markets: dict, dixon_pred: Optional[dict], bzz_markets: dict) -> dict:
     result = {}
+
     g = {}
     for k in ["victoire_home", "match_nul", "victoire_away",
               "over_2.5", "under_2.5", "btts_yes", "btts_no"]:
@@ -224,9 +232,9 @@ def combine_gemini_dixon(gemini_markets: dict, dixon_pred: Optional[dict]) -> di
                 g[k] = max(0.0, min(1.0, float(v) / 100.0))
             except (ValueError, TypeError):
                 pass
-    if not dixon_pred:
-        result.update(g)
-    else:
+
+    d = {}
+    if dixon_pred:
         d = {
             "victoire_home": dixon_pred.get("p_home", 0),
             "match_nul": dixon_pred.get("p_draw", 0),
@@ -236,23 +244,45 @@ def combine_gemini_dixon(gemini_markets: dict, dixon_pred: Optional[dict]) -> di
             "btts_yes": dixon_pred.get("btts_yes", 0),
             "btts_no": dixon_pred.get("btts_no", 0),
         }
-        for k in g:
-            if k in d:
-                result[k] = W_GEMINI * g[k] + W_DIXON * d[k]
-            else:
-                result[k] = g[k]
+
+    b = {}
+    if bzz_markets:
+        for k in ["victoire_home", "match_nul", "victoire_away",
+                  "over_2.5", "under_2.5", "btts_yes", "btts_no"]:
+            v = bzz_markets.get(k)
+            if v is not None:
+                try:
+                    b[k] = max(0.0, min(1.0, float(v) / 100.0))
+                except (ValueError, TypeError):
+                    pass
+
+    all_keys = set(g.keys()) | set(d.keys()) | set(b.keys())
+    for k in all_keys:
+        total_weight = 0.0
+        total_value = 0.0
+        if k in g:
+            total_value += W_GEMINI * g[k]
+            total_weight += W_GEMINI
+        if k in d and d[k] > 0:
+            total_value += W_DIXON * d[k]
+            total_weight += W_DIXON
+        if k in b:
+            total_value += W_BZZOIRO * b[k]
+            total_weight += W_BZZOIRO
+        if total_weight > 0:
+            result[k] = total_value / total_weight
+
     if "victoire_home" in result and "match_nul" in result:
         result["double_chance_1X"] = result["victoire_home"] + result["match_nul"]
     if "victoire_home" in result and "victoire_away" in result:
         result["double_chance_12"] = result["victoire_home"] + result["victoire_away"]
     if "match_nul" in result and "victoire_away" in result:
         result["double_chance_X2"] = result["match_nul"] + result["victoire_away"]
+
     return result
 
 
-def compute_agreement(gemini_markets: dict, dixon_pred: Optional[dict], market_key: str) -> tuple[str, float]:
-    if not dixon_pred:
-        return ("", 0.0)
+def compute_agreement_three(gemini_markets: dict, dixon_pred: Optional[dict], bzz_markets: dict, market_key: str) -> tuple[str, float]:
     map_g = {
         "victoire_home": "victoire_home", "match_nul": "match_nul", "victoire_away": "victoire_away",
         "over_2.5": "over_2.5", "under_2.5": "under_2.5",
@@ -263,22 +293,42 @@ def compute_agreement(gemini_markets: dict, dixon_pred: Optional[dict], market_k
         "over_2.5": "over_2.5", "under_2.5": "under_2.5",
         "btts_yes": "btts_yes", "btts_no": "btts_no",
     }
-    gk = map_g.get(market_key)
-    dk = map_d.get(market_key)
-    if not gk or not dk:
+
+    probs = {}
+
+    gv = gemini_markets.get(map_g.get(market_key, ""))
+    if gv is not None:
+        try:
+            probs["g"] = float(gv) / 100.0
+        except (ValueError, TypeError):
+            pass
+
+    if dixon_pred:
+        dk = map_d.get(market_key)
+        if dk:
+            dv = dixon_pred.get(dk, 0)
+            if dv > 0:
+                probs["d"] = dv
+
+    if bzz_markets:
+        bv = bzz_markets.get(market_key)
+        if bv is not None:
+            try:
+                probs["b"] = float(bv) / 100.0
+            except (ValueError, TypeError):
+                pass
+
+    if len(probs) < 2:
         return ("", 0.0)
-    gv = gemini_markets.get(gk)
-    if gv is None:
-        return ("", 0.0)
-    try:
-        g_prob = float(gv) / 100.0
-    except (ValueError, TypeError):
-        return ("", 0.0)
-    d_prob = dixon_pred.get(dk, 0)
-    delta = abs(g_prob - d_prob)
+
+    values = list(probs.values())
+    delta = max(values) - min(values)
+
+    if len(probs) == 3 and delta <= 0.10:
+        return ("🤝🤝", delta)
     if delta <= 0.10:
         return ("🤝", delta)
-    elif delta >= 0.15:
+    if delta >= 0.15:
         return ("⚠️", delta)
     return ("", delta)
 
@@ -308,8 +358,10 @@ class Selection:
     has_context: bool = False
     prob_gemini: float = 0.0
     prob_dixon: float = 0.0
+    prob_bzzoiro: float = 0.0
     agreement_emoji: str = ""
     agreement_delta: float = 0.0
+    bzz_confidence: float = 0.0
 
     def final_prob(self) -> float:
         return self.model_prob
@@ -680,7 +732,7 @@ def build_matches_from_odds(odds_events: list[dict]) -> list[dict]:
 
 
 # =========================================================
-# ENRICHISSEMENT (Bzzoiro SEUL - OPTIONNEL)
+# ENRICHISSEMENT (Bzzoiro)
 # =========================================================
 async def enrich_matches(matches: list[dict]) -> dict:
     to_enrich = matches[:MAX_MATCHES_TO_ENRICH]
@@ -705,7 +757,7 @@ async def enrich_matches(matches: list[dict]) -> dict:
                 h2h_total = ctx.get("h2h", {}).get("total_matches", 0)
                 print(f"  ✅ {home} vs {away} — Bzzoiro • H2H:{h2h_total}")
             else:
-                print(f"  ⚠️ {home} vs {away} : pas d'enrichissement (optionnel)")
+                print(f"  ⚠️ {home} vs {away} : pas d'enrichissement")
 
             await asyncio.sleep(0.3)
         except Exception as e:
@@ -721,7 +773,7 @@ async def build_gemini_picks(matches, used_today, contexts=None):
     selections: list[Selection] = []
     seen = set()
     stats = {"ok": 0, "fail": 0, "kept": 0, "with_ctx": 0, "without_ctx": 0,
-             "rejected_low_prob": 0}
+             "rejected_low_prob": 0, "triple_consensus": 0, "double_consensus": 0}
     if not predict_match_probas:
         print("❌ predict_match_probas non disponible")
         return selections
@@ -737,7 +789,6 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                 if event_id in used_today:
                     continue
 
-                # === CONTEXTE OPTIONNEL ===
                 ctx = contexts.get(event_id)
                 has_ctx = ctx is not None and ctx.get("available", False)
                 if has_ctx:
@@ -785,7 +836,10 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     except Exception as e:
                         print(f"  ⚠️ Dixon crash {home}-{away}: {e}")
 
-                combined_probs = combine_gemini_dixon(gemini_markets, dixon_pred)
+                bzz_markets = fx.get("bzz_markets", {})
+                bzz_conf = fx.get("bzz_confidence", 0)
+
+                combined_probs = combine_three_sources(gemini_markets, dixon_pred, bzz_markets)
                 real_odds = fx.get("real_odds", {})
 
                 market_map = {
@@ -854,7 +908,20 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                         dk = dk_map.get(key)
                         if dk:
                             prob_dixon = dixon_pred.get(dk, 0.0)
-                    agr_emoji, agr_delta = compute_agreement(gemini_markets, dixon_pred, key)
+                    prob_bzzoiro = 0.0
+                    if bzz_markets:
+                        bv = bzz_markets.get(key)
+                        if bv is not None:
+                            try:
+                                prob_bzzoiro = float(bv) / 100.0
+                            except (ValueError, TypeError):
+                                pass
+
+                    agr_emoji, agr_delta = compute_agreement_three(gemini_markets, dixon_pred, bzz_markets, key)
+                    if agr_emoji == "🤝🤝":
+                        stats["triple_consensus"] += 1
+                    elif agr_emoji == "🤝":
+                        stats["double_consensus"] += 1
 
                     score = prob
                     if real_odd:
@@ -864,19 +931,24 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     if edge > 0.05:
                         score += 0.4
 
-                    if agr_emoji == "🤝":
+                    if agr_emoji == "🤝🤝":
+                        score += 1.2
+                    elif agr_emoji == "🤝":
                         score += 0.8
                     elif agr_emoji == "⚠️":
                         score -= 0.6
                     elif prob_dixon > 0:
                         score += 0.4
-                    elif prob_dixon == 0 and prob_gemini > 0:
-                        score -= 0.3
+
+                    # Bonus Bzzoiro confidence
+                    if bzz_conf > 0:
+                        score += bzz_conf * 0.005  # 80 conf → +0.4
 
                     candidates.append({
                         "score": score, "label": label, "mkt": mkt,
                         "used_odd": used_odd, "real_odd": real_odd, "prob": prob,
                         "edge": edge, "prob_gemini": prob_gemini, "prob_dixon": prob_dixon,
+                        "prob_bzzoiro": prob_bzzoiro,
                         "agr_emoji": agr_emoji, "agr_delta": agr_delta,
                     })
 
@@ -892,7 +964,7 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                             kickoff=kickoff, market=c["mkt"], pick_label=c["label"],
                             odds=round(c["used_odd"], 2), model_prob=round(c["prob"], 4),
                             edge=round(c["edge"], 4),
-                            bookmaker="The Odds API" if c["real_odd"] else "Gemini+Dixon",
+                            bookmaker="The Odds API" if c["real_odd"] else "Triple Fusion",
                             real_odd=c["real_odd"],
                             analysis=analysis,
                             advice=advice,
@@ -901,17 +973,19 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                             has_context=has_ctx,
                             prob_gemini=round(c["prob_gemini"], 4),
                             prob_dixon=round(c["prob_dixon"], 4),
+                            prob_bzzoiro=round(c["prob_bzzoiro"], 4),
                             agreement_emoji=c["agr_emoji"],
                             agreement_delta=round(c["agr_delta"], 4),
+                            bzz_confidence=bzz_conf,
                         ))
                         stats["kept"] += 1
 
                 await asyncio.sleep(2.5)
             except Exception as e:
                 print(f"⚠️ build_gemini_picks: {e}")
-    print(f"🏠 Picks : ok={stats['ok']} échec={stats['fail']} "
-          f"gardés={stats['kept']} avec_ctx={stats['with_ctx']} "
-          f"sans_ctx={stats['without_ctx']} rejetés_proba={stats['rejected_low_prob']}")
+    print(f"🏠 Picks : ok={stats['ok']} gardés={stats['kept']} "
+          f"avec_ctx={stats['with_ctx']} rejetés_proba={stats['rejected_low_prob']} "
+          f"triple_consensus={stats['triple_consensus']} double_consensus={stats['double_consensus']}")
     return selections
 
 
@@ -997,18 +1071,20 @@ def build_value_list(selections, top_n=20, globally_used=None):
 
     def value_score(s):
         score = s.final_prob()
-        if s.agreement_emoji == "🤝":
+        if s.agreement_emoji == "🤝🤝":
+            score += 0.30
+        elif s.agreement_emoji == "🤝":
             score += 0.20
         elif s.prob_dixon > 0:
             score += 0.10
-        elif s.prob_dixon == 0 and s.prob_gemini > 0:
-            score -= 0.15
         if s.edge > 0.05:
             score += 0.05
         if s.edge > 0.10:
             score += 0.05
         if s.has_context:
             score += 0.05
+        if s.bzz_confidence > 0:
+            score += s.bzz_confidence * 0.002
         return score
 
     pool.sort(key=value_score, reverse=True)
@@ -1031,7 +1107,7 @@ def build_value_list(selections, top_n=20, globally_used=None):
     for s in top_list:
         globally_used.add(s.event_id)
     return Coupon(
-        "Ticket Value", f"Top {len(top_list)} pronostics (fiabilité)",
+        "Ticket Value", f"Top {len(top_list)} pronostics (triple fusion)",
         "💎", top_list,
         round(combined_odds, 2), round(combined_prob, 4),
         is_list=True,
@@ -1045,7 +1121,7 @@ def build_all_coupons(selections):
                  if s.final_prob() >= 0.70
                  and s.market in ("1X2", "Double Chance", "Over/Under", "BTTS")]
     c = build_coupon_target(
-        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Proba > 70%",
+        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Triple fusion > 70%",
         "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 6, used,
         min_leg_odds=1.35, strict=True,
     )
@@ -1055,7 +1131,7 @@ def build_all_coupons(selections):
                 if s.final_prob() >= 0.70
                 and s.market not in ("Corners", "Cartons")]
     c = build_coupon_target(
-        "Ticket Équilibré", "Cote 2.5 - 5.0 • Proba > 70%",
+        "Ticket Équilibré", "Cote 2.5 - 5.0 • Triple fusion > 70%",
         "⚖️", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
         min_leg_odds=BAL_MIN_LEG_ODDS, strict=False,
     )
@@ -1089,19 +1165,34 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False):
             day_tag = "📍 <b>Aujourd'hui</b> "
         elif dt.date() == today + timedelta(days=1):
             day_tag = "📅 <b>Demain</b> "
+
     prob_pct = s.final_prob() * 100
-    ctx_badge = " ✅ <i>H2H réel</i>" if s.has_context else ""
-    agreement = f" {s.agreement_emoji}" if s.agreement_emoji else ""
+    ctx_badge = " ✅ <i>H2H</i>" if s.has_context else ""
+
+    if s.agreement_emoji == "🤝🤝":
+        agreement = " 🤝🤝 <b>TRIPLE CONSENSUS</b>"
+    elif s.agreement_emoji == "🤝":
+        agreement = " 🤝 <b>consensus</b>"
+    elif s.agreement_emoji == "⚠️":
+        agreement = " ⚠️"
+    else:
+        agreement = ""
+
+    bzz_badge = ""
+    if s.bzz_confidence > 0:
+        bzz_badge = f" 🔮{s.bzz_confidence:.0f}"
+
     lines = [
         f"<b>┌─ #{idx} {s.home} vs {s.away}</b>",
         f"│ {day_tag}🕐 <b>{kickoff_local(s.kickoff)}</b> • {s.league}",
         f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>",
-        f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}{ctx_badge}{agreement}",
+        f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}{ctx_badge}{bzz_badge}{agreement}",
     ]
-    if s.prob_dixon > 0 or s.prob_gemini > 0:
+    if s.prob_gemini > 0 or s.prob_dixon > 0 or s.prob_bzzoiro > 0:
         g_pct = s.prob_gemini * 100
         d_pct = s.prob_dixon * 100
-        lines.append(f"│    <i>G:{g_pct:.0f}% × D:{d_pct:.0f}%</i>")
+        b_pct = s.prob_bzzoiro * 100
+        lines.append(f"│    <i>G:{g_pct:.0f}% × D:{d_pct:.0f}% × B:{b_pct:.0f}%</i>")
     if s.real_odd:
         lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b> <i>(réelle)</i>")
     else:
@@ -1141,7 +1232,7 @@ def format_coupon(c: Coupon) -> str:
             format_header(), "",
             f"<b>{c.emoji} {c.name.upper()}</b>",
             f"<i>{c.subtitle}</i>", "",
-            f"<b>🎯 {len(c.legs)} pronostics classés par fiabilité</b>",
+            f"<b>🎯 {len(c.legs)} pronostics (triple fusion)</b>",
             "",
         ]
         for i, s in enumerate(c.legs, 1):
@@ -1172,7 +1263,7 @@ def format_coupon(c: Coupon) -> str:
 def format_coupons_ready():
     if not STATE["coupons"]:
         return (f"{format_header()}\n\n<b>📭 Aucun coupon aujourd'hui</b>\n"
-                f"<i>Pas assez de paris qualifiés (proba > 70%).</i>")
+                f"<i>Pas assez de paris qualifiés.</i>")
     lignes = []
     for c in STATE["coupons"]:
         n = len(c.legs)
@@ -1381,7 +1472,7 @@ async def debug_cmd(message: Message):
         f"Bzzoiro : <b>{bzz_status}</b>\n"
         f"Ligues scannées : <b>{len(SOCCER_KEYS)}</b>\n"
         f"Events Odds API : <b>{d.get('odds_events', 0)}</b>\n"
-        f"Matchs construits : <b>{d.get('matched', 0)}</b>\n"
+        f"Après Bzzoiro : <b>{d.get('matched', 0)}</b>\n"
         f"Contextes Bzzoiro : <b>{d.get('enriched', 0)}</b>\n"
         f"Sélections : <b>{d.get('selections', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>"
@@ -1454,22 +1545,51 @@ async def btn_debug(message: Message):
 
 
 # =========================================================
-# SCAN
+# SCAN (avec Bzzoiro comme filtre principal)
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
+        # === ÉTAPE 1 : Récupérer tous les matchs via The Odds API ===
         odds_events = await fetch_all_odds_events()
         matches = build_matches_from_odds(odds_events)
+        print(f"📅 Matchs bruts (Odds API) : {len(matches)}")
 
-        print(f"📅 Matchs aujourd'hui : {len(matches)}")
+        if not matches:
+            print("⚠️ Aucun match trouvé")
+            STATE["coupons"] = []
+            STATE["selections"] = []
+            return
+
+        # === ÉTAPE 2 : Bzzoiro sélectionne les MEILLEURS matchs ===
+        if get_bzzoiro_best_matches and BZZOIRO_API_KEY:
+            try:
+                matches = await get_bzzoiro_best_matches(matches, min_confidence=BZZ_MIN_CONFIDENCE)
+                matches = matches[:BZZ_MAX_MATCHES]
+                print(f"🔮 Après filtre Bzzoiro : {len(matches)} matchs retenus")
+            except Exception as e:
+                print(f"⚠️ Bzzoiro best_matches crash: {e}")
+                matches = matches[:MAX_MATCHES_TO_ANALYZE]
+        else:
+            print("⚠️ Bzzoiro désactivé — analyse de tous les matchs")
+            matches = matches[:MAX_MATCHES_TO_ANALYZE]
+
+        if not matches:
+            print("📭 Aucun match qualifié par Bzzoiro aujourd'hui")
+            STATE["coupons"] = []
+            STATE["selections"] = []
+            return
+
+        # === ÉTAPE 3 : Tri final ===
         matches = filter_and_rank_matches(matches)
 
+        # === ÉTAPE 4 : Enrichissement Bzzoiro (H2H) ===
         contexts = {}
         try:
             contexts = await enrich_matches(matches)
         except Exception as e:
-            print(f"⚠️ Enrichissement Bzzoiro désactivé : {e}")
+            print(f"⚠️ Enrichissement désactivé : {e}")
 
+        # === ÉTAPE 5 : Analyse Gemini + Dixon + Bzzoiro (triple fusion) ===
         used_today = load_used_today()
         selections = await build_gemini_picks(matches, used_today, contexts)
         print(f"🎯 Sélections : {len(selections)}")
@@ -1496,7 +1616,7 @@ async def scan():
 
         print("──────── RÉSUMÉ ────────")
         print(f"Odds events   : {len(odds_events)}")
-        print(f"Matchs croisés: {len(matches)}")
+        print(f"Après Bzzoiro : {len(matches)}")
         print(f"Contextes     : {len(contexts)}")
         print(f"Sélections    : {len(selections)}")
         print(f"Avec contexte : {with_ctx}")
