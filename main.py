@@ -88,8 +88,10 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • H2H + Gemini")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-MIN_PROB = float(os.getenv("MIN_PROB", "0.67"))
-MIN_ODD = float(os.getenv("MIN_ODD", "1.45"))
+# === CONFIG FINALE ===
+MIN_PROB = float(os.getenv("MIN_PROB", "0.60"))       # Plus bas pour trouver plus de matchs
+MIN_ODD = float(os.getenv("MIN_ODD", "1.55"))         # Cote minimum rentable
+MAX_PROB = float(os.getenv("MAX_PROB", "0.75"))       # Plafond : rejeter les gros favoris
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
 MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "15"))
 
@@ -100,9 +102,9 @@ SAFE_MIN_ODDS = 2.0
 SAFE_MAX_ODDS = 2.5
 BAL_MIN_ODDS = 2.5
 BAL_MAX_ODDS = 5.0
-BAL_MIN_LEG_ODDS = 1.10  # ← CORRECTION : 1.35 → 1.10
-SAFE_MIN_LEG_ODDS = 1.10  # ← CORRECTION : 1.35 → 1.10
-VALUE_TOP_N = 20
+BAL_MIN_LEG_ODDS = 1.55     # Aligné avec MIN_ODD
+SAFE_MIN_LEG_ODDS = 1.55    # Aligné avec MIN_ODD
+VALUE_TOP_N = 7
 TELEGRAM_MAX_LEN = 3800
 
 if not BOT_TOKEN:
@@ -774,7 +776,8 @@ async def build_gemini_picks(matches, used_today, contexts=None):
     selections: list[Selection] = []
     seen = set()
     stats = {"ok": 0, "fail": 0, "kept": 0, "with_ctx": 0, "without_ctx": 0,
-             "rejected_low_prob": 0, "rejected_low_odd": 0,
+             "rejected_low_prob": 0, "rejected_high_prob": 0, "rejected_low_odd": 0,
+             "rejected_no_value": 0, "rejected_dc_favorite": 0,
              "triple_consensus": 0, "double_consensus": 0}
     if not predict_match_probas:
         print("❌ predict_match_probas non disponible")
@@ -863,11 +866,28 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     prob = combined_probs.get(key)
                     if prob is None:
                         continue
+
+                    # === FILTRE 1 : proba basse (edge brut) ===
                     if prob < MIN_PROB:
                         stats["rejected_low_prob"] += 1
                         continue
-                    if prob > 0.90:
+
+                    # === FILTRE 2 : plafond proba (anti-gros favori) ===
+                    if prob > MAX_PROB:
+                        stats["rejected_high_prob"] += 1
                         continue
+
+                    # === FILTRE 3 : Anti DC sur gros favoris ===
+                    if mkt == "Double Chance":
+                        if "1X" in label and prob > 0.85:
+                            stats["rejected_dc_favorite"] += 1
+                            continue
+                        if "X2" in label and prob > 0.85:
+                            stats["rejected_dc_favorite"] += 1
+                            continue
+                        if "12" in label and prob > 0.90:
+                            stats["rejected_dc_favorite"] += 1
+                            continue
 
                     real_odd = None
                     if mkt == "1X2":
@@ -890,13 +910,19 @@ async def build_gemini_picks(matches, used_today, contexts=None):
 
                     used_odd = real_odd if real_odd else 1.0 / prob
 
-                    if real_odd and used_odd < MIN_ODD:
+                    # === FILTRE 4 : MIN_ODD strict 1.55 ===
+                    if used_odd < MIN_ODD:
                         stats["rejected_low_odd"] += 1
                         continue
 
                     edge = 0.0
                     if real_odd and real_odd > 1.01:
                         edge = (prob * real_odd) - 1.0
+
+                    # === FILTRE 5 : rejeter les cotes réelles à edge négatif ===
+                    if real_odd and edge < 0:
+                        stats["rejected_no_value"] += 1
+                        continue
 
                     pg_raw = gemini_markets.get(key)
                     try:
@@ -928,13 +954,24 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     elif agr_emoji == "🤝":
                         stats["double_consensus"] += 1
 
+                    # === SCORE BASÉ SUR VALUE (EDGE) ===
                     score = prob
                     if real_odd:
                         score += 0.5
                     if has_ctx:
                         score += 0.3
-                    if edge > 0.05:
-                        score += 0.4
+
+                    # Bonus MASSIF aux paris à value
+                    if edge > 0.10:
+                        score += 1.0
+                    elif edge > 0.05:
+                        score += 0.6
+                    elif edge > 0.02:
+                        score += 0.3
+                    elif edge > 0:
+                        score += 0.1
+                    else:
+                        score -= 0.5
 
                     if agr_emoji == "🤝🤝":
                         score += 1.2
@@ -988,9 +1025,10 @@ async def build_gemini_picks(matches, used_today, contexts=None):
             except Exception as e:
                 print(f"⚠️ build_gemini_picks: {e}")
     print(f"🏠 Picks : ok={stats['ok']} gardés={stats['kept']} "
-          f"avec_ctx={stats['with_ctx']} rejetés_proba={stats['rejected_low_prob']} "
-          f"rejetés_cote={stats['rejected_low_odd']} "
-          f"triple_consensus={stats['triple_consensus']} double_consensus={stats['double_consensus']}")
+          f"proba_basse={stats['rejected_low_prob']} proba_haute={stats['rejected_high_prob']} "
+          f"cote_basse={stats['rejected_low_odd']} dc_favori={stats['rejected_dc_favorite']} "
+          f"no_value={stats['rejected_no_value']} "
+          f"triple={stats['triple_consensus']} double={stats['double_consensus']}")
     return selections
 
 
@@ -1066,7 +1104,7 @@ def build_coupon_target(name, subtitle, emoji, pool, target_min, target_max,
                   round(combined_odds, 2), round(combined_prob, 4))
 
 
-def build_value_list(selections, top_n=20, globally_used=None):
+def build_value_list(selections, top_n=7, globally_used=None):
     if globally_used is None:
         globally_used = set()
     pool = [s for s in selections
@@ -1076,16 +1114,16 @@ def build_value_list(selections, top_n=20, globally_used=None):
 
     def value_score(s):
         score = s.final_prob()
+        if s.edge > 0.10:
+            score += 0.30
+        elif s.edge > 0.05:
+            score += 0.20
+        elif s.edge > 0.02:
+            score += 0.10
         if s.agreement_emoji == "🤝🤝":
             score += 0.30
         elif s.agreement_emoji == "🤝":
             score += 0.20
-        elif s.prob_dixon > 0:
-            score += 0.10
-        if s.edge > 0.05:
-            score += 0.05
-        if s.edge > 0.10:
-            score += 0.05
         if s.has_context:
             score += 0.05
         if s.bzz_confidence > 0:
@@ -1112,7 +1150,7 @@ def build_value_list(selections, top_n=20, globally_used=None):
     for s in top_list:
         globally_used.add(s.event_id)
     return Coupon(
-        "Ticket Value", f"Top {len(top_list)} pronostics (triple fusion)",
+        "Ticket Value", f"Top {len(top_list)} pronostics (fiabilité)",
         "💎", top_list,
         round(combined_odds, 2), round(combined_prob, 4),
         is_list=True,
@@ -1123,20 +1161,20 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
     pool_safe = [s for s in selections
-                 if s.final_prob() >= 0.67
+                 if s.final_prob() >= 0.60
                  and s.market in ("1X2", "Double Chance", "Over/Under", "BTTS")]
     c = build_coupon_target(
-        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Triple fusion > 67%",
+        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Filtre value stricte",
         "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 6, used,
         min_leg_odds=SAFE_MIN_LEG_ODDS, strict=True,
     )
     if c:
         coupons.append(c)
     pool_bal = [s for s in selections
-                if s.final_prob() >= 0.67
+                if s.final_prob() >= 0.60
                 and s.market not in ("Corners", "Cartons")]
     c = build_coupon_target(
-        "Ticket Équilibré", "Cote 2.5 - 5.0 • Triple fusion > 67%",
+        "Ticket Équilibré", "Cote 2.5 - 5.0 • Filtre value",
         "⚖️", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
         min_leg_odds=BAL_MIN_LEG_ODDS, strict=False,
     )
@@ -1237,7 +1275,7 @@ def format_coupon(c: Coupon) -> str:
             format_header(), "",
             f"<b>{c.emoji} {c.name.upper()}</b>",
             f"<i>{c.subtitle}</i>", "",
-            f"<b>🎯 {len(c.legs)} pronostics (triple fusion)</b>",
+            f"<b>🎯 {len(c.legs)} pronostics (value stricte)</b>",
             "",
         ]
         for i, s in enumerate(c.legs, 1):
@@ -1268,7 +1306,7 @@ def format_coupon(c: Coupon) -> str:
 def format_coupons_ready():
     if not STATE["coupons"]:
         return (f"{format_header()}\n\n<b>📭 Aucun coupon aujourd'hui</b>\n"
-                f"<i>Pas assez de paris qualifiés.</i>")
+                f"<i>Pas assez de paris à value positive.</i>")
     lignes = []
     for c in STATE["coupons"]:
         n = len(c.legs)
