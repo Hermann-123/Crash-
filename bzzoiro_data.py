@@ -1,13 +1,15 @@
 """
-Récupération et filtrage des prédictions Bzzoiro.
-Bzzoiro = filtre principal qui sélectionne les meilleurs matchs.
+Module Bzzoiro Sports Data — H2H + Prédictions ML + Forme.
+Free tier illimité.
+Version corrigée avec matching ultra-robuste.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
@@ -15,7 +17,21 @@ import httpx
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
 BZZOIRO_BASE = "https://sports.bzzoiro.com/api/v2"
 
-_PRED_CACHE: dict = {}
+_CACHE: dict = {}
+
+
+# =========================================================
+# MOTS À IGNORER
+# =========================================================
+IGNORE_WORDS = {
+    "fc", "cf", "sc", "ac", "afc", "as", "ss", "ssc", "rc", "cd", "fk",
+    "sk", "jk", "sd", "ud", "ca", "cs", "us", "sv", "bv", "bsc", "fsv",
+    "vfb", "vfl", "tsg", "spvgg", "kfc", "krc", "kv", "kaa", "vv", "cfc",
+    "if", "bk", "ff", "ik",
+    "stade", "olympique", "sporting", "sport", "club", "de", "of",
+    "the", "and", "of",
+    "united", "utd", "city", "town", "albion", "rovers", "wanderers",
+}
 
 
 def _headers() -> dict:
@@ -23,198 +39,220 @@ def _headers() -> dict:
 
 
 def _norm(s: str) -> str:
+    """Normalisation avancée des noms d'équipes."""
     if not s:
         return ""
     s = str(s).lower().strip()
     s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    for sfx in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
-        s = s.replace(sfx, "")
-    s = re.sub(r"[^a-z0-9 ]", "", s)
-    return re.sub(r"\s+", " ", s).strip()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    words = s.split()
+    filtered = [w for w in words if w not in IGNORE_WORDS and len(w) > 1]
+    if not filtered:
+        return " ".join(words).strip()
+    return " ".join(filtered).strip()
+
+
+def _similarity_score(name_a: str, name_b: str) -> float:
+    """Score de similarité 0.0 à 1.0."""
+    a = _norm(name_a)
+    b = _norm(name_b)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if a in b or b in a:
+        shorter = min(len(a), len(b))
+        longer = max(len(a), len(b))
+        ratio = shorter / longer if longer > 0 else 0
+        return 0.70 + 0.25 * ratio
+    tokens_a = set(a.split())
+    tokens_b = set(b.split())
+    if not tokens_a or not tokens_b:
+        return 0.0
+    inter = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    jaccard = len(inter) / len(union) if union else 0.0
+    first_a = a.split()[0] if a.split() else ""
+    first_b = b.split()[0] if b.split() else ""
+    first_match = 0.20 if (first_a and first_a == first_b) else 0.0
+    return min(1.0, jaccard * 0.75 + first_match)
 
 
 async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
     try:
         r = await client.get(f"{BZZOIRO_BASE}{path}", headers=_headers(), params=params, timeout=15.0)
         if r.status_code >= 400:
-            print(f"⚠️ Bzzoiro pred {path} -> {r.status_code}")
+            print(f"⚠️ Bzzoiro {path} -> {r.status_code}")
             return {}
         return r.json()
     except Exception as e:
-        print(f"⚠️ Bzzoiro pred {path} crash: {e}")
+        print(f"⚠️ Bzzoiro {path} crash: {e}")
         return {}
 
 
-def extract_bzzoiro_markets(pred: dict) -> dict:
-    """Extrait les probas Bzzoiro au format Gemini (%)."""
-    if not pred:
-        return {}
-
-    result = {}
-    p = pred.get("predictions", pred) or {}
-
-    key_map = {
-        "home_win": "victoire_home",
-        "draw": "match_nul",
-        "away_win": "victoire_away",
-        "over_2.5": "over_2.5",
-        "over_2_5": "over_2.5",
-        "under_2.5": "under_2.5",
-        "under_2_5": "under_2.5",
-        "btts_yes": "btts_yes",
-        "btts_no": "btts_no",
-        "home_win_probability": "victoire_home",
-        "draw_probability": "match_nul",
-        "away_win_probability": "victoire_away",
-        "over_2_5_probability": "over_2.5",
-        "under_2_5_probability": "under_2.5",
-        "btts_probability": "btts_yes",
-        "prob_home": "victoire_home",
-        "prob_draw": "match_nul",
-        "prob_away": "victoire_away",
-        "prob_over_25": "over_2.5",
-        "prob_under_25": "under_2.5",
-        "prob_btts": "btts_yes",
-        "p_home": "victoire_home",
-        "p_draw": "match_nul",
-        "p_away": "victoire_away",
-    }
-
-    for bzz_key, gemini_key in key_map.items():
-        v = p.get(bzz_key)
-        if v is None:
-            continue
+# =========================================================
+# TEST CONNEXION
+# =========================================================
+async def test_connection() -> bool:
+    """Teste si la clé Bzzoiro fonctionne."""
+    if not BZZOIRO_API_KEY:
+        return False
+    async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            fv = float(v)
-            if 0 <= fv <= 1:
-                fv = fv * 100
-            if 0 < fv < 100:
-                result[gemini_key] = round(fv, 1)
-        except (ValueError, TypeError):
-            pass
+            r = await client.get(f"{BZZOIRO_BASE}/events/", headers=_headers(),
+                                  params={"limit": "1"}, timeout=10.0)
+            print(f"🔑 Bzzoiro test -> {r.status_code}")
+            return r.status_code == 200
+        except Exception as e:
+            print(f"⚠️ Bzzoiro test crash: {e}")
+            return False
 
+
+# =========================================================
+# H2H
+# =========================================================
+async def get_h2h(client: httpx.AsyncClient, event_id: int) -> dict:
+    """Récupère le H2H d'un match."""
+    cache_key = f"h2h_{event_id}"
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
+
+    data = await _get(client, f"/events/{event_id}/h2h/")
+    if not data:
+        return {}
+
+    if isinstance(data, dict):
+        result = {
+            "total_matches": data.get("total_matches", len(data.get("matches", []))),
+            "home_wins": data.get("home_wins", data.get("team_a_wins", 0)),
+            "draws": data.get("draws", 0),
+            "away_wins": data.get("away_wins", data.get("team_b_wins", 0)),
+            "avg_total_goals": data.get("avg_total_goals", data.get("average_goals", 0)),
+            "recent_matches": data.get("matches", data.get("recent_matches", []))[:5],
+            "raw": data,
+        }
+    else:
+        result = {"raw": data}
+
+    _CACHE[cache_key] = result
     return result
 
 
-def compute_bzzoiro_confidence(pred: dict, markets: dict) -> float:
+# =========================================================
+# PRÉDICTIONS ML
+# =========================================================
+async def get_prediction(client: httpx.AsyncClient, event_id: int) -> dict:
+    """Récupère les prédictions ML CatBoost."""
+    cache_key = f"pred_{event_id}"
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
+
+    data = await _get(client, f"/events/{event_id}/prediction/")
+    if data:
+        _CACHE[cache_key] = data
+    return data if data else {}
+
+
+# =========================================================
+# ÉVÉNEMENTS (recherche par date)
+# =========================================================
+async def find_bzzoiro_event(client: httpx.AsyncClient, home: str, away: str,
+                                date_iso: str) -> Optional[dict]:
+    """Cherche un match par nom d'équipes + date."""
+    cache_key = f"event_{_norm(home)}_{_norm(away)}_{date_iso}"
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
+
+    data = await _get(client, "/events/", {
+        "date_from": date_iso,
+        "date_to": date_iso,
+        "limit": "300",
+    })
+    events = data.get("results", []) or data.get("data", []) or []
+
+    if not events:
+        _CACHE[cache_key] = None
+        return None
+
+    best_event = None
+    best_score = 0.0
+    THRESHOLD = 0.55
+
+    for ev in events:
+        h = ev.get("home_team", "") or ev.get("home", "") or ev.get("team_home", "")
+        a = ev.get("away_team", "") or ev.get("away", "") or ev.get("team_away", "")
+        if not h or not a:
+            continue
+
+        score_h = _similarity_score(home, h)
+        score_a = _similarity_score(away, a)
+        combined = min(score_h, score_a)
+        if score_h > 0.75 and score_a > 0.75:
+            combined += 0.15
+
+        if combined > best_score:
+            best_score = combined
+            best_event = ev
+
+    if best_event and best_score >= THRESHOLD:
+        _CACHE[cache_key] = best_event
+        return best_event
+
+    _CACHE[cache_key] = None
+    return None
+
+
+# =========================================================
+# ENRICHISSEMENT COMPLET
+# =========================================================
+async def enrich_match_with_bzzoiro(home: str, away: str,
+                                      date_iso: str) -> dict:
     """
-    Calcule un score de confiance Bzzoiro (0-100).
-    Basé sur :
-    - Confidence explicite du modèle
-    - Écart max entre les probas (favori clair = confiance)
-    - Nombre de marchés disponibles
-    """
-    confidence = 0.0
-
-    # 1. Confidence explicite
-    raw_conf = pred.get("confidence", 0)
-    try:
-        raw_conf = float(raw_conf)
-        if 0 <= raw_conf <= 1:
-            raw_conf = raw_conf * 100
-        confidence += min(raw_conf, 100) * 0.4
-    except (ValueError, TypeError):
-        pass
-
-    # 2. Écart entre les probas (favori clair = confiance élevée)
-    if "victoire_home" in markets and "victoire_away" in markets:
-        h = markets.get("victoire_home", 0)
-        a = markets.get("victoire_away", 0)
-        d = markets.get("match_nul", 0)
-        max_prob = max(h, a, d)
-        # Plus le favori est marqué, plus la confiance est haute
-        confidence += (max_prob - 33.3) * 0.6  # 33.3% = neutre
-
-    # 3. Bonus nombre de marchés
-    confidence += min(len(markets) * 3, 20)
-
-    return max(0.0, min(100.0, confidence))
-
-
-async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 60.0) -> list[dict]:
-    """
-    Récupère les prédictions Bzzoiro ET filtre les matchs où Bzzoiro a confiance.
-    
-    Retourne une liste de matchs enrichis avec :
-    - bzz_markets : dict des probas Bzzoiro
-    - bzz_confidence : score de confiance
-    - bzz_raw : données brutes
+    Cherche le match sur Bzzoiro, puis récupère H2H + prédictions.
+    Retourne un contexte compatible avec le format Gemini.
     """
     if not BZZOIRO_API_KEY:
-        print("⚠️ BZZOIRO_API_KEY manquante — Bzzoiro désactivé")
-        return []
+        return {"available": False}
 
-    # Grouper les matchs par date
-    dates_needed = set()
-    for m in matches:
-        k = m.get("kickoff", "")
-        try:
-            d = datetime.fromisoformat(k.replace("Z", "+00:00")).strftime("%Y-%m-%d")
-            dates_needed.add(d)
-        except Exception:
-            continue
-
-    if not dates_needed:
-        return []
-
-    print(f"🔮 Bzzoiro : scan sur {len(dates_needed)} date(s)...")
-    all_predictions = []
-    
     async with httpx.AsyncClient(timeout=20.0) as client:
-        for date_iso in dates_needed:
-            data = await _get(client, "/predictions/", {
-                "date_from": date_iso,
-                "date_to": date_iso,
-                "limit": "500",
-            })
-            predictions = data.get("results", []) or data.get("data", []) or []
-            print(f"🔮 Bzzoiro {date_iso} : {len(predictions)} prédictions brutes")
-            all_predictions.extend(predictions)
+        try:
+            # 1. Retrouver l'event
+            event = await find_bzzoiro_event(client, home, away, date_iso)
+            if not event:
+                return {"available": False}
 
-    if not all_predictions:
-        print("⚠️ Aucune prédiction Bzzoiro trouvée")
-        return []
+            event_id = event.get("id")
+            if not event_id:
+                return {"available": False}
 
-    # Mapper chaque match avec sa prédiction Bzzoiro
-    enriched_matches = []
-    for m in matches:
-        mh = _norm(m.get("home", ""))
-        ma = _norm(m.get("away", ""))
-        if not mh or not ma:
-            continue
+            # 2. Récupérer H2H + prédictions en parallèle
+            h2h, prediction = await asyncio.gather(
+                get_h2h(client, event_id),
+                get_prediction(client, event_id),
+            )
 
-        best_pred = None
-        for pred in all_predictions:
-            h = pred.get("home_team", "") or pred.get("home", "")
-            a = pred.get("away_team", "") or pred.get("away", "")
-            if not h or not a:
-                continue
-            hn = _norm(h)
-            an = _norm(a)
-            if (mh in hn or hn in mh) and (ma in an or an in ma):
-                best_pred = pred
-                break
+            # 3. Extraire les infos utiles du H2H
+            h2h_clean = {}
+            if h2h:
+                h2h_clean = {
+                    "total_matches": h2h.get("total_matches", 0),
+                    "home_wins": h2h.get("home_wins", 0),
+                    "draws": h2h.get("draws", 0),
+                    "away_wins": h2h.get("away_wins", 0),
+                    "avg_total_goals": h2h.get("avg_total_goals", 0),
+                    "recent_matches": h2h.get("recent_matches", []),
+                }
 
-        if not best_pred:
-            continue
-
-        markets = extract_bzzoiro_markets(best_pred)
-        if not markets:
-            continue
-
-        confidence = compute_bzzoiro_confidence(best_pred, markets)
-
-        if confidence >= min_confidence:
-            m_copy = dict(m)
-            m_copy["bzz_markets"] = markets
-            m_copy["bzz_confidence"] = round(confidence, 1)
-            m_copy["bzz_raw"] = best_pred
-            enriched_matches.append(m_copy)
-
-    # Trier par confiance décroissante
-    enriched_matches.sort(key=lambda x: x["bzz_confidence"], reverse=True)
-    print(f"🔮 Bzzoiro : {len(enriched_matches)} matchs retenus (confiance ≥ {min_confidence})")
-    for m in enriched_matches[:10]:
-        print(f"   🎯 [{m['bzz_confidence']:.0f}] {m['home']} vs {m['away']} • {m.get('league','')[:30]}")
-
-    return enriched_matches
+            return {
+                "available": True,
+                "bzzoiro_id": event_id,
+                "h2h": h2h_clean,
+                "prediction": prediction,
+                "source": "bzzoiro",
+                "home_form": event.get("home_form", "?"),
+                "away_form": event.get("away_form", "?"),
+            }
+        except Exception as e:
+            print(f"⚠️ Bzzoiro enrich crash {home}-{away}: {e}")
+            return {"available": False}
