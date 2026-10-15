@@ -1,6 +1,12 @@
 """
-Récupération des prédictions Bzzoiro avec matching ultra-robuste.
-AVEC DEBUG complet pour diagnostiquer la structure des données.
+Récupération des prédictions Bzzoiro avec extraction CORRIGÉE.
+Structure Bzzoiro réelle :
+{
+  "match_result": {"prob_home": X, "prob_draw": Y, "prob_away": Z},
+  "over_under": {"prob_over_15": X, "prob_over_25": Y, "prob_over_35": Z},
+  "btts": {"prob_yes": X},
+  "corners": {"prob_over_85": X, "prob_over_95": Y, "prob_over_105": Z}
+}
 """
 from __future__ import annotations
 
@@ -209,108 +215,117 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None)
         return {}
 
 
+# =========================================================
+# EXTRACTION CORRIGÉE (vraie structure Bzzoiro)
+# =========================================================
 def extract_bzzoiro_markets(pred: dict) -> dict:
-    """
-    Extraction flexible des marchés Bzzoiro.
-    Les données sont dans pred['markets'] avec des clés variables.
-    """
+    """Extraction avec la vraie structure Bzzoiro."""
     if not pred:
         return {}
 
     result = {}
-
-    # Récupérer le dict markets (structure Bzzoiro)
     markets = pred.get("markets", {}) or {}
     if not isinstance(markets, dict) or not markets:
-        markets = pred.get("predictions", pred) or {}
+        return {}
 
-    # === DEBUG : afficher la structure complète ===
-    print(f"      MARKETS KEYS: {list(markets.keys())}")
-    print(f"      MARKETS CONTENU: {str(markets)[:800]}")
-    # =============================================
+    # === MATCH RESULT (1X2) ===
+    mr = markets.get("match_result", {}) or {}
+    if isinstance(mr, dict):
+        try:
+            h = float(mr.get("prob_home", 0))
+            d = float(mr.get("prob_draw", 0))
+            a = float(mr.get("prob_away", 0))
+            if 0 < h < 100:
+                result["victoire_home"] = round(h, 1)
+            if 0 < d < 100:
+                result["match_nul"] = round(d, 1)
+            if 0 < a < 100:
+                result["victoire_away"] = round(a, 1)
+        except (ValueError, TypeError):
+            pass
 
-    # Mapping flexible
-    patterns = {
-        "victoire_home": ["1", "home", "home_win", "p1", "1X2_1", "victory_home", "home_win_probability"],
-        "match_nul": ["X", "x", "draw", "nul", "1X2_X", "draw_probability"],
-        "victoire_away": ["2", "away", "away_win", "p2", "1X2_2", "victory_away", "away_win_probability"],
-        "over_2.5": ["over_2.5", "over_25", "over25", "o2.5", "plus_2.5", "over", "over_2_5"],
-        "under_2.5": ["under_2.5", "under_25", "under25", "u2.5", "moins_2.5", "under", "under_2_5"],
-        "btts_yes": ["btts_yes", "btts", "btts_y", "yes", "BTTS", "btts_probability"],
-        "btts_no": ["btts_no", "btts_n", "no", "BTTS_NO"],
-    }
+    # === OVER / UNDER ===
+    ou = markets.get("over_under", {}) or {}
+    if isinstance(ou, dict):
+        try:
+            over_25 = float(ou.get("prob_over_25", 0))
+            if 0 < over_25 < 100:
+                result["over_2.5"] = round(over_25, 1)
+                result["under_2.5"] = round(100.0 - over_25, 1)
+        except (ValueError, TypeError):
+            pass
 
-    def extract_numeric(obj, depth=0):
-        if depth > 3:
-            return None
-        if isinstance(obj, (int, float)):
-            try:
-                fv = float(obj)
-                if 0 < fv < 100:
-                    return fv
-                elif 0 < fv <= 1:
-                    return fv * 100
-            except (ValueError, TypeError):
-                return None
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                r = extract_numeric(v, depth + 1)
-                if r is not None:
-                    return r
-        if isinstance(obj, list):
-            for item in obj:
-                r = extract_numeric(item, depth + 1)
-                if r is not None:
-                    return r
-        return None
+    # === BTTS ===
+    btts = markets.get("btts", {}) or {}
+    if isinstance(btts, dict):
+        try:
+            yes = float(btts.get("prob_yes", 0))
+            if 0 < yes < 100:
+                result["btts_yes"] = round(yes, 1)
+                result["btts_no"] = round(100.0 - yes, 1)
+        except (ValueError, TypeError):
+            pass
 
-    def find_value(mkts, candidates):
-        for key in candidates:
-            if key in mkts:
-                v = mkts[key]
-                r = extract_numeric(v)
-                if r is not None:
-                    return r
-        # Match partiel (insensible à la casse)
-        for mkts_key, mkts_val in mkts.items():
-            for cand in candidates:
-                if cand.lower() in str(mkts_key).lower() or str(mkts_key).lower() in cand.lower():
-                    r = extract_numeric(mkts_val)
-                    if r is not None:
-                        return r
-        return None
-
-    for gemini_key, candidates in patterns.items():
-        v = find_value(markets, candidates)
-        if v is not None:
-            result[gemini_key] = round(v, 1)
+    # === CORNERS ===
+    corners = markets.get("corners")
+    if isinstance(corners, dict):
+        try:
+            c85 = float(corners.get("prob_over_85", 0))
+            c95 = float(corners.get("prob_over_95", 0))
+            c105 = float(corners.get("prob_over_105", 0))
+            if 0 < c85 < 100:
+                result["over_8.5_corners"] = round(c85, 1)
+            if 0 < c95 < 100:
+                result["over_9.5_corners"] = round(c95, 1)
+            if 0 < c105 < 100:
+                result["over_10.5_corners"] = round(c105, 1)
+        except (ValueError, TypeError):
+            pass
 
     return result
 
 
+# =========================================================
+# CONFIANCE CORRIGÉE (basée sur la clarté du favori)
+# =========================================================
 def compute_bzzoiro_confidence(pred: dict, markets: dict) -> float:
+    """Confiance = clarté du favori dans le 1X2 + richesse des données."""
+    if not markets:
+        return 0.0
+
     confidence = 0.0
-    raw_conf = pred.get("confidence", 0)
-    try:
-        raw_conf = float(raw_conf)
-        if 0 <= raw_conf <= 1:
-            raw_conf = raw_conf * 100
-        confidence += min(raw_conf, 100) * 0.4
-    except (ValueError, TypeError):
-        pass
 
+    # Clarté du favori principal
     if "victoire_home" in markets and "victoire_away" in markets:
-        max_prob = max(
-            markets.get("victoire_home", 0),
-            markets.get("victoire_away", 0),
-            markets.get("match_nul", 0),
-        )
-        confidence += (max_prob - 33.3) * 0.6
+        h = markets.get("victoire_home", 0)
+        d = markets.get("match_nul", 0)
+        a = markets.get("victoire_away", 0)
+        max_prob = max(h, d, a)
 
-    confidence += min(len(markets) * 3, 20)
+        if max_prob >= 75:
+            confidence += 75
+        elif max_prob >= 65:
+            confidence += 55
+        elif max_prob >= 55:
+            confidence += 40
+        elif max_prob >= 45:
+            confidence += 25
+        else:
+            confidence += 10
+
+    # Bonus si corners dispo (données riches)
+    if "over_8.5_corners" in markets:
+        confidence += 5
+
+    # Bonus nombre de marchés
+    confidence += min(len(markets) * 2, 15)
+
     return max(0.0, min(100.0, confidence))
 
 
+# =========================================================
+# FETCH EVENTS
+# =========================================================
 async def fetch_bzzoiro_events_for_date(client: httpx.AsyncClient, date_iso: str) -> list[dict]:
     data = await _get(client, "/events/", {
         "date_from": date_iso,
@@ -322,6 +337,9 @@ async def fetch_bzzoiro_events_for_date(client: httpx.AsyncClient, date_iso: str
     return events
 
 
+# =========================================================
+# FONCTION PRINCIPALE
+# =========================================================
 async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 60.0) -> list[dict]:
     if not BZZOIRO_API_KEY:
         print("⚠️ BZZOIRO_API_KEY manquante — Bzzoiro désactivé")
@@ -350,7 +368,6 @@ async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 
                 continue
 
             matched_count = 0
-            debug_count = 0
             for m in matches:
                 matched_event = find_best_event_match(m, events)
                 if not matched_event:
@@ -362,15 +379,6 @@ async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 
                     continue
 
                 pred = await _get(client, f"/events/{event_id}/prediction/")
-
-                # Debug pour les 3 premiers
-                if debug_count < 3:
-                    print(f"   🔍 DEBUG pred pour {m.get('home','')} vs {m.get('away','')}:")
-                    print(f"      Type: {type(pred).__name__}")
-                    if isinstance(pred, dict):
-                        print(f"      Clés top: {list(pred.keys())[:15]}")
-                    debug_count += 1
-
                 if not pred:
                     continue
 
@@ -379,10 +387,6 @@ async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 
                     continue
 
                 confidence = compute_bzzoiro_confidence(pred, markets)
-
-                if debug_count <= 3:
-                    print(f"      Marchés extraits: {markets}")
-                    print(f"      Confiance: {confidence:.1f}")
 
                 if confidence >= min_confidence:
                     m_copy = dict(m)
