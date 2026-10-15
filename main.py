@@ -88,10 +88,10 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • H2H + Gemini")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-# === CONFIG FINALE ===
-MIN_PROB = float(os.getenv("MIN_PROB", "0.60"))       # Plus bas pour trouver plus de matchs
-MIN_ODD = float(os.getenv("MIN_ODD", "1.55"))         # Cote minimum rentable
-MAX_PROB = float(os.getenv("MAX_PROB", "0.75"))       # Plafond : rejeter les gros favoris
+# === CORRECTIONS APPLIQUÉES ===
+MIN_PROB = float(os.getenv("MIN_PROB", "0.55"))       # CORRECTION 1 : 0.60 → 0.55
+MIN_ODD = float(os.getenv("MIN_ODD", "1.55"))
+MAX_PROB = float(os.getenv("MAX_PROB", "0.75"))
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
 MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "15"))
 
@@ -102,8 +102,8 @@ SAFE_MIN_ODDS = 2.0
 SAFE_MAX_ODDS = 2.5
 BAL_MIN_ODDS = 2.5
 BAL_MAX_ODDS = 5.0
-BAL_MIN_LEG_ODDS = 1.55     # Aligné avec MIN_ODD
-SAFE_MIN_LEG_ODDS = 1.55    # Aligné avec MIN_ODD
+BAL_MIN_LEG_ODDS = 1.40
+SAFE_MIN_LEG_ODDS = 1.40
 VALUE_TOP_N = 7
 TELEGRAM_MAX_LEN = 3800
 
@@ -867,17 +867,17 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     if prob is None:
                         continue
 
-                    # === FILTRE 1 : proba basse (edge brut) ===
+                    # === FILTRE 1 : proba minimum 55% ===
                     if prob < MIN_PROB:
                         stats["rejected_low_prob"] += 1
                         continue
 
-                    # === FILTRE 2 : plafond proba (anti-gros favori) ===
+                    # === FILTRE 2 : plafond proba 75% ===
                     if prob > MAX_PROB:
                         stats["rejected_high_prob"] += 1
                         continue
 
-                    # === FILTRE 3 : Anti DC sur gros favoris ===
+                    # === FILTRE 3 : anti DC sur gros favoris ===
                     if mkt == "Double Chance":
                         if "1X" in label and prob > 0.85:
                             stats["rejected_dc_favorite"] += 1
@@ -910,8 +910,8 @@ async def build_gemini_picks(matches, used_today, contexts=None):
 
                     used_odd = real_odd if real_odd else 1.0 / prob
 
-                    # === FILTRE 4 : MIN_ODD strict 1.55 ===
-                    if used_odd < MIN_ODD:
+                    # === CORRECTION 2 : MIN_ODD UNIQUEMENT SUR COTES RÉELLES ===
+                    if real_odd and used_odd < MIN_ODD:
                         stats["rejected_low_odd"] += 1
                         continue
 
@@ -961,7 +961,6 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     if has_ctx:
                         score += 0.3
 
-                    # Bonus MASSIF aux paris à value
                     if edge > 0.10:
                         score += 1.0
                     elif edge > 0.05:
@@ -1161,7 +1160,7 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
     pool_safe = [s for s in selections
-                 if s.final_prob() >= 0.60
+                 if s.final_prob() >= 0.55
                  and s.market in ("1X2", "Double Chance", "Over/Under", "BTTS")]
     c = build_coupon_target(
         "Ticket Sécurisé", "Cote 2.0 - 2.5 • Filtre value stricte",
@@ -1171,7 +1170,7 @@ def build_all_coupons(selections):
     if c:
         coupons.append(c)
     pool_bal = [s for s in selections
-                if s.final_prob() >= 0.60
+                if s.final_prob() >= 0.55
                 and s.market not in ("Corners", "Cartons")]
     c = build_coupon_target(
         "Ticket Équilibré", "Cote 2.5 - 5.0 • Filtre value",
