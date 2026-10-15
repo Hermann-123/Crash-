@@ -61,6 +61,7 @@ compute_cards_probs = None
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 
@@ -105,7 +106,7 @@ if not ADMIN_ID:
 TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-# === 21 LIGUES (OPTION A) ===
+# === 21 LIGUES ===
 SOCCER_KEYS = [
     # === TOP 5 EUROPÉENS ===
     "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
@@ -736,6 +737,7 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                 if event_id in used_today:
                     continue
 
+                # === CONTEXTE OPTIONNEL ===
                 ctx = contexts.get(event_id)
                 has_ctx = ctx is not None and ctx.get("available", False)
                 if has_ctx:
@@ -1372,9 +1374,11 @@ async def debug_cmd(message: Message):
         return
     d = STATE["debug"]
     dixon_status = "✅ actif" if STATE["dixon_model"] else "❌ inactif"
+    bzz_status = "✅" if BZZOIRO_API_KEY else "❌"
     txt = (
         f"<b>🔍 DEBUG</b>\n\n"
         f"Dixon-Coles : <b>{dixon_status}</b>\n"
+        f"Bzzoiro : <b>{bzz_status}</b>\n"
         f"Ligues scannées : <b>{len(SOCCER_KEYS)}</b>\n"
         f"Events Odds API : <b>{d.get('odds_events', 0)}</b>\n"
         f"Matchs construits : <b>{d.get('matched', 0)}</b>\n"
@@ -1523,6 +1527,11 @@ async def lifespan(app: FastAPI):
     STATE["users"] = load_json(USERS_DB)
     STATE["ready"] = True
     print("✅ Bot prêt.")
+
+    if not BZZOIRO_API_KEY:
+        print("⚠️ BZZOIRO_API_KEY non définie !")
+    else:
+        print(f"✅ BZZOIRO_API_KEY détectée (préfixe: {BZZOIRO_API_KEY[:8]}...)")
 
     scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(daily_broadcast, CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ),
