@@ -88,7 +88,6 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • H2H + Gemini")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-# === CORRECTION 1 : MIN_PROB à 0.67 ===
 MIN_PROB = float(os.getenv("MIN_PROB", "0.67"))
 MIN_ODD = float(os.getenv("MIN_ODD", "1.45"))
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
@@ -101,7 +100,8 @@ SAFE_MIN_ODDS = 2.0
 SAFE_MAX_ODDS = 2.5
 BAL_MIN_ODDS = 2.5
 BAL_MAX_ODDS = 5.0
-BAL_MIN_LEG_ODDS = 1.35
+BAL_MIN_LEG_ODDS = 1.10  # ← CORRECTION : 1.35 → 1.10
+SAFE_MIN_LEG_ODDS = 1.10  # ← CORRECTION : 1.35 → 1.10
 VALUE_TOP_N = 20
 TELEGRAM_MAX_LEN = 3800
 
@@ -890,11 +890,9 @@ async def build_gemini_picks(matches, used_today, contexts=None):
 
                     used_odd = real_odd if real_odd else 1.0 / prob
 
-                    # === CORRECTION 2 : MIN_ODD s'applique UNIQUEMENT aux cotes réelles ===
                     if real_odd and used_odd < MIN_ODD:
                         stats["rejected_low_odd"] += 1
                         continue
-                    # =======================================================================
 
                     edge = 0.0
                     if real_odd and real_odd > 1.01:
@@ -1130,7 +1128,7 @@ def build_all_coupons(selections):
     c = build_coupon_target(
         "Ticket Sécurisé", "Cote 2.0 - 2.5 • Triple fusion > 67%",
         "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 6, used,
-        min_leg_odds=1.35, strict=True,
+        min_leg_odds=SAFE_MIN_LEG_ODDS, strict=True,
     )
     if c:
         coupons.append(c)
