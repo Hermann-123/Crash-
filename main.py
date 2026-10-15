@@ -105,12 +105,26 @@ if not ADMIN_ID:
 TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
+# === 21 LIGUES (OPTION A) ===
 SOCCER_KEYS = [
+    # === TOP 5 EUROPÉENS ===
     "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
     "soccer_germany_bundesliga", "soccer_france_ligue_one",
+    # === COUPES EUROPÉENNES ===
     "soccer_uefa_champs_league", "soccer_uefa_europa_league",
+    "soccer_uefa_europa_conference_league",
+    # === CHAMPIONNATS SECONDAIRES EUROPE ===
     "soccer_efl_champ", "soccer_netherlands_eredivisie",
-    "soccer_portugal_primeira_liga",
+    "soccer_portugal_primeira_liga", "soccer_belgium_first_div",
+    "soccer_turkey_super_league", "soccer_greece_super_league",
+    "soccer_scotland_premiership",
+    # === AMÉRIQUE DU SUD ===
+    "soccer_brazil_campeonato", "soccer_argentina_primera_division",
+    "soccer_chile_campeonato", "soccer_colombia_primera_a",
+    # === AMÉRIQUE DU NORD ===
+    "soccer_usa_mls", "soccer_mexico_ligamx",
+    # === ASIE ===
+    "soccer_japan_j_league",
 ]
 
 
@@ -600,7 +614,7 @@ async def fetch_all_odds_events() -> list[dict]:
             events = await fetch_odds_api_league(client, key)
             all_events.extend(events)
             await asyncio.sleep(0.3)
-    print(f"💰 Odds API : {len(all_events)} events")
+    print(f"💰 Odds API : {len(all_events)} events ({len(SOCCER_KEYS)} ligues)")
     return all_events
 
 
@@ -722,7 +736,6 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                 if event_id in used_today:
                     continue
 
-                # === CONTEXTE OPTIONNEL (bonus si présent) ===
                 ctx = contexts.get(event_id)
                 has_ctx = ctx is not None and ctx.get("available", False)
                 if has_ctx:
@@ -867,7 +880,6 @@ async def build_gemini_picks(matches, used_today, contexts=None):
 
                 candidates.sort(reverse=True, key=lambda x: x["score"])
 
-                # === 1 SEUL PICK PAR MATCH ===
                 if candidates:
                     c = candidates[0]
                     dedup = f"{event_id}|{c['mkt']}|{c['label']}"
@@ -1363,6 +1375,7 @@ async def debug_cmd(message: Message):
     txt = (
         f"<b>🔍 DEBUG</b>\n\n"
         f"Dixon-Coles : <b>{dixon_status}</b>\n"
+        f"Ligues scannées : <b>{len(SOCCER_KEYS)}</b>\n"
         f"Events Odds API : <b>{d.get('odds_events', 0)}</b>\n"
         f"Matchs construits : <b>{d.get('matched', 0)}</b>\n"
         f"Contextes Bzzoiro : <b>{d.get('enriched', 0)}</b>\n"
