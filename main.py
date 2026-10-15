@@ -188,10 +188,9 @@ def calculate_match_score(fx: dict) -> float:
         except Exception:
             fx["dixon_available"] = False
 
-    # Bonus massif si Bzzoiro a confiance
     bzz_conf = fx.get("bzz_confidence", 0)
     if bzz_conf > 0:
-        score += bzz_conf * 0.3  # Ex: 80 conf → +24 pts
+        score += bzz_conf * 0.3
 
     return score
 
@@ -940,9 +939,8 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     elif prob_dixon > 0:
                         score += 0.4
 
-                    # Bonus Bzzoiro confidence
                     if bzz_conf > 0:
-                        score += bzz_conf * 0.005  # 80 conf → +0.4
+                        score += bzz_conf * 0.005
 
                     candidates.append({
                         "score": score, "label": label, "mkt": mkt,
@@ -1549,7 +1547,6 @@ async def btn_debug(message: Message):
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
-        # === ÉTAPE 1 : Récupérer tous les matchs via The Odds API ===
         odds_events = await fetch_all_odds_events()
         matches = build_matches_from_odds(odds_events)
         print(f"📅 Matchs bruts (Odds API) : {len(matches)}")
@@ -1560,7 +1557,6 @@ async def scan():
             STATE["selections"] = []
             return
 
-        # === ÉTAPE 2 : Bzzoiro sélectionne les MEILLEURS matchs ===
         if get_bzzoiro_best_matches and BZZOIRO_API_KEY:
             try:
                 matches = await get_bzzoiro_best_matches(matches, min_confidence=BZZ_MIN_CONFIDENCE)
@@ -1579,17 +1575,14 @@ async def scan():
             STATE["selections"] = []
             return
 
-        # === ÉTAPE 3 : Tri final ===
         matches = filter_and_rank_matches(matches)
 
-        # === ÉTAPE 4 : Enrichissement Bzzoiro (H2H) ===
         contexts = {}
         try:
             contexts = await enrich_matches(matches)
         except Exception as e:
             print(f"⚠️ Enrichissement désactivé : {e}")
 
-        # === ÉTAPE 5 : Analyse Gemini + Dixon + Bzzoiro (triple fusion) ===
         used_today = load_used_today()
         selections = await build_gemini_picks(matches, used_today, contexts)
         print(f"🎯 Sélections : {len(selections)}")
