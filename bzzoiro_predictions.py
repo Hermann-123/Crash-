@@ -1,6 +1,7 @@
 """
 Récupération des prédictions Bzzoiro via le bon endpoint.
 Endpoint correct : /events/{id}/prediction/ (PAS /predictions/)
+AVEC DEBUG pour voir les events Bzzoiro bruts.
 """
 from __future__ import annotations
 
@@ -148,6 +149,17 @@ async def fetch_bzzoiro_events_for_date(client: httpx.AsyncClient, date_iso: str
     })
     events = data.get("results", []) or data.get("data", []) or []
     print(f"🔮 Bzzoiro events {date_iso} : {len(events)} bruts")
+
+    # === DEBUG : Afficher les 15 premiers events ===
+    for i, ev in enumerate(events[:15]):
+        h = ev.get("home_team", "") or ev.get("home", "") or ev.get("team_home", "")
+        a = ev.get("away_team", "") or ev.get("away", "") or ev.get("team_away", "")
+        league = ev.get("league", "") or ev.get("competition", "") or ""
+        if isinstance(league, dict):
+            league = league.get("name", "")
+        print(f"   📋 BZZ #{i+1}: '{h}' vs '{a}' | {league}")
+    # ================================================
+
     return events
 
 
@@ -204,6 +216,7 @@ async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 
                         break
 
                 if not matched_event:
+                    print(f"   ❌ Pas de match BZZ pour: '{m.get('home','')}' vs '{m.get('away','')}'")
                     continue
 
                 event_id = matched_event.get("id")
