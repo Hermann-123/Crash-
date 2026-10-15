@@ -92,7 +92,9 @@ MIN_PROB = float(os.getenv("MIN_PROB", "0.70"))
 MIN_ODD = float(os.getenv("MIN_ODD", "1.45"))
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
 MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "15"))
-BZZ_MIN_CONFIDENCE = float(os.getenv("BZZ_MIN_CONFIDENCE", "60.0"))
+
+# ⚠️ SEUIL BAISSÉ À 0.0 POUR DEBUG
+BZZ_MIN_CONFIDENCE = float(os.getenv("BZZ_MIN_CONFIDENCE", "0.0"))
 BZZ_MAX_MATCHES = int(os.getenv("BZZ_MAX_MATCHES", "15"))
 
 SAFE_MIN_ODDS = 2.0
@@ -1543,7 +1545,7 @@ async def btn_debug(message: Message):
 
 
 # =========================================================
-# SCAN (avec Bzzoiro comme filtre principal)
+# SCAN
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
