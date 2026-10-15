@@ -1,6 +1,6 @@
 """
 Récupération des prédictions Bzzoiro avec matching ultra-robuste.
-Gère les variations de noms : Stade Rennais vs Rennes, Olympique de Marseille vs Marseille, etc.
+AVEC DEBUG pour diagnostiquer l'endpoint /prediction/.
 """
 from __future__ import annotations
 
@@ -20,18 +20,15 @@ BZZOIRO_BASE = "https://sports.bzzoiro.com/api/v2"
 # MOTS À IGNORER (préfixes/suffixes communs)
 # =========================================================
 IGNORE_WORDS = {
-    # Types de clubs
     "fc", "cf", "sc", "ac", "afc", "as", "ss", "ssc", "rc", "cd", "fk",
     "sk", "jk", "sd", "ud", "ca", "cs", "us", "sv", "bv", "bsc", "fsv",
     "vfb", "vfl", "tsg", "spvgg", "kfc", "krc", "kv", "kaa", "vv", "cfc",
-    "if", "bk", "ff", "ik", "fk", "fc",
-    # Mots descriptifs à ignorer
+    "if", "bk", "ff", "ik",
     "stade", "olympique", "sporting", "sport", "club", "de", "of",
-    "the", "and", "of", "and", "&",
-    "atletico", "atlético", "athletic", "atletico",
-    "real", "royal", "racing",
+    "the", "and", "of",
     "united", "utd", "city", "town", "albion", "rovers", "wanderers",
 }
+
 
 # =========================================================
 # DICTIONNAIRE D'ALIAS API → BZZOIRO
@@ -47,7 +44,6 @@ TEAM_ALIASES = {
     "lille": "losc lille",
     "paris sg": "paris saint germain",
     "psg": "paris saint germain",
-    
     # Italie
     "inter": "inter milan",
     "milan": "ac milan",
@@ -57,7 +53,6 @@ TEAM_ALIASES = {
     "juventus": "juventus",
     "atalanta": "atalanta",
     "fiorentina": "fiorentina",
-    
     # Angleterre
     "brighton": "brighton and hove albion",
     "brighton and hove albion": "brighton and hove albion",
@@ -69,7 +64,6 @@ TEAM_ALIASES = {
     "wolves": "wolverhampton wanderers",
     "west ham": "west ham united",
     "newcastle": "newcastle united",
-    
     # Allemagne
     "dortmund": "borussia dortmund",
     "bayern": "bayern munich",
@@ -78,20 +72,17 @@ TEAM_ALIASES = {
     "frankfurt": "eintracht frankfurt",
     "hoffenheim": "tsg hoffenheim",
     "freiburg": "sc freiburg",
-    
     # Espagne
     "atletico": "atletico madrid",
     "athletic": "athletic bilbao",
     "betis": "real betis",
     "sociedad": "real sociedad",
     "barca": "fc barcelona",
-    
     # Portugal
     "porto": "fc porto",
     "benfica": "sl benfica",
     "braga": "sporting braga",
     "sporting": "sporting cp",
-    
     # Danemark
     "copenhagen": "fc kobenhavn",
     "fc copenhagen": "fc kobenhavn",
@@ -101,18 +92,15 @@ TEAM_ALIASES = {
     "nordsjælland": "fc nordsjaelland",
     "fc nordsjaelland": "fc nordsjaelland",
     "fc nordsjælland": "fc nordsjaelland",
-    
     # Écosse
     "hearts": "heart of midlothian",
     "heart of midlothian": "heart of midlothian",
-    
     # Turquie
     "besiktas": "besiktas jk",
     "beşiktaş": "besiktas jk",
     "besiktas jk": "besiktas jk",
     "fenerbahce": "fenerbahce sk",
     "galatasaray": "galatasaray sk",
-    
     # Amérique du Sud
     "huracan": "huracan",
     "atletico huracan": "huracan",
@@ -120,12 +108,10 @@ TEAM_ALIASES = {
     "gimnasia": "gimnasia y esgrima",
     "gimnasia la plata": "gimnasia y esgrima",
     "gimnasia y esgrima": "gimnasia y esgrima",
-    
     # Belgique
     "sint truiden": "sint-truidense vv",
     "sint-truidense vv": "sint-truidense vv",
     "stvv": "sint-truidense vv",
-    
     # Grèce
     "olympiakos": "olympiacos fc",
     "olympiacos": "olympiacos fc",
@@ -138,32 +124,20 @@ TEAM_ALIASES = {
 # NORMALISATION ULTRA-ROBUSTE
 # =========================================================
 def _norm(s: str) -> str:
-    """Normalisation agressive des noms d'équipes."""
     if not s:
         return ""
     s = str(s).lower().strip()
-    # Accents + caractères spéciaux
     s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    # Remplacer & par and
     s = s.replace("&", " and ")
-    # Ponctuation
     s = re.sub(r"[^a-z0-9 ]", " ", s)
-    # Découper et filtrer
     words = s.split()
-    filtered = []
-    for w in words:
-        if w in IGNORE_WORDS:
-            continue
-        if len(w) <= 1:
-            continue
-        filtered.append(w)
+    filtered = [w for w in words if w not in IGNORE_WORDS and len(w) > 1]
     if not filtered:
         return " ".join(words).strip()
     return " ".join(filtered).strip()
 
 
 def _similarity_score(name_a: str, name_b: str) -> float:
-    """Score de similarité 0.0 à 1.0."""
     a = _norm(name_a)
     b = _norm(name_b)
     if not a or not b:
@@ -188,17 +162,12 @@ def _similarity_score(name_a: str, name_b: str) -> float:
     return min(1.0, jaccard * 0.75 + first_match)
 
 
-# =========================================================
-# MATCHING ULTRA-ROBUSTE
-# =========================================================
 def find_best_event_match(match: dict, events: list[dict]) -> Optional[dict]:
-    """Trouve le meilleur event Bzzoiro pour un match via scoring."""
     mh_raw = match.get("home", "")
     ma_raw = match.get("away", "")
     if not mh_raw or not ma_raw:
         return None
 
-    # Alias
     mh = _norm(TEAM_ALIASES.get(mh_raw.lower().strip(), mh_raw))
     ma = _norm(TEAM_ALIASES.get(ma_raw.lower().strip(), ma_raw))
 
@@ -212,16 +181,12 @@ def find_best_event_match(match: dict, events: list[dict]) -> Optional[dict]:
         if not h or not a:
             continue
 
-        # Alias sur Bzzoiro aussi
         h = TEAM_ALIASES.get(h.lower().strip(), h)
         a = TEAM_ALIASES.get(a.lower().strip(), a)
 
         score_h = _similarity_score(mh, h)
         score_a = _similarity_score(ma, a)
-
-        # Score minimum des deux (pour éviter les faux positifs)
         combined = min(score_h, score_a)
-        # Bonus si les deux sont forts
         if score_h > 0.75 and score_a > 0.75:
             combined += 0.15
 
@@ -237,6 +202,10 @@ def find_best_event_match(match: dict, events: list[dict]) -> Optional[dict]:
 # =========================================================
 # API BZZOIRO
 # =========================================================
+def _headers() -> dict:
+    return {"Authorization": f"Token {BZZOIRO_API_KEY}"}
+
+
 async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
     try:
         r = await client.get(f"{BZZOIRO_BASE}{path}", headers=_headers(), params=params, timeout=15.0)
@@ -249,12 +218,7 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None)
         return {}
 
 
-def _headers() -> dict:
-    return {"Authorization": f"Token {BZZOIRO_API_KEY}"}
-
-
 def extract_bzzoiro_markets(pred: dict) -> dict:
-    """Extrait les probas Bzzoiro au format Gemini (%)."""
     if not pred:
         return {}
 
@@ -296,7 +260,6 @@ def extract_bzzoiro_markets(pred: dict) -> dict:
 
 
 def compute_bzzoiro_confidence(pred: dict, markets: dict) -> float:
-    """Calcule un score de confiance Bzzoiro (0-100)."""
     confidence = 0.0
     raw_conf = pred.get("confidence", 0)
     try:
@@ -320,7 +283,6 @@ def compute_bzzoiro_confidence(pred: dict, markets: dict) -> float:
 
 
 async def fetch_bzzoiro_events_for_date(client: httpx.AsyncClient, date_iso: str) -> list[dict]:
-    """Récupère tous les événements Bzzoiro pour une date."""
     data = await _get(client, "/events/", {
         "date_from": date_iso,
         "date_to": date_iso,
@@ -332,7 +294,6 @@ async def fetch_bzzoiro_events_for_date(client: httpx.AsyncClient, date_iso: str
 
 
 async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 60.0) -> list[dict]:
-    """Filtre les matchs via Bzzoiro avec matching ultra-robuste."""
     if not BZZOIRO_API_KEY:
         print("⚠️ BZZOIRO_API_KEY manquante — Bzzoiro désactivé")
         return []
@@ -360,6 +321,7 @@ async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 
                 continue
 
             matched_count = 0
+            debug_count = 0
             for m in matches:
                 matched_event = find_best_event_match(m, events)
                 if not matched_event:
@@ -371,6 +333,17 @@ async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 
                     continue
 
                 pred = await _get(client, f"/events/{event_id}/prediction/")
+
+                # === DEBUG : Afficher la réponse brute pour les 3 premiers ===
+                if debug_count < 3:
+                    print(f"   🔍 DEBUG pred pour {m.get('home','')} vs {m.get('away','')}:")
+                    print(f"      Type: {type(pred).__name__}")
+                    if isinstance(pred, dict):
+                        keys = list(pred.keys())[:15]
+                        print(f"      Clés: {keys}")
+                        print(f"      Contenu: {str(pred)[:300]}")
+                    debug_count += 1
+
                 if not pred:
                     continue
 
@@ -379,6 +352,10 @@ async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 
                     continue
 
                 confidence = compute_bzzoiro_confidence(pred, markets)
+
+                if debug_count <= 3:
+                    print(f"      Marchés extraits: {markets}")
+                    print(f"      Confiance calculée: {confidence:.1f}")
 
                 if confidence >= min_confidence:
                     m_copy = dict(m)
