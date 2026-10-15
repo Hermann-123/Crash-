@@ -88,13 +88,13 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • H2H + Gemini")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-MIN_PROB = float(os.getenv("MIN_PROB", "0.70"))
+# === CORRECTION 1 : MIN_PROB à 0.67 ===
+MIN_PROB = float(os.getenv("MIN_PROB", "0.67"))
 MIN_ODD = float(os.getenv("MIN_ODD", "1.45"))
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
 MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "15"))
 
-# ⚠️ SEUIL BAISSÉ À 0.0 POUR DEBUG
-BZZ_MIN_CONFIDENCE = float(os.getenv("BZZ_MIN_CONFIDENCE", "0.0"))
+BZZ_MIN_CONFIDENCE = float(os.getenv("BZZ_MIN_CONFIDENCE", "60.0"))
 BZZ_MAX_MATCHES = int(os.getenv("BZZ_MAX_MATCHES", "15"))
 
 SAFE_MIN_ODDS = 2.0
@@ -774,7 +774,8 @@ async def build_gemini_picks(matches, used_today, contexts=None):
     selections: list[Selection] = []
     seen = set()
     stats = {"ok": 0, "fail": 0, "kept": 0, "with_ctx": 0, "without_ctx": 0,
-             "rejected_low_prob": 0, "triple_consensus": 0, "double_consensus": 0}
+             "rejected_low_prob": 0, "rejected_low_odd": 0,
+             "triple_consensus": 0, "double_consensus": 0}
     if not predict_match_probas:
         print("❌ predict_match_probas non disponible")
         return selections
@@ -862,7 +863,7 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                     prob = combined_probs.get(key)
                     if prob is None:
                         continue
-                    if prob < 0.70:
+                    if prob < MIN_PROB:
                         stats["rejected_low_prob"] += 1
                         continue
                     if prob > 0.90:
@@ -888,8 +889,13 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                             real_odd = real_odds.get("btts_no")
 
                     used_odd = real_odd if real_odd else 1.0 / prob
-                    if used_odd < MIN_ODD:
+
+                    # === CORRECTION 2 : MIN_ODD s'applique UNIQUEMENT aux cotes réelles ===
+                    if real_odd and used_odd < MIN_ODD:
+                        stats["rejected_low_odd"] += 1
                         continue
+                    # =======================================================================
+
                     edge = 0.0
                     if real_odd and real_odd > 1.01:
                         edge = (prob * real_odd) - 1.0
@@ -985,6 +991,7 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                 print(f"⚠️ build_gemini_picks: {e}")
     print(f"🏠 Picks : ok={stats['ok']} gardés={stats['kept']} "
           f"avec_ctx={stats['with_ctx']} rejetés_proba={stats['rejected_low_prob']} "
+          f"rejetés_cote={stats['rejected_low_odd']} "
           f"triple_consensus={stats['triple_consensus']} double_consensus={stats['double_consensus']}")
     return selections
 
@@ -1065,7 +1072,7 @@ def build_value_list(selections, top_n=20, globally_used=None):
     if globally_used is None:
         globally_used = set()
     pool = [s for s in selections
-            if s.event_id not in globally_used and s.odds >= MIN_ODD]
+            if s.event_id not in globally_used]
     if not pool:
         return None
 
@@ -1118,20 +1125,20 @@ def build_all_coupons(selections):
     coupons = []
     used = set()
     pool_safe = [s for s in selections
-                 if s.final_prob() >= 0.70
+                 if s.final_prob() >= 0.67
                  and s.market in ("1X2", "Double Chance", "Over/Under", "BTTS")]
     c = build_coupon_target(
-        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Triple fusion > 70%",
+        "Ticket Sécurisé", "Cote 2.0 - 2.5 • Triple fusion > 67%",
         "🔒", pool_safe, SAFE_MIN_ODDS, SAFE_MAX_ODDS, 6, used,
         min_leg_odds=1.35, strict=True,
     )
     if c:
         coupons.append(c)
     pool_bal = [s for s in selections
-                if s.final_prob() >= 0.70
+                if s.final_prob() >= 0.67
                 and s.market not in ("Corners", "Cartons")]
     c = build_coupon_target(
-        "Ticket Équilibré", "Cote 2.5 - 5.0 • Triple fusion > 70%",
+        "Ticket Équilibré", "Cote 2.5 - 5.0 • Triple fusion > 67%",
         "⚖️", pool_bal, BAL_MIN_ODDS, BAL_MAX_ODDS, 15, used,
         min_leg_odds=BAL_MIN_LEG_ODDS, strict=False,
     )
