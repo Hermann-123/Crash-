@@ -1,6 +1,6 @@
 """
 Récupération des prédictions Bzzoiro avec matching ultra-robuste.
-AVEC DEBUG pour diagnostiquer l'endpoint /prediction/.
+AVEC DEBUG complet pour diagnostiquer la structure des données.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
 BZZOIRO_BASE = "https://sports.bzzoiro.com/api/v2"
 
 # =========================================================
-# MOTS À IGNORER (préfixes/suffixes communs)
+# MOTS À IGNORER
 # =========================================================
 IGNORE_WORDS = {
     "fc", "cf", "sc", "ac", "afc", "as", "ss", "ssc", "rc", "cd", "fk",
@@ -34,7 +34,6 @@ IGNORE_WORDS = {
 # DICTIONNAIRE D'ALIAS API → BZZOIRO
 # =========================================================
 TEAM_ALIASES = {
-    # France
     "rennes": "stade rennais",
     "stade rennais": "stade rennais",
     "marseille": "olympique de marseille",
@@ -44,7 +43,6 @@ TEAM_ALIASES = {
     "lille": "losc lille",
     "paris sg": "paris saint germain",
     "psg": "paris saint germain",
-    # Italie
     "inter": "inter milan",
     "milan": "ac milan",
     "roma": "as roma",
@@ -53,7 +51,6 @@ TEAM_ALIASES = {
     "juventus": "juventus",
     "atalanta": "atalanta",
     "fiorentina": "fiorentina",
-    # Angleterre
     "brighton": "brighton and hove albion",
     "brighton and hove albion": "brighton and hove albion",
     "brighton & hove albion": "brighton and hove albion",
@@ -64,7 +61,6 @@ TEAM_ALIASES = {
     "wolves": "wolverhampton wanderers",
     "west ham": "west ham united",
     "newcastle": "newcastle united",
-    # Allemagne
     "dortmund": "borussia dortmund",
     "bayern": "bayern munich",
     "bayern munchen": "bayern munich",
@@ -72,18 +68,15 @@ TEAM_ALIASES = {
     "frankfurt": "eintracht frankfurt",
     "hoffenheim": "tsg hoffenheim",
     "freiburg": "sc freiburg",
-    # Espagne
     "atletico": "atletico madrid",
     "athletic": "athletic bilbao",
     "betis": "real betis",
     "sociedad": "real sociedad",
     "barca": "fc barcelona",
-    # Portugal
     "porto": "fc porto",
     "benfica": "sl benfica",
     "braga": "sporting braga",
     "sporting": "sporting cp",
-    # Danemark
     "copenhagen": "fc kobenhavn",
     "fc copenhagen": "fc kobenhavn",
     "fc kobenhavn": "fc kobenhavn",
@@ -92,36 +85,34 @@ TEAM_ALIASES = {
     "nordsjælland": "fc nordsjaelland",
     "fc nordsjaelland": "fc nordsjaelland",
     "fc nordsjælland": "fc nordsjaelland",
-    # Écosse
     "hearts": "heart of midlothian",
     "heart of midlothian": "heart of midlothian",
-    # Turquie
     "besiktas": "besiktas jk",
     "beşiktaş": "besiktas jk",
     "besiktas jk": "besiktas jk",
     "fenerbahce": "fenerbahce sk",
     "galatasaray": "galatasaray sk",
-    # Amérique du Sud
     "huracan": "huracan",
     "atletico huracan": "huracan",
     "atlético huracán": "huracan",
     "gimnasia": "gimnasia y esgrima",
     "gimnasia la plata": "gimnasia y esgrima",
     "gimnasia y esgrima": "gimnasia y esgrima",
-    # Belgique
     "sint truiden": "sint-truidense vv",
     "sint-truidense vv": "sint-truidense vv",
     "stvv": "sint-truidense vv",
-    # Grèce
     "olympiakos": "olympiacos fc",
     "olympiacos": "olympiacos fc",
     "olympiacos fc": "olympiacos fc",
     "olympiakos piraeus": "olympiacos fc",
+    "salzburg": "red bull salzburg",
+    "rb salzburg": "red bull salzburg",
+    "red bull salzburg": "red bull salzburg",
 }
 
 
 # =========================================================
-# NORMALISATION ULTRA-ROBUSTE
+# NORMALISATION
 # =========================================================
 def _norm(s: str) -> str:
     if not s:
@@ -219,42 +210,80 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None)
 
 
 def extract_bzzoiro_markets(pred: dict) -> dict:
+    """
+    Extraction flexible des marchés Bzzoiro.
+    Les données sont dans pred['markets'] avec des clés variables.
+    """
     if not pred:
         return {}
 
     result = {}
-    p = pred.get("predictions", pred) or {}
 
-    key_map = {
-        "home_win": "victoire_home", "draw": "match_nul", "away_win": "victoire_away",
-        "over_2.5": "over_2.5", "over_2_5": "over_2.5",
-        "under_2.5": "under_2.5", "under_2_5": "under_2.5",
-        "btts_yes": "btts_yes", "btts_no": "btts_no",
-        "home_win_probability": "victoire_home", "draw_probability": "match_nul",
-        "away_win_probability": "victoire_away",
-        "over_2_5_probability": "over_2.5", "under_2_5_probability": "under_2.5",
-        "btts_probability": "btts_yes",
-        "prob_home": "victoire_home", "prob_draw": "match_nul", "prob_away": "victoire_away",
-        "prob_over_25": "over_2.5", "prob_under_25": "under_2.5", "prob_btts": "btts_yes",
-        "p_home": "victoire_home", "p_draw": "match_nul", "p_away": "victoire_away",
+    # Récupérer le dict markets (structure Bzzoiro)
+    markets = pred.get("markets", {}) or {}
+    if not isinstance(markets, dict) or not markets:
+        markets = pred.get("predictions", pred) or {}
+
+    # === DEBUG : afficher la structure complète ===
+    print(f"      MARKETS KEYS: {list(markets.keys())}")
+    print(f"      MARKETS CONTENU: {str(markets)[:800]}")
+    # =============================================
+
+    # Mapping flexible
+    patterns = {
+        "victoire_home": ["1", "home", "home_win", "p1", "1X2_1", "victory_home", "home_win_probability"],
+        "match_nul": ["X", "x", "draw", "nul", "1X2_X", "draw_probability"],
+        "victoire_away": ["2", "away", "away_win", "p2", "1X2_2", "victory_away", "away_win_probability"],
+        "over_2.5": ["over_2.5", "over_25", "over25", "o2.5", "plus_2.5", "over", "over_2_5"],
+        "under_2.5": ["under_2.5", "under_25", "under25", "u2.5", "moins_2.5", "under", "under_2_5"],
+        "btts_yes": ["btts_yes", "btts", "btts_y", "yes", "BTTS", "btts_probability"],
+        "btts_no": ["btts_no", "btts_n", "no", "BTTS_NO"],
     }
 
-    sources = [p, p.get("markets", {}) or {}]
-    for source in sources:
-        for bzz_key, gemini_key in key_map.items():
-            if gemini_key in result:
-                continue
-            v = source.get(bzz_key)
-            if v is None:
-                continue
+    def extract_numeric(obj, depth=0):
+        if depth > 3:
+            return None
+        if isinstance(obj, (int, float)):
             try:
-                fv = float(v)
-                if 0 <= fv <= 1:
-                    fv = fv * 100
+                fv = float(obj)
                 if 0 < fv < 100:
-                    result[gemini_key] = round(fv, 1)
+                    return fv
+                elif 0 < fv <= 1:
+                    return fv * 100
             except (ValueError, TypeError):
-                pass
+                return None
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                r = extract_numeric(v, depth + 1)
+                if r is not None:
+                    return r
+        if isinstance(obj, list):
+            for item in obj:
+                r = extract_numeric(item, depth + 1)
+                if r is not None:
+                    return r
+        return None
+
+    def find_value(mkts, candidates):
+        for key in candidates:
+            if key in mkts:
+                v = mkts[key]
+                r = extract_numeric(v)
+                if r is not None:
+                    return r
+        # Match partiel (insensible à la casse)
+        for mkts_key, mkts_val in mkts.items():
+            for cand in candidates:
+                if cand.lower() in str(mkts_key).lower() or str(mkts_key).lower() in cand.lower():
+                    r = extract_numeric(mkts_val)
+                    if r is not None:
+                        return r
+        return None
+
+    for gemini_key, candidates in patterns.items():
+        v = find_value(markets, candidates)
+        if v is not None:
+            result[gemini_key] = round(v, 1)
 
     return result
 
@@ -334,14 +363,12 @@ async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 
 
                 pred = await _get(client, f"/events/{event_id}/prediction/")
 
-                # === DEBUG : Afficher la réponse brute pour les 3 premiers ===
+                # Debug pour les 3 premiers
                 if debug_count < 3:
                     print(f"   🔍 DEBUG pred pour {m.get('home','')} vs {m.get('away','')}:")
                     print(f"      Type: {type(pred).__name__}")
                     if isinstance(pred, dict):
-                        keys = list(pred.keys())[:15]
-                        print(f"      Clés: {keys}")
-                        print(f"      Contenu: {str(pred)[:300]}")
+                        print(f"      Clés top: {list(pred.keys())[:15]}")
                     debug_count += 1
 
                 if not pred:
@@ -355,7 +382,7 @@ async def get_bzzoiro_best_matches(matches: list[dict], min_confidence: float = 
 
                 if debug_count <= 3:
                     print(f"      Marchés extraits: {markets}")
-                    print(f"      Confiance calculée: {confidence:.1f}")
+                    print(f"      Confiance: {confidence:.1f}")
 
                 if confidence >= min_confidence:
                     m_copy = dict(m)
