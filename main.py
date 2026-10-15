@@ -35,7 +35,6 @@ except Exception as e:
     get_fixture_result = None
     print(f"⚠️ Import get_fixture_result: {e}")
 
-# Ces imports sont désactivés car API-Football est mort
 fetch_all_today_fixtures = None
 get_corners_cards = None
 get_full_context_api_football = None
@@ -52,7 +51,6 @@ except Exception as e:
     download_and_train = None
     print(f"❌ Import dixon_coles: {e}")
 
-# markets_extra désactivé (nécessite API-Football)
 compute_corners_probs = None
 compute_cards_probs = None
 
@@ -84,7 +82,6 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • H2H + Gemini")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-# === SEUIL 70% + cote min 1.45 ===
 MIN_PROB = float(os.getenv("MIN_PROB", "0.70"))
 MIN_ODD = float(os.getenv("MIN_ODD", "1.45"))
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
@@ -128,7 +125,6 @@ MIN_MATCH_SCORE = 3.0
 
 
 def get_league_score(league_name: str) -> int:
-    """Toutes les ligues ont le MÊME poids (5)."""
     return 5
 
 
@@ -575,7 +571,6 @@ def record_coupons(coupons: list[Coupon], date_str: str):
     save_tracker(tracker)
 
 
-# settle_coupons désactivé (nécessite API-Football)
 async def settle_coupons():
     print("⚠️ settle_coupons désactivé (API-Football suspendu)")
     return
@@ -647,7 +642,6 @@ def extract_real_odds(ev: dict) -> dict:
 
 
 def build_matches_from_odds(odds_events: list[dict]) -> list[dict]:
-    """Construit la liste des matchs UNIQUEMENT depuis The Odds API."""
     matches = []
     for ev in odds_events:
         h = ev.get("home_team", "")
@@ -671,10 +665,9 @@ def build_matches_from_odds(odds_events: list[dict]) -> list[dict]:
 
 
 # =========================================================
-# ENRICHISSEMENT (Bzzoiro SEUL)
+# ENRICHISSEMENT (Bzzoiro SEUL - OPTIONNEL)
 # =========================================================
 async def enrich_matches(matches: list[dict]) -> dict:
-    """Enrichit avec Bzzoiro UNIQUEMENT. Pas de fallback API-Football."""
     to_enrich = matches[:MAX_MATCHES_TO_ENRICH]
     if not to_enrich:
         return {}
@@ -697,7 +690,7 @@ async def enrich_matches(matches: list[dict]) -> dict:
                 h2h_total = ctx.get("h2h", {}).get("total_matches", 0)
                 print(f"  ✅ {home} vs {away} — Bzzoiro • H2H:{h2h_total}")
             else:
-                print(f"  ⚠️ {home} vs {away} : pas d'enrichissement Bzzoiro")
+                print(f"  ⚠️ {home} vs {away} : pas d'enrichissement (optionnel)")
 
             await asyncio.sleep(0.3)
         except Exception as e:
@@ -729,6 +722,7 @@ async def build_gemini_picks(matches, used_today, contexts=None):
                 if event_id in used_today:
                     continue
 
+                # === CONTEXTE OPTIONNEL (bonus si présent) ===
                 ctx = contexts.get(event_id)
                 has_ctx = ctx is not None and ctx.get("available", False)
                 if has_ctx:
@@ -873,7 +867,7 @@ async def build_gemini_picks(matches, used_today, contexts=None):
 
                 candidates.sort(reverse=True, key=lambda x: x["score"])
 
-                # === 1 SEUL PICK PAR MATCH (le meilleur) ===
+                # === 1 SEUL PICK PAR MATCH ===
                 if candidates:
                     c = candidates[0]
                     dedup = f"{event_id}|{c['mkt']}|{c['label']}"
@@ -1447,7 +1441,6 @@ async def btn_debug(message: Message):
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
-        # The Odds API SEUL (pas d'API-Football)
         odds_events = await fetch_all_odds_events()
         matches = build_matches_from_odds(odds_events)
 
