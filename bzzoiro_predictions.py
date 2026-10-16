@@ -1,12 +1,6 @@
 """
 Récupération des prédictions Bzzoiro avec extraction CORRIGÉE.
-Structure Bzzoiro réelle :
-{
-  "match_result": {"prob_home": X, "prob_draw": Y, "prob_away": Z},
-  "over_under": {"prob_over_15": X, "prob_over_25": Y, "prob_over_35": Z},
-  "btts": {"prob_yes": X},
-  "corners": {"prob_over_85": X, "prob_over_95": Y, "prob_over_105": Z}
-}
+Inclut maintenant : 1X2, O/U, BTTS, Corners.
 """
 from __future__ import annotations
 
@@ -21,6 +15,7 @@ import httpx
 
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
 BZZOIRO_BASE = "https://sports.bzzoiro.com/api/v2"
+
 
 # =========================================================
 # MOTS À IGNORER
@@ -216,10 +211,10 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None)
 
 
 # =========================================================
-# EXTRACTION CORRIGÉE (vraie structure Bzzoiro)
+# EXTRACTION (avec corners)
 # =========================================================
 def extract_bzzoiro_markets(pred: dict) -> dict:
-    """Extraction avec la vraie structure Bzzoiro."""
+    """Extraction avec corners inclus."""
     if not pred:
         return {}
 
@@ -252,6 +247,9 @@ def extract_bzzoiro_markets(pred: dict) -> dict:
             if 0 < over_25 < 100:
                 result["over_2.5"] = round(over_25, 1)
                 result["under_2.5"] = round(100.0 - over_25, 1)
+            over_35 = float(ou.get("prob_over_35", 0))
+            if 0 < over_35 < 100:
+                result["over_3.5"] = round(over_35, 1)
         except (ValueError, TypeError):
             pass
 
@@ -286,7 +284,7 @@ def extract_bzzoiro_markets(pred: dict) -> dict:
 
 
 # =========================================================
-# CONFIANCE CORRIGÉE (basée sur la clarté du favori)
+# CONFIANCE
 # =========================================================
 def compute_bzzoiro_confidence(pred: dict, markets: dict) -> float:
     """Confiance = clarté du favori dans le 1X2 + richesse des données."""
@@ -295,7 +293,6 @@ def compute_bzzoiro_confidence(pred: dict, markets: dict) -> float:
 
     confidence = 0.0
 
-    # Clarté du favori principal
     if "victoire_home" in markets and "victoire_away" in markets:
         h = markets.get("victoire_home", 0)
         d = markets.get("match_nul", 0)
@@ -313,11 +310,9 @@ def compute_bzzoiro_confidence(pred: dict, markets: dict) -> float:
         else:
             confidence += 10
 
-    # Bonus si corners dispo (données riches)
     if "over_8.5_corners" in markets:
         confidence += 5
 
-    # Bonus nombre de marchés
     confidence += min(len(markets) * 2, 15)
 
     return max(0.0, min(100.0, confidence))
