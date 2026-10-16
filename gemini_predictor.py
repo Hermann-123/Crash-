@@ -1,6 +1,5 @@
 """
-Prédicteur Gemini enrichi avec H2H + prédictions ML + corners/cartons.
-Accepte les données Bzzoiro ET API-Football.
+Prédicteur Gemini enrichi avec H2H + corners/cartons.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1
 
 
 def format_context(context: Optional[dict]) -> str:
-    """Formate tout le contexte (Bzzoiro ou API-Football) pour Gemini."""
+    """Formate tout le contexte pour Gemini."""
     if not context or not context.get("available"):
         return ""
 
@@ -132,18 +131,14 @@ Retourne UNIQUEMENT ce JSON :
     "double_chance_1X": 0,
     "double_chance_12": 0,
     "double_chance_X2": 0,
-    "handicap_home_plus_05": 0,
-    "handicap_away_plus_05": 0,
     "over_2.5": 0,
     "under_2.5": 0,
     "over_3.5": 0,
     "btts_yes": 0,
     "btts_no": 0,
-    "over_6.5_corners": 0,
     "over_8.5_corners": 0,
+    "over_9.5_corners": 0,
     "over_10.5_corners": 0,
-    "home_over_2.5_corners": 0,
-    "away_over_2.5_corners": 0,
     "over_2.5_cartons": 0,
     "over_3.5_cartons": 0
   }},
@@ -162,10 +157,12 @@ RÈGLES :
 - double_chance_12 = victoire_home + victoire_away
 - over_2.5 + under_2.5 = 100
 - Si tu as des corners/cartons réels, BASE tes probas dessus
+- Pour les cartons : estime selon l'intensité du match, les enjeux, les équipes (un derby ou match à enjeu = plus de cartons)
+- Pour les corners : utilise les moyennes réelles si disponibles
 - Si tu as un H2H réel, mentionne-le dans analysis
 - "analysis" : 2 phrases max
-- "advices" : DONNE 1 OU 2 CONSEILS MAXIMUM. Chaque conseil doit être un marché précis (ex: "Victoire domicile", "Over 2.5 buts", "Double Chance 1X", "BTTS Oui", "Plus de 8.5 corners"...). La "confidence" est la probabilité de réussite du conseil en pourcentage (40-90). Sois honnête : si tu n'es pas sûr, mets une confidence basse.
-- N'inclus PAS de conseils combinés (ex: "1X + Over 2.5") : chaque conseil doit être un pari simple et indépendant.
+- "advices" : DONNE 1 OU 2 CONSEILS MAXIMUM. Chaque conseil doit être un marché précis (ex: "Victoire domicile", "Over 2.5 buts", "Double Chance 1X", "Plus de 9.5 corners"...). La "confidence" est la probabilité de réussite du conseil en pourcentage (40-90).
+- N'inclus PAS de conseils combinés : chaque conseil doit être un pari simple.
 - Rien avant/après le JSON"""
 
     payload = {
@@ -209,7 +206,6 @@ RÈGLES :
                 except Exception:
                     return None
 
-            # Fallback : si Gemini n'a pas renvoyé "advices", on convertit l'ancien format
             if "advices" not in parsed and "advice" in parsed:
                 parsed["advices"] = [{
                     "text": parsed.get("advice", ""),
