@@ -1,5 +1,6 @@
 """
 Prédicteur Gemini enrichi avec H2H + corners/cartons.
+AVEC RETRY ROBUSTE + FALLBACK MULTI-MODÈLES.
 """
 from __future__ import annotations
 
@@ -12,7 +13,15 @@ from typing import Optional
 import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
+
+# === LISTE DE MODÈLES (fallback en cascade) ===
+GEMINI_MODELS = [
+    "gemini-3.1-flash-lite",       # Modèle principal (le plus rapide)
+    "gemini-2.0-flash",            # Fallback 1
+    "gemini-1.5-flash",            # Fallback 2
+]
+
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 def format_context(context: Optional[dict]) -> str:
@@ -107,15 +116,8 @@ def format_context(context: Optional[dict]) -> str:
     return "\n".join(parts)
 
 
-async def predict_match_probas(client: httpx.AsyncClient, home: str, away: str,
-                                league: str, kickoff: str,
-                                context: Optional[dict] = None) -> Optional[dict]:
-    if not GEMINI_API_KEY:
-        return None
-
-    ctx_block = format_context(context)
-
-    prompt = f"""Tu es un analyste football expert. Analyse ce match et estime les probas.
+def build_prompt(home: str, away: str, league: str, ctx_block: str) -> str:
+    return f"""Tu es un analyste football expert. Analyse ce match et estime les probas.
 
 Match : {home} vs {away}
 Compétition : {league}
@@ -157,35 +159,42 @@ RÈGLES :
 - double_chance_12 = victoire_home + victoire_away
 - over_2.5 + under_2.5 = 100
 - Si tu as des corners/cartons réels, BASE tes probas dessus
-- Pour les cartons : estime selon l'intensité du match, les enjeux, les équipes (un derby ou match à enjeu = plus de cartons)
+- Pour les cartons : estime selon l'intensité du match, les enjeux, les équipes
 - Pour les corners : utilise les moyennes réelles si disponibles
 - Si tu as un H2H réel, mentionne-le dans analysis
 - "analysis" : 2 phrases max
-- "advices" : DONNE 1 OU 2 CONSEILS MAXIMUM. Chaque conseil doit être un marché précis (ex: "Victoire domicile", "Over 2.5 buts", "Double Chance 1X", "Plus de 9.5 corners"...). La "confidence" est la probabilité de réussite du conseil en pourcentage (40-90).
-- N'inclus PAS de conseils combinés : chaque conseil doit être un pari simple.
+- "advices" : DONNE 1 OU 2 CONSEILS MAXIMUM. La "confidence" est en pourcentage (40-90).
+- N'inclus PAS de conseils combinés
 - Rien avant/après le JSON"""
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1500},
-    }
 
-    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
+async def call_gemini(client: httpx.AsyncClient, model: str, payload: dict) -> Optional[dict]:
+    """Appelle un modèle Gemini avec 6 retries robustes."""
+    url = f"{GEMINI_BASE_URL}/{model}:generateContent?key={GEMINI_API_KEY}"
 
-    for attempt in range(4):
+    for attempt in range(6):
         try:
-            r = await client.post(url, json=payload, timeout=35.0)
+            r = await client.post(url, json=payload, timeout=45.0)
 
             if r.status_code == 503:
-                print(f"  ⏳ Gemini 503, retry {attempt+1}/4...")
-                await asyncio.sleep(2 ** attempt)
+                wait = min(3 ** attempt, 60)  # 1, 3, 9, 27, 60, 60
+                print(f"  ⏳ Gemini {model} 503, retry {attempt+1}/6 (wait {wait}s)...")
+                await asyncio.sleep(wait)
                 continue
+
             if r.status_code == 429:
-                print(f"  ⏳ Gemini 429, retry {attempt+1}/4...")
-                await asyncio.sleep(5 * (attempt + 1))
+                wait = min(5 * (attempt + 1), 60)
+                print(f"  ⏳ Gemini {model} 429, retry {attempt+1}/6 (wait {wait}s)...")
+                await asyncio.sleep(wait)
                 continue
+
+            if r.status_code == 404:
+                # Modèle non trouvé → on abandonne ce modèle
+                print(f"  ⚠️ Gemini {model} 404 (modèle inexistant)")
+                return None
+
             if r.status_code >= 400:
-                print(f"⚠️ Gemini {r.status_code}: {r.text[:150]}")
+                print(f"  ⚠️ Gemini {model} {r.status_code}: {r.text[:150]}")
                 return None
 
             data = r.json()
@@ -197,6 +206,7 @@ RÈGLES :
             m = re.search(r"\{[\s\S]*\}", text)
             if not m:
                 return None
+
             try:
                 parsed = json.loads(m.group())
             except json.JSONDecodeError:
@@ -215,8 +225,42 @@ RÈGLES :
             return parsed
 
         except Exception as e:
-            print(f"⚠️ Gemini crash (attempt {attempt}): {e}")
-            await asyncio.sleep(2 ** attempt)
+            print(f"  ⚠️ Gemini {model} crash (attempt {attempt}): {e}")
+            await asyncio.sleep(min(2 ** attempt, 30))
 
-    print(f"❌ Gemini échec définitif pour {home} vs {away}")
+    print(f"  ❌ Gemini {model} : échec définitif après 6 tentatives")
+    return None
+
+
+async def predict_match_probas(client: httpx.AsyncClient, home: str, away: str,
+                                league: str, kickoff: str,
+                                context: Optional[dict] = None) -> Optional[dict]:
+    """
+    Analyse un match avec Gemini.
+    Cascade automatique entre les modèles si l'un échoue.
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    ctx_block = format_context(context)
+    prompt = build_prompt(home, away, league, ctx_block)
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1500},
+    }
+
+    for i, model in enumerate(GEMINI_MODELS):
+        result = await call_gemini(client, model, payload)
+        if result is not None:
+            if i > 0:
+                print(f"  ✅ Fallback réussi via {model}")
+            return result
+        else:
+            # Passe au modèle suivant
+            if i < len(GEMINI_MODELS) - 1:
+                print(f"  🔄 Bascule vers {GEMINI_MODELS[i+1]}...")
+            continue
+
+    print(f"❌ Tous les modèles Gemini ont échoué pour {home} vs {away}")
     return None
