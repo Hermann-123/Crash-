@@ -144,6 +144,11 @@ Retourne UNIQUEMENT ce JSON :
     "over_2.5_cartons": 0,
     "over_3.5_cartons": 0
   }},
+  "score_exact": {{
+    "home": 0,
+    "away": 0,
+    "prob": 0
+  }},
   "analysis": "2 phrases d'analyse basées sur les données réelles ci-dessus.",
   "advices": [
     {{"text": "Nom du 1er pronostic conseillé", "confidence": 0}},
@@ -162,6 +167,7 @@ RÈGLES :
 - Pour les cartons : estime selon l'intensité du match, les enjeux, les équipes
 - Pour les corners : utilise les moyennes réelles si disponibles
 - Si tu as un H2H réel, mentionne-le dans analysis
+- "score_exact" : score le plus probable selon ton analyse (home: buts équipe A, away: buts équipe B). "prob" est la probabilité 0-100 de ce score exact (typiquement entre 8 et 20).
 - "analysis" : 2 phrases max
 - "advices" : DONNE 1 OU 2 CONSEILS MAXIMUM. La "confidence" est en pourcentage (40-90).
 - N'inclus PAS de conseils combinés
@@ -232,6 +238,32 @@ async def call_gemini(client: httpx.AsyncClient, model: str, payload: dict) -> O
     return None
 
 
+# === MODIF 2 : validation score_exact ===
+def _normalize_score_exact(raw) -> dict:
+    """
+    Valide et normalise score_exact.
+    Retourne {"home": int, "away": int, "prob": float 0-1} ou {} si invalide.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    try:
+        h = int(raw.get("home", -1))
+        a = int(raw.get("away", -1))
+        p = float(raw.get("prob", 0))
+    except (ValueError, TypeError):
+        return {}
+    if not (0 <= h <= 8 and 0 <= a <= 8):
+        return {}
+    if p < 0:
+        return {}
+    # Normalise proba en 0-1
+    if p > 1.0:
+        p = p / 100.0
+    if p > 0.6:  # improbable (au-delà de 60% pour un score exact)
+        p = 0.0
+    return {"home": h, "away": a, "prob": round(p, 4)}
+
+
 async def predict_match_probas(client: httpx.AsyncClient, home: str, away: str,
                                 league: str, kickoff: str,
                                 context: Optional[dict] = None) -> Optional[dict]:
@@ -247,7 +279,7 @@ async def predict_match_probas(client: httpx.AsyncClient, home: str, away: str,
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1500},
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1600},
     }
 
     for i, model in enumerate(GEMINI_MODELS):
@@ -255,9 +287,10 @@ async def predict_match_probas(client: httpx.AsyncClient, home: str, away: str,
         if result is not None:
             if i > 0:
                 print(f"  ✅ Fallback réussi via {model}")
+            # Normalise score_exact (sécurité)
+            result["score_exact"] = _normalize_score_exact(result.get("score_exact"))
             return result
         else:
-            # Passe au modèle suivant
             if i < len(GEMINI_MODELS) - 1:
                 print(f"  🔄 Bascule vers {GEMINI_MODELS[i+1]}...")
             continue
