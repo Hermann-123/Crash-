@@ -161,6 +161,78 @@ def extract_native_confidence(pred: dict) -> float:
     return 0.0
 
 
+# === MODIF 1 : extraction du score exact Bzzoiro ===
+def extract_bzzoiro_score_exact(pred: dict) -> dict:
+    """
+    Extrait le score exact le plus probable depuis la prédiction Bzzoiro.
+    Essaie plusieurs chemins possibles car la structure peut varier.
+    Retourne {"home": int, "away": int, "prob": float 0-1} ou {} si absent.
+    """
+    if not pred:
+        return {}
+
+    # 1) Chercher dans markets (le plus probable)
+    markets = pred.get("markets", {}) or {}
+    if isinstance(markets, dict):
+        # Chemins directs possibles
+        for key in ("exact_score", "score_exact", "correct_score"):
+            cand = markets.get(key)
+            if isinstance(cand, dict):
+                # Forme {"home": 2, "away": 1, "prob": 12.5}
+                try:
+                    h = int(cand.get("home", -1))
+                    a = int(cand.get("away", -1))
+                    p = float(cand.get("prob", cand.get("probability", 0)))
+                    if 0 <= h <= 8 and 0 <= a <= 8:
+                        if p > 1.0:
+                            p = p / 100.0
+                        if 0 < p <= 0.6:
+                            return {"home": h, "away": a, "prob": round(p, 4)}
+                except (ValueError, TypeError):
+                    pass
+                # Forme {"2-1": 12.5, "1-0": 9.3}
+                best_score, best_prob = None, 0.0
+                for k, v in cand.items():
+                    m = re.match(r"^(\d+)\s*[-:]\s*(\d+)$", str(k).strip())
+                    if not m:
+                        continue
+                    try:
+                        p = float(v)
+                    except (ValueError, TypeError):
+                        continue
+                    if p > 1.0:
+                        p = p / 100.0
+                    if 0 < p <= 0.6 and p > best_prob:
+                        best_prob = p
+                        best_score = (int(m.group(1)), int(m.group(2)))
+                if best_score:
+                    return {"home": best_score[0], "away": best_score[1],
+                            "prob": round(best_prob, 4)}
+
+    # 2) Chercher au niveau racine (fallback)
+    for key in ("most_likely_score", "exact_score", "predicted_score"):
+        cand = pred.get(key)
+        if isinstance(cand, dict):
+            try:
+                h = int(cand.get("home", -1))
+                a = int(cand.get("away", -1))
+                p = float(cand.get("prob", cand.get("probability", 0)))
+                if 0 <= h <= 8 and 0 <= a <= 8:
+                    if p > 1.0:
+                        p = p / 100.0
+                    if 0 < p <= 0.6:
+                        return {"home": h, "away": a, "prob": round(p, 4)}
+            except (ValueError, TypeError):
+                pass
+        # Forme string "2-1"
+        elif isinstance(cand, str):
+            m = re.match(r"^(\d+)\s*[-:]\s*(\d+)$", cand.strip())
+            if m:
+                return {"home": int(m.group(1)), "away": int(m.group(2)), "prob": 0.0}
+
+    return {}
+
+
 async def fetch_bzzoiro_predictions_direct(min_confidence: float = 75.0) -> list[dict]:
     """
     Récupère TOUTES les prédictions Bzzoiro à venir avec confiance >= min_confidence.
@@ -220,6 +292,9 @@ async def fetch_bzzoiro_predictions_direct(min_confidence: float = 75.0) -> list
             if confidence < min_confidence:
                 continue
 
+            # === MODIF 2 : extraction score exact ===
+            score_exact = extract_bzzoiro_score_exact(pred)
+
             enriched.append({
                 "event_id": f"bzz_{pred.get('id', home + away)}",
                 "home": home,
@@ -229,6 +304,7 @@ async def fetch_bzzoiro_predictions_direct(min_confidence: float = 75.0) -> list
                 "bzz_markets": markets,
                 "bzz_confidence": round(confidence, 1),
                 "bzz_raw": pred,
+                "bzz_score_exact": score_exact,  # ← NOUVEAU
                 "has_odds": False,  # Sera mis à jour si cotes réelles dispo
                 "real_odds": {},
                 "odds_sport_key": "",
@@ -240,7 +316,13 @@ async def fetch_bzzoiro_predictions_direct(min_confidence: float = 75.0) -> list
     enriched.sort(key=lambda x: x["bzz_confidence"], reverse=True)
 
     print(f"🔮 Bzzoiro DIRECT : {len(enriched)} prédictions retenues (confiance ≥ {min_confidence})")
+    n_score = sum(1 for e in enriched if e.get("bzz_score_exact"))
+    print(f"⚽ Score exact Bzzoiro disponible : {n_score}/{len(enriched)}")
     for p in enriched[:15]:
-        print(f"   🎯 [{p['bzz_confidence']:.0f}%] {p['home']} vs {p['away']} • {p['league'][:30]}")
+        se = p.get("bzz_score_exact") or {}
+        se_txt = ""
+        if se.get("home") is not None:
+            se_txt = f" ⚽{se['home']}-{se['away']}"
+        print(f"   🎯 [{p['bzz_confidence']:.0f}%]{se_txt} {p['home']} vs {p['away']} • {p['league'][:30]}")
 
     return enriched
