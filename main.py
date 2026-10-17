@@ -81,7 +81,7 @@ try:
 except ValueError:
     ADMIN_ID = 0
 
-NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "14"))
+NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "0"))
 NOTIFY_MINUTE = int(os.getenv("NOTIFY_MINUTE", "0"))
 NOTIFY_TZ = os.getenv("NOTIFY_TZ", "Africa/Abidjan")
 
@@ -120,7 +120,6 @@ BAL_MAX_TOTAL = 5.0
 BAL_MAX_LEGS = 15
 
 # === TICKET VALUE (REFONTE) ===
-# === MODIF 1 : plage haute proba style Sécurisé + cotes basses ===
 VALUE_MIN_PROB = float(os.getenv("VALUE_MIN_PROB", "0.85"))
 VALUE_MAX_PROB = float(os.getenv("VALUE_MAX_PROB", "0.92"))
 VALUE_FALLBACK_MIN_PROB = float(os.getenv("VALUE_FALLBACK_MIN_PROB", "0.80"))
@@ -157,22 +156,16 @@ SOCCER_KEYS = [
 
 
 # =========================================================
-# === MODIF 2 : FILTRE LIGUES OBSCURES (Ticket Value) ===
+# FILTRE LIGUES OBSCURES (Ticket Value)
 # =========================================================
 TOP_LEAGUES_KEYWORDS = {
-    # Anglais
     "premier league", "epl", "champions league", "europa league",
     "conference league", "uefa champions", "uefa europa",
     "uefa conference", "fa cup", "carabao cup",
-    # Espagnol
     "la liga", "laliga", "primera division spain", "copa del rey",
-    # Italien
     "serie a", "coppa italia",
-    # Allemand
     "bundesliga", "dfb pokal",
-    # Français
     "ligue 1", "ligue1", "coupe de france",
-    # Autres top
     "eredivisie top", "primeira liga top",
 }
 
@@ -198,7 +191,7 @@ def is_obscure_league(league_name: str) -> bool:
     Refonte Ticket Value : on veut UNIQUEMENT du obscur.
     """
     if not league_name:
-        return True  # par défaut on accepte (unknown = obscure potentiel)
+        return True
     low = league_name.lower().strip()
     for kw in TOP_LEAGUES_KEYWORDS:
         if kw in low:
@@ -440,7 +433,6 @@ class Candidate:
     advice: str = ""
     advice_confidence: int = 0
     advices: list = None
-    # === MODIF 3 : score exact ===
     score_exact_home: int = -1
     score_exact_away: int = -1
     score_exact_prob: float = 0.0
@@ -473,7 +465,6 @@ class Selection:
     agreement_emoji: str = ""
     agreement_delta: float = 0.0
     bzz_confidence: float = 0.0
-    # === MODIF 4 : score exact ===
     score_exact_home: int = -1
     score_exact_away: int = -1
     score_exact_prob: float = 0.0
@@ -910,7 +901,6 @@ async def build_all_candidates(matches, used_today, contexts=None):
                 bzz_markets_direct = fx.get("bzz_markets", {})
                 bzz_conf_direct = fx.get("bzz_confidence", 0)
 
-                # === MODIF 5 : extraction score exact Gemini + Bzzoiro fallback ===
                 score_home = -1
                 score_away = -1
                 score_prob = 0.0
@@ -954,7 +944,6 @@ async def build_all_candidates(matches, used_today, contexts=None):
                                     "text": str(a.get("text", "")).strip(),
                                     "confidence": conf,
                                 })
-                    # Score exact Gemini
                     se = pred.get("score_exact") or {}
                     if isinstance(se, dict):
                         try:
@@ -968,7 +957,6 @@ async def build_all_candidates(matches, used_today, contexts=None):
                         except (ValueError, TypeError):
                             pass
 
-                # Fallback Bzzoiro si pas de score Gemini
                 if score_source == "":
                     bzz_se = fx.get("bzz_score_exact") or {}
                     if isinstance(bzz_se, dict):
@@ -1121,7 +1109,6 @@ def candidate_to_selection(c: Candidate) -> Selection:
         agreement_emoji=c.agreement_emoji,
         agreement_delta=c.agreement_delta,
         bzz_confidence=c.bzz_confidence,
-        # === MODIF 6 : propagation score exact ===
         score_exact_home=c.score_exact_home,
         score_exact_away=c.score_exact_away,
         score_exact_prob=c.score_exact_prob,
@@ -1243,7 +1230,6 @@ def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
                   "⚖️", legs, round(combined_odds, 2), round(combined_prob, 4))
 
 
-# === MODIF 7 : REFONTE COMPLÈTE DU TICKET VALUE ===
 def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     """
     Ticket Value refondu :
@@ -1255,21 +1241,16 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     - 1 seul pari par match
     - Top 20
     """
-    # Filtre 1 : ligues obscures
     pool = [c for c in candidates if is_obscure_league(c.league)]
     n_obscure = len(pool)
     print(f"  → Ticket Value: {n_obscure}/{len(candidates)} candidates ligues obscures")
 
-    # Filtre 2 : marchés compatibles haute proba
     pool = [c for c in pool if c.market in ("Double Chance", "1X2")]
-
-    # Filtre 3 : cotes 1.10 - 1.35
     pool = [c for c in pool if VALUE_MIN_LEG_ODDS <= c.odds <= VALUE_MAX_LEG_ODDS]
 
-    # Filtre 4 : au moins 2 sources valides
     def n_sources(c: Candidate) -> int:
         n = 0
-        if c.has_context:  # H2H réel
+        if c.has_context:
             n += 1
         if c.prob_dixon > 0:
             n += 1
@@ -1283,11 +1264,9 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
 
     print(f"  → Ticket Value: {len(pool)} candidates après filtres marchés/sources/cotes")
 
-    # Filtre 5 : proba — passe 1 = 85-92%
     strict = [c for c in pool if VALUE_MIN_PROB <= c.prob <= VALUE_MAX_PROB]
     print(f"  → Ticket Value: {len(strict)} paris en 85-92% strict")
 
-    # 1 seul pari par match (on garde la meilleure proba)
     def dedup(pool_list):
         by_ev = {}
         for c in pool_list:
@@ -1297,14 +1276,12 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
 
     strict = dedup(strict)
 
-    # Tri par proba descendante + edge
     def score(c):
         return (c.prob, c.edge, c.bzz_confidence * 0.001)
 
     strict.sort(key=score, reverse=True)
     selected = strict[:VALUE_TOP_N]
 
-    # Fallback : si < 20, compléter avec 80-85%
     if len(selected) < VALUE_TOP_N:
         print(f"  → Ticket Value: fallback (compléter 80-85%), manque {VALUE_TOP_N - len(selected)}")
         used_ids = {c.event_id for c in selected}
@@ -1323,7 +1300,6 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     if not selected:
         return None
 
-    # Cotes/probas "combinées" indicatives (pas affichées comme récap, juste pour log)
     combined_odds = 1.0
     combined_prob = 1.0
     for c in selected:
@@ -1365,8 +1341,9 @@ def format_header():
     )
 
 
-# === MODIF 8 : hide_ai_block + score exact ===
-def format_selection_block(s: Selection, idx: int, compact: bool = False, hide_ai_block: bool = False):
+# === MODIF 1 + 2 : séparation Avis IA / Conseils IA ===
+def format_selection_block(s: Selection, idx: int, compact: bool = False,
+                           hide_analysis: bool = False, hide_advices: bool = False):
     dt = parse_dt_safe(s.kickoff)
     day_tag = ""
     if dt:
@@ -1403,7 +1380,6 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False, hide_a
         d_pct = s.prob_dixon * 100
         b_pct = s.prob_bzzoiro * 100
         lines.append(f"│    <i>G:{g_pct:.0f}% × D:{d_pct:.0f}% × B:{b_pct:.0f}%</i>")
-    # Score exact (nouveau)
     if s.score_exact_home >= 0 and s.score_exact_away >= 0:
         prob_txt = f" ({s.score_exact_prob*100:.1f}%)" if s.score_exact_prob > 0 else ""
         lines.append(f"│ ⚽ <b>Score exact</b> : {s.score_exact_home}-{s.score_exact_away}{prob_txt}")
@@ -1413,29 +1389,35 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False, hide_a
         lines.append(f"│ 💰 Cote : <b>{s.odds}</b> <i>(estimée)</i>")
     if s.edge > 0.05:
         lines.append(f"│ 💎 <b>Value</b> : +{s.edge*100:.1f}%")
-    if not compact and not hide_ai_block and s.analysis:
-        lines.append(f"│")
-        lines.append(f"│ 🧠 <b>Avis IA</b> :")
-        lines.append(f"│ 💬 <i>{s.analysis}</i>")
-        if s.advices:
-            lines.append(f"│ 💡 <b>Conseils IA</b> :")
-            for a in s.advices:
-                txt = a.get("text", "").strip()
-                conf = a.get("confidence", 0)
-                if not txt:
-                    continue
-                if conf > 0:
-                    conf_bar = confidence_bar(conf)
-                    lines.append(f"│    • {txt}  {conf_bar} <b>{conf}%</b>")
+
+    if not compact and (s.analysis or s.advices or s.advice):
+        # 🧠 Avis IA — masquable indépendamment
+        if not hide_analysis and s.analysis:
+            lines.append(f"│")
+            lines.append(f"│ 🧠 <b>Avis IA</b> :")
+            lines.append(f"│ 💬 <i>{s.analysis}</i>")
+        # 💡 Conseils IA — masquable indépendamment
+        if not hide_advices:
+            if s.advices:
+                lines.append(f"│ 💡 <b>Conseils IA</b> :")
+                for a in s.advices:
+                    txt = a.get("text", "").strip()
+                    conf = a.get("confidence", 0)
+                    if not txt:
+                        continue
+                    if conf > 0:
+                        conf_bar = confidence_bar(conf)
+                        lines.append(f"│    • {txt}  {conf_bar} <b>{conf}%</b>")
+                    else:
+                        lines.append(f"│    • {txt}")
+            elif s.advice:
+                if s.advice_confidence > 0:
+                    conf_bar = confidence_bar(s.advice_confidence)
+                    lines.append(f"│ 💡 <b>Conseil IA</b> ({conf_bar} <b>{s.advice_confidence}%</b>) :")
+                    lines.append(f"│    {s.advice}")
                 else:
-                    lines.append(f"│    • {txt}")
-        elif s.advice:
-            if s.advice_confidence > 0:
-                conf_bar = confidence_bar(s.advice_confidence)
-                lines.append(f"│ 💡 <b>Conseil IA</b> ({conf_bar} <b>{s.advice_confidence}%</b>) :")
-                lines.append(f"│    {s.advice}")
-            else:
-                lines.append(f"│ 💡 <b>Conseil IA</b> : {s.advice}")
+                    lines.append(f"│ 💡 <b>Conseil IA</b> : {s.advice}")
+
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
@@ -1450,8 +1432,9 @@ def format_coupon(c: Coupon) -> str:
             "",
         ]
         for i, s in enumerate(c.legs, 1):
-            # === MODIF 8b : Value = hide_ai_block=True ===
-            lines.append(format_selection_block(s, i, compact=False, hide_ai_block=True))
+            # === MODIF 3a : Value = Avis IA masqué, Conseils IA affichés ===
+            lines.append(format_selection_block(s, i, compact=False,
+                                                hide_analysis=True, hide_advices=False))
             lines.append("")
         lines.append(f"<i>{PUBLIC_FOOTER}</i>")
         return "\n".join(lines)
@@ -1469,7 +1452,8 @@ def format_coupon(c: Coupon) -> str:
         f"<b>┗━━━━━━━━━━━━━━━┛</b>", "",
     ]
     for i, s in enumerate(c.legs, 1):
-        lines.append(format_selection_block(s, i, compact=False, hide_ai_block=False))
+        # === MODIF 3b : Sécurisé/Équilibré = tout affiché (défauts) ===
+        lines.append(format_selection_block(s, i, compact=False))
         lines.append("")
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
@@ -1765,7 +1749,6 @@ async def btn_debug(message: Message):
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
-        # === ÉTAPE 1 : Prédictions Bzzoiro DIRECTES ===
         bzz_predictions = []
         if fetch_bzzoiro_predictions_direct and BZZOIRO_API_KEY:
             try:
@@ -1775,10 +1758,8 @@ async def scan():
             except Exception as e:
                 print(f"⚠️ Bzzoiro direct crash: {e}")
 
-        # === ÉTAPE 2 : Cotes réelles The Odds API ===
         odds_events = await fetch_all_odds_events()
 
-        # === ÉTAPE 3 : Matching Bzzoiro ↔ Odds ===
         matches = []
         if bzz_predictions:
             print(f"🔮 Matching {len(bzz_predictions)} prédictions Bzzoiro avec cotes réelles...")
@@ -1804,7 +1785,6 @@ async def scan():
             odds_count = sum(1 for m in matches if m.get("has_odds"))
             print(f"🔗 Prédictions Bzzoiro avec cotes réelles : {odds_count}/{len(matches)}")
 
-        # === ÉTAPE 4 : Fallback ancienne logique ===
         if not matches:
             print("⚠️ Fallback : utilisation de l'ancienne logique")
             odds_matches = build_matches_from_odds(odds_events)
@@ -1833,7 +1813,6 @@ async def scan():
             STATE["candidates"] = []
             return
 
-        # === ÉTAPE 5 : Enrichissement H2H ===
         matches = filter_and_rank_matches(matches)
         contexts = {}
         try:
@@ -1841,7 +1820,6 @@ async def scan():
         except Exception as e:
             print(f"⚠️ Enrichissement désactivé : {e}")
 
-        # === ÉTAPE 6 : Analyse ===
         used_today = load_used_today()
         candidates = await build_all_candidates(matches, used_today, contexts)
         print(f"🎯 Candidats totaux : {len(candidates)}")
