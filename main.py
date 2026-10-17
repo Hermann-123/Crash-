@@ -119,10 +119,13 @@ BAL_MIN_TOTAL = 2.5
 BAL_MAX_TOTAL = 5.0
 BAL_MAX_LEGS = 15
 
-# === TICKET VALUE ===
-VALUE_MIN_PROB = float(os.getenv("VALUE_MIN_PROB", "0.55"))
-VALUE_MAX_PROB = float(os.getenv("VALUE_MAX_PROB", "0.80"))
-VALUE_MIN_LEG_ODDS = float(os.getenv("VALUE_MIN_LEG_ODDS", "1.55"))
+# === TICKET VALUE (REFONTE) ===
+# === MODIF 1 : plage haute proba style Sécurisé + cotes basses ===
+VALUE_MIN_PROB = float(os.getenv("VALUE_MIN_PROB", "0.85"))
+VALUE_MAX_PROB = float(os.getenv("VALUE_MAX_PROB", "0.92"))
+VALUE_FALLBACK_MIN_PROB = float(os.getenv("VALUE_FALLBACK_MIN_PROB", "0.80"))
+VALUE_MIN_LEG_ODDS = float(os.getenv("VALUE_MIN_LEG_ODDS", "1.10"))
+VALUE_MAX_LEG_ODDS = float(os.getenv("VALUE_MAX_LEG_ODDS", "1.35"))
 VALUE_TOP_N = int(os.getenv("VALUE_TOP_N", "20"))
 
 TELEGRAM_MAX_LEN = 3800
@@ -151,6 +154,56 @@ SOCCER_KEYS = [
     "soccer_usa_mls", "soccer_mexico_ligamx",
     "soccer_japan_j_league",
 ]
+
+
+# =========================================================
+# === MODIF 2 : FILTRE LIGUES OBSCURES (Ticket Value) ===
+# =========================================================
+TOP_LEAGUES_KEYWORDS = {
+    # Anglais
+    "premier league", "epl", "champions league", "europa league",
+    "conference league", "uefa champions", "uefa europa",
+    "uefa conference", "fa cup", "carabao cup",
+    # Espagnol
+    "la liga", "laliga", "primera division spain", "copa del rey",
+    # Italien
+    "serie a", "coppa italia",
+    # Allemand
+    "bundesliga", "dfb pokal",
+    # Français
+    "ligue 1", "ligue1", "coupe de france",
+    # Autres top
+    "eredivisie top", "primeira liga top",
+}
+
+OBSCURE_LEAGUES_KEYWORDS = {
+    "championship", "efl champ", "league one", "league two",
+    "segunda", "serie b", "2. bundesliga", "bundesliga 2",
+    "ligue 2", "eerste divisie",
+    "super lig", "super league", "süper lig",
+    "brasileirao", "brasileirão", "brazil campeonato", "serie a brazil",
+    "liga mx", "mls", "primera division argentina",
+    "primeira liga", "liga portugal",
+    "jupiler", "belgium first",
+    "scottish premiership", "scottish championship",
+    "super league greece", "greek super",
+    "j1 league", "j league", "japan",
+    "primera a colombia", "chile campeonato",
+}
+
+
+def is_obscure_league(league_name: str) -> bool:
+    """
+    Retourne True si la ligue N'EST PAS une Top ligue européenne.
+    Refonte Ticket Value : on veut UNIQUEMENT du obscur.
+    """
+    if not league_name:
+        return True  # par défaut on accepte (unknown = obscure potentiel)
+    low = league_name.lower().strip()
+    for kw in TOP_LEAGUES_KEYWORDS:
+        if kw in low:
+            return False
+    return True
 
 
 # =========================================================
@@ -387,6 +440,11 @@ class Candidate:
     advice: str = ""
     advice_confidence: int = 0
     advices: list = None
+    # === MODIF 3 : score exact ===
+    score_exact_home: int = -1
+    score_exact_away: int = -1
+    score_exact_prob: float = 0.0
+    score_exact_source: str = ""
 
 
 @dataclass
@@ -415,6 +473,11 @@ class Selection:
     agreement_emoji: str = ""
     agreement_delta: float = 0.0
     bzz_confidence: float = 0.0
+    # === MODIF 4 : score exact ===
+    score_exact_home: int = -1
+    score_exact_away: int = -1
+    score_exact_prob: float = 0.0
+    score_exact_source: str = ""
 
     def final_prob(self) -> float:
         return self.model_prob
@@ -847,7 +910,12 @@ async def build_all_candidates(matches, used_today, contexts=None):
                 bzz_markets_direct = fx.get("bzz_markets", {})
                 bzz_conf_direct = fx.get("bzz_confidence", 0)
 
-                # Si on a déjà les marchés Bzzoiro directs, on peut skip Gemini
+                # === MODIF 5 : extraction score exact Gemini + Bzzoiro fallback ===
+                score_home = -1
+                score_away = -1
+                score_prob = 0.0
+                score_source = ""
+
                 if bzz_markets_direct:
                     stats["direct_bzz"] += 1
                     gemini_markets = bzz_markets_direct
@@ -886,6 +954,34 @@ async def build_all_candidates(matches, used_today, contexts=None):
                                     "text": str(a.get("text", "")).strip(),
                                     "confidence": conf,
                                 })
+                    # Score exact Gemini
+                    se = pred.get("score_exact") or {}
+                    if isinstance(se, dict):
+                        try:
+                            sh = int(se.get("home", -1))
+                            sa = int(se.get("away", -1))
+                            sp = float(se.get("prob", 0))
+                            if 0 <= sh <= 8 and 0 <= sa <= 8 and sp > 0:
+                                score_home, score_away = sh, sa
+                                score_prob = sp if sp <= 1.0 else sp / 100.0
+                                score_source = "gemini"
+                        except (ValueError, TypeError):
+                            pass
+
+                # Fallback Bzzoiro si pas de score Gemini
+                if score_source == "":
+                    bzz_se = fx.get("bzz_score_exact") or {}
+                    if isinstance(bzz_se, dict):
+                        try:
+                            sh = int(bzz_se.get("home", -1))
+                            sa = int(bzz_se.get("away", -1))
+                            sp = float(bzz_se.get("prob", 0))
+                            if 0 <= sh <= 8 and 0 <= sa <= 8:
+                                score_home, score_away = sh, sa
+                                score_prob = sp if sp <= 1.0 else sp / 100.0
+                                score_source = "bzzoiro"
+                        except (ValueError, TypeError):
+                            pass
 
                 dixon_pred = None
                 if STATE["dixon_model"]:
@@ -993,6 +1089,10 @@ async def build_all_candidates(matches, used_today, contexts=None):
                         advice=advice,
                         advice_confidence=advice_conf,
                         advices=advices_clean,
+                        score_exact_home=score_home,
+                        score_exact_away=score_away,
+                        score_exact_prob=score_prob,
+                        score_exact_source=score_source,
                     ))
                     stats["total_markets"] += 1
 
@@ -1021,6 +1121,11 @@ def candidate_to_selection(c: Candidate) -> Selection:
         agreement_emoji=c.agreement_emoji,
         agreement_delta=c.agreement_delta,
         bzz_confidence=c.bzz_confidence,
+        # === MODIF 6 : propagation score exact ===
+        score_exact_home=c.score_exact_home,
+        score_exact_away=c.score_exact_away,
+        score_exact_prob=c.score_exact_prob,
+        score_exact_source=c.score_exact_source,
     )
 
 
@@ -1138,50 +1243,97 @@ def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
                   "⚖️", legs, round(combined_odds, 2), round(combined_prob, 4))
 
 
+# === MODIF 7 : REFONTE COMPLÈTE DU TICKET VALUE ===
 def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
-    pool = [c for c in candidates
-            if VALUE_MIN_PROB <= c.prob <= VALUE_MAX_PROB
-            and c.odds >= VALUE_MIN_LEG_ODDS]
+    """
+    Ticket Value refondu :
+    - Ligues obscures uniquement (pas Top 5 européen)
+    - Marchés : Double Chance + 1X2 (style Sécurisé)
+    - Probas 85-92% (fallback 80-85% pour compléter)
+    - Cotes 1.10-1.35
+    - Au moins 2 sources parmi H2H/Dixon/Bzzoiro/Gemini
+    - 1 seul pari par match
+    - Top 20
+    """
+    # Filtre 1 : ligues obscures
+    pool = [c for c in candidates if is_obscure_league(c.league)]
+    n_obscure = len(pool)
+    print(f"  → Ticket Value: {n_obscure}/{len(candidates)} candidates ligues obscures")
 
-    print(f"  → Ticket Value: {len(pool)} candidates")
-    if not pool:
-        return None
+    # Filtre 2 : marchés compatibles haute proba
+    pool = [c for c in pool if c.market in ("Double Chance", "1X2")]
 
-    by_event = {}
-    for c in pool:
-        if c.event_id not in by_event or c.edge > by_event[c.event_id].edge:
-            by_event[c.event_id] = c
+    # Filtre 3 : cotes 1.10 - 1.35
+    pool = [c for c in pool if VALUE_MIN_LEG_ODDS <= c.odds <= VALUE_MAX_LEG_ODDS]
 
-    pool = list(by_event.values())
+    # Filtre 4 : au moins 2 sources valides
+    def n_sources(c: Candidate) -> int:
+        n = 0
+        if c.has_context:  # H2H réel
+            n += 1
+        if c.prob_dixon > 0:
+            n += 1
+        if c.prob_bzzoiro > 0:
+            n += 1
+        if c.prob_gemini > 0:
+            n += 1
+        return n
 
+    pool = [c for c in pool if n_sources(c) >= 2]
+
+    print(f"  → Ticket Value: {len(pool)} candidates après filtres marchés/sources/cotes")
+
+    # Filtre 5 : proba — passe 1 = 85-92%
+    strict = [c for c in pool if VALUE_MIN_PROB <= c.prob <= VALUE_MAX_PROB]
+    print(f"  → Ticket Value: {len(strict)} paris en 85-92% strict")
+
+    # 1 seul pari par match (on garde la meilleure proba)
+    def dedup(pool_list):
+        by_ev = {}
+        for c in pool_list:
+            if c.event_id not in by_ev or c.prob > by_ev[c.event_id].prob:
+                by_ev[c.event_id] = c
+        return list(by_ev.values())
+
+    strict = dedup(strict)
+
+    # Tri par proba descendante + edge
     def score(c):
-        s = c.edge
-        if c.agreement_emoji == "🤝🤝":
-            s += 0.30
-        elif c.agreement_emoji == "🤝":
-            s += 0.15
-        if c.has_context:
-            s += 0.05
-        if c.bzz_confidence > 0:
-            s += c.bzz_confidence * 0.002
-        return s
+        return (c.prob, c.edge, c.bzz_confidence * 0.001)
 
-    pool.sort(key=score, reverse=True)
-    top = pool[:VALUE_TOP_N]
+    strict.sort(key=score, reverse=True)
+    selected = strict[:VALUE_TOP_N]
 
-    print(f"  → Ticket Value: {len(top)} paris retenus")
-    if not top:
+    # Fallback : si < 20, compléter avec 80-85%
+    if len(selected) < VALUE_TOP_N:
+        print(f"  → Ticket Value: fallback (compléter 80-85%), manque {VALUE_TOP_N - len(selected)}")
+        used_ids = {c.event_id for c in selected}
+        fallback = [c for c in pool
+                    if VALUE_FALLBACK_MIN_PROB <= c.prob < VALUE_MIN_PROB
+                    and c.event_id not in used_ids]
+        fallback = dedup(fallback)
+        fallback.sort(key=score, reverse=True)
+        for c in fallback:
+            if len(selected) >= VALUE_TOP_N:
+                break
+            selected.append(c)
+
+    print(f"  → Ticket Value: {len(selected)} paris retenus (cible {VALUE_TOP_N})")
+
+    if not selected:
         return None
 
+    # Cotes/probas "combinées" indicatives (pas affichées comme récap, juste pour log)
     combined_odds = 1.0
     combined_prob = 1.0
-    for c in top:
+    for c in selected:
         combined_odds *= c.odds
         combined_prob *= c.prob
 
-    legs = [candidate_to_selection(c) for c in top]
+    legs = [candidate_to_selection(c) for c in selected]
 
-    return Coupon("Ticket Value", f"Top {len(top)} pronostics (valeur)",
+    return Coupon("Ticket Value",
+                  f"Top {len(legs)} • Ligues obscures • DC haute proba",
                   "💎", legs, round(combined_odds, 2), round(combined_prob, 4),
                   is_list=True)
 
@@ -1213,7 +1365,8 @@ def format_header():
     )
 
 
-def format_selection_block(s: Selection, idx: int, compact: bool = False):
+# === MODIF 8 : hide_ai_block + score exact ===
+def format_selection_block(s: Selection, idx: int, compact: bool = False, hide_ai_block: bool = False):
     dt = parse_dt_safe(s.kickoff)
     day_tag = ""
     if dt:
@@ -1250,13 +1403,17 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False):
         d_pct = s.prob_dixon * 100
         b_pct = s.prob_bzzoiro * 100
         lines.append(f"│    <i>G:{g_pct:.0f}% × D:{d_pct:.0f}% × B:{b_pct:.0f}%</i>")
+    # Score exact (nouveau)
+    if s.score_exact_home >= 0 and s.score_exact_away >= 0:
+        prob_txt = f" ({s.score_exact_prob*100:.1f}%)" if s.score_exact_prob > 0 else ""
+        lines.append(f"│ ⚽ <b>Score exact</b> : {s.score_exact_home}-{s.score_exact_away}{prob_txt}")
     if s.real_odd:
         lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b> <i>(réelle)</i>")
     else:
         lines.append(f"│ 💰 Cote : <b>{s.odds}</b> <i>(estimée)</i>")
     if s.edge > 0.05:
         lines.append(f"│ 💎 <b>Value</b> : +{s.edge*100:.1f}%")
-    if not compact and s.analysis:
+    if not compact and not hide_ai_block and s.analysis:
         lines.append(f"│")
         lines.append(f"│ 🧠 <b>Avis IA</b> :")
         lines.append(f"│ 💬 <i>{s.analysis}</i>")
@@ -1293,7 +1450,8 @@ def format_coupon(c: Coupon) -> str:
             "",
         ]
         for i, s in enumerate(c.legs, 1):
-            lines.append(format_selection_block(s, i, compact=True))
+            # === MODIF 8b : Value = hide_ai_block=True ===
+            lines.append(format_selection_block(s, i, compact=False, hide_ai_block=True))
             lines.append("")
         lines.append(f"<i>{PUBLIC_FOOTER}</i>")
         return "\n".join(lines)
@@ -1311,7 +1469,7 @@ def format_coupon(c: Coupon) -> str:
         f"<b>┗━━━━━━━━━━━━━━━┛</b>", "",
     ]
     for i, s in enumerate(c.legs, 1):
-        lines.append(format_selection_block(s, i, compact=False))
+        lines.append(format_selection_block(s, i, compact=False, hide_ai_block=False))
         lines.append("")
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
@@ -1632,7 +1790,7 @@ async def scan():
                 for ev in odds_events:
                     ev_h = normalize_name(ev.get("home_team", ""))
                     ev_a = normalize_name(ev.get("away_team", ""))
-                    if (h_norm in ev_h or ev_h in h_norm) and (a_norm in ev_a or ev_a in a_norm):
+                    if (h_norm in ev_h or ev_h in h_norm) and (a_norm in ev_a or ev_a in h_norm):
                         matched_odds = ev
                         break
 
