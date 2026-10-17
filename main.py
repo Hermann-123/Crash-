@@ -81,7 +81,7 @@ try:
 except ValueError:
     ADMIN_ID = 0
 
-NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "0"))
+NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "14"))
 NOTIFY_MINUTE = int(os.getenv("NOTIFY_MINUTE", "0"))
 NOTIFY_TZ = os.getenv("NOTIFY_TZ", "Africa/Abidjan")
 
