@@ -917,7 +917,7 @@ async def build_all_candidates(matches, used_today, contexts=None):
                     if prob is None or prob < 0.40 or prob > 0.95:
                         continue
 
-                    # === LOT 1 : Fix 3 - Anti-hallucination Corners/Cartons ===
+                    # === Fix 3 : Anti-hallucination Corners/Cartons ===
                     if mkt in ("Corners", "Cartons") and key not in bzz_markets_direct:
                         continue
 
@@ -944,7 +944,7 @@ async def build_all_candidates(matches, used_today, contexts=None):
                     if used_odd < 1.05:
                         continue
 
-                    # === LOT 1 : Fix 7 - Edge sur cote réelle uniquement ===
+                    # === Fix 7 : Edge sur cote réelle uniquement ===
                     edge = -1.0
                     if real_odd and real_odd > 1.01:
                         edge = (prob * real_odd) - 1.0
@@ -970,7 +970,7 @@ async def build_all_candidates(matches, used_today, contexts=None):
 
                     agr_emoji, agr_delta = compute_agreement_three(gemini_markets, dixon_pred, bzz_markets_direct, key)
 
-                    # === LOT 1 : Fix 4 - Rejeter consensus ⚠️ ===
+                    # === Fix 4 : Rejeter consensus ⚠️ ===
                     if agr_emoji == "⚠️":
                         continue
 
@@ -1080,18 +1080,39 @@ def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     return Coupon("Ticket Équilibré", f"Cote {BAL_MIN_TOTAL} - {BAL_MAX_TOTAL} • Multi-marchés", "⚖️", legs, round(combined_odds, 2), round(combined_prob, 4))
 
 def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
+    # Filtre 1 : ligues obscures
     pool = [c for c in candidates if is_obscure_league(c.league)]
-    pool = [c for c in pool if c.market in ("Double Chance", "1X2")]
+    print(f"  → Value Filtre 1 (obscure) : {len(pool)}/{len(candidates)}")
+
+    # Filtre 2 : marchés autorisés (DC, 1X2, O/U, BTTS)
+    pool = [c for c in pool if c.market in ("Double Chance", "1X2", "Over/Under", "BTTS")]
+    print(f"  → Value Filtre 2 (markets) : {len(pool)}")
+
+    # Filtre 3 : cotes 1.10 - 1.35
     pool = [c for c in pool if VALUE_MIN_LEG_ODDS <= c.odds <= VALUE_MAX_LEG_ODDS]
-    
-    # === LOT 1 : Fix 5 - Filtre Edge minimum 3% ===
-    pool = [c for c in pool if c.edge >= 0.03]
+    print(f"  → Value Filtre 3 (cotes 1.10-1.35) : {len(pool)}")
 
+    # === FIX : Filtre Value conditionnel ===
+    # Si cote réelle dispo → exiger edge ≥ 3%. Sinon (DC sans cote) → exiger proba ≥ 88%.
+    def qualifies(c: Candidate) -> bool:
+        if c.real_odd is not None:
+            return c.edge >= 0.03
+        return c.prob >= 0.88
+
+    pool = [c for c in pool if qualifies(c)]
+    print(f"  → Value Filtre 4 (edge/prob) : {len(pool)}")
+
+    # Filtre 5 : au moins 2 sources
     def n_sources(c: Candidate) -> int:
-        return sum([1 for x in (c.has_context, c.prob_dixon > 0, c.prob_bzzoiro > 0, c.prob_gemini > 0) if x])
+        return sum([1 for x in (c.has_context, c.prob_dixon > 0,
+                                c.prob_bzzoiro > 0, c.prob_gemini > 0) if x])
     pool = [c for c in pool if n_sources(c) >= 2]
+    print(f"  → Value Filtre 5 (2 sources) : {len(pool)}")
 
+    # Filtre 6 : proba stricte 85-92%
     strict = [c for c in pool if VALUE_MIN_PROB <= c.prob <= VALUE_MAX_PROB]
+    print(f"  → Value Filtre 6 (proba 85-92%) : {len(strict)}")
+
     def dedup(pool_list):
         by_ev = {}
         for c in pool_list:
@@ -1100,30 +1121,45 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
         return list(by_ev.values())
 
     strict = dedup(strict)
+
     def score(c):
-        return (c.prob, c.edge, c.bzz_confidence * 0.001)
+        edge_score = c.edge if c.edge > 0 else 0.0
+        return (c.prob, edge_score, c.bzz_confidence * 0.001)
+
     strict.sort(key=score, reverse=True)
     selected = strict[:VALUE_TOP_N]
 
+    # Fallback 80-85%
     if len(selected) < VALUE_TOP_N:
+        print(f"  → Value : fallback 80-85% (manque {VALUE_TOP_N - len(selected)})")
         used_ids = {c.event_id for c in selected}
-        fallback = [c for c in pool if VALUE_FALLBACK_MIN_PROB <= c.prob < VALUE_MIN_PROB and c.event_id not in used_ids]
+        fallback = [c for c in pool
+                    if VALUE_FALLBACK_MIN_PROB <= c.prob < VALUE_MIN_PROB
+                    and c.event_id not in used_ids]
         fallback = dedup(fallback)
         fallback.sort(key=score, reverse=True)
         for c in fallback:
-            if len(selected) >= VALUE_TOP_N: break
+            if len(selected) >= VALUE_TOP_N:
+                break
             selected.append(c)
+
+    print(f"  → Ticket Value FINAL : {len(selected)} paris retenus")
 
     if not selected:
         return None
 
-    combined_odds, combined_prob = 1.0, 1.0
+    combined_odds = 1.0
+    combined_prob = 1.0
     for c in selected:
         combined_odds *= c.odds
         combined_prob *= c.prob
 
     legs = [candidate_to_selection(c) for c in selected]
-    return Coupon("Ticket Value", f"Top {len(legs)} • Ligues obscures • DC haute proba", "💎", legs, round(combined_odds, 2), round(combined_prob, 4), is_list=True)
+
+    return Coupon("Ticket Value",
+                  f"Top {len(legs)} • Ligues obscures • DC haute proba",
+                  "💎", legs, round(combined_odds, 2), round(combined_prob, 4),
+                  is_list=True)
 
 def build_all_coupons(candidates: list[Candidate]) -> list[Coupon]:
     coupons = []
@@ -1401,7 +1437,7 @@ async def scan():
                 h_norm, a_norm = normalize_name(bzz["home"]), normalize_name(bzz["away"])
                 for ev in odds_events:
                     ev_h, ev_a = normalize_name(ev.get("home_team", "")), normalize_name(ev.get("away_team", ""))
-                    if (h_norm in ev_h or ev_h in h_norm) and (a_norm in ev_a or ev_a in h_norm):
+                    if (h_norm in ev_h or ev_h in h_norm) and (a_norm in ev_a or a_norm in ev_h):
                         matched_odds = ev; break
                 bzz_copy = dict(bzz)
                 if matched_odds:
