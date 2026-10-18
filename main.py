@@ -110,13 +110,12 @@ SAFE_MAX_TOTAL = 2.5
 SAFE_MAX_LEGS = 6
 
 # === TICKET ÉQUILIBRÉ ===
-BAL_MIN_PROB = float(os.getenv("BAL_MIN_PROB", "0.65"))
-BAL_MAX_PROB = float(os.getenv("BAL_MAX_PROB", "0.85"))
-BAL_MIN_LEG_ODDS = float(os.getenv("BAL_MIN_LEG_ODDS", "1.35"))
-BAL_MAX_LEG_ODDS = float(os.getenv("BAL_MAX_LEG_ODDS", "1.80"))
-BAL_MIN_TOTAL = 2.5
-BAL_MAX_TOTAL = 5.0
-BAL_MAX_LEGS = 15
+BAL_MIN_PROB = float(os.getenv("BAL_MIN_PROB", "0.60"))
+BAL_MAX_PROB = float(os.getenv("BAL_MAX_PROB", "0.88"))
+BAL_MIN_LEG_ODDS = float(os.getenv("BAL_MIN_LEG_ODDS", "1.30"))
+BAL_MAX_LEG_ODDS = float(os.getenv("BAL_MAX_LEG_ODDS", "2.00"))
+BAL_MIN_TOTAL = 2.0
+BAL_MAX_TOTAL = 6.0
 
 # === TICKET VALUE ===
 VALUE_MIN_PROB = float(os.getenv("VALUE_MIN_PROB", "0.85"))
@@ -917,7 +916,6 @@ async def build_all_candidates(matches, used_today, contexts=None):
                     if prob is None or prob < 0.40 or prob > 0.95:
                         continue
 
-                    # === Fix 3 : Anti-hallucination Corners/Cartons ===
                     if mkt in ("Corners", "Cartons") and key not in bzz_markets_direct:
                         continue
 
@@ -944,7 +942,6 @@ async def build_all_candidates(matches, used_today, contexts=None):
                     if used_odd < 1.05:
                         continue
 
-                    # === Fix 7 : Edge sur cote réelle uniquement ===
                     edge = -1.0
                     if real_odd and real_odd > 1.01:
                         edge = (prob * real_odd) - 1.0
@@ -969,8 +966,6 @@ async def build_all_candidates(matches, used_today, contexts=None):
                                 pass
 
                     agr_emoji, agr_delta = compute_agreement_three(gemini_markets, dixon_pred, bzz_markets_direct, key)
-
-                    # === Fix 4 : Rejeter consensus ⚠️ ===
                     if agr_emoji == "⚠️":
                         continue
 
@@ -1040,7 +1035,10 @@ def build_safe_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
 def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     market_types = ["Over/Under", "BTTS", "Double Chance", "1X2"]
     pool_all = [c for c in candidates if c.market in market_types and BAL_MIN_PROB <= c.prob <= BAL_MAX_PROB and BAL_MIN_LEG_ODDS <= c.odds <= BAL_MAX_LEG_ODDS]
+    
+    print(f"  → Ticket Équilibré: {len(pool_all)} candidates initiales")
     if not pool_all:
+        print("  → Ticket Équilibré: Aucun candidat dans les critères")
         return None
 
     legs, used_events, used_leagues = [], set(), set()
@@ -1062,6 +1060,7 @@ def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
             used_leagues.add(c.league)
             added += 1
 
+    print(f"  → Ticket Équilibré: {len(legs)} legs préliminaires")
     if not legs:
         return None
 
@@ -1075,44 +1074,44 @@ def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
         combined_odds /= removed.odds
         combined_prob /= removed.final_prob()
 
-    if combined_odds < BAL_MIN_TOTAL * 0.85 or combined_odds > BAL_MAX_TOTAL * 1.25:
+    print(f"  → Ticket Équilibré: {len(legs)} legs, cote {combined_odds:.2f}")
+
+    # Seuil de cote minimale assoupli à 1.70 (au lieu de 2.125)
+    if combined_odds < 1.70:
+        print(f"  → Ticket Équilibré: REJETÉ (cote {combined_odds:.2f} < 1.70)")
         return None
-    return Coupon("Ticket Équilibré", f"Cote {BAL_MIN_TOTAL} - {BAL_MAX_TOTAL} • Multi-marchés", "⚖️", legs, round(combined_odds, 2), round(combined_prob, 4))
+    if combined_odds > BAL_MAX_TOTAL * 1.25:
+        print(f"  → Ticket Équilibré: REJETÉ (cote {combined_odds:.2f} > {BAL_MAX_TOTAL * 1.25})")
+        return None
+
+    return Coupon("Ticket Équilibré", f"Cote 2.0 - 6.0 • Multi-marchés", "⚖️", legs, round(combined_odds, 2), round(combined_prob, 4))
 
 def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
-    # Filtre 1 : ligues obscures
     pool = [c for c in candidates if is_obscure_league(c.league)]
     print(f"  → Value Filtre 1 (obscure) : {len(pool)}/{len(candidates)}")
 
-    # Filtre 2 : marchés autorisés
     pool = [c for c in pool if c.market in ("Double Chance", "1X2", "Over/Under", "BTTS")]
     print(f"  → Value Filtre 2 (markets) : {len(pool)}")
 
-    # Filtre 3 : cotes 1.10 - 1.35
     pool = [c for c in pool if VALUE_MIN_LEG_ODDS <= c.odds <= VALUE_MAX_LEG_ODDS]
     print(f"  → Value Filtre 3 (cotes 1.10-1.35) : {len(pool)}")
 
-    # Diagnostic : combien ont une cote réelle ?
     n_real = sum(1 for c in pool if c.real_odd is not None)
     print(f"  → Value Diagnostic : {n_real} cotes réelles / {len(pool)-n_real} estimées")
 
-    # === FIX : Filtre Value ASSOUPLI ===
     def qualifies(c: Candidate) -> bool:
         if c.real_odd is not None:
-            return c.edge >= 0.01   # 1% d'edge min sur cote réelle
-        return c.prob >= 0.80       # 80% proba min sur cote estimée (assoupli)
+            return c.edge >= 0.01
+        return c.prob >= 0.80
 
     pool = [c for c in pool if qualifies(c)]
     print(f"  → Value Filtre 4 (edge/prob) : {len(pool)}")
 
-    # Filtre 5 : au moins 2 sources
     def n_sources(c: Candidate) -> int:
-        return sum([1 for x in (c.has_context, c.prob_dixon > 0,
-                                c.prob_bzzoiro > 0, c.prob_gemini > 0) if x])
+        return sum([1 for x in (c.has_context, c.prob_dixon > 0, c.prob_bzzoiro > 0, c.prob_gemini > 0) if x])
     pool = [c for c in pool if n_sources(c) >= 2]
     print(f"  → Value Filtre 5 (2 sources) : {len(pool)}")
 
-    # Filtre 6 : proba stricte 85-92%
     strict = [c for c in pool if VALUE_MIN_PROB <= c.prob <= VALUE_MAX_PROB]
     print(f"  → Value Filtre 6 (proba 85-92%) : {len(strict)}")
 
@@ -1132,18 +1131,14 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     strict.sort(key=score, reverse=True)
     selected = strict[:VALUE_TOP_N]
 
-    # Fallback 80-85%
     if len(selected) < VALUE_TOP_N:
         print(f"  → Value : fallback 80-85% (manque {VALUE_TOP_N - len(selected)})")
         used_ids = {c.event_id for c in selected}
-        fallback = [c for c in pool
-                    if VALUE_FALLBACK_MIN_PROB <= c.prob < VALUE_MIN_PROB
-                    and c.event_id not in used_ids]
+        fallback = [c for c in pool if VALUE_FALLBACK_MIN_PROB <= c.prob < VALUE_MIN_PROB and c.event_id not in used_ids]
         fallback = dedup(fallback)
         fallback.sort(key=score, reverse=True)
         for c in fallback:
-            if len(selected) >= VALUE_TOP_N:
-                break
+            if len(selected) >= VALUE_TOP_N: break
             selected.append(c)
 
     print(f"  → Ticket Value FINAL : {len(selected)} paris retenus")
@@ -1151,18 +1146,13 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     if not selected:
         return None
 
-    combined_odds = 1.0
-    combined_prob = 1.0
+    combined_odds, combined_prob = 1.0, 1.0
     for c in selected:
         combined_odds *= c.odds
         combined_prob *= c.prob
 
     legs = [candidate_to_selection(c) for c in selected]
-
-    return Coupon("Ticket Value",
-                  f"Top {len(legs)} • Ligues obscures • DC haute proba",
-                  "💎", legs, round(combined_odds, 2), round(combined_prob, 4),
-                  is_list=True)
+    return Coupon("Ticket Value", f"Top {len(legs)} • Ligues obscures • DC haute proba", "💎", legs, round(combined_odds, 2), round(combined_prob, 4), is_list=True)
 
 def build_all_coupons(candidates: list[Candidate]) -> list[Coupon]:
     coupons = []
