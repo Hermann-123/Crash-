@@ -1,6 +1,6 @@
 """
 Prédicteur Gemini enrichi avec H2H + corners/cartons.
-AVEC RETRY ROBUSTE + FALLBACK MULTI-MODÈLES.
+AVEC RETRY ROBUSTE + FALLBACK MULTI-MODÈLES (Version Rapide).
 """
 from __future__ import annotations
 
@@ -14,12 +14,11 @@ import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# === LISTE DE MODÈLES (fallback en cascade) ===
-# Mise à jour Octobre 2026 : noms valides et stables (les anciens 1.5 et 2.0 renvoient des 404)
+# === LISTE DE MODÈLES ===
+# On privilégie Flash-Lite qui est beaucoup moins surchargé que les gros modèles
 GEMINI_MODELS = [
-    "gemini-3.8-flash",       # Modèle principal (stable et récent)
+    "gemini-3.5-flash-lite",  # Modèle principal (rapide, stable, moins de 503)
     "gemini-3.5-flash",       # Fallback 1
-    "gemini-3.5-flash-lite",  # Fallback 2
 ]
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -176,32 +175,27 @@ RÈGLES :
 
 
 async def call_gemini(client: httpx.AsyncClient, model: str, payload: dict) -> Optional[dict]:
-    """Appelle un modèle Gemini avec 6 retries robustes."""
+    """Appelle un modèle Gemini avec 3 retries max et délais courts."""
     url = f"{GEMINI_BASE_URL}/{model}:generateContent?key={GEMINI_API_KEY}"
 
-    for attempt in range(6):
+    # On passe de 6 à 3 tentatives pour ne pas bloquer le bot
+    for attempt in range(3):
         try:
-            r = await client.post(url, json=payload, timeout=45.0)
+            r = await client.post(url, json=payload, timeout=30.0)
 
-            if r.status_code == 503:
-                wait = min(3 ** attempt, 60)  # 1, 3, 9, 27, 60, 60
-                print(f"  ⏳ Gemini {model} 503, retry {attempt+1}/6 (wait {wait}s)...")
-                await asyncio.sleep(wait)
-                continue
-
-            if r.status_code == 429:
-                wait = min(5 * (attempt + 1), 60)
-                print(f"  ⏳ Gemini {model} 429, retry {attempt+1}/6 (wait {wait}s)...")
+            if r.status_code in (503, 429):
+                # On attend max 10s au lieu de 60s
+                wait = min(2 ** attempt, 10)  
+                print(f"  ⏳ Gemini {model} {r.status_code}, retry {attempt+1}/3 (wait {wait}s)...")
                 await asyncio.sleep(wait)
                 continue
 
             if r.status_code == 404:
-                # Modèle non trouvé → on abandonne ce modèle
                 print(f"  ⚠️ Gemini {model} 404 (modèle inexistant)")
                 return None
 
             if r.status_code >= 400:
-                print(f"  ⚠️ Gemini {model} {r.status_code}: {r.text[:150]}")
+                print(f"  ⚠️ Gemini {model} {r.status_code}: {r.text[:100]}")
                 return None
 
             data = r.json()
@@ -233,17 +227,13 @@ async def call_gemini(client: httpx.AsyncClient, model: str, payload: dict) -> O
 
         except Exception as e:
             print(f"  ⚠️ Gemini {model} crash (attempt {attempt}): {e}")
-            await asyncio.sleep(min(2 ** attempt, 30))
+            await asyncio.sleep(2)
 
-    print(f"  ❌ Gemini {model} : échec définitif après 6 tentatives")
+    print(f"  ❌ Gemini {model} : échec après 3 tentatives")
     return None
 
 
 def _normalize_score_exact(raw) -> dict:
-    """
-    Valide et normalise score_exact.
-    Retourne {"home": int, "away": int, "prob": float 0-1} ou {} si invalide.
-    """
     if not isinstance(raw, dict):
         return {}
     try:
@@ -256,10 +246,9 @@ def _normalize_score_exact(raw) -> dict:
         return {}
     if p < 0:
         return {}
-    # Normalise proba en 0-1
     if p > 1.0:
         p = p / 100.0
-    if p > 0.6:  # improbable (au-delà de 60% pour un score exact)
+    if p > 0.6:
         p = 0.0
     return {"home": h, "away": a, "prob": round(p, 4)}
 
@@ -267,10 +256,6 @@ def _normalize_score_exact(raw) -> dict:
 async def predict_match_probas(client: httpx.AsyncClient, home: str, away: str,
                                 league: str, kickoff: str,
                                 context: Optional[dict] = None) -> Optional[dict]:
-    """
-    Analyse un match avec Gemini.
-    Cascade automatique entre les modèles si l'un échoue.
-    """
     if not GEMINI_API_KEY:
         return None
 
@@ -283,11 +268,11 @@ async def predict_match_probas(client: httpx.AsyncClient, home: str, away: str,
     }
 
     for i, model in enumerate(GEMINI_MODELS):
+        print(f"  🧠 Analyse de {home} vs {away} avec {model}...")
         result = await call_gemini(client, model, payload)
         if result is not None:
             if i > 0:
                 print(f"  ✅ Fallback réussi via {model}")
-            # Normalise score_exact (sécurité)
             result["score_exact"] = _normalize_score_exact(result.get("score_exact"))
             return result
         else:
