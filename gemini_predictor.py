@@ -15,10 +15,11 @@ import httpx
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # === LISTE DE MODÈLES (fallback en cascade) ===
+# Mise à jour Octobre 2026 : noms valides et stables (les anciens 1.5 et 2.0 renvoient des 404)
 GEMINI_MODELS = [
-    "gemini-3.1-flash-lite",       # Modèle principal (le plus rapide)
-    "gemini-2.0-flash",            # Fallback 1
-    "gemini-1.5-flash",            # Fallback 2
+    "gemini-3.8-flash",       # Modèle principal (stable et récent)
+    "gemini-3.5-flash",       # Fallback 1
+    "gemini-3.5-flash-lite",  # Fallback 2
 ]
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -238,7 +239,6 @@ async def call_gemini(client: httpx.AsyncClient, model: str, payload: dict) -> O
     return None
 
 
-# === MODIF 2 : validation score_exact ===
 def _normalize_score_exact(raw) -> dict:
     """
     Valide et normalise score_exact.
