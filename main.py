@@ -1084,7 +1084,7 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     pool = [c for c in candidates if is_obscure_league(c.league)]
     print(f"  → Value Filtre 1 (obscure) : {len(pool)}/{len(candidates)}")
 
-    # Filtre 2 : marchés autorisés (DC, 1X2, O/U, BTTS)
+    # Filtre 2 : marchés autorisés
     pool = [c for c in pool if c.market in ("Double Chance", "1X2", "Over/Under", "BTTS")]
     print(f"  → Value Filtre 2 (markets) : {len(pool)}")
 
@@ -1092,12 +1092,15 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     pool = [c for c in pool if VALUE_MIN_LEG_ODDS <= c.odds <= VALUE_MAX_LEG_ODDS]
     print(f"  → Value Filtre 3 (cotes 1.10-1.35) : {len(pool)}")
 
-    # === FIX : Filtre Value conditionnel ===
-    # Si cote réelle dispo → exiger edge ≥ 3%. Sinon (DC sans cote) → exiger proba ≥ 88%.
+    # Diagnostic : combien ont une cote réelle ?
+    n_real = sum(1 for c in pool if c.real_odd is not None)
+    print(f"  → Value Diagnostic : {n_real} cotes réelles / {len(pool)-n_real} estimées")
+
+    # === FIX : Filtre Value ASSOUPLI ===
     def qualifies(c: Candidate) -> bool:
         if c.real_odd is not None:
-            return c.edge >= 0.03
-        return c.prob >= 0.88
+            return c.edge >= 0.01   # 1% d'edge min sur cote réelle
+        return c.prob >= 0.80       # 80% proba min sur cote estimée (assoupli)
 
     pool = [c for c in pool if qualifies(c)]
     print(f"  → Value Filtre 4 (edge/prob) : {len(pool)}")
