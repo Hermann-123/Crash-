@@ -125,6 +125,9 @@ VALUE_MIN_LEG_ODDS = float(os.getenv("VALUE_MIN_LEG_ODDS", "1.10"))
 VALUE_MAX_LEG_ODDS = float(os.getenv("VALUE_MAX_LEG_ODDS", "1.35"))
 VALUE_TOP_N = int(os.getenv("VALUE_TOP_N", "20"))
 
+# === TICKET BBTS+2.5 ===
+BTTS_TOP_N = 3 # On veut exactement 3 matchs
+
 TELEGRAM_MAX_LEN = 3800
 
 if not BOT_TOKEN:
@@ -257,7 +260,7 @@ W_BZZOIRO = 0.40
 ALL_MARKETS = [
     "victoire_home", "match_nul", "victoire_away",
     "over_2.5", "under_2.5", "over_3.5",
-    "btts_yes", "btts_no",
+    "btts_yes", "btts_no", "btts_over_25",
     "over_8.5_corners", "over_9.5_corners", "over_10.5_corners",
     "over_2.5_cartons", "over_3.5_cartons",
 ]
@@ -284,6 +287,7 @@ def combine_three_sources(gemini_markets: dict, dixon_pred: Optional[dict], bzz_
             "over_3.5": dixon_pred.get("over_3.5", 0),
             "btts_yes": dixon_pred.get("btts_yes", 0),
             "btts_no": dixon_pred.get("btts_no", 0),
+            "btts_over_25": dixon_pred.get("btts_over_25", 0),
         }
 
     b = {}
@@ -326,7 +330,7 @@ def compute_agreement_three(gemini_markets: dict, dixon_pred: Optional[dict], bz
     map_d = {
         "victoire_home": "p_home", "match_nul": "p_draw", "victoire_away": "p_away",
         "over_2.5": "over_2.5", "under_2.5": "under_2.5", "over_3.5": "over_3.5",
-        "btts_yes": "btts_yes", "btts_no": "btts_no",
+        "btts_yes": "btts_yes", "btts_no": "btts_no", "btts_over_25": "btts_over_25",
     }
     probs = {}
     gk = map_g.get(market_key)
@@ -452,6 +456,7 @@ dp = Dispatcher()
 BTN_SAFE = "🔒 Sécurisé"
 BTN_BAL = "⚖️ Équilibré"
 BTN_VAR = "💎 Value"
+BTN_BTTS = "🎯 BBTS+2.5"
 BTN_SCAN = "🔄 Actualiser"
 BTN_BILAN = "📊 Bilan"
 BTN_ACTIVATE = "🔑 Activer mon abonnement"
@@ -459,8 +464,8 @@ BTN_ACTIVATE = "🔑 Activer mon abonnement"
 USER_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_SAFE), KeyboardButton(text=BTN_BAL)],
-        [KeyboardButton(text=BTN_VAR), KeyboardButton(text=BTN_BILAN)],
-        [KeyboardButton(text=BTN_ACTIVATE)],
+        [KeyboardButton(text=BTN_VAR), KeyboardButton(text=BTN_BTTS)],
+        [KeyboardButton(text=BTN_BILAN), KeyboardButton(text=BTN_ACTIVATE)],
     ],
     resize_keyboard=True,
     input_field_placeholder="Choisis un ticket…",
@@ -469,8 +474,8 @@ USER_KEYBOARD = ReplyKeyboardMarkup(
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_SAFE), KeyboardButton(text=BTN_BAL)],
-        [KeyboardButton(text=BTN_VAR), KeyboardButton(text=BTN_BILAN)],
-        [KeyboardButton(text=BTN_SCAN), KeyboardButton(text="⚙️ Debug")],
+        [KeyboardButton(text=BTN_VAR), KeyboardButton(text=BTN_BTTS)],
+        [KeyboardButton(text=BTN_SCAN), KeyboardButton(text=BTN_BILAN), KeyboardButton(text="⚙️ Debug")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Admin: Choisis une action…",
@@ -904,6 +909,7 @@ async def build_all_candidates(matches, used_today, contexts=None):
                     "over_3.5": ("Over 3.5 buts", "Over/Under"),
                     "btts_yes": ("Les 2 marquent : Oui", "BTTS"),
                     "btts_no": ("Les 2 marquent : Non", "BTTS"),
+                    "btts_over_25": ("BTTS + Plus de 2.5 buts", "BTTS+O2.5"),
                     "over_8.5_corners": ("Plus de 8.5 corners", "Corners"),
                     "over_9.5_corners": ("Plus de 9.5 corners", "Corners"),
                     "over_10.5_corners": ("Plus de 10.5 corners", "Corners"),
@@ -953,7 +959,7 @@ async def build_all_candidates(matches, used_today, contexts=None):
                         prob_gemini = 0.0
                     prob_dixon = 0.0
                     if dixon_pred:
-                        dk = {"victoire_home": "p_home", "match_nul": "p_draw", "victoire_away": "p_away", "over_2.5": "over_2.5", "under_2.5": "under_2.5", "over_3.5": "over_3.5", "btts_yes": "btts_yes", "btts_no": "btts_no"}.get(key)
+                        dk = {"victoire_home": "p_home", "match_nul": "p_draw", "victoire_away": "p_away", "over_2.5": "over_2.5", "under_2.5": "under_2.5", "over_3.5": "over_3.5", "btts_yes": "btts_yes", "btts_no": "btts_no", "btts_over_25": "btts_over_25"}.get(key)
                         if dk:
                             prob_dixon = dixon_pred.get(dk, 0.0)
                     prob_bzzoiro = 0.0
@@ -1036,9 +1042,7 @@ def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     market_types = ["Over/Under", "BTTS", "Double Chance", "1X2"]
     pool_all = [c for c in candidates if c.market in market_types and BAL_MIN_PROB <= c.prob <= BAL_MAX_PROB and BAL_MIN_LEG_ODDS <= c.odds <= BAL_MAX_LEG_ODDS]
     
-    print(f"  → Ticket Équilibré: {len(pool_all)} candidates initiales")
     if not pool_all:
-        print("  → Ticket Équilibré: Aucun candidat dans les critères")
         return None
 
     legs, used_events, used_leagues = [], set(), set()
@@ -1060,7 +1064,6 @@ def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
             used_leagues.add(c.league)
             added += 1
 
-    print(f"  → Ticket Équilibré: {len(legs)} legs préliminaires")
     if not legs:
         return None
 
@@ -1074,30 +1077,15 @@ def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
         combined_odds /= removed.odds
         combined_prob /= removed.final_prob()
 
-    print(f"  → Ticket Équilibré: {len(legs)} legs, cote {combined_odds:.2f}")
-
-    # Seuil de cote minimale assoupli à 1.70 (au lieu de 2.125)
-    if combined_odds < 1.70:
-        print(f"  → Ticket Équilibré: REJETÉ (cote {combined_odds:.2f} < 1.70)")
-        return None
-    if combined_odds > BAL_MAX_TOTAL * 1.25:
-        print(f"  → Ticket Équilibré: REJETÉ (cote {combined_odds:.2f} > {BAL_MAX_TOTAL * 1.25})")
+    if combined_odds < 1.70 or combined_odds > BAL_MAX_TOTAL * 1.25:
         return None
 
     return Coupon("Ticket Équilibré", f"Cote 2.0 - 6.0 • Multi-marchés", "⚖️", legs, round(combined_odds, 2), round(combined_prob, 4))
 
 def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     pool = [c for c in candidates if is_obscure_league(c.league)]
-    print(f"  → Value Filtre 1 (obscure) : {len(pool)}/{len(candidates)}")
-
     pool = [c for c in pool if c.market in ("Double Chance", "1X2", "Over/Under", "BTTS")]
-    print(f"  → Value Filtre 2 (markets) : {len(pool)}")
-
     pool = [c for c in pool if VALUE_MIN_LEG_ODDS <= c.odds <= VALUE_MAX_LEG_ODDS]
-    print(f"  → Value Filtre 3 (cotes 1.10-1.35) : {len(pool)}")
-
-    n_real = sum(1 for c in pool if c.real_odd is not None)
-    print(f"  → Value Diagnostic : {n_real} cotes réelles / {len(pool)-n_real} estimées")
 
     def qualifies(c: Candidate) -> bool:
         if c.real_odd is not None:
@@ -1105,15 +1093,12 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
         return c.prob >= 0.80
 
     pool = [c for c in pool if qualifies(c)]
-    print(f"  → Value Filtre 4 (edge/prob) : {len(pool)}")
 
     def n_sources(c: Candidate) -> int:
         return sum([1 for x in (c.has_context, c.prob_dixon > 0, c.prob_bzzoiro > 0, c.prob_gemini > 0) if x])
     pool = [c for c in pool if n_sources(c) >= 2]
-    print(f"  → Value Filtre 5 (2 sources) : {len(pool)}")
 
     strict = [c for c in pool if VALUE_MIN_PROB <= c.prob <= VALUE_MAX_PROB]
-    print(f"  → Value Filtre 6 (proba 85-92%) : {len(strict)}")
 
     def dedup(pool_list):
         by_ev = {}
@@ -1132,7 +1117,6 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     selected = strict[:VALUE_TOP_N]
 
     if len(selected) < VALUE_TOP_N:
-        print(f"  → Value : fallback 80-85% (manque {VALUE_TOP_N - len(selected)})")
         used_ids = {c.event_id for c in selected}
         fallback = [c for c in pool if VALUE_FALLBACK_MIN_PROB <= c.prob < VALUE_MIN_PROB and c.event_id not in used_ids]
         fallback = dedup(fallback)
@@ -1140,8 +1124,6 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
         for c in fallback:
             if len(selected) >= VALUE_TOP_N: break
             selected.append(c)
-
-    print(f"  → Ticket Value FINAL : {len(selected)} paris retenus")
 
     if not selected:
         return None
@@ -1154,11 +1136,30 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     legs = [candidate_to_selection(c) for c in selected]
     return Coupon("Ticket Value", f"Top {len(legs)} • Ligues obscures • DC haute proba", "💎", legs, round(combined_odds, 2), round(combined_prob, 4), is_list=True)
 
+def build_btts_over_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
+    pool = [c for c in candidates if c.market == "BTTS+O2.5"]
+    if not pool:
+        return None
+    
+    # Tri par probabilité pure (comme demandé)
+    pool.sort(key=lambda x: x.prob, reverse=True)
+    top = pool[:BTTS_TOP_N]
+    if not top:
+        return None
+    
+    combined_odds, combined_prob = 1.0, 1.0
+    for c in top:
+        combined_odds *= c.odds
+        combined_prob *= c.prob
+    
+    return Coupon("BBTS+2.5", f"Top {len(top)} matchs probables (BTTS & +2.5)", "🎯", [candidate_to_selection(c) for c in top], round(combined_odds, 2), round(combined_prob, 4), is_list=True)
+
 def build_all_coupons(candidates: list[Candidate]) -> list[Coupon]:
     coupons = []
     if c := build_safe_coupon(candidates): coupons.append(c)
     if c := build_balanced_coupon(candidates): coupons.append(c)
     if c := build_value_coupon(candidates): coupons.append(c)
+    if c := build_btts_over_coupon(candidates): coupons.append(c) # === AJOUT BBTS ===
     return coupons
 
 # =========================================================
@@ -1231,7 +1232,9 @@ def format_coupon(c: Coupon) -> str:
             f"<b>🎯 {len(c.legs)} pronostics (valeur)</b>", "",
         ]
         for i, s in enumerate(c.legs, 1):
-            lines.append(format_selection_block(s, i, compact=False, hide_analysis=True, hide_advices=False))
+            # Pour le Ticket Value : on cache l'Avis IA. Pour BBTS+2.5 : on affiche tout.
+            hide_ana = (c.name == "Ticket Value")
+            lines.append(format_selection_block(s, i, compact=False, hide_analysis=hide_ana, hide_advices=False))
             lines.append("")
         lines.append(f"<i>{PUBLIC_FOOTER}</i>")
         return "\n".join(lines)
@@ -1271,7 +1274,7 @@ def format_bilan(tracker):
     return f"{format_header()}\n\n<b>📊 BILAN</b>\n🎫 Total : <b>{total}</b>\n✅ Gagnés : <b>{won}</b>\n❌ Perdus : <b>{lost}</b>\n⏳ En attente : <b>{pending}</b>\n\n📈 Taux réussite : <b>{wr:.1f}%</b>"
 
 # =========================================================
-# TELEGRAM
+# TELEGRAM HANDLERS
 # =========================================================
 async def safe_answer(message, text, reply_markup=None):
     for i, part in enumerate(split_message(text)):
@@ -1391,6 +1394,12 @@ async def btn_var(message: Message):
         await message.answer(f"❌ {get_subscription_message(message.from_user.id)}"); return
     await send_coupon(message, "Ticket Value")
 
+@dp.message(F.text == BTN_BTTS)
+async def btn_btts(message: Message):
+    if message.from_user.id != ADMIN_ID and not is_subscribed(message.from_user.id):
+        await message.answer(f"❌ {get_subscription_message(message.from_user.id)}"); return
+    await send_coupon(message, "BBTS+2.5")
+
 @dp.message(F.text == BTN_BILAN)
 async def btn_bilan(message: Message):
     if message.from_user.id != ADMIN_ID and not is_subscribed(message.from_user.id):
@@ -1412,7 +1421,7 @@ async def btn_debug(message: Message):
     await debug_cmd(message)
 
 # =========================================================
-# SCAN - NOUVELLE LOGIQUE
+# SCAN
 # =========================================================
 async def scan():
     async with STATE["scan_lock"]:
