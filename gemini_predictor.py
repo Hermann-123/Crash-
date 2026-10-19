@@ -1,6 +1,6 @@
 """
 Prédicteur Gemini enrichi avec H2H + corners/cartons.
-AVEC RETRY ROBUSTE + FALLBACK MULTI-MODÈLES (Version Rapide).
+AVEC RETRY ROBUSTE + FALLBACK MULTI-MODÈLES.
 """
 from __future__ import annotations
 
@@ -14,8 +14,7 @@ import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# === LISTE DE MODÈLES ===
-# On privilégie Flash-Lite qui est beaucoup moins surchargé que les gros modèles
+# === LISTE DE MODÈLES (fallback en cascade) ===
 GEMINI_MODELS = [
     "gemini-3.5-flash-lite",  # Modèle principal (rapide, stable, moins de 503)
     "gemini-3.5-flash",       # Fallback 1
@@ -138,6 +137,7 @@ Retourne UNIQUEMENT ce JSON :
     "over_3.5": 0,
     "btts_yes": 0,
     "btts_no": 0,
+    "btts_over_25": 0,
     "over_8.5_corners": 0,
     "over_9.5_corners": 0,
     "over_10.5_corners": 0,
@@ -163,6 +163,7 @@ RÈGLES :
 - double_chance_X2 = match_nul + victoire_away
 - double_chance_12 = victoire_home + victoire_away
 - over_2.5 + under_2.5 = 100
+- "btts_over_25" = probabilité que les DEUX équipes marquent ET qu'il y ait 3 buts ou plus (ex: 2-1, 3-1, 2-2...).
 - Si tu as des corners/cartons réels, BASE tes probas dessus
 - Pour les cartons : estime selon l'intensité du match, les enjeux, les équipes
 - Pour les corners : utilise les moyennes réelles si disponibles
@@ -178,13 +179,11 @@ async def call_gemini(client: httpx.AsyncClient, model: str, payload: dict) -> O
     """Appelle un modèle Gemini avec 3 retries max et délais courts."""
     url = f"{GEMINI_BASE_URL}/{model}:generateContent?key={GEMINI_API_KEY}"
 
-    # On passe de 6 à 3 tentatives pour ne pas bloquer le bot
     for attempt in range(3):
         try:
             r = await client.post(url, json=payload, timeout=30.0)
 
             if r.status_code in (503, 429):
-                # On attend max 10s au lieu de 60s
                 wait = min(2 ** attempt, 10)  
                 print(f"  ⏳ Gemini {model} {r.status_code}, retry {attempt+1}/3 (wait {wait}s)...")
                 await asyncio.sleep(wait)
