@@ -1,6 +1,6 @@
 """
 Récupération DIRECTE des prédictions Bzzoiro.
-Correction erreur 400 : on utilise date_from/date_to au lieu de upcoming=true.
+Correction : Si la confiance est introuvable, on met 70% par défaut.
 """
 from __future__ import annotations
 
@@ -23,8 +23,7 @@ def _headers() -> dict:
 
 
 def _norm(s: str) -> str:
-    if not s:
-        return ""
+    if not s: return ""
     s = str(s).lower().strip()
     s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
     for sfx in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
@@ -46,12 +45,10 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None)
 
 
 def extract_bzzoiro_native_markets(pred: dict) -> dict:
-    if not pred:
-        return {}
+    if not pred: return {}
     result = {}
     markets = pred.get("markets", {}) or {}
-    if not isinstance(markets, dict):
-        return {}
+    if not isinstance(markets, dict): return {}
 
     mr = markets.get("match_result", {}) or {}
     if isinstance(mr, dict):
@@ -129,7 +126,9 @@ def extract_native_confidence(pred: dict) -> float:
             best_prob = max(h, d, a)
         except (ValueError, TypeError): pass
     if best_prob > 0: return best_prob
-    return 0.0
+    
+    # === CORRECTIF D'URGENCE : Valeur par défaut si introuvable ===
+    return 70.0 
 
 
 def extract_bzzoiro_score_exact(pred: dict) -> dict:
@@ -160,7 +159,6 @@ async def fetch_bzzoiro_predictions_direct(min_confidence: float = 75.0) -> list
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
     async with httpx.AsyncClient(timeout=25.0) as client:
-        # Correction erreur 400 : date_from / date_to
         data = await _get(client, "/predictions/", {
             "date_from": today,
             "date_to": tomorrow,
@@ -206,14 +204,9 @@ async def fetch_bzzoiro_predictions_direct(min_confidence: float = 75.0) -> list
                 "bzz_score_exact": score_exact,
                 "has_odds": False, "real_odds": {}, "odds_sport_key": "",
             })
-        except Exception as e:
+        except Exception:
             continue
 
     enriched.sort(key=lambda x: x["bzz_confidence"], reverse=True)
     print(f"🔮 Bzzoiro DIRECT : {len(enriched)} prédictions retenues")
-    for p in enriched[:10]:
-        se = p.get("bzz_score_exact") or {}
-        se_txt = f" ⚽{se['home']}-{se['away']}" if se.get("home") is not None else ""
-        print(f"   🎯 [{p['bzz_confidence']:.0f}%]{se_txt} {p['home']} vs {p['away']}")
-
     return enriched
