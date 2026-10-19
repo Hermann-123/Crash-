@@ -34,6 +34,15 @@ except Exception as e:
     get_fixture_result = None
     print(f"⚠️ Import get_fixture_result: {e}")
 
+try:
+    from api_football import find_team_id, get_team_btts_stats
+    _API_FOOTBALL_BTTS_AVAILABLE = True
+except Exception as e:
+    find_team_id = None
+    get_team_btts_stats = None
+    _API_FOOTBALL_BTTS_AVAILABLE = False
+    print(f"⚠️ Import api_football (stats BTTS): {e}")
+
 fetch_all_today_fixtures = None
 get_corners_cards = None
 get_full_context_api_football = None
@@ -72,6 +81,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 
@@ -93,8 +103,8 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • H2H + Gemini")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
-MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "15"))
+MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "50"))
+MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "20"))
 
 BZZ_MIN_CONFIDENCE = float(os.getenv("BZZ_MIN_CONFIDENCE", "75.0"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "80.0"))
@@ -126,7 +136,12 @@ VALUE_MAX_LEG_ODDS = float(os.getenv("VALUE_MAX_LEG_ODDS", "1.35"))
 VALUE_TOP_N = int(os.getenv("VALUE_TOP_N", "20"))
 
 # === TICKET BBTS+2.5 ===
-BTTS_TOP_N = 3 # On veut exactement 3 matchs
+BTTS_TOP_N = 3
+BTTS_MIN_PROB = 0.70          # Seuil minimum de proba finale
+BTTS_MIN_DIXON = 0.30         # Dixon OBLIGATOIRE
+BTTS_STATS_MIN_TEAM = 0.55    # Chaque équipe doit avoir ≥ 55% BTTS+O2.5
+BTTS_STATS_MIN_AVG = 0.65     # Moyenne des 2 équipes ≥ 65%
+BTTS_STATS_MIN_CONCEDED = 0.65  # Chaque équipe encaisse ≥ 65%
 
 TELEGRAM_MAX_LEN = 3800
 
@@ -140,19 +155,37 @@ if not ADMIN_ID:
 TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
+# === LIGUES ÉLARGIES (Q2=C) ===
 SOCCER_KEYS = [
+    # Top 5 européens
     "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
     "soccer_germany_bundesliga", "soccer_france_ligue_one",
+    # Coupes européennes
     "soccer_uefa_champs_league", "soccer_uefa_europa_league",
     "soccer_uefa_europa_conference_league",
-    "soccer_efl_champ", "soccer_netherlands_eredivisie",
-    "soccer_portugal_primeira_liga", "soccer_belgium_first_div",
-    "soccer_turkey_super_league", "soccer_greece_super_league",
-    "soccer_scotland_premiership",
-    "soccer_brazil_campeonato", "soccer_argentina_primera_division",
+    # 2e divisions
+    "soccer_efl_champ", "soccer_efl_league_one", "soccer_efl_league_two",
+    "soccer_spain_la_liga2", "soccer_italy_serie_b",
+    "soccer_germany_bundesliga2", "soccer_france_ligue_two",
+    "soccer_netherlands_eerste_divisie",
+    # Autres européennes
+    "soccer_netherlands_eredivisie", "soccer_portugal_primeira_liga",
+    "soccer_belgium_first_div", "soccer_turkey_super_league",
+    "soccer_greece_super_league", "soccer_scotland_premiership",
+    "soccer_denmark_superliga", "soccer_norway_eliteserien",
+    "soccer_sweden_allsvenskan", "soccer_poland_ekstraklasa",
+    "soccer_switzerland_superleague", "soccer_austria_bundesliga",
+    "soccer_romania_liga_i", "soccer_ukraine_premier_league",
+    # Amériques
+    "soccer_brazil_campeonato", "soccer_brazil_serie_b",
+    "soccer_argentina_primera_division",
     "soccer_chile_campeonato", "soccer_colombia_primera_a",
     "soccer_usa_mls", "soccer_mexico_ligamx",
-    "soccer_japan_j_league",
+    "soccer_ecuador_liga_pro", "soccer_peru_primera_division",
+    "soccer_uruguay_primera_division",
+    # Asie / Océanie
+    "soccer_japan_j_league", "soccer_korea_kleague1",
+    "soccer_australia_aleague",
 ]
 
 # =========================================================
@@ -169,16 +202,14 @@ TOP_LEAGUES_KEYWORDS = {
 }
 
 def is_obscure_league(league_name: str) -> bool:
-    if not league_name:
-        return True
+    if not league_name: return True
     low = league_name.lower().strip()
     for kw in TOP_LEAGUES_KEYWORDS:
-        if kw in low:
-            return False
+        if kw in low: return False
     return True
 
 # =========================================================
-# MATCH QUALITY SCORING SYSTEM
+# MATCH QUALITY SCORING
 # =========================================================
 WEIGHT_LEAGUE = 10.0
 WEIGHT_ODDS_COUNT = 2.0
@@ -198,46 +229,32 @@ def calculate_match_score(fx: dict) -> float:
         return -1.0
     markets_count = sum(1 for v in real_odds.values() if v is not None)
     score += markets_count * WEIGHT_ODDS_COUNT
-    home = real_odds.get("home")
-    draw = real_odds.get("draw")
-    away = real_odds.get("away")
+    home = real_odds.get("home"); draw = real_odds.get("draw"); away = real_odds.get("away")
     if home and away:
         min_odd = min(home, away, draw or 999)
-        if min_odd < 1.60:
-            score += WEIGHT_FAVORITE_CLARITY
-        elif min_odd < 1.90:
-            score += WEIGHT_FAVORITE_CLARITY * 0.6
-        elif min_odd < 2.30:
-            score += WEIGHT_FAVORITE_CLARITY * 0.3
+        if min_odd < 1.60: score += WEIGHT_FAVORITE_CLARITY
+        elif min_odd < 1.90: score += WEIGHT_FAVORITE_CLARITY * 0.6
+        elif min_odd < 2.30: score += WEIGHT_FAVORITE_CLARITY * 0.3
     dt = parse_dt_safe(fx.get("kickoff", ""))
     if dt:
         hours_until = (dt - datetime.now(TZ)).total_seconds() / 3600
-        if 1 <= hours_until <= 6:
-            score += WEIGHT_TIME_PROXIMITY
-        elif hours_until <= 12:
-            score += WEIGHT_TIME_PROXIMITY * 0.7
-        elif hours_until <= 24:
-            score += WEIGHT_TIME_PROXIMITY * 0.3
-
+        if 1 <= hours_until <= 6: score += WEIGHT_TIME_PROXIMITY
+        elif hours_until <= 12: score += WEIGHT_TIME_PROXIMITY * 0.7
+        elif hours_until <= 24: score += WEIGHT_TIME_PROXIMITY * 0.3
     if STATE.get("dixon_model"):
         try:
             h_key = STATE["dixon_model"]._find_team(fx.get("home", ""))
             a_key = STATE["dixon_model"]._find_team(fx.get("away", ""))
             if h_key and a_key:
-                score += 15.0
-                fx["dixon_available"] = True
+                score += 15.0; fx["dixon_available"] = True
             elif h_key or a_key:
-                score += 5.0
-                fx["dixon_available"] = False
+                score += 5.0; fx["dixon_available"] = False
             else:
                 fx["dixon_available"] = False
         except Exception:
             fx["dixon_available"] = False
-
     bzz_conf = fx.get("bzz_confidence", 0)
-    if bzz_conf > 0:
-        score += bzz_conf * 0.3
-
+    if bzz_conf > 0: score += bzz_conf * 0.3
     return score
 
 def filter_and_rank_matches(matches: list[dict]) -> list[dict]:
@@ -251,11 +268,12 @@ def filter_and_rank_matches(matches: list[dict]) -> list[dict]:
     return scored
 
 # =========================================================
-# FUSION 3 MOTEURS
+# FUSION 3 SOURCES (existant) + 4 SOURCES pour BBTS+2.5
 # =========================================================
-W_GEMINI = 0.35
-W_DIXON = 0.25
-W_BZZOIRO = 0.40
+W_GEMINI = 0.35; W_DIXON = 0.25; W_BZZOIRO = 0.40
+
+# Poids spécifiques BBTS+2.5 (Gemini réduit car il hallucine)
+W_GEMINI_BTTS = 0.20; W_DIXON_BTTS = 0.25; W_BZZOIRO_BTTS = 0.30; W_STATS_BTTS = 0.25
 
 ALL_MARKETS = [
     "victoire_home", "match_nul", "victoire_away",
@@ -271,11 +289,8 @@ def combine_three_sources(gemini_markets: dict, dixon_pred: Optional[dict], bzz_
     for k in ALL_MARKETS:
         v = gemini_markets.get(k)
         if v is not None:
-            try:
-                g[k] = max(0.0, min(1.0, float(v) / 100.0))
-            except (ValueError, TypeError):
-                pass
-
+            try: g[k] = max(0.0, min(1.0, float(v) / 100.0))
+            except (ValueError, TypeError): pass
     d = {}
     if dixon_pred:
         d = {
@@ -289,41 +304,53 @@ def combine_three_sources(gemini_markets: dict, dixon_pred: Optional[dict], bzz_
             "btts_no": dixon_pred.get("btts_no", 0),
             "btts_over_25": dixon_pred.get("btts_over_25", 0),
         }
-
     b = {}
     if bzz_markets:
         for k in ALL_MARKETS:
             v = bzz_markets.get(k)
             if v is not None:
-                try:
-                    b[k] = max(0.0, min(1.0, float(v) / 100.0))
-                except (ValueError, TypeError):
-                    pass
-
+                try: b[k] = max(0.0, min(1.0, float(v) / 100.0))
+                except (ValueError, TypeError): pass
     all_keys = set(g.keys()) | set(d.keys()) | set(b.keys())
     for k in all_keys:
-        total_weight = 0.0
-        total_value = 0.0
-        if k in g:
-            total_value += W_GEMINI * g[k]
-            total_weight += W_GEMINI
-        if k in d and d[k] > 0:
-            total_value += W_DIXON * d[k]
-            total_weight += W_DIXON
-        if k in b:
-            total_value += W_BZZOIRO * b[k]
-            total_weight += W_BZZOIRO
-        if total_weight > 0:
-            result[k] = total_value / total_weight
-
+        total_weight = 0.0; total_value = 0.0
+        if k in g: total_value += W_GEMINI * g[k]; total_weight += W_GEMINI
+        if k in d and d[k] > 0: total_value += W_DIXON * d[k]; total_weight += W_DIXON
+        if k in b: total_value += W_BZZOIRO * b[k]; total_weight += W_BZZOIRO
+        if total_weight > 0: result[k] = total_value / total_weight
     if "victoire_home" in result and "match_nul" in result:
         result["double_chance_1X"] = result["victoire_home"] + result["match_nul"]
     if "victoire_home" in result and "victoire_away" in result:
         result["double_chance_12"] = result["victoire_home"] + result["victoire_away"]
     if "match_nul" in result and "victoire_away" in result:
         result["double_chance_X2"] = result["match_nul"] + result["victoire_away"]
-
     return result
+
+
+def compute_stats_btts_prob(home_stats: dict, away_stats: dict) -> float:
+    """
+    Calcule une proba "stats" pour BTTS+O2.5 à partir des 10 derniers matchs de chaque équipe.
+    Méthode : moyenne des 2 btts_over_25_pct + bonus cohérence.
+    """
+    if not home_stats or not away_stats:
+        return 0.0
+    h = home_stats.get("btts_over_25_pct", 0)
+    a = away_stats.get("btts_over_25_pct", 0)
+    if h <= 0 or a <= 0:
+        return 0.0
+    base = (h + a) / 2.0
+    # Bonus : si les 2 équipes encaissent souvent
+    h_conc = home_stats.get("conceded_pct", 0)
+    a_conc = away_stats.get("conceded_pct", 0)
+    if h_conc >= 0.7 and a_conc >= 0.7:
+        base += 0.03
+    # Bonus : si les 2 équipes marquent souvent
+    h_score = home_stats.get("scored_pct", 0)
+    a_score = away_stats.get("scored_pct", 0)
+    if h_score >= 0.7 and a_score >= 0.7:
+        base += 0.03
+    return min(0.95, round(base, 4))
+
 
 def compute_agreement_three(gemini_markets: dict, dixon_pred: Optional[dict], bzz_markets: dict, market_key: str) -> tuple[str, float]:
     map_g = {k: k for k in ALL_MARKETS}
@@ -337,39 +364,26 @@ def compute_agreement_three(gemini_markets: dict, dixon_pred: Optional[dict], bz
     if gk:
         gv = gemini_markets.get(gk)
         if gv is not None:
-            try:
-                probs["g"] = float(gv) / 100.0
-            except (ValueError, TypeError):
-                pass
-
+            try: probs["g"] = float(gv) / 100.0
+            except (ValueError, TypeError): pass
     if dixon_pred:
         dk = map_d.get(market_key)
         if dk:
             dv = dixon_pred.get(dk, 0)
-            if dv > 0:
-                probs["d"] = dv
-
+            if dv > 0: probs["d"] = dv
     if bzz_markets:
         bv = bzz_markets.get(market_key)
         if bv is not None:
-            try:
-                probs["b"] = float(bv) / 100.0
-            except (ValueError, TypeError):
-                pass
-
-    if len(probs) < 2:
-        return ("", 0.0)
-
+            try: probs["b"] = float(bv) / 100.0
+            except (ValueError, TypeError): pass
+    if len(probs) < 2: return ("", 0.0)
     values = list(probs.values())
     delta = max(values) - min(values)
-
-    if len(probs) == 3 and delta <= 0.10:
-        return ("🤝🤝", delta)
-    if delta <= 0.10:
-        return ("🤝", delta)
-    if delta >= 0.15:
-        return ("⚠️", delta)
+    if len(probs) == 3 and delta <= 0.10: return ("🤝🤝", delta)
+    if delta <= 0.10: return ("🤝", delta)
+    if delta >= 0.15: return ("⚠️", delta)
     return ("", delta)
+
 
 # =========================================================
 # MODELS
@@ -402,6 +416,10 @@ class Candidate:
     score_exact_away: int = -1
     score_exact_prob: float = 0.0
     score_exact_source: str = ""
+    prob_stats: float = 0.0   # NOUVEAU
+    stats_home: dict = None   # NOUVEAU
+    stats_away: dict = None   # NOUVEAU
+
 
 @dataclass
 class Selection:
@@ -433,9 +451,13 @@ class Selection:
     score_exact_away: int = -1
     score_exact_prob: float = 0.0
     score_exact_source: str = ""
+    prob_stats: float = 0.0
+    stats_home: dict = None
+    stats_away: dict = None
 
     def final_prob(self) -> float:
         return self.model_prob
+
 
 @dataclass
 class Coupon:
@@ -446,6 +468,7 @@ class Coupon:
     combined_odds: float
     combined_prob: float
     is_list: bool = False
+
 
 # =========================================================
 # GLOBALS & KEYBOARDS
@@ -482,26 +505,17 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 STATE = {
-    "ready": False,
-    "candidates": [],
-    "selections": [],
-    "coupons": [],
-    "last_scan": None,
-    "debug": {},
-    "tracker": {"coupons": []},
-    "keys": {},
-    "users": {},
-    "scan_lock": asyncio.Lock(),
-    "dixon_model": None,
+    "ready": False, "candidates": [], "selections": [], "coupons": [],
+    "last_scan": None, "debug": {}, "tracker": {"coupons": []}, "keys": {}, "users": {},
+    "scan_lock": asyncio.Lock(), "dixon_model": None,
 }
 
 TARGETS = []
 for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
     if raw:
-        try:
-            TARGETS.append(int(raw))
-        except ValueError:
-            TARGETS.append(raw)
+        try: TARGETS.append(int(raw))
+        except ValueError: TARGETS.append(raw)
+
 
 # =========================================================
 # HELPERS
@@ -514,8 +528,7 @@ def today_pretty():
     return f"{d.day} {months[d.month]} {d.year}"
 
 def normalize_name(s: str) -> str:
-    if not s:
-        return ""
+    if not s: return ""
     s = str(s).lower().strip()
     s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
     for sfx in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
@@ -524,22 +537,17 @@ def normalize_name(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 def parse_dt_safe(s) -> Optional[datetime]:
-    if not s:
-        return None
+    if not s: return None
     if isinstance(s, (int, float)):
-        try:
-            return datetime.fromtimestamp(int(s), tz=ZoneInfo("UTC")).astimezone(TZ)
-        except Exception:
-            return None
+        try: return datetime.fromtimestamp(int(s), tz=ZoneInfo("UTC")).astimezone(TZ)
+        except Exception: return None
     s = str(s).strip()
     s = re.sub(r"(\.\d{6})\d+", r"\1", s).replace("Z", "+00:00")
     try:
         dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=ZoneInfo("UTC"))
         return dt.astimezone(TZ)
-    except Exception:
-        return None
+    except Exception: return None
 
 def kickoff_local(iso_str) -> str:
     dt = parse_dt_safe(iso_str)
@@ -547,152 +555,113 @@ def kickoff_local(iso_str) -> str:
 
 def is_today_upcoming(iso_str) -> bool:
     dt = parse_dt_safe(iso_str)
-    if not dt:
-        return False
+    if not dt: return False
     now = datetime.now(TZ)
-    if dt.date() != now.date():
-        return False
+    if dt.date() != now.date(): return False
     return dt > now + timedelta(minutes=5)
 
 def prob_bar(p: float) -> str:
-    if p >= 0.80:
-        return "🟢🟢🟢"
-    if p >= 0.72:
-        return "🟢🟢⚪"
-    if p >= 0.65:
-        return "🟢⚪⚪"
+    if p >= 0.80: return "🟢🟢🟢"
+    if p >= 0.72: return "🟢🟢⚪"
+    if p >= 0.65: return "🟢⚪⚪"
     return "⚪⚪⚪"
 
 def confidence_bar(pct: int) -> str:
-    if pct >= 80:
-        return "🟢🟢🟢"
-    if pct >= 70:
-        return "🟢🟢⚪"
-    if pct >= 60:
-        return "🟢⚪⚪"
+    if pct >= 80: return "🟢🟢🟢"
+    if pct >= 70: return "🟢🟢⚪"
+    if pct >= 60: return "🟢⚪⚪"
     return "⚪⚪⚪"
 
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
-    if len(text) <= max_len:
-        return [text]
-    parts = []
-    current = ""
+    if len(text) <= max_len: return [text]
+    parts, current = [], ""
     for line in text.split("\n"):
         if len(current) + len(line) + 1 > max_len:
-            if current:
-                parts.append(current.rstrip())
+            if current: parts.append(current.rstrip())
             current = line + "\n"
-        else:
-            current += line + "\n"
-    if current.strip():
-        parts.append(current.rstrip())
+        else: current += line + "\n"
+    if current.strip(): parts.append(current.rstrip())
     return parts
 
+
 # =========================================================
-# GESTION DES CLÉS ET ABONNEMENTS
+# CLÉS / ABONNEMENTS
 # =========================================================
 def load_json(path, default=None):
-    if default is None:
-        default = {}
+    if default is None: default = {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+        with open(path, "r", encoding="utf-8") as f: return json.load(f)
+    except Exception: return default
 
 def save_json(path, data):
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+        with open(path, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
+    except Exception: pass
 
 def is_subscribed(user_id: int) -> bool:
     uid = str(user_id)
-    if uid not in STATE["users"]:
-        return False
+    if uid not in STATE["users"]: return False
     exp = STATE["users"][uid].get("expires_at")
-    if not exp:
-        return False
-    try:
-        exp_dt = datetime.fromisoformat(exp)
-        return datetime.now(TZ) < exp_dt
-    except Exception:
-        return False
+    if not exp: return False
+    try: return datetime.now(TZ) < datetime.fromisoformat(exp)
+    except Exception: return False
 
 def get_subscription_message(user_id: int) -> str:
     if is_subscribed(user_id):
         exp = STATE["users"][str(user_id)]["expires_at"]
-        exp_dt = datetime.fromisoformat(exp)
-        return f"✅ Votre abonnement est actif jusqu'au {exp_dt.strftime('%d/%m/%Y à %H:%M')}."
-    else:
-        return "❌ Votre abonnement est expiré ou inexistant.\nContactez l'administrateur : @hermann1123"
+        return f"✅ Abonnement actif jusqu'au {datetime.fromisoformat(exp).strftime('%d/%m/%Y à %H:%M')}."
+    return "❌ Abonnement expiré ou inexistant.\nContactez : @hermann1123"
+
 
 # =========================================================
 # TRACKER
 # =========================================================
 def load_tracker() -> dict:
     try:
-        with open(LOCAL_DB, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"coupons": []}
+        with open(LOCAL_DB, "r", encoding="utf-8") as f: return json.load(f)
+    except Exception: return {"coupons": []}
 
 def save_tracker(data: dict):
     try:
-        with open(LOCAL_DB, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+        with open(LOCAL_DB, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
+    except Exception: pass
 
 def load_used_today() -> set:
     tracker = STATE["tracker"]
     today = datetime.now(TZ).strftime("%Y-%m-%d")
     u = tracker.get("used_today", {})
-    if u.get("date") != today:
-        return set()
+    if u.get("date") != today: return set()
     return set(u.get("ids", []))
 
 def save_used_today(ids: set):
     tracker = STATE["tracker"]
     today = datetime.now(TZ).strftime("%Y-%m-%d")
     existing = tracker.get("used_today", {})
-    if existing.get("date") == today:
-        merged = set(existing.get("ids", [])) | ids
-    else:
-        merged = ids
+    merged = set(existing.get("ids", [])) | ids if existing.get("date") == today else ids
     tracker["used_today"] = {"date": today, "ids": list(merged)}
     save_tracker(tracker)
 
 def mark_picks_used(selections: list):
-    if selections:
-        save_used_today({s.event_id for s in selections})
+    if selections: save_used_today({s.event_id for s in selections})
 
 def record_coupons(coupons: list[Coupon], date_str: str):
     tracker = STATE["tracker"]
     existing = {c["id"] for c in tracker["coupons"]}
     for c in coupons:
         cid = f"{date_str}-{c.name}"
-        if cid in existing:
-            continue
-        legs_data = []
-        for s in c.legs:
-            legs_data.append({
-                "event_id": s.event_id, "home": s.home, "away": s.away,
-                "market": s.market, "pick_label": s.pick_label,
-                "odds": s.odds, "kickoff": s.kickoff, "result": "pending",
-            })
-        tracker["coupons"].append({
-            "id": cid, "date": date_str, "name": c.name,
-            "combined_odds": c.combined_odds,
-            "legs": legs_data, "status": "pending",
-        })
+        if cid in existing: continue
+        legs_data = [{"event_id": s.event_id, "home": s.home, "away": s.away,
+                      "market": s.market, "pick_label": s.pick_label,
+                      "odds": s.odds, "kickoff": s.kickoff, "result": "pending"} for s in c.legs]
+        tracker["coupons"].append({"id": cid, "date": date_str, "name": c.name,
+                                    "combined_odds": c.combined_odds,
+                                    "legs": legs_data, "status": "pending"})
     tracker["coupons"] = tracker["coupons"][-500:]
     save_tracker(tracker)
 
 async def settle_coupons():
     print("⚠️ settle_coupons désactivé")
-    return
+
 
 # =========================================================
 # THE ODDS API
@@ -703,8 +672,7 @@ async def fetch_odds_api_league(client: httpx.AsyncClient, sport_key: str) -> li
               "markets": "h2h,totals", "oddsFormat": "decimal"}
     try:
         r = await client.get(url, params=params, timeout=30.0)
-        if r.status_code >= 400:
-            return []
+        if r.status_code >= 400: return []
         data = r.json()
         return data if isinstance(data, list) else []
     except Exception:
@@ -716,7 +684,7 @@ async def fetch_all_odds_events() -> list[dict]:
         for key in SOCCER_KEYS:
             events = await fetch_odds_api_league(client, key)
             all_events.extend(events)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)  # Réduit pour ne pas exploser le temps de scan
     print(f"💰 Odds API : {len(all_events)} events ({len(SOCCER_KEYS)} ligues)")
     return all_events
 
@@ -724,79 +692,57 @@ def extract_real_odds(ev: dict) -> dict:
     result = {"home": None, "draw": None, "away": None,
               "over_2.5": None, "under_2.5": None,
               "btts_yes": None, "btts_no": None}
-    home = ev.get("home_team", "")
-    away = ev.get("away_team", "")
+    home = ev.get("home_team", ""); away = ev.get("away_team", "")
     for book in ev.get("bookmakers", []) or []:
         for market in book.get("markets", []) or []:
             mk = market.get("key", "")
             for out in market.get("outcomes", []) or []:
-                try:
-                    price = float(out.get("price", 0))
-                except (ValueError, TypeError):
-                    continue
-                if price <= 1.01:
-                    continue
+                try: price = float(out.get("price", 0))
+                except (ValueError, TypeError): continue
+                if price <= 1.01: continue
                 name = out.get("name", "")
                 if mk == "h2h":
-                    if name == home and result["home"] is None:
-                        result["home"] = price
-                    elif name == away and result["away"] is None:
-                        result["away"] = price
-                    elif "draw" in name.lower() and result["draw"] is None:
-                        result["draw"] = price
+                    if name == home and result["home"] is None: result["home"] = price
+                    elif name == away and result["away"] is None: result["away"] = price
+                    elif "draw" in name.lower() and result["draw"] is None: result["draw"] = price
                 elif mk == "totals" and out.get("point") == 2.5:
-                    if "over" in name.lower() and result["over_2.5"] is None:
-                        result["over_2.5"] = price
-                    elif "under" in name.lower() and result["under_2.5"] is None:
-                        result["under_2.5"] = price
+                    if "over" in name.lower() and result["over_2.5"] is None: result["over_2.5"] = price
+                    elif "under" in name.lower() and result["under_2.5"] is None: result["under_2.5"] = price
                 elif mk == "btts":
-                    if "yes" in name.lower() and result["btts_yes"] is None:
-                        result["btts_yes"] = price
-                    elif "no" in name.lower() and result["btts_no"] is None:
-                        result["btts_no"] = price
+                    if "yes" in name.lower() and result["btts_yes"] is None: result["btts_yes"] = price
+                    elif "no" in name.lower() and result["btts_no"] is None: result["btts_no"] = price
     return result
 
 def build_matches_from_odds(odds_events: list[dict]) -> list[dict]:
     matches = []
     for ev in odds_events:
-        h = ev.get("home_team", "")
-        a = ev.get("away_team", "")
-        kick = ev.get("commence_time", "")
-        if not h or not a:
-            continue
-        if not is_today_upcoming(kick):
-            continue
+        h = ev.get("home_team", ""); a = ev.get("away_team", ""); kick = ev.get("commence_time", "")
+        if not h or not a: continue
+        if not is_today_upcoming(kick): continue
         matches.append({
-            "event_id": ev.get("id", ""),
-            "home": h, "away": a,
-            "league": ev.get("sport_title", ""),
-            "kickoff": kick,
-            "has_odds": True,
-            "real_odds": extract_real_odds(ev),
+            "event_id": ev.get("id", ""), "home": h, "away": a,
+            "league": ev.get("sport_title", ""), "kickoff": kick,
+            "has_odds": True, "real_odds": extract_real_odds(ev),
             "odds_sport_key": ev.get("sport_key", ""),
         })
     return matches
 
+
 # =========================================================
-# ENRICHISSEMENT
+# ENRICHISSEMENT BZZOIRO
 # =========================================================
 async def enrich_matches(matches: list[dict]) -> dict:
     to_enrich = matches[:MAX_MATCHES_TO_ENRICH]
-    if not to_enrich:
-        return {}
+    if not to_enrich: return {}
     contexts = {}
     for fx in to_enrich:
         try:
-            home = fx.get("home", "")
-            away = fx.get("away", "")
-            kickoff = fx.get("kickoff", "")
-            dt = parse_dt_safe(kickoff)
+            home = fx.get("home", ""); away = fx.get("away", "")
+            dt = parse_dt_safe(fx.get("kickoff", ""))
             date_iso = dt.strftime("%Y-%m-%d") if dt else datetime.now(TZ).strftime("%Y-%m-%d")
-
             ctx = None
             if enrich_match_with_bzzoiro:
                 ctx = await enrich_match_with_bzzoiro(home, away, date_iso)
-
             if ctx and ctx.get("available"):
                 contexts[fx["event_id"]] = ctx
                 print(f"  ✅ {home} vs {away} — Bzzoiro • H2H:{ctx.get('h2h', {}).get('total_matches', 0)}")
@@ -805,14 +751,64 @@ async def enrich_matches(matches: list[dict]) -> dict:
             pass
     return contexts
 
+
+# =========================================================
+# ENRICHISSEMENT STATS BTTS+O2.5 (API-Football)
+# =========================================================
+async def enrich_btts_stats(matches: list[dict]) -> dict:
+    """
+    Pour les matchs prometteurs (Dixon >= 0.40 sur BTTS+O2.5), récupère les
+    stats des 2 équipes sur leurs 10 derniers matchs.
+    Optimisé pour ne pas exploser les quotas API-Football.
+    """
+    if not _API_FOOTBALL_BTTS_AVAILABLE or not API_FOOTBALL_KEY:
+        return {}
+
+    # Pré-filtre par Dixon (gratuit, pas d'appel API)
+    prefiltered = []
+    if STATE.get("dixon_model"):
+        for fx in matches:
+            try:
+                pred = STATE["dixon_model"].predict_all(fx["home"], fx["away"])
+                if pred and pred.get("btts_over_25", 0) >= 0.40:
+                    prefiltered.append(fx)
+            except Exception:
+                pass
+    print(f"📊 Pré-filtre BBTS+2.5 (Dixon ≥ 40%) : {len(prefiltered)}/{len(matches)} matchs à enrichir")
+
+    if not prefiltered:
+        return {}
+
+    stats_by_event = {}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for fx in prefiltered:
+            try:
+                home = fx["home"]; away = fx["away"]
+                home_id = await find_team_id(client, home)
+                away_id = await find_team_id(client, away)
+                if not home_id or not away_id:
+                    continue
+                home_stats = await get_team_btts_stats(home_id, last=10)
+                away_stats = await get_team_btts_stats(away_id, last=10)
+                if home_stats and away_stats:
+                    stats_by_event[fx["event_id"]] = {"home": home_stats, "away": away_stats}
+                    print(f"  📈 {home} ({home_stats.get('btts_over_25_pct',0)*100:.0f}%) vs {away} ({away_stats.get('btts_over_25_pct',0)*100:.0f}%)")
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                print(f"  ⚠️ stats crash {fx.get('home')}: {e}")
+    print(f"📊 Stats BTTS+O2.5 : {len(stats_by_event)}/{len(prefiltered)} matchs enrichis")
+    return stats_by_event
+
+
 # =========================================================
 # BUILD CANDIDATES
 # =========================================================
-async def build_all_candidates(matches, used_today, contexts=None):
+async def build_all_candidates(matches, used_today, contexts=None, btts_stats_map=None):
     candidates: list[Candidate] = []
     if not predict_match_probas:
         return candidates
     contexts = contexts or {}
+    btts_stats_map = btts_stats_map or {}
     ordered = [m for m in matches if m.get("has_odds") or m.get("bzz_markets")]
 
     async with httpx.AsyncClient(timeout=40.0) as client:
@@ -828,6 +824,10 @@ async def build_all_candidates(matches, used_today, contexts=None):
                 has_ctx = ctx is not None and ctx.get("available", False)
                 bzz_markets_direct = fx.get("bzz_markets", {})
                 bzz_conf_direct = fx.get("bzz_confidence", 0)
+                stats_ctx = btts_stats_map.get(event_id, {})
+                stats_home = stats_ctx.get("home", {})
+                stats_away = stats_ctx.get("away", {})
+                stats_p_btts = compute_stats_btts_prob(stats_home, stats_away)
 
                 score_home, score_away, score_prob, score_source = -1, -1, 0.0, ""
 
@@ -844,10 +844,8 @@ async def build_all_candidates(matches, used_today, contexts=None):
                     advice_conf = pred.get("advice_confidence", 0)
                     try:
                         advice_conf = int(advice_conf)
-                        if advice_conf < 0 or advice_conf > 100:
-                            advice_conf = 0
-                    except (ValueError, TypeError):
-                        advice_conf = 0
+                        if advice_conf < 0 or advice_conf > 100: advice_conf = 0
+                    except (ValueError, TypeError): advice_conf = 0
                     raw_advices = pred.get("advices", [])
                     advices_clean = []
                     if isinstance(raw_advices, list):
@@ -855,46 +853,46 @@ async def build_all_candidates(matches, used_today, contexts=None):
                             if isinstance(a, dict) and a.get("text"):
                                 try:
                                     conf = int(a.get("confidence", 0))
-                                    if conf < 0 or conf > 100:
-                                        conf = 0
-                                except (ValueError, TypeError):
-                                    conf = 0
+                                    if conf < 0 or conf > 100: conf = 0
+                                except (ValueError, TypeError): conf = 0
                                 advices_clean.append({"text": str(a.get("text", "")).strip(), "confidence": conf})
                     se = pred.get("score_exact") or {}
                     if isinstance(se, dict):
                         try:
-                            sh = int(se.get("home", -1))
-                            sa = int(se.get("away", -1))
-                            sp = float(se.get("prob", 0))
+                            sh, sa, sp = int(se.get("home", -1)), int(se.get("away", -1)), float(se.get("prob", 0))
                             if 0 <= sh <= 8 and 0 <= sa <= 8 and sp > 0:
                                 score_home, score_away = sh, sa
                                 score_prob = sp if sp <= 1.0 else sp / 100.0
                                 score_source = "gemini"
-                        except (ValueError, TypeError):
-                            pass
+                        except (ValueError, TypeError): pass
 
                 if score_source == "":
                     bzz_se = fx.get("bzz_score_exact") or {}
                     if isinstance(bzz_se, dict):
                         try:
-                            sh = int(bzz_se.get("home", -1))
-                            sa = int(bzz_se.get("away", -1))
-                            sp = float(bzz_se.get("prob", 0))
+                            sh, sa, sp = int(bzz_se.get("home", -1)), int(bzz_se.get("away", -1)), float(bzz_se.get("prob", 0))
                             if 0 <= sh <= 8 and 0 <= sa <= 8:
                                 score_home, score_away = sh, sa
                                 score_prob = sp if sp <= 1.0 else sp / 100.0
                                 score_source = "bzzoiro"
-                        except (ValueError, TypeError):
-                            pass
+                        except (ValueError, TypeError): pass
 
-                dixon_pred = None
-                if STATE["dixon_model"]:
-                    try:
-                        dixon_pred = STATE["dixon_model"].predict_all(home, away)
-                    except Exception:
-                        pass
-
+                dixon_pred = STATE["dixon_model"].predict_all(home, away) if STATE.get("dixon_model") else None
                 combined_probs = combine_three_sources(gemini_markets, dixon_pred, bzz_markets_direct)
+
+                # === RECALCUL SPÉCIFIQUE btts_over_25 AVEC LES STATS (4 sources) ===
+                if stats_p_btts > 0:
+                    g_p = float(gemini_markets.get("btts_over_25", 0)) / 100.0 if gemini_markets.get("btts_over_25") else 0.0
+                    d_p = dixon_pred.get("btts_over_25", 0) if dixon_pred else 0.0
+                    b_p = float(bzz_markets_direct.get("btts_over_25", 0)) / 100.0 if bzz_markets_direct.get("btts_over_25") else 0.0
+                    weights = []; values = []
+                    if g_p > 0: weights.append(W_GEMINI_BTTS); values.append(g_p)
+                    if d_p > 0: weights.append(W_DIXON_BTTS); values.append(d_p)
+                    if b_p > 0: weights.append(W_BZZOIRO_BTTS); values.append(b_p)
+                    weights.append(W_STATS_BTTS); values.append(stats_p_btts)
+                    if weights:
+                        combined_probs["btts_over_25"] = sum(w * v for w, v in zip(weights, values)) / sum(weights)
+
                 real_odds = fx.get("real_odds", {})
 
                 market_map = {
@@ -927,53 +925,61 @@ async def build_all_candidates(matches, used_today, contexts=None):
 
                     real_odd = None
                     if mkt == "1X2":
-                        if "victoire" in label.lower() and home.lower() in label.lower():
-                            real_odd = real_odds.get("home")
-                        elif "victoire" in label.lower() and away.lower() in label.lower():
-                            real_odd = real_odds.get("away")
-                        elif "nul" in label.lower():
-                            real_odd = real_odds.get("draw")
+                        if "victoire" in label.lower() and home.lower() in label.lower(): real_odd = real_odds.get("home")
+                        elif "victoire" in label.lower() and away.lower() in label.lower(): real_odd = real_odds.get("away")
+                        elif "nul" in label.lower(): real_odd = real_odds.get("draw")
                     elif mkt == "Over/Under":
-                        if "over 2.5" in label.lower():
-                            real_odd = real_odds.get("over_2.5")
-                        elif "under 2.5" in label.lower():
-                            real_odd = real_odds.get("under_2.5")
+                        if "over 2.5" in label.lower(): real_odd = real_odds.get("over_2.5")
+                        elif "under 2.5" in label.lower(): real_odd = real_odds.get("under_2.5")
                     elif mkt == "BTTS":
-                        if "oui" in label.lower():
-                            real_odd = real_odds.get("btts_yes")
-                        elif "non" in label.lower():
-                            real_odd = real_odds.get("btts_no")
+                        if "oui" in label.lower(): real_odd = real_odds.get("btts_yes")
+                        elif "non" in label.lower(): real_odd = real_odds.get("btts_no")
 
                     used_odd = real_odd if real_odd else 1.0 / prob
                     if used_odd < 1.05:
                         continue
 
                     edge = -1.0
-                    if real_odd and real_odd > 1.01:
-                        edge = (prob * real_odd) - 1.0
+                    if real_odd and real_odd > 1.01: edge = (prob * real_odd) - 1.0
 
                     pg_raw = gemini_markets.get(key)
-                    try:
-                        prob_gemini = float(pg_raw) / 100.0 if pg_raw is not None else 0.0
-                    except (ValueError, TypeError):
-                        prob_gemini = 0.0
+                    try: prob_gemini = float(pg_raw) / 100.0 if pg_raw is not None else 0.0
+                    except (ValueError, TypeError): prob_gemini = 0.0
                     prob_dixon = 0.0
                     if dixon_pred:
                         dk = {"victoire_home": "p_home", "match_nul": "p_draw", "victoire_away": "p_away", "over_2.5": "over_2.5", "under_2.5": "under_2.5", "over_3.5": "over_3.5", "btts_yes": "btts_yes", "btts_no": "btts_no", "btts_over_25": "btts_over_25"}.get(key)
-                        if dk:
-                            prob_dixon = dixon_pred.get(dk, 0.0)
+                        if dk: prob_dixon = dixon_pred.get(dk, 0.0)
                     prob_bzzoiro = 0.0
                     if bzz_markets_direct:
                         bv = bzz_markets_direct.get(key)
                         if bv is not None:
-                            try:
-                                prob_bzzoiro = float(bv) / 100.0
-                            except (ValueError, TypeError):
-                                pass
+                            try: prob_bzzoiro = float(bv) / 100.0
+                            except (ValueError, TypeError): pass
 
                     agr_emoji, agr_delta = compute_agreement_three(gemini_markets, dixon_pred, bzz_markets_direct, key)
                     if agr_emoji == "⚠️":
                         continue
+
+                    # === FILTRE SPÉCIAL BBTS+O2.5 ===
+                    if key == "btts_over_25":
+                        # 1) Dixon obligatoire
+                        if prob_dixon < BTTS_MIN_DIXON: continue
+                        # 2) Score exact cohérent (si présent)
+                        if score_home >= 0 and score_away >= 0:
+                            if score_home == 0 or score_away == 0: continue
+                            if score_home + score_away < 3: continue
+                        # 3) Stats obligatoires pour les 2 équipes
+                        if stats_p_btts > 0:
+                            h_pct = stats_home.get("btts_over_25_pct", 0)
+                            a_pct = stats_away.get("btts_over_25_pct", 0)
+                            h_conc = stats_home.get("conceded_pct", 0)
+                            a_conc = stats_away.get("conceded_pct", 0)
+                            avg_pct = (h_pct + a_pct) / 2.0
+                            if h_pct < BTTS_STATS_MIN_TEAM: continue
+                            if a_pct < BTTS_STATS_MIN_TEAM: continue
+                            if avg_pct < BTTS_STATS_MIN_AVG: continue
+                            if h_conc < BTTS_STATS_MIN_CONCEDED: continue
+                            if a_conc < BTTS_STATS_MIN_CONCEDED: continue
 
                     candidates.append(Candidate(
                         event_id=event_id, league=league, home=home, away=away,
@@ -985,12 +991,16 @@ async def build_all_candidates(matches, used_today, contexts=None):
                         has_context=has_ctx, bzz_confidence=bzz_conf_direct,
                         analysis=analysis, advice=advice, advice_confidence=advice_conf, advices=advices_clean,
                         score_exact_home=score_home, score_exact_away=score_away, score_exact_prob=score_prob, score_exact_source=score_source,
+                        prob_stats=round(stats_p_btts, 4) if key == "btts_over_25" else 0.0,
+                        stats_home=stats_home if key == "btts_over_25" else None,
+                        stats_away=stats_away if key == "btts_over_25" else None,
                     ))
 
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(2.0)
             except Exception as e:
                 print(f"⚠️ build_all_candidates: {e}")
     return candidates
+
 
 # =========================================================
 # CONSTRUCTION DES TICKETS
@@ -1006,6 +1016,7 @@ def candidate_to_selection(c: Candidate) -> Selection:
         has_context=c.has_context, prob_gemini=c.prob_gemini, prob_dixon=c.prob_dixon, prob_bzzoiro=c.prob_bzzoiro,
         agreement_emoji=c.agreement_emoji, agreement_delta=c.agreement_delta, bzz_confidence=c.bzz_confidence,
         score_exact_home=c.score_exact_home, score_exact_away=c.score_exact_away, score_exact_prob=c.score_exact_prob, score_exact_source=c.score_exact_source,
+        prob_stats=c.prob_stats, stats_home=c.stats_home, stats_away=c.stats_away,
     )
 
 def build_safe_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
@@ -1014,12 +1025,8 @@ def build_safe_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     for c in pool:
         if c.event_id not in by_event or c.prob > by_event[c.event_id].prob:
             by_event[c.event_id] = c
-    pool = list(by_event.values())
-    pool.sort(key=lambda x: x.prob, reverse=True)
-
-    if not pool:
-        return None
-
+    pool = list(by_event.values()); pool.sort(key=lambda x: x.prob, reverse=True)
+    if not pool: return None
     legs, used_events, used_leagues, combined_odds, combined_prob = [], set(), set(), 1.0, 1.0
     for c in pool:
         if len(legs) >= SAFE_MAX_LEGS: break
@@ -1028,94 +1035,70 @@ def build_safe_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
         next_odds = combined_odds * c.odds
         if next_odds > SAFE_MAX_TOTAL * 1.15 and legs: continue
         legs.append(candidate_to_selection(c))
-        used_events.add(c.event_id)
-        used_leagues.add(c.league)
-        combined_odds = next_odds
-        combined_prob *= c.prob
+        used_events.add(c.event_id); used_leagues.add(c.league)
+        combined_odds = next_odds; combined_prob *= c.prob
         if combined_odds >= SAFE_MIN_TOTAL: break
-
-    if not legs or combined_odds < SAFE_MIN_TOTAL or combined_odds > SAFE_MAX_TOTAL * 1.25:
-        return None
+    if not legs or combined_odds < SAFE_MIN_TOTAL or combined_odds > SAFE_MAX_TOTAL * 1.25: return None
     return Coupon("Ticket Sécurisé", f"Cote {SAFE_MIN_TOTAL} - {SAFE_MAX_TOTAL} • DC sûrs", "🔒", legs, round(combined_odds, 2), round(combined_prob, 4))
 
 def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     market_types = ["Over/Under", "BTTS", "Double Chance", "1X2"]
     pool_all = [c for c in candidates if c.market in market_types and BAL_MIN_PROB <= c.prob <= BAL_MAX_PROB and BAL_MIN_LEG_ODDS <= c.odds <= BAL_MAX_LEG_ODDS]
-    
+    print(f"  → Ticket Équilibré: {len(pool_all)} candidates initiales")
     if not pool_all:
+        print("  → Ticket Équilibré: Aucun candidat dans les critères")
         return None
-
     legs, used_events, used_leagues = [], set(), set()
     for mkt in market_types:
         pool_mkt = [c for c in pool_all if c.market == mkt]
         by_event = {}
         for c in pool_mkt:
-            if c.event_id not in by_event or c.prob > by_event[c.event_id].prob:
-                by_event[c.event_id] = c
-        pool_mkt = list(by_event.values())
-        pool_mkt.sort(key=lambda x: (x.prob, x.edge), reverse=True)
+            if c.event_id not in by_event or c.prob > by_event[c.event_id].prob: by_event[c.event_id] = c
+        pool_mkt = list(by_event.values()); pool_mkt.sort(key=lambda x: (x.prob, x.edge), reverse=True)
         added = 0
         for c in pool_mkt:
             if added >= 2: break
             if c.event_id in used_events: continue
             if c.league in used_leagues and added >= 1: continue
             legs.append(candidate_to_selection(c))
-            used_events.add(c.event_id)
-            used_leagues.add(c.league)
-            added += 1
-
-    if not legs:
-        return None
-
+            used_events.add(c.event_id); used_leagues.add(c.league); added += 1
+    print(f"  → Ticket Équilibré: {len(legs)} legs préliminaires")
+    if not legs: return None
     combined_odds, combined_prob = 1.0, 1.0
-    for s in legs:
-        combined_odds *= s.odds
-        combined_prob *= s.final_prob()
-
+    for s in legs: combined_odds *= s.odds; combined_prob *= s.final_prob()
     while combined_odds > BAL_MAX_TOTAL * 1.25 and len(legs) > 3:
-        removed = legs.pop()
-        combined_odds /= removed.odds
-        combined_prob /= removed.final_prob()
-
-    if combined_odds < 1.70 or combined_odds > BAL_MAX_TOTAL * 1.25:
+        removed = legs.pop(); combined_odds /= removed.odds; combined_prob /= removed.final_prob()
+    print(f"  → Ticket Équilibré: {len(legs)} legs, cote {combined_odds:.2f}")
+    if combined_odds < 1.70:
+        print(f"  → Ticket Équilibré: REJETÉ (cote {combined_odds:.2f} < 1.70)")
         return None
-
+    if combined_odds > BAL_MAX_TOTAL * 1.25: return None
     return Coupon("Ticket Équilibré", f"Cote 2.0 - 6.0 • Multi-marchés", "⚖️", legs, round(combined_odds, 2), round(combined_prob, 4))
 
 def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     pool = [c for c in candidates if is_obscure_league(c.league)]
     pool = [c for c in pool if c.market in ("Double Chance", "1X2", "Over/Under", "BTTS")]
     pool = [c for c in pool if VALUE_MIN_LEG_ODDS <= c.odds <= VALUE_MAX_LEG_ODDS]
-
+    print(f"  → Value après filtres marché/cote : {len(pool)}")
     def qualifies(c: Candidate) -> bool:
-        if c.real_odd is not None:
-            return c.edge >= 0.01
+        if c.real_odd is not None: return c.edge >= 0.01
         return c.prob >= 0.80
-
     pool = [c for c in pool if qualifies(c)]
-
     def n_sources(c: Candidate) -> int:
         return sum([1 for x in (c.has_context, c.prob_dixon > 0, c.prob_bzzoiro > 0, c.prob_gemini > 0) if x])
     pool = [c for c in pool if n_sources(c) >= 2]
-
     strict = [c for c in pool if VALUE_MIN_PROB <= c.prob <= VALUE_MAX_PROB]
-
     def dedup(pool_list):
         by_ev = {}
         for c in pool_list:
-            if c.event_id not in by_ev or c.prob > by_ev[c.event_id].prob:
-                by_ev[c.event_id] = c
+            if c.event_id not in by_ev or c.prob > by_ev[c.event_id].prob: by_ev[c.event_id] = c
         return list(by_ev.values())
-
     strict = dedup(strict)
-
     def score(c):
         edge_score = c.edge if c.edge > 0 else 0.0
         return (c.prob, edge_score, c.bzz_confidence * 0.001)
-
     strict.sort(key=score, reverse=True)
     selected = strict[:VALUE_TOP_N]
-
     if len(selected) < VALUE_TOP_N:
         used_ids = {c.event_id for c in selected}
         fallback = [c for c in pool if VALUE_FALLBACK_MIN_PROB <= c.prob < VALUE_MIN_PROB and c.event_id not in used_ids]
@@ -1124,43 +1107,62 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
         for c in fallback:
             if len(selected) >= VALUE_TOP_N: break
             selected.append(c)
-
-    if not selected:
-        return None
-
+    print(f"  → Ticket Value FINAL : {len(selected)} paris retenus")
+    if not selected: return None
     combined_odds, combined_prob = 1.0, 1.0
-    for c in selected:
-        combined_odds *= c.odds
-        combined_prob *= c.prob
+    for c in selected: combined_odds *= c.odds; combined_prob *= c.prob
+    return Coupon("Ticket Value", f"Top {len(selected)} • Ligues obscures", "💎", [candidate_to_selection(c) for c in selected], round(combined_odds, 2), round(combined_prob, 4), is_list=True)
 
-    legs = [candidate_to_selection(c) for c in selected]
-    return Coupon("Ticket Value", f"Top {len(legs)} • Ligues obscures • DC haute proba", "💎", legs, round(combined_odds, 2), round(combined_prob, 4), is_list=True)
 
 def build_btts_over_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
+    """
+    Ticket BBTS+2.5 - Haute précision (filtre stats + proba minimum).
+    """
     pool = [c for c in candidates if c.market == "BTTS+O2.5"]
-    if not pool:
-        return None
-    
-    # Tri par probabilité pure (comme demandé)
+    print(f"  → BBTS+2.5 : {len(pool)} candidats bruts")
+
+    pool = [c for c in pool if c.prob >= BTTS_MIN_PROB]
+    print(f"  → BBTS+2.5 après seuil {BTTS_MIN_PROB*100:.0f}% : {len(pool)}")
+
+    pool = [c for c in pool if c.prob_dixon >= BTTS_MIN_DIXON]
+    print(f"  → BBTS+2.5 après Dixon ≥ {BTTS_MIN_DIXON*100:.0f}% : {len(pool)}")
+
+    def n_sources(c: Candidate) -> int:
+        return sum([1 for x in (c.has_context, c.prob_dixon > 0, c.prob_bzzoiro > 0, c.prob_gemini > 0, c.prob_stats > 0) if x])
+    pool = [c for c in pool if n_sources(c) >= 3]  # AU MOINS 3 sources (stats incluses)
+    print(f"  → BBTS+2.5 après 3 sources : {len(pool)}")
+
+    def has_stats(c: Candidate) -> bool:
+        if not c.stats_home or not c.stats_away: return False
+        h_pct = c.stats_home.get("btts_over_25_pct", 0)
+        a_pct = c.stats_away.get("btts_over_25_pct", 0)
+        return h_pct >= BTTS_STATS_MIN_TEAM and a_pct >= BTTS_STATS_MIN_TEAM
+    pool = [c for c in pool if has_stats(c)]
+    print(f"  → BBTS+2.5 après filtre stats : {len(pool)}")
+
+    by_ev = {}
+    for c in pool:
+        if c.event_id not in by_ev or c.prob > by_ev[c.event_id].prob: by_ev[c.event_id] = c
+    pool = list(by_ev.values())
+
     pool.sort(key=lambda x: x.prob, reverse=True)
-    top = pool[:BTTS_TOP_N]
-    if not top:
-        return None
-    
+    selected = pool[:BTTS_TOP_N]
+    print(f"  → BBTS+2.5 FINAL : {len(selected)} matchs retenus")
+
+    if not selected: return None
     combined_odds, combined_prob = 1.0, 1.0
-    for c in top:
-        combined_odds *= c.odds
-        combined_prob *= c.prob
-    
-    return Coupon("BBTS+2.5", f"Top {len(top)} matchs probables (BTTS & +2.5)", "🎯", [candidate_to_selection(c) for c in top], round(combined_odds, 2), round(combined_prob, 4), is_list=True)
+    for c in selected: combined_odds *= c.odds; combined_prob *= c.prob
+    return Coupon("BBTS+2.5", f"Top {len(selected)} matchs haute confiance", "🎯", [candidate_to_selection(c) for c in selected], round(combined_odds, 2), round(combined_prob, 4), is_list=True)
+
 
 def build_all_coupons(candidates: list[Candidate]) -> list[Coupon]:
     coupons = []
     if c := build_safe_coupon(candidates): coupons.append(c)
     if c := build_balanced_coupon(candidates): coupons.append(c)
     if c := build_value_coupon(candidates): coupons.append(c)
-    if c := build_btts_over_coupon(candidates): coupons.append(c) # === AJOUT BBTS ===
+    if c := build_btts_over_coupon(candidates): coupons.append(c)
     return coupons
+
 
 # =========================================================
 # FORMAT
@@ -1181,14 +1183,12 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False, hide_a
         today = datetime.now(TZ).date()
         if dt.date() == today: day_tag = "📍 <b>Aujourd'hui</b> "
         elif dt.date() == today + timedelta(days=1): day_tag = "📅 <b>Demain</b> "
-
     prob_pct = s.final_prob() * 100
     ctx_badge = " ✅ <i>H2H</i>" if s.has_context else ""
     agreement = ""
     if s.agreement_emoji == "🤝🤝": agreement = " 🤝🤝 <b>TRIPLE CONSENSUS</b>"
     elif s.agreement_emoji == "🤝": agreement = " 🤝 <b>consensus</b>"
     elif s.agreement_emoji == "⚠️": agreement = " ⚠️"
-
     bzz_badge = f" 🔮{s.bzz_confidence:.0f}" if s.bzz_confidence > 0 else ""
 
     lines = [
@@ -1197,8 +1197,26 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False, hide_a
         f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>",
         f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}{ctx_badge}{bzz_badge}{agreement}",
     ]
-    if s.prob_gemini > 0 or s.prob_dixon > 0 or s.prob_bzzoiro > 0:
-        lines.append(f"│    <i>G:{s.prob_gemini*100:.0f}% × D:{s.prob_dixon*100:.0f}% × B:{s.prob_bzzoiro*100:.0f}%</i>")
+    # Ligne G × D × B (+ S si stats)
+    src_parts = []
+    if s.prob_gemini > 0: src_parts.append(f"G:{s.prob_gemini*100:.0f}%")
+    if s.prob_dixon > 0: src_parts.append(f"D:{s.prob_dixon*100:.0f}%")
+    if s.prob_bzzoiro > 0: src_parts.append(f"B:{s.prob_bzzoiro*100:.0f}%")
+    if s.prob_stats > 0: src_parts.append(f"S:{s.prob_stats*100:.0f}%")
+    if src_parts:
+        lines.append(f"│    <i>{' × '.join(src_parts)}</i>")
+
+    # Ligne stats détaillées (BBTS+2.5)
+    if s.stats_home and s.stats_away:
+        h_pct = s.stats_home.get("btts_over_25_pct", 0) * 100
+        a_pct = s.stats_away.get("btts_over_25_pct", 0) * 100
+        h_gf = s.stats_home.get("goals_for_avg", 0)
+        a_gf = s.stats_away.get("goals_for_avg", 0)
+        h_conc = s.stats_home.get("conceded_pct", 0) * 100
+        a_conc = s.stats_away.get("conceded_pct", 0) * 100
+        lines.append(f"│ 📈 Stats {s.home[:14]} : {h_gf:.1f}b/m • BTTS+O2.5 {h_pct:.0f}% • encaisse {h_conc:.0f}%")
+        lines.append(f"│ 📈 Stats {s.away[:14]} : {a_gf:.1f}b/m • BTTS+O2.5 {a_pct:.0f}% • encaisse {a_conc:.0f}%")
+
     if s.score_exact_home >= 0 and s.score_exact_away >= 0:
         prob_txt = f" ({s.score_exact_prob*100:.1f}%)" if s.score_exact_prob > 0 else ""
         lines.append(f"│ ⚽ <b>Score exact</b> : {s.score_exact_home}-{s.score_exact_away}{prob_txt}")
@@ -1221,7 +1239,6 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False, hide_a
             elif s.advice:
                 if s.advice_confidence > 0: lines.append(f"│ 💡 <b>Conseil IA</b> ({confidence_bar(s.advice_confidence)} <b>{s.advice_confidence}%</b>) :\n│    {s.advice}")
                 else: lines.append(f"│ 💡 <b>Conseil IA</b> : {s.advice}")
-
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
@@ -1232,22 +1249,18 @@ def format_coupon(c: Coupon) -> str:
             f"<b>🎯 {len(c.legs)} pronostics (valeur)</b>", "",
         ]
         for i, s in enumerate(c.legs, 1):
-            # Pour le Ticket Value : on cache l'Avis IA. Pour BBTS+2.5 : on affiche tout.
             hide_ana = (c.name == "Ticket Value")
             lines.append(format_selection_block(s, i, compact=False, hide_analysis=hide_ana, hide_advices=False))
             lines.append("")
         lines.append(f"<i>{PUBLIC_FOOTER}</i>")
         return "\n".join(lines)
-
     prob_level = "🟢 Faible risque" if c.combined_prob >= 0.40 else "🟡 Risque modéré" if c.combined_prob >= 0.20 else "🔴 Risque élevé"
     lines = [
         format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", "",
-        f"<b>┏━━━━━━━━━━━━━━━┓</b>",
-        f"<b>┃ 📊 RÉCAP TICKET</b>",
+        f"<b>┏━━━━━━━━━━━━━━━┓</b>", f"<b>┃ 📊 RÉCAP TICKET</b>",
         f"<b>┃ 🎫 Cote totale : {c.combined_odds}</b>",
         f"<b>┃ 📈 Proba combinée : {c.combined_prob*100:.1f}%</b>",
-        f"<b>┃ 🎯 {prob_level}</b>",
-        f"<b>┗━━━━━━━━━━━━━━━┛</b>", "",
+        f"<b>┃ 🎯 {prob_level}</b>", f"<b>┗━━━━━━━━━━━━━━━┛</b>", "",
     ]
     for i, s in enumerate(c.legs, 1):
         lines.append(format_selection_block(s, i, compact=False))
@@ -1269,12 +1282,12 @@ def format_bilan(tracker):
     coupons = tracker.get("coupons", [])
     if not coupons: return f"{format_header()}\n\n<b>📊 Bilan</b>\n<i>Aucun historique.</i>"
     total, won, lost, pending = len(coupons), sum(1 for c in coupons if c.get("status") == "won"), sum(1 for c in coupons if c.get("status") == "lost"), sum(1 for c in coupons if c.get("status") == "pending")
-    settled = won + lost
-    wr = (won / settled * 100) if settled > 0 else 0
+    settled = won + lost; wr = (won / settled * 100) if settled > 0 else 0
     return f"{format_header()}\n\n<b>📊 BILAN</b>\n🎫 Total : <b>{total}</b>\n✅ Gagnés : <b>{won}</b>\n❌ Perdus : <b>{lost}</b>\n⏳ En attente : <b>{pending}</b>\n\n📈 Taux réussite : <b>{wr:.1f}%</b>"
 
+
 # =========================================================
-# TELEGRAM HANDLERS
+# TELEGRAM
 # =========================================================
 async def safe_answer(message, text, reply_markup=None):
     for i, part in enumerate(split_message(text)):
@@ -1293,14 +1306,11 @@ async def safe_send(chat_id, text):
 
 async def broadcast_after_scan():
     for chat_id in TARGETS:
-        await safe_send(chat_id, format_coupons_ready())
-        await asyncio.sleep(0.5)
+        await safe_send(chat_id, format_coupons_ready()); await asyncio.sleep(0.5)
     for user_id_str in STATE["users"]:
         try:
             uid = int(user_id_str)
-            if is_subscribed(uid):
-                await safe_send(uid, format_coupons_ready())
-                await asyncio.sleep(0.3)
+            if is_subscribed(uid): await safe_send(uid, format_coupons_ready()); await asyncio.sleep(0.3)
         except Exception: pass
 
 @dp.message(Command("start"))
@@ -1309,21 +1319,19 @@ async def start_cmd(message: Message):
         await safe_answer(message, f"{format_header()}\n\n<b>👋 Bienvenue Admin !</b>\n\nUtilise /scan pour lancer une analyse.", reply_markup=ADMIN_KEYBOARD)
     else:
         status = get_subscription_message(message.from_user.id)
-        msg = f"{format_header()}\n\n<b>👋 Bienvenue sur le bot de pronostics !</b>\n\n{status}\n\n<b>🔑 Pour activer votre accès :</b>\nEnvoyez simplement la commande <code>/activate VOTRE_CLE</code>\n<i>ou cliquez sur le bouton ci-dessous et envoyez votre clé.</i>"
+        msg = f"{format_header()}\n\n<b>👋 Bienvenue !</b>\n\n{status}\n\n<b>🔑 Pour activer :</b>\n<code>/activate VOTRE_CLE</code>"
         await safe_answer(message, msg, reply_markup=USER_KEYBOARD)
 
 @dp.message(Command("keygen"))
 async def keygen_cmd(message: Message):
     if message.from_user.id != ADMIN_ID: return
     args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /keygen [1m | 1s | 60]"); return
+    if len(args) != 2: await message.answer("Usage: /keygen [1m | 1s | 60]"); return
     duration_str, days = args[1].lower(), 0
     if duration_str.endswith("m"): days = int(duration_str[:-1]) * 30
     elif duration_str.endswith("s"): days = int(duration_str[:-1]) * 7
     else: days = int(duration_str)
-    if days <= 0:
-        await message.answer("❌ Durée invalide."); return
+    if days <= 0: await message.answer("❌ Durée invalide."); return
     key = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
     STATE["keys"][key] = {"days": days, "used": False, "created_at": datetime.now(TZ).isoformat()}
     save_json(KEYS_DB, STATE["keys"])
@@ -1332,8 +1340,7 @@ async def keygen_cmd(message: Message):
 @dp.message(Command("activate", "vip", "cle", "key"))
 async def activate_cmd(message: Message):
     args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Usage: /activate <votre_clé>"); return
+    if len(args) != 2: await message.answer("Usage: /activate <votre_clé>"); return
     await process_activation(message, args[1].strip().upper())
 
 @dp.message(F.text.regexp(r"^[A-Z0-9]{8}$"))
@@ -1342,11 +1349,9 @@ async def raw_key_cmd(message: Message):
 
 async def process_activation(message: Message, key: str):
     user_id = message.from_user.id
-    if key not in STATE["keys"]:
-        await message.answer("❌ Clé invalide."); return
+    if key not in STATE["keys"]: await message.answer("❌ Clé invalide."); return
     key_data = STATE["keys"][key]
-    if key_data.get("used"):
-        await message.answer("❌ Cette clé a déjà été utilisée."); return
+    if key_data.get("used"): await message.answer("❌ Clé déjà utilisée."); return
     days = key_data["days"]
     expires_at = datetime.now(TZ) + timedelta(days=days)
     STATE["users"][str(user_id)] = {"expires_at": expires_at.isoformat(), "key_used": key}
@@ -1368,7 +1373,7 @@ async def regler_cmd(message: Message):
 async def debug_cmd(message: Message):
     if message.from_user.id != ADMIN_ID: return
     d = STATE["debug"]
-    txt = f"<b>🔍 DEBUG</b>\n\nDixon : <b>{'✅' if STATE['dixon_model'] else '❌'}</b>\nBzzoiro : <b>{'✅' if BZZOIRO_API_KEY else '❌'}</b>\nOdds events : <b>{d.get('odds_events', 0)}</b>\nBzzoiro direct : <b>{d.get('bzz_predictions', 0)}</b>\nMatchs finaux : <b>{d.get('matched', 0)}</b>\nContextes : <b>{d.get('enriched', 0)}</b>\nCandidats : <b>{d.get('candidates', 0)}</b>\nCoupons : <b>{d.get('coupons', 0)}</b>"
+    txt = f"<b>🔍 DEBUG</b>\n\nDixon : <b>{'✅' if STATE['dixon_model'] else '❌'}</b>\nBzzoiro : <b>{'✅' if BZZOIRO_API_KEY else '❌'}</b>\nAPI-Football : <b>{'✅' if API_FOOTBALL_KEY else '❌'}</b>\nOdds events : <b>{d.get('odds_events', 0)}</b>\nBzzoiro direct : <b>{d.get('bzz_predictions', 0)}</b>\nStats BTTS : <b>{d.get('btts_stats', 0)}</b>\nMatchs finaux : <b>{d.get('matched', 0)}</b>\nCandidats : <b>{d.get('candidates', 0)}</b>\nCoupons : <b>{d.get('coupons', 0)}</b>"
     await safe_answer(message, txt)
 
 async def send_coupon(message, name):
@@ -1413,12 +1418,13 @@ async def btn_scan(message: Message):
 
 @dp.message(F.text == BTN_ACTIVATE)
 async def btn_activate(message: Message):
-    await message.answer("🔑 <b>Pour activer votre abonnement :</b>\n\nEnvoyez <code>/activate VOTRE_CLE</code>\nou votre clé à 8 caractères.", parse_mode="HTML")
+    await message.answer("🔑 <b>Pour activer votre abonnement :</b>\n\nEnvoyez <code>/activate VOTRE_CLE</code>", parse_mode="HTML")
 
 @dp.message(F.text == "⚙️ Debug")
 async def btn_debug(message: Message):
     if message.from_user.id != ADMIN_ID: return
     await debug_cmd(message)
+
 
 # =========================================================
 # SCAN
@@ -1466,20 +1472,34 @@ async def scan():
         contexts = {}
         try:
             contexts = await enrich_matches(matches)
-        except Exception as e: print(f"⚠️ Enrichissement : {e}")
+        except Exception as e: print(f"⚠️ Enrichissement Bzzoiro : {e}")
+
+        # === NOUVEAU : enrichissement stats BTTS+O2.5 (API-Football) ===
+        btts_stats_map = {}
+        try:
+            btts_stats_map = await enrich_btts_stats(matches)
+        except Exception as e: print(f"⚠️ Enrichissement stats BTTS : {e}")
 
         used_today = load_used_today()
-        candidates = await build_all_candidates(matches, used_today, contexts)
+        candidates = await build_all_candidates(matches, used_today, contexts, btts_stats_map)
         STATE["candidates"] = candidates
         STATE["coupons"] = build_all_coupons(candidates)
         mark_picks_used([s for c in STATE["coupons"] for s in c.legs])
         STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
-        STATE["debug"] = {"odds_events": len(odds_events), "bzz_predictions": len(bzz_predictions), "matched": len(matches), "enriched": len(contexts), "candidates": len(candidates), "coupons": len(STATE["coupons"])}
+        STATE["debug"] = {
+            "odds_events": len(odds_events),
+            "bzz_predictions": len(bzz_predictions),
+            "btts_stats": len(btts_stats_map),
+            "matched": len(matches),
+            "candidates": len(candidates),
+            "coupons": len(STATE["coupons"]),
+        }
 
         print(f"──────── RÉSUMÉ ────────\nCandidats : {len(candidates)}\nCoupons : {len(STATE['coupons'])}\n────────────────────────")
 
+
 # =========================================================
-# BROADCAST / LIFESPAN
+# LIFESPAN
 # =========================================================
 async def daily_broadcast():
     await scan()
@@ -1493,7 +1513,9 @@ async def lifespan(app: FastAPI):
 
     STATE["tracker"] = load_tracker(); STATE["keys"] = load_json(KEYS_DB); STATE["users"] = load_json(USERS_DB); STATE["ready"] = True
     print("✅ Bot prêt.")
-    
+    if not API_FOOTBALL_KEY:
+        print("⚠️ API_FOOTBALL_KEY manquante → le filtre stats BTTS+O2.5 sera DÉSACTIVÉ")
+
     scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(daily_broadcast, CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ), id="daily_broadcast", replace_existing=True)
     scheduler.start()
