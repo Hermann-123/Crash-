@@ -1,6 +1,5 @@
 """
-Bzzoiro Direct — Version avec DIAGNOSTIC COMPLET.
-Logge la structure réelle + accepte plusieurs formats.
+Bzzoiro Direct — Version CORRIGÉE (structure event.markets).
 """
 from __future__ import annotations
 
@@ -37,7 +36,7 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None)
     try:
         r = await client.get(f"{BZZOIRO_BASE}{path}", headers=_headers(), params=params, timeout=20.0)
         if r.status_code >= 400:
-            print(f"⚠️ Bzzoiro {path} -> {r.status_code} | {r.text[:200]}")
+            print(f"⚠️ Bzzoiro {path} -> {r.status_code}")
             return {}
         return r.json()
     except Exception as e:
@@ -46,7 +45,6 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict | None = None)
 
 
 def _safe_float(v, default=0.0) -> float:
-    """Convertit n'importe quoi en float entre 0 et 100."""
     if v is None:
         return default
     try:
@@ -60,117 +58,57 @@ def _safe_float(v, default=0.0) -> float:
         return default
 
 
-def _extract_from_market_dict(mkt: dict) -> dict:
-    """Extrait les probas d'un dict de marché, quel que soit le nom des clés."""
-    result = {}
-    if not isinstance(mkt, dict):
-        return result
-
-    # Chercher les clés home/draw/away avec tous les noms possibles
-    home_keys = ["prob_home", "home", "home_win", "prob_1", "1", "team_a", "home_probability"]
-    draw_keys = ["prob_draw", "draw", "prob_x", "x", "tie", "draw_probability"]
-    away_keys = ["prob_away", "away", "away_win", "prob_2", "2", "team_b", "away_probability"]
-
-    for k in home_keys:
-        if k in mkt:
-            result["victoire_home"] = _safe_float(mkt[k])
-            break
-    for k in draw_keys:
-        if k in mkt:
-            result["match_nul"] = _safe_float(mkt[k])
-            break
-    for k in away_keys:
-        if k in mkt:
-            result["victoire_away"] = _safe_float(mkt[k])
-            break
-
-    # Over/Under
-    for k in ["prob_over_25", "over_2_5", "over_25", "o25", "over25"]:
-        if k in mkt:
-            result["over_2.5"] = _safe_float(mkt[k])
-            break
-    for k in ["prob_under_25", "under_2_5", "under_25", "u25", "under25"]:
-        if k in mkt:
-            result["under_2.5"] = _safe_float(mkt[k])
-            break
-
-    # BTTS
-    for k in ["prob_yes", "btts_yes", "yes", "gg", "both_score"]:
-        if k in mkt:
-            result["btts_yes"] = _safe_float(mkt[k])
-            break
-    for k in ["prob_no", "btts_no", "no", "ng", "both_not_score"]:
-        if k in mkt:
-            result["btts_no"] = _safe_float(mkt[k])
-            break
-
-    return result
-
-
 def extract_bzzoiro_native_markets(pred: dict) -> dict:
-    """
-    Version ROBUSTE qui accepte plusieurs formats de l'API Bzzoiro.
-    Logge ce qu'elle voit pour diagnostic.
-    """
+    """Parse markets selon la structure réelle : pred['markets'] contient sous-dicts."""
     if not pred:
         return {}
 
     result = {}
-    markets = pred.get("markets", {}) or pred.get("predictions", {}) or pred.get("tips", {})
+    markets = pred.get("markets", {}) or {}
 
-    # Cas 1 : markets est une LISTE
-    if isinstance(markets, list):
-        for mkt in markets:
-            if isinstance(mkt, dict):
-                # Nom du marché
-                mkt_name = str(mkt.get("name", "") or mkt.get("market", "") or mkt.get("type", "")).lower()
-                probs = _extract_from_market_dict(mkt)
+    if not isinstance(markets, dict):
+        return result
 
-                if "result" in mkt_name or "1x2" in mkt_name or "match" in mkt_name or "winner" in mkt_name:
-                    if "victoire_home" in probs: result["victoire_home"] = probs["victoire_home"]
-                    if "match_nul" in probs: result["match_nul"] = probs["match_nul"]
-                    if "victoire_away" in probs: result["victoire_away"] = probs["victoire_away"]
-                if "over" in mkt_name or "under" in mkt_name or "total" in mkt_name or "ou" in mkt_name:
-                    if "over_2.5" in probs: result["over_2.5"] = probs["over_2.5"]
-                    if "under_2.5" in probs: result["under_2.5"] = probs["under_2.5"]
-                if "btts" in mkt_name or "both" in mkt_name or "gg" in mkt_name:
-                    if "btts_yes" in probs: result["btts_yes"] = probs["btts_yes"]
-                    if "btts_no" in probs: result["btts_no"] = probs["btts_no"]
+    # 1X2
+    mr = markets.get("match_result", {}) or {}
+    if isinstance(mr, dict):
+        h = _safe_float(mr.get("prob_home"))
+        d = _safe_float(mr.get("prob_draw"))
+        a = _safe_float(mr.get("prob_away"))
+        if 0 < h < 100: result["victoire_home"] = round(h, 1)
+        if 0 < d < 100: result["match_nul"] = round(d, 1)
+        if 0 < a < 100: result["victoire_away"] = round(a, 1)
 
-    # Cas 2 : markets est un dict avec sous-dicts (format original)
-    elif isinstance(markets, dict):
-        # On cherche d'abord les sous-dicts connus
-        for key in ["match_result", "1x2", "1X2", "result", "winner", "home_draw_away"]:
-            sub = markets.get(key)
-            if isinstance(sub, dict):
-                probs = _extract_from_market_dict(sub)
-                if "victoire_home" in probs: result["victoire_home"] = probs["victoire_home"]
-                if "match_nul" in probs: result["match_nul"] = probs["match_nul"]
-                if "victoire_away" in probs: result["victoire_away"] = probs["victoire_away"]
-                break
+    # Over/Under
+    ou = markets.get("over_under", {}) or {}
+    if isinstance(ou, dict):
+        o25 = _safe_float(ou.get("prob_over_25") or ou.get("over_2_5") or ou.get("over_25"))
+        if 0 < o25 < 100:
+            result["over_2.5"] = round(o25, 1)
+            result["under_2.5"] = round(100.0 - o25, 1)
+        o35 = _safe_float(ou.get("prob_over_35") or ou.get("over_3_5") or ou.get("over_35"))
+        if 0 < o35 < 100:
+            result["over_3.5"] = round(o35, 1)
 
-        for key in ["over_under", "ou", "total_goals", "goals", "totals"]:
-            sub = markets.get(key)
-            if isinstance(sub, dict):
-                probs = _extract_from_market_dict(sub)
-                if "over_2.5" in probs: result["over_2.5"] = probs["over_2.5"]
-                if "under_2.5" in probs: result["under_2.5"] = probs["under_2.5"]
-                break
+    # BTTS
+    btts = markets.get("btts", {}) or {}
+    if isinstance(btts, dict):
+        yes = _safe_float(btts.get("prob_yes") or btts.get("yes") or btts.get("gg"))
+        if 0 < yes < 100:
+            result["btts_yes"] = round(yes, 1)
+            result["btts_no"] = round(100.0 - yes, 1)
 
-        for key in ["btts", "btts_yes_no", "both_teams_to_score", "gg_ng"]:
-            sub = markets.get(key)
-            if isinstance(sub, dict):
-                probs = _extract_from_market_dict(sub)
-                if "btts_yes" in probs: result["btts_yes"] = probs["btts_yes"]
-                if "btts_no" in probs: result["btts_no"] = probs["btts_no"]
-                break
+    # Corners
+    corners = markets.get("corners", {}) or {}
+    if isinstance(corners, dict):
+        c85 = _safe_float(corners.get("prob_over_85") or corners.get("over_85"))
+        c95 = _safe_float(corners.get("prob_over_95") or corners.get("over_95"))
+        c105 = _safe_float(corners.get("prob_over_105") or corners.get("over_105"))
+        if 0 < c85 < 100: result["over_8.5_corners"] = round(c85, 1)
+        if 0 < c95 < 100: result["over_9.5_corners"] = round(c95, 1)
+        if 0 < c105 < 100: result["over_10.5_corners"] = round(c105, 1)
 
-        # Si rien trouvé, on cherche les probas direct dans markets
-        if not result:
-            direct = _extract_from_market_dict(markets)
-            result.update(direct)
-
-    # Dériver Double Chance
+    # Double Chance
     if "victoire_home" in result and "match_nul" in result:
         result["double_chance_1X"] = round(result["victoire_home"] + result["match_nul"], 1)
     if "victoire_home" in result and "victoire_away" in result:
@@ -178,7 +116,7 @@ def extract_bzzoiro_native_markets(pred: dict) -> dict:
     if "match_nul" in result and "victoire_away" in result:
         result["double_chance_X2"] = round(result["match_nul"] + result["victoire_away"], 1)
 
-    # Dériver BTTS+O2.5
+    # BTTS+O2.5
     if "btts_yes" in result and "over_2.5" in result:
         result["btts_over_25"] = round(min(result["btts_yes"], result["over_2.5"]) * 0.85, 1)
 
@@ -186,52 +124,80 @@ def extract_bzzoiro_native_markets(pred: dict) -> dict:
 
 
 def extract_native_confidence(pred: dict) -> float:
-    """Confiance native — cherche dans tous les champs possibles."""
-    for key in ["confidence", "confidence_score", "model_confidence", "score", "accuracy", "trust"]:
-        v = pred.get(key)
-        if v is not None:
-            try:
-                fv = float(v)
-                if 0 <= fv <= 1:
-                    return fv * 100
-                if 0 < fv <= 100:
-                    return fv
-            except (ValueError, TypeError):
-                pass
+    """Cherche la confiance dans model, recommendations, ou racine."""
+    # Dans model
+    model = pred.get("model", {}) or {}
+    if isinstance(model, dict):
+        for k in ["confidence", "confidence_score", "score", "accuracy"]:
+            if model.get(k) is not None:
+                v = _safe_float(model[k])
+                if 0 < v <= 100:
+                    return v
 
-    # Fallback : meilleure proba du marché
+    # Dans recommendations
+    recs = pred.get("recommendations", []) or []
+    if isinstance(recs, list):
+        for r in recs:
+            if isinstance(r, dict):
+                for k in ["confidence", "probability", "prob"]:
+                    if r.get(k) is not None:
+                        v = _safe_float(r[k])
+                        if 0 < v <= 100:
+                            return v
+
+    # À la racine
+    for k in ["confidence", "confidence_score", "model_confidence"]:
+        if pred.get(k) is not None:
+            v = _safe_float(pred[k])
+            if 0 < v <= 100:
+                return v
+
+    # Fallback : meilleure proba 1X2
     markets = pred.get("markets", {}) or {}
-    if isinstance(markets, dict):
-        mr = markets.get("match_result", {}) or markets.get("1x2", {}) or {}
-        if isinstance(mr, dict):
-            h = _safe_float(mr.get("prob_home") or mr.get("home"))
-            d = _safe_float(mr.get("prob_draw") or mr.get("draw"))
-            a = _safe_float(mr.get("prob_away") or mr.get("away"))
-            if max(h, d, a) > 0:
-                return max(h, d, a)
+    mr = markets.get("match_result", {}) or {}
+    if isinstance(mr, dict):
+        h = _safe_float(mr.get("prob_home"))
+        d = _safe_float(mr.get("prob_draw"))
+        a = _safe_float(mr.get("prob_away"))
+        if max(h, d, a) > 0:
+            return max(h, d, a)
 
-    return 65.0  # Défaut
+    return 65.0
 
 
 def extract_bzzoiro_score_exact(pred: dict) -> dict:
+    """Parse markets.score."""
     if not pred:
         return {}
-    # Chercher dans markets
     markets = pred.get("markets", {}) or {}
-    if isinstance(markets, dict):
-        for key in ("exact_score", "score_exact", "correct_score", "score"):
-            cand = markets.get(key)
-            if isinstance(cand, dict):
-                try:
-                    h = int(cand.get("home", -1))
-                    a = int(cand.get("away", -1))
-                    p = float(cand.get("prob", cand.get("probability", 0)))
-                    if 0 <= h <= 8 and 0 <= a <= 8:
+    score = markets.get("score", {}) or {}
+    if isinstance(score, dict):
+        # Format {"2-1": 12.5, "1-0": 9.3}
+        best_h, best_a, best_p = -1, -1, 0.0
+        for k, v in score.items():
+            if isinstance(k, str):
+                m = re.match(r"^(\d+)\s*[-:]\s*(\d+)$", k.strip())
+                if m:
+                    try:
+                        p = float(v)
                         if p > 1.0: p = p / 100.0
-                        if 0 < p <= 0.6:
-                            return {"home": h, "away": a, "prob": round(p, 4)}
-                except (ValueError, TypeError):
-                    pass
+                        if 0 < p <= 0.6 and p > best_p:
+                            best_p = p
+                            best_h, best_a = int(m.group(1)), int(m.group(2))
+                    except (ValueError, TypeError):
+                        pass
+        if best_h >= 0:
+            return {"home": best_h, "away": best_a, "prob": round(best_p, 4)}
+        # Format {"home": 2, "away": 1, "prob": 12.5}
+        if "home" in score and "away" in score:
+            try:
+                return {
+                    "home": int(score["home"]),
+                    "away": int(score["away"]),
+                    "prob": round(_safe_float(score.get("prob")) / 100.0, 4)
+                }
+            except (ValueError, TypeError):
+                pass
     return {}
 
 
@@ -257,45 +223,34 @@ async def fetch_bzzoiro_predictions_direct(min_confidence: float = 65.0) -> list
     if not predictions:
         return []
 
-    # === DIAGNOSTIC : on logge la structure du 1er match ===
-    first = predictions[0]
-    print(f"🔍 DIAGNOSTIC Bzzoiro — clés du 1er match : {list(first.keys())}")
-    mk = first.get("markets") or first.get("predictions") or first.get("tips")
-    print(f"🔍 Type de 'markets' : {type(mk).__name__}")
-    if isinstance(mk, dict):
-        print(f"🔍 Sous-clés markets : {list(mk.keys())[:10]}")
-        if mk:
-            first_sub = list(mk.values())[0] if mk else None
-            if isinstance(first_sub, dict):
-                print(f"🔍 Exemple sous-dict : {dict(list(first_sub.items())[:5])}")
-    elif isinstance(mk, list):
-        print(f"🔍 Longueur liste markets : {len(mk)}")
-        if mk and isinstance(mk[0], dict):
-            print(f"🔍 Clés du 1er élément : {list(mk[0].keys())[:10]}")
-
     enriched = []
     for pred in predictions:
         try:
-            home = pred.get("home_team", "") or pred.get("home", "") or pred.get("team_a", "")
-            away = pred.get("away_team", "") or pred.get("away", "") or pred.get("team_b", "")
+            # === LE FIX : les équipes sont dans pred['event'] ===
+            event = pred.get("event", {}) or {}
+            home = event.get("home_team") or event.get("home") or pred.get("home_team") or pred.get("home", "")
+            away = event.get("away_team") or event.get("away") or pred.get("away_team") or pred.get("away", "")
             if not home or not away:
                 continue
 
-            kickoff = pred.get("commence_time", "") or pred.get("kickoff", "") or pred.get("date", "") or pred.get("start_time", "")
+            kickoff = (event.get("commence_time") or event.get("kickoff") or event.get("date")
+                       or pred.get("commence_time") or pred.get("kickoff", ""))
             if not kickoff:
                 continue
+
+            league = (event.get("league_name") or event.get("league") or event.get("competition")
+                      or pred.get("league_name") or pred.get("league", ""))
 
             markets = extract_bzzoiro_native_markets(pred)
             confidence = extract_native_confidence(pred)
 
-            # On garde TOUS les matchs valides, même sans marchés (pour contexte)
             enriched.append({
                 "event_id": f"bzz_{pred.get('id', home + away)}",
                 "home": home,
                 "away": away,
-                "league": pred.get("league_name", "") or pred.get("league", "") or pred.get("competition", "") or pred.get("tournament", ""),
+                "league": league,
                 "kickoff": kickoff,
-                "bzz_markets": markets,  # peut être {} si parsing échoue
+                "bzz_markets": markets,
                 "bzz_confidence": round(confidence, 1),
                 "bzz_raw": pred,
                 "bzz_score_exact": extract_bzzoiro_score_exact(pred),
@@ -307,16 +262,14 @@ async def fetch_bzzoiro_predictions_direct(min_confidence: float = 65.0) -> list
             print(f"  ⚠️ Erreur parsing: {e}")
             continue
 
-    # Tri par confiance
     enriched.sort(key=lambda x: x["bzz_confidence"], reverse=True)
 
-    # Diagnostic final : combien ont des marchés parsés ?
     with_markets = sum(1 for e in enriched if e["bzz_markets"])
     print(f"🔮 Bzzoiro DIRECT : {len(enriched)} retenues ({with_markets} avec marchés parsés)")
 
     for p in enriched[:10]:
-        has_m = "✅" if p["bzz_markets"] else "⚠️"
         m_count = len(p["bzz_markets"]) if p["bzz_markets"] else 0
-        print(f"   {has_m} [{p['bzz_confidence']:.0f}%] {p['home']} vs {p['away']} • {m_count} marchés")
+        has_25 = "✅" if p["bzz_markets"].get("btts_over_25") else "❌"
+        print(f"   [{p['bzz_confidence']:.0f}%] {p['home']} vs {p['away']} • {m_count} marchés • BTTS+O2.5:{has_25}")
 
     return enriched
