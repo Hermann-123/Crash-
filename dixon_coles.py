@@ -118,18 +118,16 @@ class DixonColesModel:
         if len(results) < 100:
             return False
 
-        # === LOT 2 : Time Decay (pondération par la date) ===
         now = datetime.datetime.now()
         def get_weight(date_str):
             if not date_str: return 1.0
             try:
-                # Gère les formats DD/MM/YYYY et DD/MM/YY
                 if len(date_str.split('/')[-1]) == 2:
                     dt = datetime.datetime.strptime(date_str, "%d/%m/%y")
                 else:
                     dt = datetime.datetime.strptime(date_str, "%d/%m/%Y")
                 days = (now - dt).days
-                return math.exp(-0.005 * max(0, days)) # Demi-vie ~140 jours
+                return math.exp(-0.005 * max(0, days))
             except:
                 return 1.0
 
@@ -156,8 +154,6 @@ class DixonColesModel:
             team_stats[a]["gf"] += ag * w; team_stats[a]["ga"] += hg * w; team_stats[a]["n"] += w
 
         self.avg_goals = max(0.5, total_goals / (2 * total_weight)) if total_weight > 0 else 1.35
-        
-        # === LOT 2 : Calcul dynamique de l'avantage domicile ===
         self.home_advantage = max(1.0, min(1.40, total_home_goals / max(1.0, total_away_goals)))
 
         for t, s in team_stats.items():
@@ -186,6 +182,7 @@ class DixonColesModel:
 
         p_home = p_draw = p_away = 0.0
         p_over_15 = p_over_25 = p_over_35 = p_btts_yes = total = 0.0
+        p_btts_over_25 = 0.0
 
         for i in range(max_goals + 1):
             for j in range(max_goals + 1):
@@ -197,7 +194,10 @@ class DixonColesModel:
                 if (i + j) >= 2: p_over_15 += p
                 if (i + j) >= 3: p_over_25 += p
                 if (i + j) >= 4: p_over_35 += p
-                if i >= 1 and j >= 1: p_btts_yes += p
+                if i >= 1 and j >= 1: 
+                    p_btts_yes += p
+                    if (i + j) >= 3:
+                        p_btts_over_25 += p
 
         if total <= 0: return None
 
@@ -207,6 +207,7 @@ class DixonColesModel:
             "over_2.5": round(p_over_25 / total, 4), "under_2.5": round((total - p_over_25) / total, 4),
             "over_3.5": round(p_over_35 / total, 4), "under_3.5": round((total - p_over_35) / total, 4),
             "btts_yes": round(p_btts_yes / total, 4), "btts_no": round((total - p_btts_yes) / total, 4),
+            "btts_over_25": round(p_btts_over_25 / total, 4),
         }
 
     def _find_team(self, name: str) -> Optional[str]:
@@ -222,7 +223,6 @@ class DixonColesModel:
         if n_norm and n_norm in self._normalized_index:
             return self._normalized_index[n_norm]
 
-        # === LOT 2 : Matching strict (seuil 0.75) ===
         best_team, best_score = None, 0.0
         for csv_name in self.teams:
             score = _similarity_score(name, csv_name)
@@ -248,7 +248,7 @@ async def download_and_train() -> Optional[DixonColesModel]:
                     if not h or not a: continue
                     results.append({
                         "home": h, "away": a, "home_goals": hg, "away_goals": ag, "league": league,
-                        "date": row.get("Date", "") # === LOT 2 : Ajout de la date ===
+                        "date": row.get("Date", "")
                     })
             except Exception: pass
 
