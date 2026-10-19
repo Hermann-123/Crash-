@@ -135,13 +135,14 @@ VALUE_MIN_LEG_ODDS = float(os.getenv("VALUE_MIN_LEG_ODDS", "1.10"))
 VALUE_MAX_LEG_ODDS = float(os.getenv("VALUE_MAX_LEG_ODDS", "1.35"))
 VALUE_TOP_N = int(os.getenv("VALUE_TOP_N", "20"))
 
+# === CORRECTION BBTS : seuils assouplis ===
 # === TICKET BBTS+2.5 ===
 BTTS_TOP_N = 3
-BTTS_MIN_PROB = 0.70          # Seuil minimum de proba finale
-BTTS_MIN_DIXON = 0.30         # Dixon OBLIGATOIRE
-BTTS_STATS_MIN_TEAM = 0.55    # Chaque équipe doit avoir ≥ 55% BTTS+O2.5
-BTTS_STATS_MIN_AVG = 0.65     # Moyenne des 2 équipes ≥ 65%
-BTTS_STATS_MIN_CONCEDED = 0.65  # Chaque équipe encaisse ≥ 65%
+BTTS_MIN_PROB = 0.55          # Seuil assoupli à 55% (au lieu de 70%)
+BTTS_MIN_DIXON = 0.20         # Dixon peut être absent sur ligues obscures
+BTTS_STATS_MIN_TEAM = 0.50    # Stats par équipe
+BTTS_STATS_MIN_AVG = 0.55     # Moyenne des 2
+BTTS_STATS_MIN_CONCEDED = 0.60
 
 TELEGRAM_MAX_LEN = 3800
 
@@ -155,20 +156,15 @@ if not ADMIN_ID:
 TZ = ZoneInfo(NOTIFY_TZ)
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-# === LIGUES ÉLARGIES (Q2=C) ===
 SOCCER_KEYS = [
-    # Top 5 européens
     "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
     "soccer_germany_bundesliga", "soccer_france_ligue_one",
-    # Coupes européennes
     "soccer_uefa_champs_league", "soccer_uefa_europa_league",
     "soccer_uefa_europa_conference_league",
-    # 2e divisions
     "soccer_efl_champ", "soccer_efl_league_one", "soccer_efl_league_two",
     "soccer_spain_la_liga2", "soccer_italy_serie_b",
     "soccer_germany_bundesliga2", "soccer_france_ligue_two",
     "soccer_netherlands_eerste_divisie",
-    # Autres européennes
     "soccer_netherlands_eredivisie", "soccer_portugal_primeira_liga",
     "soccer_belgium_first_div", "soccer_turkey_super_league",
     "soccer_greece_super_league", "soccer_scotland_premiership",
@@ -176,20 +172,18 @@ SOCCER_KEYS = [
     "soccer_sweden_allsvenskan", "soccer_poland_ekstraklasa",
     "soccer_switzerland_superleague", "soccer_austria_bundesliga",
     "soccer_romania_liga_i", "soccer_ukraine_premier_league",
-    # Amériques
     "soccer_brazil_campeonato", "soccer_brazil_serie_b",
     "soccer_argentina_primera_division",
     "soccer_chile_campeonato", "soccer_colombia_primera_a",
     "soccer_usa_mls", "soccer_mexico_ligamx",
     "soccer_ecuador_liga_pro", "soccer_peru_primera_division",
     "soccer_uruguay_primera_division",
-    # Asie / Océanie
     "soccer_japan_j_league", "soccer_korea_kleague1",
     "soccer_australia_aleague",
 ]
 
 # =========================================================
-# FILTRE LIGUES OBSCURES (Ticket Value)
+# FILTRE LIGUES OBSCURES
 # =========================================================
 TOP_LEAGUES_KEYWORDS = {
     "premier league", "epl", "champions league", "europa league",
@@ -268,11 +262,9 @@ def filter_and_rank_matches(matches: list[dict]) -> list[dict]:
     return scored
 
 # =========================================================
-# FUSION 3 SOURCES (existant) + 4 SOURCES pour BBTS+2.5
+# FUSION SOURCES
 # =========================================================
 W_GEMINI = 0.35; W_DIXON = 0.25; W_BZZOIRO = 0.40
-
-# Poids spécifiques BBTS+2.5 (Gemini réduit car il hallucine)
 W_GEMINI_BTTS = 0.20; W_DIXON_BTTS = 0.25; W_BZZOIRO_BTTS = 0.30; W_STATS_BTTS = 0.25
 
 ALL_MARKETS = [
@@ -328,27 +320,18 @@ def combine_three_sources(gemini_markets: dict, dixon_pred: Optional[dict], bzz_
 
 
 def compute_stats_btts_prob(home_stats: dict, away_stats: dict) -> float:
-    """
-    Calcule une proba "stats" pour BTTS+O2.5 à partir des 10 derniers matchs de chaque équipe.
-    Méthode : moyenne des 2 btts_over_25_pct + bonus cohérence.
-    """
     if not home_stats or not away_stats:
         return 0.0
     h = home_stats.get("btts_over_25_pct", 0)
     a = away_stats.get("btts_over_25_pct", 0)
-    if h <= 0 or a <= 0:
-        return 0.0
+    if h <= 0 or a <= 0: return 0.0
     base = (h + a) / 2.0
-    # Bonus : si les 2 équipes encaissent souvent
     h_conc = home_stats.get("conceded_pct", 0)
     a_conc = away_stats.get("conceded_pct", 0)
-    if h_conc >= 0.7 and a_conc >= 0.7:
-        base += 0.03
-    # Bonus : si les 2 équipes marquent souvent
+    if h_conc >= 0.7 and a_conc >= 0.7: base += 0.03
     h_score = home_stats.get("scored_pct", 0)
     a_score = away_stats.get("scored_pct", 0)
-    if h_score >= 0.7 and a_score >= 0.7:
-        base += 0.03
+    if h_score >= 0.7 and a_score >= 0.7: base += 0.03
     return min(0.95, round(base, 4))
 
 
@@ -416,9 +399,9 @@ class Candidate:
     score_exact_away: int = -1
     score_exact_prob: float = 0.0
     score_exact_source: str = ""
-    prob_stats: float = 0.0   # NOUVEAU
-    stats_home: dict = None   # NOUVEAU
-    stats_away: dict = None   # NOUVEAU
+    prob_stats: float = 0.0
+    stats_home: dict = None
+    stats_away: dict = None
 
 
 @dataclass
@@ -684,7 +667,7 @@ async def fetch_all_odds_events() -> list[dict]:
         for key in SOCCER_KEYS:
             events = await fetch_odds_api_league(client, key)
             all_events.extend(events)
-            await asyncio.sleep(0.2)  # Réduit pour ne pas exploser le temps de scan
+            await asyncio.sleep(0.2)
     print(f"💰 Odds API : {len(all_events)} events ({len(SOCCER_KEYS)} ligues)")
     return all_events
 
@@ -729,7 +712,7 @@ def build_matches_from_odds(odds_events: list[dict]) -> list[dict]:
 
 
 # =========================================================
-# ENRICHISSEMENT BZZOIRO
+# ENRICHISSEMENT
 # =========================================================
 async def enrich_matches(matches: list[dict]) -> dict:
     to_enrich = matches[:MAX_MATCHES_TO_ENRICH]
@@ -752,19 +735,9 @@ async def enrich_matches(matches: list[dict]) -> dict:
     return contexts
 
 
-# =========================================================
-# ENRICHISSEMENT STATS BTTS+O2.5 (API-Football)
-# =========================================================
 async def enrich_btts_stats(matches: list[dict]) -> dict:
-    """
-    Pour les matchs prometteurs (Dixon >= 0.40 sur BTTS+O2.5), récupère les
-    stats des 2 équipes sur leurs 10 derniers matchs.
-    Optimisé pour ne pas exploser les quotas API-Football.
-    """
     if not _API_FOOTBALL_BTTS_AVAILABLE or not API_FOOTBALL_KEY:
         return {}
-
-    # Pré-filtre par Dixon (gratuit, pas d'appel API)
     prefiltered = []
     if STATE.get("dixon_model"):
         for fx in matches:
@@ -775,10 +748,8 @@ async def enrich_btts_stats(matches: list[dict]) -> dict:
             except Exception:
                 pass
     print(f"📊 Pré-filtre BBTS+2.5 (Dixon ≥ 40%) : {len(prefiltered)}/{len(matches)} matchs à enrichir")
-
     if not prefiltered:
         return {}
-
     stats_by_event = {}
     async with httpx.AsyncClient(timeout=15.0) as client:
         for fx in prefiltered:
@@ -786,8 +757,7 @@ async def enrich_btts_stats(matches: list[dict]) -> dict:
                 home = fx["home"]; away = fx["away"]
                 home_id = await find_team_id(client, home)
                 away_id = await find_team_id(client, away)
-                if not home_id or not away_id:
-                    continue
+                if not home_id or not away_id: continue
                 home_stats = await get_team_btts_stats(home_id, last=10)
                 away_stats = await get_team_btts_stats(away_id, last=10)
                 if home_stats and away_stats:
@@ -817,8 +787,7 @@ async def build_all_candidates(matches, used_today, contexts=None, btts_stats_ma
                 home, away = fx["home"], fx["away"]
                 event_id, league = fx["event_id"], fx["league"]
                 kickoff = fx["kickoff"]
-                if event_id in used_today:
-                    continue
+                if event_id in used_today: continue
 
                 ctx = contexts.get(event_id)
                 has_ctx = ctx is not None and ctx.get("available", False)
@@ -836,8 +805,7 @@ async def build_all_candidates(matches, used_today, contexts=None, btts_stats_ma
                     analysis, advices_clean, advice, advice_conf = "", [], "", 0
                 else:
                     pred = await predict_match_probas(client, home, away, league, kickoff, context=ctx)
-                    if not pred or "markets" not in pred:
-                        continue
+                    if not pred or "markets" not in pred: continue
                     gemini_markets = pred.get("markets", {})
                     analysis = pred.get("analysis", "")
                     advice = pred.get("advice", "")
@@ -880,7 +848,6 @@ async def build_all_candidates(matches, used_today, contexts=None, btts_stats_ma
                 dixon_pred = STATE["dixon_model"].predict_all(home, away) if STATE.get("dixon_model") else None
                 combined_probs = combine_three_sources(gemini_markets, dixon_pred, bzz_markets_direct)
 
-                # === RECALCUL SPÉCIFIQUE btts_over_25 AVEC LES STATS (4 sources) ===
                 if stats_p_btts > 0:
                     g_p = float(gemini_markets.get("btts_over_25", 0)) / 100.0 if gemini_markets.get("btts_over_25") else 0.0
                     d_p = dixon_pred.get("btts_over_25", 0) if dixon_pred else 0.0
@@ -917,11 +884,8 @@ async def build_all_candidates(matches, used_today, contexts=None, btts_stats_ma
 
                 for key, (label, mkt) in market_map.items():
                     prob = combined_probs.get(key)
-                    if prob is None or prob < 0.40 or prob > 0.95:
-                        continue
-
-                    if mkt in ("Corners", "Cartons") and key not in bzz_markets_direct:
-                        continue
+                    if prob is None or prob < 0.40 or prob > 0.95: continue
+                    if mkt in ("Corners", "Cartons") and key not in bzz_markets_direct: continue
 
                     real_odd = None
                     if mkt == "1X2":
@@ -936,8 +900,7 @@ async def build_all_candidates(matches, used_today, contexts=None, btts_stats_ma
                         elif "non" in label.lower(): real_odd = real_odds.get("btts_no")
 
                     used_odd = real_odd if real_odd else 1.0 / prob
-                    if used_odd < 1.05:
-                        continue
+                    if used_odd < 1.05: continue
 
                     edge = -1.0
                     if real_odd and real_odd > 1.01: edge = (prob * real_odd) - 1.0
@@ -957,29 +920,7 @@ async def build_all_candidates(matches, used_today, contexts=None, btts_stats_ma
                             except (ValueError, TypeError): pass
 
                     agr_emoji, agr_delta = compute_agreement_three(gemini_markets, dixon_pred, bzz_markets_direct, key)
-                    if agr_emoji == "⚠️":
-                        continue
-
-                    # === FILTRE SPÉCIAL BBTS+O2.5 ===
-                    if key == "btts_over_25":
-                        # 1) Dixon obligatoire
-                        if prob_dixon < BTTS_MIN_DIXON: continue
-                        # 2) Score exact cohérent (si présent)
-                        if score_home >= 0 and score_away >= 0:
-                            if score_home == 0 or score_away == 0: continue
-                            if score_home + score_away < 3: continue
-                        # 3) Stats obligatoires pour les 2 équipes
-                        if stats_p_btts > 0:
-                            h_pct = stats_home.get("btts_over_25_pct", 0)
-                            a_pct = stats_away.get("btts_over_25_pct", 0)
-                            h_conc = stats_home.get("conceded_pct", 0)
-                            a_conc = stats_away.get("conceded_pct", 0)
-                            avg_pct = (h_pct + a_pct) / 2.0
-                            if h_pct < BTTS_STATS_MIN_TEAM: continue
-                            if a_pct < BTTS_STATS_MIN_TEAM: continue
-                            if avg_pct < BTTS_STATS_MIN_AVG: continue
-                            if h_conc < BTTS_STATS_MIN_CONCEDED: continue
-                            if a_conc < BTTS_STATS_MIN_CONCEDED: continue
+                    if agr_emoji == "⚠️": continue
 
                     candidates.append(Candidate(
                         event_id=event_id, league=league, home=home, away=away,
@@ -1114,9 +1055,15 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     return Coupon("Ticket Value", f"Top {len(selected)} • Ligues obscures", "💎", [candidate_to_selection(c) for c in selected], round(combined_odds, 2), round(combined_prob, 4), is_list=True)
 
 
+# === CORRECTION BBTS : fonction assouplie ===
 def build_btts_over_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     """
-    Ticket BBTS+2.5 - Haute précision (filtre stats + proba minimum).
+    Ticket BBTS+2.5 - Version assouplie pour fonctionner sans API-Football.
+    Règles :
+    - proba finale >= 55%
+    - score exact cohérent (obligatoire si présent)
+    - au moins 2 sources (sur Dixon, Bzzoiro, Gemini, Stats)
+    - stats vérifiées SI disponibles
     """
     pool = [c for c in candidates if c.market == "BTTS+O2.5"]
     print(f"  → BBTS+2.5 : {len(pool)} candidats bruts")
@@ -1124,20 +1071,28 @@ def build_btts_over_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     pool = [c for c in pool if c.prob >= BTTS_MIN_PROB]
     print(f"  → BBTS+2.5 après seuil {BTTS_MIN_PROB*100:.0f}% : {len(pool)}")
 
-    pool = [c for c in pool if c.prob_dixon >= BTTS_MIN_DIXON]
-    print(f"  → BBTS+2.5 après Dixon ≥ {BTTS_MIN_DIXON*100:.0f}% : {len(pool)}")
+    filtered = []
+    for c in pool:
+        if c.score_exact_home >= 0 and c.score_exact_away >= 0:
+            if c.score_exact_home == 0 or c.score_exact_away == 0: continue
+            if c.score_exact_home + c.score_exact_away < 3: continue
+        filtered.append(c)
+    pool = filtered
+    print(f"  → BBTS+2.5 après score cohérent : {len(pool)}")
 
     def n_sources(c: Candidate) -> int:
-        return sum([1 for x in (c.has_context, c.prob_dixon > 0, c.prob_bzzoiro > 0, c.prob_gemini > 0, c.prob_stats > 0) if x])
-    pool = [c for c in pool if n_sources(c) >= 3]  # AU MOINS 3 sources (stats incluses)
-    print(f"  → BBTS+2.5 après 3 sources : {len(pool)}")
+        return sum([1 for x in (c.has_context, c.prob_dixon > 0,
+                                c.prob_bzzoiro > 0, c.prob_gemini > 0,
+                                c.prob_stats > 0) if x])
+    pool = [c for c in pool if n_sources(c) >= 2]
+    print(f"  → BBTS+2.5 après 2 sources : {len(pool)}")
 
-    def has_stats(c: Candidate) -> bool:
-        if not c.stats_home or not c.stats_away: return False
+    def stats_ok(c: Candidate) -> bool:
+        if not c.stats_home or not c.stats_away: return True
         h_pct = c.stats_home.get("btts_over_25_pct", 0)
         a_pct = c.stats_away.get("btts_over_25_pct", 0)
         return h_pct >= BTTS_STATS_MIN_TEAM and a_pct >= BTTS_STATS_MIN_TEAM
-    pool = [c for c in pool if has_stats(c)]
+    pool = [c for c in pool if stats_ok(c)]
     print(f"  → BBTS+2.5 après filtre stats : {len(pool)}")
 
     by_ev = {}
@@ -1152,7 +1107,7 @@ def build_btts_over_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     if not selected: return None
     combined_odds, combined_prob = 1.0, 1.0
     for c in selected: combined_odds *= c.odds; combined_prob *= c.prob
-    return Coupon("BBTS+2.5", f"Top {len(selected)} matchs haute confiance", "🎯", [candidate_to_selection(c) for c in selected], round(combined_odds, 2), round(combined_prob, 4), is_list=True)
+    return Coupon("BBTS+2.5", f"Top {len(selected)} matchs BTTS+O2.5", "🎯", [candidate_to_selection(c) for c in selected], round(combined_odds, 2), round(combined_prob, 4), is_list=True)
 
 
 def build_all_coupons(candidates: list[Candidate]) -> list[Coupon]:
@@ -1197,7 +1152,6 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False, hide_a
         f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>",
         f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}{ctx_badge}{bzz_badge}{agreement}",
     ]
-    # Ligne G × D × B (+ S si stats)
     src_parts = []
     if s.prob_gemini > 0: src_parts.append(f"G:{s.prob_gemini*100:.0f}%")
     if s.prob_dixon > 0: src_parts.append(f"D:{s.prob_dixon*100:.0f}%")
@@ -1206,7 +1160,6 @@ def format_selection_block(s: Selection, idx: int, compact: bool = False, hide_a
     if src_parts:
         lines.append(f"│    <i>{' × '.join(src_parts)}</i>")
 
-    # Ligne stats détaillées (BBTS+2.5)
     if s.stats_home and s.stats_away:
         h_pct = s.stats_home.get("btts_over_25_pct", 0) * 100
         a_pct = s.stats_away.get("btts_over_25_pct", 0) * 100
@@ -1474,7 +1427,6 @@ async def scan():
             contexts = await enrich_matches(matches)
         except Exception as e: print(f"⚠️ Enrichissement Bzzoiro : {e}")
 
-        # === NOUVEAU : enrichissement stats BTTS+O2.5 (API-Football) ===
         btts_stats_map = {}
         try:
             btts_stats_map = await enrich_btts_stats(matches)
