@@ -1,6 +1,6 @@
 """
-API-Football : fixtures, stats équipes, corners/cartons, H2H, blessés, 
-+ stats BTTS+Over2.5 (avec diagnostics).
+API-Football : fixtures, stats équipes, corners/cartons, H2H, blessés,
+stats BTTS+Over2.5 (compatible Free Plan).
 """
 from __future__ import annotations
 
@@ -52,7 +52,6 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
     try:
         r = await client.get(f"{API_BASE}{path}", headers=_headers(), params=params, timeout=15.0)
         if r.status_code >= 400:
-            # === DIAGNOSTIC : on affiche l'erreur au lieu de la cacher ===
             print(f"  🚨 API-Football {path} -> {r.status_code} | {r.text[:120]}")
             return {}
         data = r.json()
@@ -67,37 +66,60 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
 
 
 async def find_team_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
+    """Trouve l'ID de l'équipe PREMIÈRE (exclut Women, U23, U21, B, etc.)"""
     key = _norm(name)
     if not key:
         return None
     if key in _TEAM_ID_CACHE:
         return _TEAM_ID_CACHE[key]
     
-    print(f"    🔎 Recherche ID pour '{name}'...")
     data = await _get(client, "/teams", {"search": name})
     teams = data.get("response", [])
     
     if not teams:
-        print(f"    ❌ Aucune équipe trouvée pour '{name}'")
         _TEAM_ID_CACHE[key] = None
         return None
-        
+
+    # Mots-clés à exclure (équipes féminines, jeunes, réserves)
+    EXCLUDE_KW = ["women", "w", "u23", "u21", "u20", "u19", "u18", "reserve", "reserves", "ii"]
+
+    best_team_id = None
+    best_team_name = None
+
     for t in teams:
         team = t.get("team", {})
         tid = team.get("id")
-        tname = team.get("name", "")
+        tname = team.get("name", "").strip()
+        tname_lower = tname.lower()
+
+        # Exclure
+        skip = False
+        for kw in EXCLUDE_KW:
+            if f" {kw}" in tname_lower or tname_lower.endswith(kw):
+                skip = True; break
+        if skip:
+            continue
+
+        # Match exact ou contenu
         if tid and (_norm(tname) == key or key in _norm(tname) or _norm(tname) in key):
-            print(f"    ✅ Matché '{name}' -> '{tname}' (ID: {tid})")
-            _TEAM_ID_CACHE[key] = tid
-            return tid
-            
-    tid = teams[0].get("team", {}).get("id")
-    print(f"    ⚠️ Pas de match exact pour '{name}', on prend '{teams[0].get('team', {}).get('name')}' (ID: {tid})")
-    _TEAM_ID_CACHE[key] = tid
-    return tid
+            best_team_id = tid
+            best_team_name = tname
+            # Si match exact, on s'arrête tout de suite
+            if _norm(tname) == key:
+                break
+
+    if best_team_id:
+        print(f"    ✅ Matché '{name}' -> '{best_team_name}' (ID: {best_team_id})")
+        _TEAM_ID_CACHE[key] = best_team_id
+        return best_team_id
+
+    print(f"    ❌ Aucune équipe première trouvée pour '{name}' (filtré women/U23/etc)")
+    _TEAM_ID_CACHE[key] = None
+    return None
 
 
 async def get_team_btts_stats(team_id: int, last: int = 10) -> dict:
+    """Free plan : utilise 'season' au lieu de 'last'."""
     if not API_FOOTBALL_KEY or not team_id:
         return {}
 
@@ -105,45 +127,53 @@ async def get_team_btts_stats(team_id: int, last: int = 10) -> dict:
     if cache_key in _BTTS_STATS_CACHE:
         return _BTTS_STATS_CACHE[cache_key]
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        print(f"    📥 Fetch stats 10 derniers matchs pour team_id={team_id}...")
-        data = await _get(client, "/fixtures", {
-            "team": team_id,
-            "last": str(last),
-            "timezone": "Africa/Abidjan",
-        })
-        fixtures = data.get("response", [])
+    # On teste l'année en cours, puis l'année précédente
+    current_year = datetime.now().year
+    fixtures = []
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        for season in [current_year, current_year - 1]:
+            data = await _get(client, "/fixtures", {
+                "team": team_id,
+                "season": str(season),
+            })
+            fixtures = data.get("response", [])
+            if fixtures:
+                break
 
     if not fixtures:
-        print(f"    ❌ Aucun match retourné pour team_id={team_id}")
         _BTTS_STATS_CACHE[cache_key] = {}
         return {}
 
-    total = goals_for = goals_against = 0
-    scored_count = conceded_count = btts_count = over_25_count = btts_over_25_count = 0
+    # Garder uniquement les matchs terminés
+    finished = [fx for fx in fixtures if fx.get("fixture", {}).get("status", {}).get("short") in ("FT", "AET", "PEN")]
 
-    for fx in fixtures:
+    # Trier par timestamp DESC et prendre les N derniers
+    finished.sort(key=lambda x: x.get("fixture", {}).get("timestamp", 0), reverse=True)
+    recent = finished[:last]
+
+    if not recent:
+        _BTTS_STATS_CACHE[cache_key] = {}
+        return {}
+
+    total = gf_sum = ga_sum = 0
+    scored = conceded = btts = over25 = btts_over25 = 0
+
+    for fx in recent:
         goals = fx.get("goals", {})
         hg, ag = goals.get("home"), goals.get("away")
         if hg is None or ag is None: continue
-        status = fx.get("fixture", {}).get("status", {}).get("short", "")
-        if status not in ("FT", "AET", "PEN"): continue
 
-        teams = fx.get("teams", {})
-        home_id = teams.get("home", {}).get("id")
-        
-        if home_id == team_id:
-            gf, ga = hg, ag
-        else:
-            gf, ga = ag, hg
+        home_id = fx.get("teams", {}).get("home", {}).get("id")
+        gf, ga = (hg, ag) if home_id == team_id else (ag, hg)
 
         total += 1
-        goals_for += gf; goals_against += ga
-        if gf >= 1: scored_count += 1
-        if ga >= 1: conceded_count += 1
-        if gf >= 1 and ga >= 1: btts_count += 1
-        if (gf + ga) >= 3: over_25_count += 1
-        if gf >= 1 and ga >= 1 and (gf + ga) >= 3: btts_over_25_count += 1
+        gf_sum += gf; ga_sum += ga
+        if gf >= 1: scored += 1
+        if ga >= 1: conceded += 1
+        if gf >= 1 and ga >= 1: btts += 1
+        if (gf + ga) >= 3: over25 += 1
+        if gf >= 1 and ga >= 1 and (gf + ga) >= 3: btts_over25 += 1
 
     if total == 0:
         _BTTS_STATS_CACHE[cache_key] = {}
@@ -151,24 +181,22 @@ async def get_team_btts_stats(team_id: int, last: int = 10) -> dict:
 
     result = {
         "matches_played": total,
-        "goals_for_avg": round(goals_for / total, 2),
-        "goals_against_avg": round(goals_against / total, 2),
-        "scored_pct": round(scored_count / total, 3),
-        "conceded_pct": round(conceded_count / total, 3),
-        "btts_pct": round(btts_count / total, 3),
-        "over_25_pct": round(over_25_count / total, 3),
-        "btts_over_25_pct": round(btts_over_25_count / total, 3),
+        "goals_for_avg": round(gf_sum / total, 2),
+        "goals_against_avg": round(ga_sum / total, 2),
+        "scored_pct": round(scored / total, 3),
+        "conceded_pct": round(conceded / total, 3),
+        "btts_pct": round(btts / total, 3),
+        "over_25_pct": round(over25 / total, 3),
+        "btts_over_25_pct": round(btts_over25 / total, 3),
     }
     print(f"    📊 Stats OK pour team_id={team_id} : BTTS+O2.5 = {result['btts_over_25_pct']*100:.0f}% (sur {total} matchs)")
     _BTTS_STATS_CACHE[cache_key] = result
     return result
 
 
-# =========================================================
-# AUTRES FONCTIONS (inchangées)
-# =========================================================
+# --- Fonctions conservées telles quelles (pas critiques pour BBTS+2.5) ---
 async def fetch_all_today_fixtures() -> list[dict]:
-    return [] # Simplifié pour l'exemple, garde ton ancien code si besoin
+    return []
 
 async def get_h2h_by_names(home: str, away: str) -> dict:
-    return {"available": False} # Simplifié pour l'exemple
+    return {"available": False}
