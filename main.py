@@ -107,7 +107,8 @@ MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "50"))
 MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "20"))
 
 BZZ_MIN_CONFIDENCE = float(os.getenv("BZZ_MIN_CONFIDENCE", "75.0"))
-BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "80.0"))
+# === CORRECTION : Bzzoiro confiance baissée à 65% ===
+BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 BZZ_MAX_MATCHES = int(os.getenv("BZZ_MAX_MATCHES", "15"))
 
 # === TICKET SÉCURISÉ ===
@@ -135,13 +136,12 @@ VALUE_MIN_LEG_ODDS = float(os.getenv("VALUE_MIN_LEG_ODDS", "1.10"))
 VALUE_MAX_LEG_ODDS = float(os.getenv("VALUE_MAX_LEG_ODDS", "1.35"))
 VALUE_TOP_N = int(os.getenv("VALUE_TOP_N", "20"))
 
-# === CORRECTION BBTS : seuils assouplis ===
 # === TICKET BBTS+2.5 ===
 BTTS_TOP_N = 3
-BTTS_MIN_PROB = 0.55          # Seuil assoupli à 55% (au lieu de 70%)
-BTTS_MIN_DIXON = 0.20         # Dixon peut être absent sur ligues obscures
-BTTS_STATS_MIN_TEAM = 0.50    # Stats par équipe
-BTTS_STATS_MIN_AVG = 0.55     # Moyenne des 2
+BTTS_MIN_PROB = 0.50          # Seuil à 50% (compromis)
+BTTS_MIN_DIXON = 0.15         # Dixon optionnel si ligue inconnue
+BTTS_STATS_MIN_TEAM = 0.50
+BTTS_STATS_MIN_AVG = 0.55
 BTTS_STATS_MIN_CONCEDED = 0.60
 
 TELEGRAM_MAX_LEN = 3800
@@ -318,7 +318,6 @@ def combine_three_sources(gemini_markets: dict, dixon_pred: Optional[dict], bzz_
         result["double_chance_X2"] = result["match_nul"] + result["victoire_away"]
     return result
 
-
 def compute_stats_btts_prob(home_stats: dict, away_stats: dict) -> float:
     if not home_stats or not away_stats:
         return 0.0
@@ -333,7 +332,6 @@ def compute_stats_btts_prob(home_stats: dict, away_stats: dict) -> float:
     a_score = away_stats.get("scored_pct", 0)
     if h_score >= 0.7 and a_score >= 0.7: base += 0.03
     return min(0.95, round(base, 4))
-
 
 def compute_agreement_three(gemini_markets: dict, dixon_pred: Optional[dict], bzz_markets: dict, market_key: str) -> tuple[str, float]:
     map_g = {k: k for k in ALL_MARKETS}
@@ -366,7 +364,6 @@ def compute_agreement_three(gemini_markets: dict, dixon_pred: Optional[dict], bz
     if delta <= 0.10: return ("🤝", delta)
     if delta >= 0.15: return ("⚠️", delta)
     return ("", delta)
-
 
 # =========================================================
 # MODELS
@@ -402,7 +399,6 @@ class Candidate:
     prob_stats: float = 0.0
     stats_home: dict = None
     stats_away: dict = None
-
 
 @dataclass
 class Selection:
@@ -441,7 +437,6 @@ class Selection:
     def final_prob(self) -> float:
         return self.model_prob
 
-
 @dataclass
 class Coupon:
     name: str
@@ -451,7 +446,6 @@ class Coupon:
     combined_odds: float
     combined_prob: float
     is_list: bool = False
-
 
 # =========================================================
 # GLOBALS & KEYBOARDS
@@ -498,7 +492,6 @@ for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
     if raw:
         try: TARGETS.append(int(raw))
         except ValueError: TARGETS.append(raw)
-
 
 # =========================================================
 # HELPERS
@@ -566,7 +559,6 @@ def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
     if current.strip(): parts.append(current.rstrip())
     return parts
 
-
 # =========================================================
 # CLÉS / ABONNEMENTS
 # =========================================================
@@ -594,7 +586,6 @@ def get_subscription_message(user_id: int) -> str:
         exp = STATE["users"][str(user_id)]["expires_at"]
         return f"✅ Abonnement actif jusqu'au {datetime.fromisoformat(exp).strftime('%d/%m/%Y à %H:%M')}."
     return "❌ Abonnement expiré ou inexistant.\nContactez : @hermann1123"
-
 
 # =========================================================
 # TRACKER
@@ -644,7 +635,6 @@ def record_coupons(coupons: list[Coupon], date_str: str):
 
 async def settle_coupons():
     print("⚠️ settle_coupons désactivé")
-
 
 # =========================================================
 # THE ODDS API
@@ -710,7 +700,6 @@ def build_matches_from_odds(odds_events: list[dict]) -> list[dict]:
         })
     return matches
 
-
 # =========================================================
 # ENRICHISSEMENT
 # =========================================================
@@ -733,7 +722,6 @@ async def enrich_matches(matches: list[dict]) -> dict:
         except Exception:
             pass
     return contexts
-
 
 async def enrich_btts_stats(matches: list[dict]) -> dict:
     if not _API_FOOTBALL_BTTS_AVAILABLE or not API_FOOTBALL_KEY:
@@ -768,7 +756,6 @@ async def enrich_btts_stats(matches: list[dict]) -> dict:
                 print(f"  ⚠️ stats crash {fx.get('home')}: {e}")
     print(f"📊 Stats BTTS+O2.5 : {len(stats_by_event)}/{len(prefiltered)} matchs enrichis")
     return stats_by_event
-
 
 # =========================================================
 # BUILD CANDIDATES
@@ -942,7 +929,6 @@ async def build_all_candidates(matches, used_today, contexts=None, btts_stats_ma
                 print(f"⚠️ build_all_candidates: {e}")
     return candidates
 
-
 # =========================================================
 # CONSTRUCTION DES TICKETS
 # =========================================================
@@ -1054,17 +1040,7 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     for c in selected: combined_odds *= c.odds; combined_prob *= c.prob
     return Coupon("Ticket Value", f"Top {len(selected)} • Ligues obscures", "💎", [candidate_to_selection(c) for c in selected], round(combined_odds, 2), round(combined_prob, 4), is_list=True)
 
-
-# === CORRECTION BBTS : fonction assouplie ===
 def build_btts_over_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
-    """
-    Ticket BBTS+2.5 - Version assouplie pour fonctionner sans API-Football.
-    Règles :
-    - proba finale >= 55%
-    - score exact cohérent (obligatoire si présent)
-    - au moins 2 sources (sur Dixon, Bzzoiro, Gemini, Stats)
-    - stats vérifiées SI disponibles
-    """
     pool = [c for c in candidates if c.market == "BTTS+O2.5"]
     print(f"  → BBTS+2.5 : {len(pool)} candidats bruts")
 
@@ -1109,7 +1085,6 @@ def build_btts_over_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
     for c in selected: combined_odds *= c.odds; combined_prob *= c.prob
     return Coupon("BBTS+2.5", f"Top {len(selected)} matchs BTTS+O2.5", "🎯", [candidate_to_selection(c) for c in selected], round(combined_odds, 2), round(combined_prob, 4), is_list=True)
 
-
 def build_all_coupons(candidates: list[Candidate]) -> list[Coupon]:
     coupons = []
     if c := build_safe_coupon(candidates): coupons.append(c)
@@ -1117,7 +1092,6 @@ def build_all_coupons(candidates: list[Candidate]) -> list[Coupon]:
     if c := build_value_coupon(candidates): coupons.append(c)
     if c := build_btts_over_coupon(candidates): coupons.append(c)
     return coupons
-
 
 # =========================================================
 # FORMAT
@@ -1237,7 +1211,6 @@ def format_bilan(tracker):
     total, won, lost, pending = len(coupons), sum(1 for c in coupons if c.get("status") == "won"), sum(1 for c in coupons if c.get("status") == "lost"), sum(1 for c in coupons if c.get("status") == "pending")
     settled = won + lost; wr = (won / settled * 100) if settled > 0 else 0
     return f"{format_header()}\n\n<b>📊 BILAN</b>\n🎫 Total : <b>{total}</b>\n✅ Gagnés : <b>{won}</b>\n❌ Perdus : <b>{lost}</b>\n⏳ En attente : <b>{pending}</b>\n\n📈 Taux réussite : <b>{wr:.1f}%</b>"
-
 
 # =========================================================
 # TELEGRAM
@@ -1378,7 +1351,6 @@ async def btn_debug(message: Message):
     if message.from_user.id != ADMIN_ID: return
     await debug_cmd(message)
 
-
 # =========================================================
 # SCAN
 # =========================================================
@@ -1448,7 +1420,6 @@ async def scan():
         }
 
         print(f"──────── RÉSUMÉ ────────\nCandidats : {len(candidates)}\nCoupons : {len(STATE['coupons'])}\n────────────────────────")
-
 
 # =========================================================
 # LIFESPAN
