@@ -1155,8 +1155,10 @@ def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
 # === MOTEUR ELITE BBTS+2.5 ===
 def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
     """
-    MOTEUR ELITE BBTS+2.5 — vise 70-75% de réussite réelle.
-    Combinaison : Bookmaker (principal) + Stats Engine + Dixon-Coles.
+    MOTEUR ELITE BBTS+2.5 — 70-75% de réussite
+    Accepte 2 cas :
+    - Cas A : cotes réelles bookmaker dispo (le top)
+    - Cas B : pas de cotes réelles, mais Bzzoiro + moteur stats convergent
     """
     engine = STATE.get("btts_engine")
     if not engine or not engine.is_ready():
@@ -1173,25 +1175,40 @@ def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
             continue
 
         real_odds = fx.get("real_odds", {}) or {}
+        bzz_markets = fx.get("bzz_markets", {}) or {}
         btts_odd = real_odds.get("btts_yes")
         over_odd = real_odds.get("over_2.5")
 
-        # === FILTRE 1 : BOOKMAKER ULTRA-CONFIANT ===
-        if not btts_odd or not over_odd:
-            continue
-        if btts_odd > BTTS_MAX_BOOK_BTTS or over_odd > BTTS_MAX_BOOK_O25:
-            continue
-        if btts_odd < 1.01 or over_odd < 1.01:
-            continue
+        # === DÉTERMINER LA PROBA BBTS+O2.5 ===
+        combined_real_prob = 0.0
+        source = ""
 
-        btts_implied = (1.0 / btts_odd) * 0.95
-        over_implied = (1.0 / over_odd) * 0.95
-        combined_real_prob = min(btts_implied, over_implied) * 0.92
+        # Cas A : cotes réelles dispo
+        if btts_odd and over_odd and btts_odd > 1.01 and over_odd > 1.01:
+            if btts_odd > BTTS_MAX_BOOK_BTTS or over_odd > BTTS_MAX_BOOK_O25:
+                continue  # bookmaker pas assez confiant
+            btts_implied = (1.0 / btts_odd) * 0.95
+            over_implied = (1.0 / over_odd) * 0.95
+            combined_real_prob = min(btts_implied, over_implied) * 0.92
+            source = "bookmaker"
+
+        # Cas B : pas de cotes, on utilise Bzzoiro
+        else:
+            bzz_btts_over_25 = bzz_markets.get("btts_over_25")
+            if not bzz_btts_over_25:
+                continue  # pas de source fiable
+            try:
+                combined_real_prob = float(bzz_btts_over_25) / 100.0
+            except (ValueError, TypeError):
+                continue
+            # On retire 10% pour prudence (Bzzoiro est parfois optimiste)
+            combined_real_prob = combined_real_prob * 0.90
+            source = "bzzoiro"
 
         if combined_real_prob < BTTS_MIN_PROB:
             continue
 
-        # === FILTRE 2 : MOTEUR STATISTIQUE ===
+        # === FILTRE STATS ENGINE ===
         analysis = engine.analyze_match(home, away)
         if not analysis:
             continue
@@ -1207,7 +1224,7 @@ def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
         if analysis["avg_total_goals"] < BTTS_MIN_AVG_GOALS:
             continue
 
-        # === FILTRE 3 : DIXON ===
+        # === FILTRE DIXON ===
         dixon_prob = 0.0
         if STATE.get("dixon_model"):
             try:
@@ -1222,9 +1239,11 @@ def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
         picks.append({
             "match": fx, "home": home, "away": away,
             "real_prob": combined_real_prob,
-            "btts_odd": btts_odd, "over_odd": over_odd,
-            "engine_stats": analysis, "dixon_prob": dixon_prob,
-            "btts_implied": btts_implied, "over_implied": over_implied,
+            "btts_odd": btts_odd or 0.0,
+            "over_odd": over_odd or 0.0,
+            "engine_stats": analysis,
+            "dixon_prob": dixon_prob,
+            "source": source,
         })
 
     print(f"  → BBTS+2.5 ELITE : {len(picks)} matchs valident les 3 conditions")
@@ -1239,7 +1258,14 @@ def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
     legs = []
     for p in top:
         fx = p["match"]
-        combined_book_odd = round(p["btts_odd"] * p["over_odd"] * 0.85, 2)
+        # Cote affichée
+        if p["source"] == "bookmaker":
+            display_odd = round(p["btts_odd"] * p["over_odd"] * 0.85, 2)
+            bookmaker_label = "ELITE (bookmaker+stats+dixon)"
+        else:
+            # Pas de cotes → cote estimée = 1/proba
+            display_odd = round(1.0 / p["real_prob"], 2)
+            bookmaker_label = "ELITE (bzzoiro+stats+dixon)"
 
         sel = Selection(
             event_id=fx.get("event_id", f"{p['home']}_{p['away']}"),
@@ -1248,11 +1274,11 @@ def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
             kickoff=fx.get("kickoff", ""),
             market="BTTS+O2.5",
             pick_label="BTTS + Plus de 2.5 buts",
-            odds=combined_book_odd,
+            odds=display_odd,
             model_prob=p["real_prob"],
-            edge=(p["real_prob"] * combined_book_odd) - 1.0,
-            bookmaker="ELITE (3 sources)",
-            real_odd=combined_book_odd,
+            edge=(p["real_prob"] * display_odd) - 1.0,
+            bookmaker=bookmaker_label,
+            real_odd=display_odd,
             has_context=True,
             prob_dixon=p["dixon_prob"],
             prob_stats=p["real_prob"],
@@ -1261,8 +1287,7 @@ def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
         )
         legs.append(sel)
 
-        print(f"     🥇 {p['home']} vs {p['away']} : {p['real_prob']*100:.1f}%")
-        print(f"        Bookmaker : BTTS {p['btts_odd']} • O2.5 {p['over_odd']}")
+        print(f"     🥇 {p['home']} vs {p['away']} : {p['real_prob']*100:.1f}% [{p['source']}]")
         print(f"        Stats : {p['home'][:15]} marque {p['engine_stats']['home_stats']['scored_pct']*100:.0f}% • encaisse {p['engine_stats']['home_stats']['conceded_pct']*100:.0f}%")
         print(f"        Stats : {p['away'][:15]} marque {p['engine_stats']['away_stats']['scored_pct']*100:.0f}% • encaisse {p['engine_stats']['away_stats']['conceded_pct']*100:.0f}%")
         print(f"        Dixon : {p['dixon_prob']*100:.0f}% BTTS+O2.5")
@@ -1619,11 +1644,16 @@ async def scan():
                 print(f"⚠️ Bzzoiro direct crash: {e}")
 
         odds_events = await fetch_all_odds_events()
-        if not odds_events:
+
+        # === FALLBACK : on continue même si Odds API est vide, tant que Bzzoiro a des matchs ===
+        if not odds_events and not bzz_predictions:
             STATE["coupons"] = []
             STATE["candidates"] = []
-            print("⚠️ Scan annulé : The Odds API renvoie 0 match.")
+            print("⚠️ Scan annulé : 0 events Odds API ET 0 prédictions Bzzoiro.")
             return
+
+        if not odds_events:
+            print(f"⚠️ Odds API vide. On continue avec {len(bzz_predictions)} prédictions Bzzoiro uniquement.")
 
         matches = []
         if bzz_predictions:
