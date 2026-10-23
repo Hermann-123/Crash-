@@ -1207,21 +1207,29 @@ def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
         if combined_real_prob < BTTS_MIN_PROB:
             continue
 
+        # === FILTRE STATS ENGINE (optionnel si équipe inconnue) ===
         analysis = engine.analyze_match(home, away)
-        if not analysis:
-            continue
-        hs = analysis["home_stats"]
-        as_ = analysis["away_stats"]
+        engine_stats = None
+        
+        if analysis:
+            hs = analysis["home_stats"]
+            as_ = analysis["away_stats"]
 
-        if hs["scored_pct"] < BTTS_MIN_SCORED or as_["scored_pct"] < BTTS_MIN_SCORED:
-            continue
-        if hs["conceded_pct"] < BTTS_MIN_CONCEDED or as_["conceded_pct"] < BTTS_MIN_CONCEDED:
-            continue
-        if hs["btts_over25_pct"] < BTTS_MIN_STATS or as_["btts_over25_pct"] < BTTS_MIN_STATS:
-            continue
-        if analysis["avg_total_goals"] < BTTS_MIN_AVG_GOALS:
-            continue
+            # On filtre SEULEMENT si le moteur connaît les 2 équipes
+            if hs["scored_pct"] < BTTS_MIN_SCORED or as_["scored_pct"] < BTTS_MIN_SCORED:
+                continue
+            if hs["conceded_pct"] < BTTS_MIN_CONCEDED or as_["conceded_pct"] < BTTS_MIN_CONCEDED:
+                continue
+            if hs["btts_over25_pct"] < BTTS_MIN_STATS or as_["btts_over25_pct"] < BTTS_MIN_STATS:
+                continue
+            if analysis["avg_total_goals"] < BTTS_MIN_AVG_GOALS:
+                continue
+            engine_stats = analysis
+        else:
+            # Équipe inconnue → on fait confiance à Bzzoiro, on continue
+            pass
 
+        # === FILTRE DIXON (optionnel) ===
         dixon_prob = 0.0
         if STATE.get("dixon_model"):
             try:
@@ -1238,15 +1246,15 @@ def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
             "real_prob": combined_real_prob,
             "btts_odd": btts_odd or 0.0,
             "over_odd": over_odd or 0.0,
-            "engine_stats": analysis,
+            "engine_stats": engine_stats,
             "dixon_prob": dixon_prob,
             "source": source,
         })
 
-    print(f"  → BBTS+2.5 ELITE : {len(picks)} matchs valident les 3 conditions")
+    print(f"  → BBTS+2.5 ELITE : {len(picks)} matchs valident les conditions")
 
     if not picks:
-        print("  → BBTS+2.5 ELITE : 0 ticket aujourd'hui (normal, conditions strictes)")
+        print("  → BBTS+2.5 ELITE : 0 ticket aujourd'hui")
         return None
 
     picks.sort(key=lambda x: x["real_prob"], reverse=True)
@@ -1277,14 +1285,15 @@ def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
             has_context=True,
             prob_dixon=p["dixon_prob"],
             prob_stats=p["real_prob"],
-            stats_home=p["engine_stats"]["home_stats"],
-            stats_away=p["engine_stats"]["away_stats"],
+            stats_home=p["engine_stats"]["home_stats"] if p["engine_stats"] else None,
+            stats_away=p["engine_stats"]["away_stats"] if p["engine_stats"] else None,
         )
         legs.append(sel)
 
         print(f"     🥇 {p['home']} vs {p['away']} : {p['real_prob']*100:.1f}% [{p['source']}]")
-        print(f"        Stats : {p['home'][:15]} marque {p['engine_stats']['home_stats']['scored_pct']*100:.0f}% • encaisse {p['engine_stats']['home_stats']['conceded_pct']*100:.0f}%")
-        print(f"        Stats : {p['away'][:15]} marque {p['engine_stats']['away_stats']['scored_pct']*100:.0f}% • encaisse {p['engine_stats']['away_stats']['conceded_pct']*100:.0f}%")
+        if p["engine_stats"]:
+            print(f"        Stats : {p['home'][:15]} marque {p['engine_stats']['home_stats']['scored_pct']*100:.0f}% • encaisse {p['engine_stats']['home_stats']['conceded_pct']*100:.0f}%")
+            print(f"        Stats : {p['away'][:15]} marque {p['engine_stats']['away_stats']['scored_pct']*100:.0f}% • encaisse {p['engine_stats']['away_stats']['conceded_pct']*100:.0f}%")
         print(f"        Dixon : {p['dixon_prob']*100:.0f}% BTTS+O2.5")
 
     combined_odds = 1.0
