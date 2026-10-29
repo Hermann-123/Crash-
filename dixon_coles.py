@@ -194,20 +194,29 @@ class DixonColesModel:
                 if (i + j) >= 2: p_over_15 += p
                 if (i + j) >= 3: p_over_25 += p
                 if (i + j) >= 4: p_over_35 += p
-                if i >= 1 and j >= 1: 
+                if i >= 1 and j >= 1:
                     p_btts_yes += p
                     if (i + j) >= 3:
                         p_btts_over_25 += p
 
         if total <= 0: return None
 
+        # === RETURN COMPLET avec lambda_home et lambda_away ===
         return {
-            "p_home": round(p_home / total, 4), "p_draw": round(p_draw / total, 4), "p_away": round(p_away / total, 4),
-            "over_1.5": round(p_over_15 / total, 4), "under_1.5": round((total - p_over_15) / total, 4),
-            "over_2.5": round(p_over_25 / total, 4), "under_2.5": round((total - p_over_25) / total, 4),
-            "over_3.5": round(p_over_35 / total, 4), "under_3.5": round((total - p_over_35) / total, 4),
-            "btts_yes": round(p_btts_yes / total, 4), "btts_no": round((total - p_btts_yes) / total, 4),
+            "p_home": round(p_home / total, 4),
+            "p_draw": round(p_draw / total, 4),
+            "p_away": round(p_away / total, 4),
+            "over_1.5": round(p_over_15 / total, 4),
+            "under_1.5": round((total - p_over_15) / total, 4),
+            "over_2.5": round(p_over_25 / total, 4),
+            "under_2.5": round((total - p_over_25) / total, 4),
+            "over_3.5": round(p_over_35 / total, 4),
+            "under_3.5": round((total - p_over_35) / total, 4),
+            "btts_yes": round(p_btts_yes / total, 4),
+            "btts_no": round((total - p_btts_yes) / total, 4),
             "btts_over_25": round(p_btts_over_25 / total, 4),
+            "lambda_home": round(lambda_home, 2),
+            "lambda_away": round(lambda_away, 2),
         }
 
     def _find_team(self, name: str) -> Optional[str]:
@@ -218,7 +227,7 @@ class DixonColesModel:
             target_norm = _normalize_team_name(alias)
             for csv_name in self.teams:
                 if _normalize_team_name(csv_name) == target_norm: return csv_name
-                
+
         n_norm = _normalize_team_name(name)
         if n_norm and n_norm in self._normalized_index:
             return self._normalized_index[n_norm]
