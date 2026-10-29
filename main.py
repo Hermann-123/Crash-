@@ -73,7 +73,7 @@ NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "20"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
-# === ODDS +3 (Top 5, AVEC Avis IA) ===
+# === ODDS +3 (AVEC Avis IA) ===
 ODDS3_MIN_ODDS = 3.0
 ODDS3_MAX_ODDS = 4.0
 ODDS3_MIN_PROB_PER_LEG = 0.60
@@ -81,23 +81,23 @@ ODDS3_MIN_LEG_ODDS = 1.55
 ODDS3_MAX_LEG_ODDS = 2.20
 ODDS3_MAX_LEGS = 5
 
-# === ODDS +10 (Obscures, SANS Avis IA) ===
+# === ODDS +10 (SANS Avis IA) ===
 ODDS10_MIN_ODDS = 10.0
 ODDS10_MIN_PROB_PER_LEG = 0.50
-ODDS10_MIN_LEG_ODDS = 1.60   # ← plus de DC à 1.36
+ODDS10_MIN_LEG_ODDS = 1.60
 ODDS10_MAX_LEG_ODDS = 2.80
 ODDS10_MAX_LEGS = 7
 
-# === MT-FIN (Top 5, SANS Avis IA) ===
+# === MT-FIN (SANS Avis IA) ===
 MTFIN_TOP_N = 3
-MTFIN_MIN_PROB = 0.30        # ← baissé de 50 à 30
+MTFIN_MIN_PROB = 0.15
 MTFIN_SIMULATIONS = 1000
 MTFIN_FIRST_HALF_RATIO = 0.45
 
-# === SCORE EXACT (Toutes, SANS Avis IA) ===
+# === SCORE EXACT (SANS Avis IA) ===
 SCORE_EXACT_TARGETS = [(1,2), (0,2), (0,1), (2,1), (2,0), (1,0)]
 SCORE_EXACT_TOP_N = 3
-SCORE_EXACT_MIN_PROB = 0.30  # ← baissé de 50 à 30
+SCORE_EXACT_MIN_PROB = 0.30
 
 TELEGRAM_MAX_LEN = 3800
 
@@ -139,8 +139,7 @@ def is_top_league(league: str, sport_key: str = "") -> bool:
         return True
     if not league:
         return False
-    low = league.lower()
-    return any(kw in low for kw in TOP5_LEAGUES_KW)
+    return any(kw in league.lower() for kw in TOP5_LEAGUES_KW)
 
 def is_obscure_league(league: str, sport_key: str = "") -> bool:
     if not league and not sport_key:
@@ -183,12 +182,23 @@ def parse_dt_safe(s) -> Optional[datetime]:
     except Exception:
         return None
 
-def kickoff_day_only(iso_str) -> str:
-    """Affiche UNIQUEMENT le jour (pas l'heure fausse de Bzzoiro)."""
-    dt = parse_dt_safe(iso_str)
-    if not dt:
+def format_kickoff(kickoff_str) -> str:
+    """Affiche DD/MM HH:MM si l'heure existe, sinon DD/MM."""
+    if not kickoff_str:
         return "?"
-    return dt.strftime("%d/%m")
+    s = str(kickoff_str).strip()
+    # Essayer de parser comme datetime complet
+    dt = parse_dt_safe(s)
+    if dt:
+        # Si le kickoff contient une heure réelle (pas juste une date)
+        if "T" in s or " " in s and len(s) > 10:
+            return dt.strftime("%d/%m %H:%M")
+        return dt.strftime("%d/%m")
+    # Fallback : extraire date
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return f"{m.group(3)}/{m.group(2)}"
+    return "?"
 
 def prob_bar(p: float) -> str:
     if p >= 0.80: return "🟢🟢🟢"
@@ -320,7 +330,7 @@ class Coupon:
     name: str; subtitle: str; emoji: str; legs: list[Selection]
     combined_odds: float; combined_prob: float
     is_list: bool = False
-    show_analysis: bool = False  # ← nouveau
+    show_analysis: bool = False
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -381,7 +391,7 @@ def is_subscribed(user_id: int) -> bool:
 def get_subscription_message(user_id: int) -> str:
     if is_subscribed(user_id):
         exp = STATE["users"][str(user_id)]["expires_at"]
-        return f"✅ Abonnement actif jusqu'au {datetime.fromisoformat(exp).strftime('%d/%m/%Y à %H:%M')}."
+        return f"✅ Actif jusqu'au {datetime.fromisoformat(exp).strftime('%d/%m/%Y à %H:%M')}."
     return "❌ Abonnement expiré.\n@hermann1123"
 
 def load_tracker() -> dict:
@@ -395,19 +405,17 @@ def save_tracker(data):
     except: pass
 
 def load_used_today() -> set:
-    tracker = STATE["tracker"]
     today = datetime.now(TZ).strftime("%Y-%m-%d")
-    u = tracker.get("used_today", {})
+    u = STATE["tracker"].get("used_today", {})
     if u.get("date") != today: return set()
     return set(u.get("ids", []))
 
 def save_used_today(ids):
-    tracker = STATE["tracker"]
     today = datetime.now(TZ).strftime("%Y-%m-%d")
-    existing = tracker.get("used_today", {})
+    existing = STATE["tracker"].get("used_today", {})
     merged = (set(existing.get("ids", [])) | ids) if existing.get("date") == today else ids
-    tracker["used_today"] = {"date": today, "ids": list(merged)}
-    save_tracker(tracker)
+    STATE["tracker"]["used_today"] = {"date": today, "ids": list(merged)}
+    save_tracker(STATE["tracker"])
 
 def mark_picks_used(selections):
     if selections: save_used_today({s.event_id for s in selections})
@@ -600,10 +608,9 @@ def candidate_to_selection(c, with_analysis=False):
     )
 
 def build_odds3_coupon(candidates):
-    """Odds +3 : Top 5, cotes estimées OK, AVEC Avis IA"""
+    """Odds +3 : TOUTES ligues, AVEC Avis IA"""
     pool = [c for c in candidates
-            if is_top_league(c.league, c.sport_key)
-            and c.market in ("Double Chance", "Over/Under", "BTTS", "1X2")
+            if c.market in ("Double Chance", "Over/Under", "BTTS", "1X2")
             and c.prob >= ODDS3_MIN_PROB_PER_LEG
             and ODDS3_MIN_LEG_ODDS <= c.odds <= ODDS3_MAX_LEG_ODDS]
 
@@ -632,11 +639,11 @@ def build_odds3_coupon(candidates):
     if not legs or odds < ODDS3_MIN_ODDS or odds > ODDS3_MAX_ODDS: return None
 
     print(f"  → Odds +3 OK : {len(legs)} legs, cote {odds:.2f}")
-    return Coupon("Odds +3", f"Cote {ODDS3_MIN_ODDS}-{ODDS3_MAX_ODDS} • Top 5",
+    return Coupon("Odds +3", f"Cote {ODDS3_MIN_ODDS}-{ODDS3_MAX_ODDS}",
                   "🎯", legs, round(odds, 2), round(prob, 4), show_analysis=True)
 
 def build_odds10_coupon(candidates):
-    """Odds +10 : obscures, cote min 1.60, SANS Avis IA, marchés variés"""
+    """Odds +10 : obscures, cote min 1.60, SANS Avis IA"""
     pool = [c for c in candidates
             if is_obscure_league(c.league, c.sport_key)
             and c.market in ("Double Chance", "Over/Under", "BTTS", "1X2")
@@ -653,15 +660,11 @@ def build_odds10_coupon(candidates):
 
     if len(pool) < 4: return None
 
-    # Exiger au moins 2 marchés différents
     legs, used, odds, prob = [], set(), 1.0, 1.0
     markets_used = set()
     for c in pool:
         if len(legs) >= ODDS10_MAX_LEGS: break
         if c.event_id in used: continue
-        # Diversité : si on a déjà 3 DC, on skip les autres DC
-        if c.market == "Double Chance" and list(markets_used).count("Double Chance") >= 0:
-            pass  # on accepte mais on mixe plus bas
         legs.append(candidate_to_selection(c, with_analysis=False))
         used.add(c.event_id)
         markets_used.add(c.market)
@@ -670,7 +673,7 @@ def build_odds10_coupon(candidates):
         if odds >= ODDS10_MIN_ODDS: break
 
     if odds < ODDS10_MIN_ODDS: return None
-    if len(markets_used) < 2: return None  # au moins 2 marchés
+    if len(markets_used) < 2: return None
     if len(legs) < 4: return None
 
     print(f"  → Odds +10 OK : {len(legs)} legs, cote {odds:.2f}, {len(markets_used)} marchés")
@@ -679,12 +682,11 @@ def build_odds10_coupon(candidates):
 
 def build_mtft_coupon(matches):
     if not STATE.get("dixon_model"): return None
-    print(f"  → MT-Fin : analyse de {len(matches)}")
+    print(f"  → MT-Fin : {len(matches)}")
 
     picks = []
     for fx in matches:
         home, away = fx["home"], fx["away"]
-        if not is_top_league(fx.get("league",""), fx.get("odds_sport_key","")): continue
         try: dixon = STATE["dixon_model"].predict_all(home, away)
         except: dixon = None
         if not dixon: continue
@@ -787,7 +789,7 @@ def format_selection_block(s, idx, show_analysis):
 
     lines = [
         f"<b>┌─ #{idx} {s.home} vs {s.away}</b>",
-        f"│ 📅 <b>{kickoff_day_only(s.kickoff)}</b> • {s.league}",
+        f"│ 📅 <b>{format_kickoff(s.kickoff)}</b> • {s.league}",
         f"│ 🎯 <b>{s.pick_label}</b>",
         f"│ 📊 <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}{ctx_badge}{bzz_badge}",
     ]
@@ -802,7 +804,6 @@ def format_selection_block(s, idx, show_analysis):
     else:
         lines.append(f"│ 💰 Cote : <b>{s.odds}</b>")
 
-    # === Avis IA UNIQUEMENT si demandé ===
     if show_analysis:
         if s.analysis:
             lines.append(f"│")
@@ -940,7 +941,7 @@ async def process_activation(message, key):
 @dp.message(Command("scan"))
 async def scan_cmd(message: Message):
     if message.from_user.id != ADMIN_ID: return
-    await safe_answer(message, "⏳ Analyse (2-3 min)...")
+    await safe_answer(message, "⏳ Analyse...")
     await scan()
     await broadcast_after_scan()
 
@@ -948,7 +949,7 @@ async def scan_cmd(message: Message):
 async def debug_cmd(message: Message):
     if message.from_user.id != ADMIN_ID: return
     d = STATE["debug"]
-    await safe_answer(message, f"<b>🔍 DEBUG</b>\n\nDixon : {'✅' if STATE['dixon_model'] else '❌'}\nOdds events : {d.get('odds_events',0)}\nBzzoiro : {d.get('bzz_predictions',0)}\nMatchs : {d.get('matched',0)}\nCandidats : {d.get('candidates',0)}\nCoupons : {d.get('coupons',0)}")
+    await safe_answer(message, f"<b>🔍 DEBUG</b>\n\nDixon : {'✅' if STATE['dixon_model'] else '❌'}\nOdds : {d.get('odds_events',0)}\nBzzoiro : {d.get('bzz_predictions',0)}\nMatchs : {d.get('matched',0)}\nCandidats : {d.get('candidates',0)}\nCoupons : {d.get('coupons',0)}")
 
 async def send_coupon(message, name):
     c = next((x for x in STATE["coupons"] if x.name == name), None)
@@ -1030,7 +1031,24 @@ async def scan():
                     bzz_copy["has_odds"] = True
                     bzz_copy["odds_sport_key"] = matched.get("sport_key","")
                     bzz_copy["league"] = matched.get("sport_title", bzz.get("league",""))
+                    # Priorité au vrai kickoff Odds API
+                    ct = matched.get("commence_time")
+                    if ct:
+                        bzz_copy["kickoff"] = ct
                 matches.append(bzz_copy)
+
+        if not matches and odds_events:
+            # Construire depuis Odds uniquement
+            for ev in odds_events:
+                h = ev.get("home_team",""); a = ev.get("away_team",""); kick = ev.get("commence_time","")
+                if not h or not a: continue
+                matches.append({
+                    "event_id": ev.get("id",""), "home": h, "away": a,
+                    "league": ev.get("sport_title",""), "kickoff": kick,
+                    "has_odds": True, "real_odds": extract_real_odds(ev),
+                    "odds_sport_key": ev.get("sport_key",""),
+                    "bzz_markets": {}, "bzz_confidence": 0,
+                })
 
         if not matches:
             print("❌ Aucun match."); STATE["coupons"] = []; STATE["candidates"] = []; return
@@ -1083,7 +1101,7 @@ async def lifespan(app):
         try:
             if download_and_train:
                 STATE["dixon_model"] = await download_and_train()
-                print(f"✅ Dixon ({len(STATE['dixon_model'].teams) if STATE['dixon_model'] else 0} équipes)")
+                print(f"✅ Dixon ({len(STATE['dixon_model'].teams) if STATE['dixon_model'] else 0})")
             await asyncio.sleep(5)
             if NOTIFY_ON_STARTUP:
                 for cid in TARGETS: await safe_send(cid, f"{format_header()}\n\n⏳ <b>Démarrage...</b>")
