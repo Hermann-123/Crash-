@@ -31,12 +31,6 @@ except Exception as e:
     print(f"❌ Import gemini_predictor: {e}")
 
 try:
-    from football_data import get_fixture_result
-except Exception as e:
-    get_fixture_result = None
-    print(f"⚠️ Import get_fixture_result: {e}")
-
-try:
     from bzzoiro_data import enrich_match_with_bzzoiro
 except Exception as e:
     enrich_match_with_bzzoiro = None
@@ -54,9 +48,6 @@ except Exception as e:
     download_and_train = None
     print(f"❌ Import dixon_coles: {e}")
 
-# =========================================================
-# CONFIG
-# =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -69,7 +60,6 @@ try:
 except ValueError:
     ADMIN_ID = 0
 
-# === HEURE 10h00 PAR DÉFAUT ===
 NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "10"))
 NOTIFY_MINUTE = int(os.getenv("NOTIFY_MINUTE", "0"))
 NOTIFY_TZ = os.getenv("NOTIFY_TZ", "Africa/Abidjan")
@@ -84,14 +74,12 @@ PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue res
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
 MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
-MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "20"))
-GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "25"))
+MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "15"))
+GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "20"))
 
 BZZ_MIN_CONFIDENCE = float(os.getenv("BZZ_MIN_CONFIDENCE", "65.0"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
-BZZ_MAX_MATCHES = int(os.getenv("BZZ_MAX_MATCHES", "15"))
 
-# === ODDS +3 (Top 5 + cotes réelles) ===
 ODDS3_MIN_ODDS = 3.0
 ODDS3_MAX_ODDS = 4.0
 ODDS3_MIN_PROB_PER_LEG = 0.65
@@ -99,23 +87,20 @@ ODDS3_MIN_LEG_ODDS = 1.15
 ODDS3_MAX_LEG_ODDS = 1.90
 ODDS3_MAX_LEGS = 5
 
-# === ODDS +10 (Obscures) ===
 ODDS10_MIN_ODDS = 10.0
 ODDS10_MIN_PROB_PER_LEG = 0.55
 ODDS10_MIN_LEG_ODDS = 1.35
 ODDS10_MAX_LEG_ODDS = 2.60
 ODDS10_MAX_LEGS = 10
 
-# === MT-FIN ===
 MTFIN_TOP_N = 3
-MTFIN_MIN_PROB = 0.55
+MTFIN_MIN_PROB = 0.50
 MTFIN_SIMULATIONS = 1000
 MTFIN_FIRST_HALF_RATIO = 0.45
 
-# === SCORE EXACT ===
 SCORE_EXACT_TARGETS = [(1,2), (0,2), (0,1), (2,1), (2,0), (1,0)]
 SCORE_EXACT_TOP_N = 3
-SCORE_EXACT_MIN_PROB = 0.55
+SCORE_EXACT_MIN_PROB = 0.50
 
 KICKOFF_MIN_MINUTES_AHEAD = 30
 
@@ -157,9 +142,6 @@ SOCCER_KEYS = [
     "soccer_australia_aleague",
 ]
 
-# =========================================================
-# FILTRES LIGUES
-# =========================================================
 TOP5_SPORT_KEYS = {
     "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
     "soccer_germany_bundesliga", "soccer_france_ligue_one",
@@ -185,9 +167,6 @@ def is_obscure_league(league: str, sport_key: str = "") -> bool:
         return False
     return not is_top_league(league, sport_key)
 
-# =========================================================
-# HELPERS
-# =========================================================
 def today_pretty():
     months = {1:"janvier",2:"février",3:"mars",4:"avril",5:"mai",6:"juin",
               7:"juillet",8:"août",9:"septembre",10:"octobre",11:"novembre",12:"décembre"}
@@ -231,10 +210,12 @@ def kickoff_local(iso_str) -> str:
     return dt.strftime("%d/%m %H:%M")
 
 def is_match_upcoming(kickoff_str, min_minutes: int = KICKOFF_MIN_MINUTES_AHEAD) -> bool:
-    """FIX bug 3 : strict - kickoff > now + 30min."""
+    """Permissif : si kickoff illisible ou vide, on garde le match."""
+    if not kickoff_str:
+        return True
     dt = parse_dt_safe(kickoff_str)
     if not dt:
-        return False
+        return True
     return dt > datetime.now(TZ) + timedelta(minutes=min_minutes)
 
 def prob_bar(p: float) -> str:
@@ -271,9 +252,6 @@ def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
         parts.append(current.rstrip())
     return parts
 
-# =========================================================
-# MONTE CARLO HT/FT
-# =========================================================
 def _poisson_sample(lam: float) -> int:
     if lam <= 0:
         return 0
@@ -306,9 +284,6 @@ def best_htft(probs: dict) -> tuple[str, float]:
     best = max(probs.items(), key=lambda x: x[1])
     return best
 
-# =========================================================
-# FUSION SOURCES
-# =========================================================
 W_GEMINI = 0.35
 W_DIXON = 0.25
 W_BZZOIRO = 0.40
@@ -378,9 +353,6 @@ def combine_three_sources(gemini_markets: dict, dixon_pred: Optional[dict], bzz_
 
     return result
 
-# =========================================================
-# MODELS
-# =========================================================
 @dataclass
 class Candidate:
     event_id: str
@@ -446,9 +418,6 @@ class Coupon:
     combined_prob: float
     is_list: bool = False
 
-# =========================================================
-# GLOBALS & KEYBOARDS
-# =========================================================
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
@@ -481,7 +450,7 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 STATE = {
-    "ready": False, "candidates": [], "selections": [], "coupons": [],
+    "ready": False, "candidates": [], "coupons": [],
     "last_scan": None, "debug": {}, "tracker": {"coupons": []}, "keys": {}, "users": {},
     "scan_lock": asyncio.Lock(), "dixon_model": None,
 }
@@ -494,9 +463,6 @@ for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
         except ValueError:
             TARGETS.append(raw)
 
-# =========================================================
-# STORAGE
-# =========================================================
 def load_json(path, default=None):
     if default is None:
         default = {}
@@ -590,9 +556,6 @@ def record_coupons(coupons: list[Coupon], date_str: str):
 async def settle_coupons():
     print("⚠️ settle_coupons désactivé")
 
-# =========================================================
-# THE ODDS API
-# =========================================================
 async def fetch_odds_api_league(client: httpx.AsyncClient, sport_key: str) -> list[dict]:
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
     params = {"apiKey": ODDS_API_KEY, "regions": "eu",
@@ -673,9 +636,6 @@ def build_matches_from_odds(odds_events: list[dict]) -> list[dict]:
         })
     return matches
 
-# =========================================================
-# ENRICHISSEMENT
-# =========================================================
 async def enrich_matches(matches: list[dict]) -> dict:
     to_enrich = matches[:MAX_MATCHES_TO_ENRICH]
     if not to_enrich:
@@ -693,14 +653,11 @@ async def enrich_matches(matches: list[dict]) -> dict:
             if ctx and ctx.get("available"):
                 contexts[fx["event_id"]] = ctx
                 print(f"  ✅ {home} vs {away} — H2H:{ctx.get('h2h', {}).get('total_matches', 0)}")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
         except Exception:
             pass
     return contexts
 
-# =========================================================
-# BUILD CANDIDATES (Gemini TOUJOURS appelé = Avis IA garanti)
-# =========================================================
 async def build_all_candidates(matches, used_today, contexts=None):
     candidates: list[Candidate] = []
     if not predict_match_probas:
@@ -711,7 +668,7 @@ async def build_all_candidates(matches, used_today, contexts=None):
     print(f"🎯 Analyse Gemini forcée (Avis IA garanti) — max {GEMINI_MAX_CALLS_PER_SCAN}")
 
     async with httpx.AsyncClient(timeout=40.0) as client:
-        for fx in ordered[:GEMINI_MAX_CALLS_PER_SCAN]:
+        for idx, fx in enumerate(ordered[:GEMINI_MAX_CALLS_PER_SCAN]):
             try:
                 home, away = fx["home"], fx["away"]
                 event_id, league = fx["event_id"], fx["league"]
@@ -722,12 +679,13 @@ async def build_all_candidates(matches, used_today, contexts=None):
                 if not is_match_upcoming(kickoff):
                     continue
 
+                print(f"  [{idx+1}/{min(len(ordered), GEMINI_MAX_CALLS_PER_SCAN)}] {home} vs {away}")
+
                 ctx = contexts.get(event_id)
                 has_ctx = ctx is not None and ctx.get("available", False)
                 bzz_markets_direct = fx.get("bzz_markets", {})
                 bzz_conf_direct = fx.get("bzz_confidence", 0)
 
-                # === FIX bug 1 : Gemini TOUJOURS appelé ===
                 pred = await predict_match_probas(client, home, away, league, kickoff, context=ctx)
                 if not pred or "markets" not in pred:
                     continue
@@ -816,16 +774,13 @@ async def build_all_candidates(matches, used_today, contexts=None):
                         sport_key=sport_key,
                     ))
 
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(1.5)
             except Exception as e:
                 print(f"⚠️ build_all_candidates: {e}")
 
     print(f"🏠 Candidats totaux : {len(candidates)}")
     return candidates
 
-# =========================================================
-# TICKETS
-# =========================================================
 def candidate_to_selection(c: Candidate) -> Selection:
     return Selection(
         event_id=c.event_id, league=c.league, home=c.home, away=c.away,
@@ -841,7 +796,6 @@ def candidate_to_selection(c: Candidate) -> Selection:
     )
 
 def build_odds3_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
-    """Odds +3 : Top 5, cotes réelles OBLIGATOIRES, total 3.0-4.0"""
     pool = []
     for c in candidates:
         if not is_top_league(c.league, c.sport_key):
@@ -895,7 +849,6 @@ def build_odds3_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
                   "🎯", legs, round(combined_odds, 2), round(combined_prob, 4))
 
 def build_odds10_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
-    """Odds +10 : ligues obscures, mix marchés"""
     pool = []
     for c in candidates:
         if not is_obscure_league(c.league, c.sport_key):
@@ -943,12 +896,11 @@ def build_odds10_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
                   "🔥", legs, round(combined_odds, 2), round(combined_prob, 4))
 
 def build_mtft_coupon(matches: list[dict]) -> Optional[Coupon]:
-    """MT-Fin : Monte Carlo 1000 sims, 3 matchs exactement, Top 5"""
     if not STATE.get("dixon_model"):
         print("  → MT-Fin : Dixon non disponible")
         return None
 
-    print(f"  → MT-Fin : analyse de {len(matches)} matchs (Monte Carlo x{MTFIN_SIMULATIONS})")
+    print(f"  → MT-Fin : analyse de {len(matches)} matchs")
 
     picks = []
     for fx in matches:
@@ -984,7 +936,7 @@ def build_mtft_coupon(matches: list[dict]) -> Optional[Coupon]:
     print(f"  → MT-Fin : {len(picks)} matchs ≥ {MTFIN_MIN_PROB*100:.0f}%")
 
     if len(picks) < MTFIN_TOP_N:
-        print(f"  → MT-Fin : besoin de {MTFIN_TOP_N} matchs, seulement {len(picks)}")
+        print(f"  → MT-Fin : besoin de {MTFIN_TOP_N}, seulement {len(picks)}")
         return None
 
     picks.sort(key=lambda x: x["htft_prob"], reverse=True)
@@ -1010,11 +962,10 @@ def build_mtft_coupon(matches: list[dict]) -> Optional[Coupon]:
         combined_odds *= s.odds
         combined_prob *= s.final_prob()
 
-    return Coupon("MT-Fin", "Mi-Temps/Fin • 3 matchs (Monte Carlo)",
+    return Coupon("MT-Fin", "Mi-Temps/Fin • 3 matchs",
                   "⏱", legs, round(combined_odds, 2), round(combined_prob, 4), is_list=True)
 
 def build_score_exact_coupon(matches: list[dict]) -> Optional[Coupon]:
-    """Score Exact : 6 scores cibles, toutes ligues, 3 matchs"""
     if not STATE.get("dixon_model"):
         print("  → Score Exact : Dixon non disponible")
         return None
@@ -1058,7 +1009,7 @@ def build_score_exact_coupon(matches: list[dict]) -> Optional[Coupon]:
             "cumulative_prob": cumulative,
         })
 
-    print(f"  → Score Exact : {len(picks)} matchs ≥ {SCORE_EXACT_MIN_PROB*100:.0f}% cumulé")
+    print(f"  → Score Exact : {len(picks)} matchs ≥ {SCORE_EXACT_MIN_PROB*100:.0f}%")
 
     if len(picks) < SCORE_EXACT_TOP_N:
         print(f"  → Score Exact : besoin de {SCORE_EXACT_TOP_N}, seulement {len(picks)}")
@@ -1104,9 +1055,6 @@ def build_all_coupons(candidates: list[Candidate], matches: list[dict] = None) -
             coupons.append(c)
     return coupons
 
-# =========================================================
-# FORMAT
-# =========================================================
 def format_header():
     return (
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
@@ -1147,7 +1095,6 @@ def format_selection_block(s: Selection, idx: int) -> str:
     else:
         lines.append(f"│ 💰 Cote : <b>{s.odds}</b>")
 
-    # === Avis IA toujours affiché ===
     if s.analysis:
         lines.append(f"│")
         lines.append(f"│ 🧠 <b>Avis IA</b> :")
@@ -1222,9 +1169,6 @@ def format_bilan(tracker):
     wr = (won / settled * 100) if settled > 0 else 0
     return f"{format_header()}\n\n<b>📊 BILAN</b>\n🎫 Total : <b>{total}</b>\n✅ Gagnés : <b>{won}</b>\n❌ Perdus : <b>{lost}</b>\n⏳ En attente : <b>{pending}</b>\n\n📈 Taux réussite : <b>{wr:.1f}%</b>"
 
-# =========================================================
-# TELEGRAM HANDLERS
-# =========================================================
 async def safe_answer(message, text, reply_markup=None):
     for i, part in enumerate(split_message(text)):
         try:
@@ -1325,7 +1269,7 @@ async def process_activation(message: Message, key: str):
 async def scan_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    await safe_answer(message, "⏳ Analyse en cours...")
+    await safe_answer(message, "⏳ Analyse en cours (2-3 min)...")
     await scan()
     await broadcast_after_scan()
 
@@ -1404,7 +1348,7 @@ async def btn_scan(message: Message):
 
 @dp.message(F.text == BTN_ACTIVATE)
 async def btn_activate(message: Message):
-    await message.answer("🔑 <b>Pour activer votre abonnement :</b>\n\nEnvoyez <code>/activate VOTRE_CLE</code>\nou votre clé à 8 caractères.", parse_mode="HTML")
+    await message.answer("🔑 <b>Pour activer votre abonnement :</b>\n\nEnvoyez <code>/activate VOTRE_CLE</code>", parse_mode="HTML")
 
 @dp.message(F.text == "⚙️ Debug")
 async def btn_debug(message: Message):
@@ -1412,9 +1356,6 @@ async def btn_debug(message: Message):
         return
     await debug_cmd(message)
 
-# =========================================================
-# SCAN
-# =========================================================
 async def scan():
     async with STATE["scan_lock"]:
         bzz_predictions = []
@@ -1436,9 +1377,12 @@ async def scan():
             print(f"⚠️ Odds API vide. On continue avec {len(bzz_predictions)} prédictions Bzzoiro.")
 
         matches = []
+        rejected_kickoff = 0
         if bzz_predictions:
             for bzz in bzz_predictions:
-                if not is_match_upcoming(bzz.get("kickoff", "")):
+                kickoff = bzz.get("kickoff", "")
+                if not is_match_upcoming(kickoff):
+                    rejected_kickoff += 1
                     continue
                 matched_odds = None
                 h_norm = normalize_name(bzz["home"])
@@ -1457,15 +1401,19 @@ async def scan():
                     bzz_copy["league"] = matched_odds.get("sport_title", bzz.get("league", ""))
                 matches.append(bzz_copy)
 
+            if rejected_kickoff > 0:
+                print(f"⚠️ {rejected_kickoff}/{len(bzz_predictions)} rejetés (kickoff passé)")
+
         if not matches:
             matches = build_matches_from_odds(odds_events)
 
         if not matches:
+            print("❌ Aucun match éligible — scan annulé.")
             STATE["coupons"] = []
             STATE["candidates"] = []
             return
 
-        print(f"📋 {len(matches)} matchs éligibles (kickoff > +30min)")
+        print(f"📋 {len(matches)} matchs éligibles")
 
         contexts = {}
         try:
@@ -1493,9 +1441,6 @@ async def scan():
             print(f"  • {c.name} : {len(c.legs)} legs, cote {c.combined_odds}")
         print("────────────────────────")
 
-# =========================================================
-# LIFESPAN
-# =========================================================
 async def daily_broadcast():
     await scan()
     record_coupons(STATE["coupons"], datetime.now(TZ).strftime("%Y-%m-%d"))
