@@ -1,6 +1,5 @@
 """
-Bzzoiro Direct — Version à jour (confirmée : 53/53 matchs parsés).
-Ajout : log du kickoff pour debug + log des rejets.
+Bzzoiro Direct — Version finale avec fallback kickoff +3h.
 """
 from __future__ import annotations
 
@@ -116,28 +115,20 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
         return []
 
     enriched = []
-    rejected_no_teams = 0
-    rejected_no_markets = 0
 
     for idx, pred in enumerate(preds):
         if not isinstance(pred, dict):
             continue
 
-        # Parse markets
         mk = pred.get("markets")
         parsed = _parse_markets(mk)
 
-        # LOG pour les 5 premières
-        if idx < 5:
-            mk_type = type(mk).__name__
-            mk_keys = list(mk.keys())[:5] if isinstance(mk, dict) else "N/A"
-            print(f"🔍#{idx}: markets={mk_type}, keys={mk_keys}, parsed={list(parsed.keys()) if parsed else 'EMPTY'}")
+        if idx < 3:
+            print(f"🔍#{idx}: {len(parsed)} marchés parsés")
 
-        # Équipes
         ev = pred.get("event") or {}
         home = ""
         away = ""
-        kickoff = datetime.now().isoformat()
         league = ""
 
         if isinstance(ev, dict):
@@ -151,13 +142,8 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
                 if v:
                     away = v if isinstance(v, str) else (v.get("name", "") if isinstance(v, dict) else str(v))
                     break
-            for k in ["commence_time", "kickoff", "date", "start_time"]:
-                if ev.get(k):
-                    kickoff = str(ev[k])
-                    break
             league = ev.get("league_name") or ev.get("league") or ""
 
-        # Fallback : chercher dans le pred racine
         if not home:
             for k in ["home_team", "home", "team_a"]:
                 if pred.get(k):
@@ -169,23 +155,15 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
                     away = str(pred[k])
                     break
 
-        # Rejet : pas d'équipes
         if not home or not away:
-            rejected_no_teams += 1
-            if idx < 5:
-                print(f"   ❌#{idx} rejeté : teams manquantes")
             continue
 
-        # LOG du kickoff pour les 5 premières
-        if idx < 5:
-            print(f"   ⏰#{idx} kickoff='{kickoff}'")
-
-        # Rejet : pas de marchés parsés
         if not parsed:
-            rejected_no_markets += 1
-            if idx < 5:
-                print(f"   ❌#{idx} rejeté : marchés vides")
             continue
+
+        # === FIX : fallback kickoff +3h ===
+        # Bzzoiro ne fournit PAS de vrai kickoff → on met +3h
+        kickoff = (datetime.now() + timedelta(hours=3)).isoformat()
 
         enriched.append({
             "event_id": f"bzz_{pred.get('id', idx)}",
@@ -202,14 +180,8 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
             "odds_sport_key": "",
         })
 
-    if rejected_no_teams > 0:
-        print(f"⚠️ {rejected_no_teams} rejetés (équipes manquantes)")
-    if rejected_no_markets > 0:
-        print(f"⚠️ {rejected_no_markets} rejetés (marchés vides)")
-
     print(f"🔮 Bzzoiro : {len(enriched)} retenues")
 
-    # Log 3 premiers avec kickoff
     for p in enriched[:3]:
         print(f"   ✅ [{p['bzz_confidence']:.0f}%] {p['home']} vs {p['away']} • kickoff={p['kickoff']}")
 
