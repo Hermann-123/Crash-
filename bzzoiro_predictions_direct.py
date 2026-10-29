@@ -1,5 +1,6 @@
 """
-Bzzoiro Direct — Version ULTRA-DÉFENSIVE avec log par prédiction.
+Bzzoiro Direct — Version à jour (confirmée : 53/53 matchs parsés).
+Ajout : log du kickoff pour debug + log des rejets.
 """
 from __future__ import annotations
 
@@ -45,23 +46,23 @@ async def _get(client, path, params=None):
 
 
 def _parse_markets(mk):
-    """Extrait les probas depuis le dict markets. Log les erreurs."""
     if not isinstance(mk, dict):
         return {}
 
     result = {}
 
-    # 1X2
     mr = mk.get("match_result")
     if isinstance(mr, dict):
         h = _safe_float(mr.get("prob_home"))
         d = _safe_float(mr.get("prob_draw"))
         a = _safe_float(mr.get("prob_away"))
-        if h > 0: result["victoire_home"] = round(h, 1)
-        if d > 0: result["match_nul"] = round(d, 1)
-        if a > 0: result["victoire_away"] = round(a, 1)
+        if h > 0:
+            result["victoire_home"] = round(h, 1)
+        if d > 0:
+            result["match_nul"] = round(d, 1)
+        if a > 0:
+            result["victoire_away"] = round(a, 1)
 
-    # Over/Under
     ou = mk.get("over_under")
     if isinstance(ou, dict):
         o25 = _safe_float(ou.get("prob_over_25"))
@@ -72,7 +73,6 @@ def _parse_markets(mk):
         if o35 > 0:
             result["over_3.5"] = round(o35, 1)
 
-    # BTTS
     btts = mk.get("btts")
     if isinstance(btts, dict):
         y = _safe_float(btts.get("prob_yes"))
@@ -80,7 +80,6 @@ def _parse_markets(mk):
             result["btts_yes"] = round(y, 1)
             result["btts_no"] = round(100 - y, 1)
 
-    # Dérivés
     if "victoire_home" in result and "match_nul" in result:
         result["double_chance_1X"] = round(result["victoire_home"] + result["match_nul"], 1)
     if "victoire_home" in result and "victoire_away" in result:
@@ -116,12 +115,12 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
     if not preds:
         return []
 
-    # LOG CHAQUE PRÉDICTION (5 premières)
     enriched = []
+    rejected_no_teams = 0
+    rejected_no_markets = 0
+
     for idx, pred in enumerate(preds):
         if not isinstance(pred, dict):
-            if idx < 5:
-                print(f"🔍#{idx}: NOT DICT ({type(pred).__name__})")
             continue
 
         # Parse markets
@@ -158,15 +157,41 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
                     break
             league = ev.get("league_name") or ev.get("league") or ""
 
-        # Fallback names
-        home = home or f"Équipe_{pred.get('id', idx)}_A"
-        away = away or f"Équipe_{pred.get('id', idx)}_B"
+        # Fallback : chercher dans le pred racine
+        if not home:
+            for k in ["home_team", "home", "team_a"]:
+                if pred.get(k):
+                    home = str(pred[k])
+                    break
+        if not away:
+            for k in ["away_team", "away", "team_b"]:
+                if pred.get(k):
+                    away = str(pred[k])
+                    break
+
+        # Rejet : pas d'équipes
+        if not home or not away:
+            rejected_no_teams += 1
+            if idx < 5:
+                print(f"   ❌#{idx} rejeté : teams manquantes")
+            continue
+
+        # LOG du kickoff pour les 5 premières
+        if idx < 5:
+            print(f"   ⏰#{idx} kickoff='{kickoff}'")
+
+        # Rejet : pas de marchés parsés
+        if not parsed:
+            rejected_no_markets += 1
+            if idx < 5:
+                print(f"   ❌#{idx} rejeté : marchés vides")
+            continue
 
         enriched.append({
             "event_id": f"bzz_{pred.get('id', idx)}",
-            "home": str(home),
-            "away": str(away),
-            "league": str(league),
+            "home": home,
+            "away": away,
+            "league": league,
             "kickoff": kickoff,
             "bzz_markets": parsed,
             "bzz_confidence": 70.0,
@@ -177,7 +202,15 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
             "odds_sport_key": "",
         })
 
-    with_m = sum(1 for e in enriched if e["bzz_markets"])
-    print(f"🔮 Bzzoiro : {len(enriched)} retenues ({with_m} avec marchés)")
+    if rejected_no_teams > 0:
+        print(f"⚠️ {rejected_no_teams} rejetés (équipes manquantes)")
+    if rejected_no_markets > 0:
+        print(f"⚠️ {rejected_no_markets} rejetés (marchés vides)")
+
+    print(f"🔮 Bzzoiro : {len(enriched)} retenues")
+
+    # Log 3 premiers avec kickoff
+    for p in enriched[:3]:
+        print(f"   ✅ [{p['bzz_confidence']:.0f}%] {p['home']} vs {p['away']} • kickoff={p['kickoff']}")
 
     return enriched
