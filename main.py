@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import random
 import re
 import secrets
 import string
@@ -41,12 +43,6 @@ except Exception as e:
     print(f"❌ Import bzzoiro_data: {e}")
 
 try:
-    from bzzoiro_predictions import get_bzzoiro_best_matches
-except Exception as e:
-    get_bzzoiro_best_matches = None
-    print(f"❌ Import bzzoiro_predictions: {e}")
-
-try:
     from bzzoiro_predictions_direct import fetch_bzzoiro_predictions_direct
 except Exception as e:
     fetch_bzzoiro_predictions_direct = None
@@ -57,15 +53,6 @@ try:
 except Exception as e:
     download_and_train = None
     print(f"❌ Import dixon_coles: {e}")
-
-try:
-    from btts_engine import load_btts_engine, BTTSEngine
-    _BTTS_ENGINE_AVAILABLE = True
-except Exception as e:
-    load_btts_engine = None
-    BTTSEngine = None
-    _BTTS_ENGINE_AVAILABLE = False
-    print(f"⚠️ Import btts_engine: {e}")
 
 # =========================================================
 # CONFIG
@@ -82,7 +69,8 @@ try:
 except ValueError:
     ADMIN_ID = 0
 
-NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "14"))
+# === HEURE 10h00 PAR DÉFAUT ===
+NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "10"))
 NOTIFY_MINUTE = int(os.getenv("NOTIFY_MINUTE", "0"))
 NOTIFY_TZ = os.getenv("NOTIFY_TZ", "Africa/Abidjan")
 
@@ -95,48 +83,41 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • H2H + Gemini")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "50"))
+MAX_MATCHES_TO_ANALYZE = int(os.getenv("MAX_MATCHES_TO_ANALYZE", "40"))
 MAX_MATCHES_TO_ENRICH = int(os.getenv("MAX_MATCHES_TO_ENRICH", "20"))
+GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "25"))
 
 BZZ_MIN_CONFIDENCE = float(os.getenv("BZZ_MIN_CONFIDENCE", "65.0"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 BZZ_MAX_MATCHES = int(os.getenv("BZZ_MAX_MATCHES", "15"))
 
-# === TICKET SÉCURISÉ ===
-SAFE_MIN_PROB = float(os.getenv("SAFE_MIN_PROB", "0.75"))
-SAFE_MAX_PROB = float(os.getenv("SAFE_MAX_PROB", "0.92"))
-SAFE_MIN_LEG_ODDS = float(os.getenv("SAFE_MIN_LEG_ODDS", "1.10"))
-SAFE_MAX_LEG_ODDS = float(os.getenv("SAFE_MAX_LEG_ODDS", "1.35"))
-SAFE_MIN_TOTAL = 2.0
-SAFE_MAX_TOTAL = 2.5
-SAFE_MAX_LEGS = 6
+# === ODDS +3 (Top 5 + cotes réelles) ===
+ODDS3_MIN_ODDS = 3.0
+ODDS3_MAX_ODDS = 4.0
+ODDS3_MIN_PROB_PER_LEG = 0.65
+ODDS3_MIN_LEG_ODDS = 1.15
+ODDS3_MAX_LEG_ODDS = 1.90
+ODDS3_MAX_LEGS = 5
 
-# === TICKET ÉQUILIBRÉ ===
-BAL_MIN_PROB = float(os.getenv("BAL_MIN_PROB", "0.60"))
-BAL_MAX_PROB = float(os.getenv("BAL_MAX_PROB", "0.88"))
-BAL_MIN_LEG_ODDS = float(os.getenv("BAL_MIN_LEG_ODDS", "1.30"))
-BAL_MAX_LEG_ODDS = float(os.getenv("BAL_MAX_LEG_ODDS", "2.00"))
-BAL_MIN_TOTAL = 2.0
-BAL_MAX_TOTAL = 6.0
+# === ODDS +10 (Obscures) ===
+ODDS10_MIN_ODDS = 10.0
+ODDS10_MIN_PROB_PER_LEG = 0.55
+ODDS10_MIN_LEG_ODDS = 1.35
+ODDS10_MAX_LEG_ODDS = 2.60
+ODDS10_MAX_LEGS = 10
 
-# === TICKET VALUE ===
-VALUE_MIN_PROB = float(os.getenv("VALUE_MIN_PROB", "0.85"))
-VALUE_MAX_PROB = float(os.getenv("VALUE_MAX_PROB", "0.92"))
-VALUE_FALLBACK_MIN_PROB = float(os.getenv("VALUE_FALLBACK_MIN_PROB", "0.80"))
-VALUE_MIN_LEG_ODDS = float(os.getenv("VALUE_MIN_LEG_ODDS", "1.10"))
-VALUE_MAX_LEG_ODDS = float(os.getenv("VALUE_MAX_LEG_ODDS", "1.35"))
-VALUE_TOP_N = int(os.getenv("VALUE_TOP_N", "20"))
+# === MT-FIN ===
+MTFIN_TOP_N = 3
+MTFIN_MIN_PROB = 0.55
+MTFIN_SIMULATIONS = 1000
+MTFIN_FIRST_HALF_RATIO = 0.45
 
-# === TICKET BBTS+2.5 ELITE (seuils assouplis) ===
-BTTS_TOP_N = 3
-BTTS_MIN_PROB = 0.55
-BTTS_MAX_BOOK_BTTS = 1.45
-BTTS_MAX_BOOK_O25 = 1.50
-BTTS_MIN_STATS = 0.60
-BTTS_MIN_SCORED = 0.70
-BTTS_MIN_CONCEDED = 0.70
-BTTS_MIN_AVG_GOALS = 2.8
-BTTS_MIN_DIXON = 0.50
+# === SCORE EXACT ===
+SCORE_EXACT_TARGETS = [(1,2), (0,2), (0,1), (2,1), (2,0), (1,0)]
+SCORE_EXACT_TOP_N = 3
+SCORE_EXACT_MIN_PROB = 0.55
+
+KICKOFF_MIN_MINUTES_AHEAD = 30
 
 TELEGRAM_MAX_LEN = 3800
 
@@ -177,109 +158,153 @@ SOCCER_KEYS = [
 ]
 
 # =========================================================
-# FILTRE LIGUES OBSCURES
+# FILTRES LIGUES
 # =========================================================
-TOP_LEAGUES_KEYWORDS = {
-    "premier league", "epl", "champions league", "europa league",
-    "conference league", "uefa champions", "uefa europa",
-    "uefa conference", "fa cup", "carabao cup",
-    "la liga", "laliga", "primera division spain", "copa del rey",
-    "serie a", "coppa italia",
-    "bundesliga", "dfb pokal",
-    "ligue 1", "ligue1", "coupe de france",
+TOP5_SPORT_KEYS = {
+    "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
+    "soccer_germany_bundesliga", "soccer_france_ligue_one",
+    "soccer_uefa_champs_league", "soccer_uefa_europa_league",
 }
 
-def is_obscure_league(league_name: str) -> bool:
-    if not league_name:
+TOP5_LEAGUES_KW = {
+    "premier league", "epl", "la liga", "laliga", "serie a",
+    "bundesliga", "ligue 1", "ligue1", "champions league", "europa league",
+    "uefa champions", "uefa europa",
+}
+
+def is_top_league(league: str, sport_key: str = "") -> bool:
+    if sport_key and sport_key in TOP5_SPORT_KEYS:
         return True
-    low = league_name.lower().strip()
-    for kw in TOP_LEAGUES_KEYWORDS:
-        if kw in low:
-            return False
-    return True
+    if not league:
+        return False
+    low = league.lower()
+    return any(kw in low for kw in TOP5_LEAGUES_KW)
+
+def is_obscure_league(league: str, sport_key: str = "") -> bool:
+    if not league and not sport_key:
+        return False
+    return not is_top_league(league, sport_key)
 
 # =========================================================
-# MATCH QUALITY SCORING
+# HELPERS
 # =========================================================
-WEIGHT_LEAGUE = 10.0
-WEIGHT_ODDS_COUNT = 2.0
-WEIGHT_FAVORITE_CLARITY = 8.0
-WEIGHT_TIME_PROXIMITY = 3.0
-MIN_MATCH_SCORE = 3.0
+def today_pretty():
+    months = {1:"janvier",2:"février",3:"mars",4:"avril",5:"mai",6:"juin",
+              7:"juillet",8:"août",9:"septembre",10:"octobre",11:"novembre",12:"décembre"}
+    d = datetime.now(TZ)
+    return f"{d.day} {months[d.month]} {d.year}"
 
-def get_league_score(league_name: str) -> int:
-    return 5
+def normalize_name(s: str) -> str:
+    if not s:
+        return ""
+    s = str(s).lower().strip()
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+    for sfx in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
+        s = s.replace(sfx, "")
+    s = re.sub(r"[^a-z0-9 ]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
 
-def calculate_match_score(fx: dict) -> float:
-    score = 0.0
-    real_odds = fx.get("real_odds", {}) or {}
-    has_odds = fx.get("has_odds", False)
-    bzz_markets = fx.get("bzz_markets", {})
-    
-    score += get_league_score(fx.get("league", "")) * (WEIGHT_LEAGUE / 10.0)
-
-    # === FIX : accepter les matchs Bzzoiro même sans cotes Odds API ===
-    if not has_odds and not bzz_markets:
-        return -1.0
-
-    if has_odds:
-        markets_count = sum(1 for v in real_odds.values() if v is not None)
-        score += markets_count * WEIGHT_ODDS_COUNT
-        home = real_odds.get("home")
-        draw = real_odds.get("draw")
-        away = real_odds.get("away")
-        if home and away:
-            min_odd = min(home, away, draw or 999)
-            if min_odd < 1.60:
-                score += WEIGHT_FAVORITE_CLARITY
-            elif min_odd < 1.90:
-                score += WEIGHT_FAVORITE_CLARITY * 0.6
-            elif min_odd < 2.30:
-                score += WEIGHT_FAVORITE_CLARITY * 0.3
-    else:
-        # Match Bzzoiro sans cotes : on donne un score de base pour le garder
-        score += 10.0
-
-    dt = parse_dt_safe(fx.get("kickoff", ""))
-    if dt:
-        hours_until = (dt - datetime.now(TZ)).total_seconds() / 3600
-        if 1 <= hours_until <= 6:
-            score += WEIGHT_TIME_PROXIMITY
-        elif hours_until <= 12:
-            score += WEIGHT_TIME_PROXIMITY * 0.7
-        elif hours_until <= 24:
-            score += WEIGHT_TIME_PROXIMITY * 0.3
-
-    if STATE.get("dixon_model"):
+def parse_dt_safe(s) -> Optional[datetime]:
+    if not s:
+        return None
+    if isinstance(s, (int, float)):
         try:
-            h_key = STATE["dixon_model"]._find_team(fx.get("home", ""))
-            a_key = STATE["dixon_model"]._find_team(fx.get("away", ""))
-            if h_key and a_key:
-                score += 15.0
-                fx["dixon_available"] = True
-            elif h_key or a_key:
-                score += 5.0
-                fx["dixon_available"] = False
-            else:
-                fx["dixon_available"] = False
+            return datetime.fromtimestamp(int(s), tz=ZoneInfo("UTC")).astimezone(TZ)
         except Exception:
-            fx["dixon_available"] = False
+            return None
+    s = str(s).strip()
+    if not s:
+        return None
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s).replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        return dt.astimezone(TZ)
+    except Exception:
+        return None
 
-    bzz_conf = fx.get("bzz_confidence", 0)
-    if bzz_conf > 0:
-        score += bzz_conf * 0.3
+def kickoff_local(iso_str) -> str:
+    dt = parse_dt_safe(iso_str)
+    if not dt:
+        return "?"
+    return dt.strftime("%d/%m %H:%M")
 
-    return score
+def is_match_upcoming(kickoff_str, min_minutes: int = KICKOFF_MIN_MINUTES_AHEAD) -> bool:
+    """FIX bug 3 : strict - kickoff > now + 30min."""
+    dt = parse_dt_safe(kickoff_str)
+    if not dt:
+        return False
+    return dt > datetime.now(TZ) + timedelta(minutes=min_minutes)
 
-def filter_and_rank_matches(matches: list[dict]) -> list[dict]:
-    scored = []
-    for fx in matches:
-        s = calculate_match_score(fx)
-        fx["_score"] = s
-        if s >= MIN_MATCH_SCORE:
-            scored.append(fx)
-    scored.sort(key=lambda m: m["_score"], reverse=True)
-    return scored
+def prob_bar(p: float) -> str:
+    if p >= 0.80:
+        return "🟢🟢🟢"
+    if p >= 0.72:
+        return "🟢🟢⚪"
+    if p >= 0.65:
+        return "🟢⚪⚪"
+    return "⚪⚪⚪"
+
+def confidence_bar(pct: int) -> str:
+    if pct >= 80:
+        return "🟢🟢🟢"
+    if pct >= 70:
+        return "🟢🟢⚪"
+    if pct >= 60:
+        return "🟢⚪⚪"
+    return "⚪⚪⚪"
+
+def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
+    if len(text) <= max_len:
+        return [text]
+    parts = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > max_len:
+            if current:
+                parts.append(current.rstrip())
+            current = line + "\n"
+        else:
+            current += line + "\n"
+    if current.strip():
+        parts.append(current.rstrip())
+    return parts
+
+# =========================================================
+# MONTE CARLO HT/FT
+# =========================================================
+def _poisson_sample(lam: float) -> int:
+    if lam <= 0:
+        return 0
+    L = math.exp(-lam)
+    k, p = 0, 1.0
+    while p > L and k < 20:
+        k += 1
+        p *= random.random()
+    return k - 1
+
+def _binomial_sample(n: int, p: float) -> int:
+    return sum(1 for _ in range(n) if random.random() < p)
+
+def simulate_htft(lambda_home: float, lambda_away: float, n_sims: int = MTFIN_SIMULATIONS) -> dict:
+    counts: dict = {}
+    for _ in range(n_sims):
+        hg = _poisson_sample(lambda_home)
+        ag = _poisson_sample(lambda_away)
+        ht_hg = _binomial_sample(hg, MTFIN_FIRST_HALF_RATIO)
+        ht_ag = _binomial_sample(ag, MTFIN_FIRST_HALF_RATIO)
+        ht_res = "V1" if ht_hg > ht_ag else ("X" if ht_hg == ht_ag else "V2")
+        ft_res = "V1" if hg > ag else ("X" if hg == ag else "V2")
+        key = f"{ht_res}/{ft_res}"
+        counts[key] = counts.get(key, 0) + 1
+    return {k: round(v / n_sims, 4) for k, v in counts.items()}
+
+def best_htft(probs: dict) -> tuple[str, float]:
+    if not probs:
+        return ("", 0.0)
+    best = max(probs.items(), key=lambda x: x[1])
+    return best
 
 # =========================================================
 # FUSION SOURCES
@@ -292,8 +317,6 @@ ALL_MARKETS = [
     "victoire_home", "match_nul", "victoire_away",
     "over_2.5", "under_2.5", "over_3.5",
     "btts_yes", "btts_no", "btts_over_25",
-    "over_8.5_corners", "over_9.5_corners", "over_10.5_corners",
-    "over_2.5_cartons", "over_3.5_cartons",
 ]
 
 def combine_three_sources(gemini_markets: dict, dixon_pred: Optional[dict], bzz_markets: dict) -> dict:
@@ -333,19 +356,18 @@ def combine_three_sources(gemini_markets: dict, dixon_pred: Optional[dict], bzz_
 
     all_keys = set(g.keys()) | set(d.keys()) | set(b.keys())
     for k in all_keys:
-        total_weight = 0.0
-        total_value = 0.0
+        tw, tv = 0.0, 0.0
         if k in g:
-            total_value += W_GEMINI * g[k]
-            total_weight += W_GEMINI
+            tv += W_GEMINI * g[k]
+            tw += W_GEMINI
         if k in d and d[k] > 0:
-            total_value += W_DIXON * d[k]
-            total_weight += W_DIXON
+            tv += W_DIXON * d[k]
+            tw += W_DIXON
         if k in b:
-            total_value += W_BZZOIRO * b[k]
-            total_weight += W_BZZOIRO
-        if total_weight > 0:
-            result[k] = total_value / total_weight
+            tv += W_BZZOIRO * b[k]
+            tw += W_BZZOIRO
+        if tw > 0:
+            result[k] = tv / tw
 
     if "victoire_home" in result and "match_nul" in result:
         result["double_chance_1X"] = result["victoire_home"] + result["match_nul"]
@@ -355,52 +377,6 @@ def combine_three_sources(gemini_markets: dict, dixon_pred: Optional[dict], bzz_
         result["double_chance_X2"] = result["match_nul"] + result["victoire_away"]
 
     return result
-
-def compute_agreement_three(gemini_markets: dict, dixon_pred: Optional[dict], bzz_markets: dict, market_key: str) -> tuple[str, float]:
-    map_g = {k: k for k in ALL_MARKETS}
-    map_d = {
-        "victoire_home": "p_home", "match_nul": "p_draw", "victoire_away": "p_away",
-        "over_2.5": "over_2.5", "under_2.5": "under_2.5", "over_3.5": "over_3.5",
-        "btts_yes": "btts_yes", "btts_no": "btts_no", "btts_over_25": "btts_over_25",
-    }
-    probs = {}
-    gk = map_g.get(market_key)
-    if gk:
-        gv = gemini_markets.get(gk)
-        if gv is not None:
-            try:
-                probs["g"] = float(gv) / 100.0
-            except (ValueError, TypeError):
-                pass
-
-    if dixon_pred:
-        dk = map_d.get(market_key)
-        if dk:
-            dv = dixon_pred.get(dk, 0)
-            if dv > 0:
-                probs["d"] = dv
-
-    if bzz_markets:
-        bv = bzz_markets.get(market_key)
-        if bv is not None:
-            try:
-                probs["b"] = float(bv) / 100.0
-            except (ValueError, TypeError):
-                pass
-
-    if len(probs) < 2:
-        return ("", 0.0)
-
-    values = list(probs.values())
-    delta = max(values) - min(values)
-
-    if len(probs) == 3 and delta <= 0.10:
-        return ("🤝🤝", delta)
-    if delta <= 0.10:
-        return ("🤝", delta)
-    if delta >= 0.15:
-        return ("⚠️", delta)
-    return ("", delta)
 
 # =========================================================
 # MODELS
@@ -421,21 +397,14 @@ class Candidate:
     prob_gemini: float
     prob_dixon: float
     prob_bzzoiro: float
-    agreement_emoji: str
-    agreement_delta: float
     has_context: bool
     bzz_confidence: float
     analysis: str = ""
-    advice: str = ""
-    advice_confidence: int = 0
     advices: list = None
     score_exact_home: int = -1
     score_exact_away: int = -1
     score_exact_prob: float = 0.0
-    score_exact_source: str = ""
-    prob_stats: float = 0.0
-    stats_home: dict = None
-    stats_away: dict = None
+    sport_key: str = ""
 
 @dataclass
 class Selection:
@@ -450,26 +419,19 @@ class Selection:
     model_prob: float
     edge: float
     bookmaker: str
-    source: str = "gemini"
     real_odd: Optional[float] = None
     analysis: str = ""
-    advice: str = ""
-    advice_confidence: int = 0
     advices: list = None
     has_context: bool = False
     prob_gemini: float = 0.0
     prob_dixon: float = 0.0
     prob_bzzoiro: float = 0.0
-    agreement_emoji: str = ""
-    agreement_delta: float = 0.0
     bzz_confidence: float = 0.0
     score_exact_home: int = -1
     score_exact_away: int = -1
     score_exact_prob: float = 0.0
-    score_exact_source: str = ""
-    prob_stats: float = 0.0
-    stats_home: dict = None
-    stats_away: dict = None
+    htft_pick: str = ""
+    htft_prob: float = 0.0
 
     def final_prob(self) -> float:
         return self.model_prob
@@ -490,18 +452,18 @@ class Coupon:
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-BTN_SAFE = "🔒 Sécurisé"
-BTN_BAL = "⚖️ Équilibré"
-BTN_VAR = "💎 Value"
-BTN_BTTS = "🎯 BBTS+2.5"
+BTN_ODDS3 = "🎯 Odds +3"
+BTN_ODDS10 = "🔥 Odds +10"
+BTN_MTFT = "⏱ MT-Fin"
+BTN_SCOREEXACT = "⚽ Score Exact"
 BTN_SCAN = "🔄 Actualiser"
 BTN_BILAN = "📊 Bilan"
 BTN_ACTIVATE = "🔑 Activer mon abonnement"
 
 USER_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_SAFE), KeyboardButton(text=BTN_BAL)],
-        [KeyboardButton(text=BTN_VAR), KeyboardButton(text=BTN_BTTS)],
+        [KeyboardButton(text=BTN_ODDS3), KeyboardButton(text=BTN_ODDS10)],
+        [KeyboardButton(text=BTN_MTFT), KeyboardButton(text=BTN_SCOREEXACT)],
         [KeyboardButton(text=BTN_BILAN), KeyboardButton(text=BTN_ACTIVATE)],
     ],
     resize_keyboard=True,
@@ -510,8 +472,8 @@ USER_KEYBOARD = ReplyKeyboardMarkup(
 
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_SAFE), KeyboardButton(text=BTN_BAL)],
-        [KeyboardButton(text=BTN_VAR), KeyboardButton(text=BTN_BTTS)],
+        [KeyboardButton(text=BTN_ODDS3), KeyboardButton(text=BTN_ODDS10)],
+        [KeyboardButton(text=BTN_MTFT), KeyboardButton(text=BTN_SCOREEXACT)],
         [KeyboardButton(text=BTN_SCAN), KeyboardButton(text=BTN_BILAN), KeyboardButton(text="⚙️ Debug")],
     ],
     resize_keyboard=True,
@@ -521,7 +483,7 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup(
 STATE = {
     "ready": False, "candidates": [], "selections": [], "coupons": [],
     "last_scan": None, "debug": {}, "tracker": {"coupons": []}, "keys": {}, "users": {},
-    "scan_lock": asyncio.Lock(), "dixon_model": None, "btts_engine": None,
+    "scan_lock": asyncio.Lock(), "dixon_model": None,
 }
 
 TARGETS = []
@@ -533,92 +495,7 @@ for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
             TARGETS.append(raw)
 
 # =========================================================
-# HELPERS
-# =========================================================
-def today_pretty():
-    months = {1: "janvier", 2: "février", 3: "mars", 4: "avril", 5: "mai", 6: "juin",
-              7: "juillet", 8: "août", 9: "septembre", 10: "octobre",
-              11: "novembre", 12: "décembre"}
-    d = datetime.now(TZ)
-    return f"{d.day} {months[d.month]} {d.year}"
-
-def normalize_name(s: str) -> str:
-    if not s:
-        return ""
-    s = str(s).lower().strip()
-    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    for sfx in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
-        s = s.replace(sfx, "")
-    s = re.sub(r"[^a-z0-9 ]", "", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-def parse_dt_safe(s) -> Optional[datetime]:
-    if not s:
-        return None
-    if isinstance(s, (int, float)):
-        try:
-            return datetime.fromtimestamp(int(s), tz=ZoneInfo("UTC")).astimezone(TZ)
-        except Exception:
-            return None
-    s = str(s).strip()
-    s = re.sub(r"(\.\d{6})\d+", r"\1", s).replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-        return dt.astimezone(TZ)
-    except Exception:
-        return None
-
-def kickoff_local(iso_str) -> str:
-    dt = parse_dt_safe(iso_str)
-    return dt.strftime("%H:%M") if dt else "?"
-
-def is_today_upcoming(iso_str) -> bool:
-    dt = parse_dt_safe(iso_str)
-    if not dt:
-        return False
-    now = datetime.now(TZ)
-    if dt.date() != now.date():
-        return False
-    return dt > now + timedelta(minutes=5)
-
-def prob_bar(p: float) -> str:
-    if p >= 0.80:
-        return "🟢🟢🟢"
-    if p >= 0.72:
-        return "🟢🟢⚪"
-    if p >= 0.65:
-        return "🟢⚪⚪"
-    return "⚪⚪⚪"
-
-def confidence_bar(pct: int) -> str:
-    if pct >= 80:
-        return "🟢🟢🟢"
-    if pct >= 70:
-        return "🟢🟢⚪"
-    if pct >= 60:
-        return "🟢⚪⚪"
-    return "⚪⚪⚪"
-
-def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
-    if len(text) <= max_len:
-        return [text]
-    parts = []
-    current = ""
-    for line in text.split("\n"):
-        if len(current) + len(line) + 1 > max_len:
-            if current:
-                parts.append(current.rstrip())
-            current = line + "\n"
-        else:
-            current += line + "\n"
-    if current.strip():
-        parts.append(current.rstrip())
-    return parts
-
-# =========================================================
-# CLÉS / ABONNEMENTS
+# STORAGE
 # =========================================================
 def load_json(path, default=None):
     if default is None:
@@ -654,9 +531,6 @@ def get_subscription_message(user_id: int) -> str:
         return f"✅ Abonnement actif jusqu'au {datetime.fromisoformat(exp).strftime('%d/%m/%Y à %H:%M')}."
     return "❌ Abonnement expiré ou inexistant.\nContactez : @hermann1123"
 
-# =========================================================
-# TRACKER
-# =========================================================
 def load_tracker() -> dict:
     try:
         with open(LOCAL_DB, "r", encoding="utf-8") as f:
@@ -738,10 +612,10 @@ async def fetch_all_odds_events() -> list[dict]:
         for key in SOCCER_KEYS:
             events = await fetch_odds_api_league(client, key)
             all_events.extend(events)
-            await asyncio.sleep(0.2)
-    print(f"💰 Odds API : {len(all_events)} events ({len(SOCCER_KEYS)} ligues)")
+            await asyncio.sleep(0.15)
+    print(f"💰 Odds API : {len(all_events)} events")
     if not all_events:
-        print("🚨 ALERTE : The Odds API renvoie 0 match ! Vérifie ton quota.")
+        print("🚨 ALERTE : The Odds API renvoie 0 match !")
     return all_events
 
 def extract_real_odds(ev: dict) -> dict:
@@ -786,13 +660,16 @@ def build_matches_from_odds(odds_events: list[dict]) -> list[dict]:
         h = ev.get("home_team", "")
         a = ev.get("away_team", "")
         kick = ev.get("commence_time", "")
-        if not h or not a or not is_today_upcoming(kick):
+        if not h or not a:
+            continue
+        if not is_match_upcoming(kick):
             continue
         matches.append({
             "event_id": ev.get("id", ""), "home": h, "away": a,
             "league": ev.get("sport_title", ""), "kickoff": kick,
             "has_odds": True, "real_odds": extract_real_odds(ev),
             "odds_sport_key": ev.get("sport_key", ""),
+            "bzz_markets": {}, "bzz_confidence": 0,
         })
     return matches
 
@@ -815,14 +692,14 @@ async def enrich_matches(matches: list[dict]) -> dict:
                 ctx = await enrich_match_with_bzzoiro(home, away, date_iso)
             if ctx and ctx.get("available"):
                 contexts[fx["event_id"]] = ctx
-                print(f"  ✅ {home} vs {away} — Bzzoiro • H2H:{ctx.get('h2h', {}).get('total_matches', 0)}")
+                print(f"  ✅ {home} vs {away} — H2H:{ctx.get('h2h', {}).get('total_matches', 0)}")
             await asyncio.sleep(0.3)
         except Exception:
             pass
     return contexts
 
 # =========================================================
-# BUILD CANDIDATES
+# BUILD CANDIDATES (Gemini TOUJOURS appelé = Avis IA garanti)
 # =========================================================
 async def build_all_candidates(matches, used_today, contexts=None):
     candidates: list[Candidate] = []
@@ -831,13 +708,18 @@ async def build_all_candidates(matches, used_today, contexts=None):
     contexts = contexts or {}
     ordered = [m for m in matches if m.get("has_odds") or m.get("bzz_markets")]
 
+    print(f"🎯 Analyse Gemini forcée (Avis IA garanti) — max {GEMINI_MAX_CALLS_PER_SCAN}")
+
     async with httpx.AsyncClient(timeout=40.0) as client:
-        for fx in ordered[:MAX_MATCHES_TO_ANALYZE]:
+        for fx in ordered[:GEMINI_MAX_CALLS_PER_SCAN]:
             try:
                 home, away = fx["home"], fx["away"]
                 event_id, league = fx["event_id"], fx["league"]
                 kickoff = fx["kickoff"]
+                sport_key = fx.get("odds_sport_key", "")
                 if event_id in used_today:
+                    continue
+                if not is_match_upcoming(kickoff):
                     continue
 
                 ctx = contexts.get(event_id)
@@ -845,456 +727,282 @@ async def build_all_candidates(matches, used_today, contexts=None):
                 bzz_markets_direct = fx.get("bzz_markets", {})
                 bzz_conf_direct = fx.get("bzz_confidence", 0)
 
-                score_home, score_away, score_prob, score_source = -1, -1, 0.0, ""
+                # === FIX bug 1 : Gemini TOUJOURS appelé ===
+                pred = await predict_match_probas(client, home, away, league, kickoff, context=ctx)
+                if not pred or "markets" not in pred:
+                    continue
 
-                if bzz_markets_direct:
-                    gemini_markets = bzz_markets_direct
-                    analysis, advices_clean, advice, advice_conf = "", [], "", 0
-                else:
-                    pred = await predict_match_probas(client, home, away, league, kickoff, context=ctx)
-                    if not pred or "markets" not in pred:
-                        continue
-                    gemini_markets = pred.get("markets", {})
-                    analysis = pred.get("analysis", "")
-                    advice = pred.get("advice", "")
-                    advice_conf = pred.get("advice_confidence", 0)
+                gemini_markets = pred.get("markets", {})
+                analysis = pred.get("analysis", "")
+                advices_clean = []
+                for a in (pred.get("advices") or [])[:2]:
+                    if isinstance(a, dict) and a.get("text"):
+                        try:
+                            conf = int(a.get("confidence", 0))
+                        except (ValueError, TypeError):
+                            conf = 0
+                        advices_clean.append({"text": str(a.get("text", "")).strip(), "confidence": conf})
+
+                score_home, score_away, score_prob = -1, -1, 0.0
+                se = pred.get("score_exact") or {}
+                if isinstance(se, dict):
                     try:
-                        advice_conf = int(advice_conf)
-                        if advice_conf < 0 or advice_conf > 100:
-                            advice_conf = 0
+                        sh = int(se.get("home", -1))
+                        sa = int(se.get("away", -1))
+                        sp = float(se.get("prob", 0))
+                        if 0 <= sh <= 8 and 0 <= sa <= 8 and sp > 0:
+                            score_home, score_away = sh, sa
+                            score_prob = sp if sp <= 1.0 else sp / 100.0
                     except (ValueError, TypeError):
-                        advice_conf = 0
-                    raw_advices = pred.get("advices", [])
-                    advices_clean = []
-                    if isinstance(raw_advices, list):
-                        for a in raw_advices[:2]:
-                            if isinstance(a, dict) and a.get("text"):
-                                try:
-                                    conf = int(a.get("confidence", 0))
-                                    if conf < 0 or conf > 100:
-                                        conf = 0
-                                except (ValueError, TypeError):
-                                    conf = 0
-                                advices_clean.append({"text": str(a.get("text", "")).strip(), "confidence": conf})
-                    se = pred.get("score_exact") or {}
-                    if isinstance(se, dict):
-                        try:
-                            sh = int(se.get("home", -1))
-                            sa = int(se.get("away", -1))
-                            sp = float(se.get("prob", 0))
-                            if 0 <= sh <= 8 and 0 <= sa <= 8 and sp > 0:
-                                score_home, score_away = sh, sa
-                                score_prob = sp if sp <= 1.0 else sp / 100.0
-                                score_source = "gemini"
-                        except (ValueError, TypeError):
-                            pass
-
-                if score_source == "":
-                    bzz_se = fx.get("bzz_score_exact") or {}
-                    if isinstance(bzz_se, dict):
-                        try:
-                            sh = int(bzz_se.get("home", -1))
-                            sa = int(bzz_se.get("away", -1))
-                            sp = float(bzz_se.get("prob", 0))
-                            if 0 <= sh <= 8 and 0 <= sa <= 8:
-                                score_home, score_away = sh, sa
-                                score_prob = sp if sp <= 1.0 else sp / 100.0
-                                score_source = "bzzoiro"
-                        except (ValueError, TypeError):
-                            pass
+                        pass
 
                 dixon_pred = STATE["dixon_model"].predict_all(home, away) if STATE.get("dixon_model") else None
                 combined_probs = combine_three_sources(gemini_markets, dixon_pred, bzz_markets_direct)
-
                 real_odds = fx.get("real_odds", {})
 
                 market_map = {
-                    "victoire_home": (f"Victoire {home}", "1X2"),
-                    "match_nul": ("Match nul", "1X2"),
-                    "victoire_away": (f"Victoire {away}", "1X2"),
-                    "double_chance_1X": (f"Double Chance 1X ({home} ou nul)", "Double Chance"),
-                    "double_chance_12": ("Double Chance 12 (Pas de nul)", "Double Chance"),
-                    "double_chance_X2": (f"Double Chance X2 (Nul ou {away})", "Double Chance"),
-                    "over_2.5": ("Over 2.5 buts", "Over/Under"),
-                    "under_2.5": ("Under 2.5 buts", "Over/Under"),
-                    "over_3.5": ("Over 3.5 buts", "Over/Under"),
-                    "btts_yes": ("Les 2 marquent : Oui", "BTTS"),
-                    "btts_no": ("Les 2 marquent : Non", "BTTS"),
-                    "over_8.5_corners": ("Plus de 8.5 corners", "Corners"),
-                    "over_9.5_corners": ("Plus de 9.5 corners", "Corners"),
-                    "over_10.5_corners": ("Plus de 10.5 corners", "Corners"),
-                    "over_2.5_cartons": ("Plus de 2.5 cartons", "Cartons"),
-                    "over_3.5_cartons": ("Plus de 3.5 cartons", "Cartons"),
+                    "victoire_home": (f"Victoire {home}", "1X2", real_odds.get("home")),
+                    "match_nul": ("Match nul", "1X2", real_odds.get("draw")),
+                    "victoire_away": (f"Victoire {away}", "1X2", real_odds.get("away")),
+                    "double_chance_1X": (f"Double Chance 1X", "Double Chance", None),
+                    "double_chance_X2": (f"Double Chance X2", "Double Chance", None),
+                    "over_2.5": ("Over 2.5 buts", "Over/Under", real_odds.get("over_2.5")),
+                    "under_2.5": ("Under 2.5 buts", "Over/Under", real_odds.get("under_2.5")),
+                    "btts_yes": ("BTTS Oui", "BTTS", real_odds.get("btts_yes")),
+                    "btts_no": ("BTTS Non", "BTTS", real_odds.get("btts_no")),
                 }
 
-                for key, (label, mkt) in market_map.items():
+                for key, (label, mkt, real_odd) in market_map.items():
                     prob = combined_probs.get(key)
                     if prob is None or prob < 0.40 or prob > 0.95:
                         continue
-
-                    if mkt in ("Corners", "Cartons") and key not in bzz_markets_direct:
-                        continue
-
-                    real_odd = None
-                    if mkt == "1X2":
-                        if "victoire" in label.lower() and home.lower() in label.lower():
-                            real_odd = real_odds.get("home")
-                        elif "victoire" in label.lower() and away.lower() in label.lower():
-                            real_odd = real_odds.get("away")
-                        elif "nul" in label.lower():
-                            real_odd = real_odds.get("draw")
-                    elif mkt == "Over/Under":
-                        if "over 2.5" in label.lower():
-                            real_odd = real_odds.get("over_2.5")
-                        elif "under 2.5" in label.lower():
-                            real_odd = real_odds.get("under_2.5")
-                    elif mkt == "BTTS":
-                        if "oui" in label.lower():
-                            real_odd = real_odds.get("btts_yes")
-                        elif "non" in label.lower():
-                            real_odd = real_odds.get("btts_no")
 
                     used_odd = real_odd if real_odd else 1.0 / prob
                     if used_odd < 1.05:
                         continue
 
-                    edge = -1.0
-                    if real_odd and real_odd > 1.01:
-                        edge = (prob * real_odd) - 1.0
+                    edge = (prob * used_odd) - 1.0 if real_odd else -1.0
 
-                    pg_raw = gemini_markets.get(key)
                     try:
-                        prob_gemini = float(pg_raw) / 100.0 if pg_raw is not None else 0.0
+                        pg = float(gemini_markets.get(key, 0)) / 100.0
                     except (ValueError, TypeError):
-                        prob_gemini = 0.0
-                    prob_dixon = 0.0
+                        pg = 0.0
+                    pd_ = 0.0
                     if dixon_pred:
                         dk = {"victoire_home": "p_home", "match_nul": "p_draw", "victoire_away": "p_away",
-                              "over_2.5": "over_2.5", "under_2.5": "under_2.5", "over_3.5": "over_3.5",
-                              "btts_yes": "btts_yes", "btts_no": "btts_no", "btts_over_25": "btts_over_25"}.get(key)
+                              "over_2.5": "over_2.5", "under_2.5": "under_2.5",
+                              "btts_yes": "btts_yes", "btts_no": "btts_no"}.get(key)
                         if dk:
-                            prob_dixon = dixon_pred.get(dk, 0.0)
-                    prob_bzzoiro = 0.0
+                            pd_ = dixon_pred.get(dk, 0.0)
+                    pb = 0.0
                     if bzz_markets_direct:
                         bv = bzz_markets_direct.get(key)
                         if bv is not None:
                             try:
-                                prob_bzzoiro = float(bv) / 100.0
+                                pb = float(bv) / 100.0
                             except (ValueError, TypeError):
                                 pass
-
-                    agr_emoji, agr_delta = compute_agreement_three(gemini_markets, dixon_pred, bzz_markets_direct, key)
-                    if agr_emoji == "⚠️":
-                        continue
 
                     candidates.append(Candidate(
                         event_id=event_id, league=league, home=home, away=away,
                         kickoff=kickoff, market=mkt, pick_label=label,
-                        odds=round(used_odd, 2), prob=round(prob, 4),
-                        edge=round(edge, 4), real_odd=real_odd,
-                        prob_gemini=round(prob_gemini, 4), prob_dixon=round(prob_dixon, 4), prob_bzzoiro=round(prob_bzzoiro, 4),
-                        agreement_emoji=agr_emoji, agreement_delta=round(agr_delta, 4),
+                        odds=round(used_odd, 2), prob=round(prob, 4), edge=round(edge, 4),
+                        real_odd=real_odd,
+                        prob_gemini=round(pg, 4), prob_dixon=round(pd_, 4), prob_bzzoiro=round(pb, 4),
                         has_context=has_ctx, bzz_confidence=bzz_conf_direct,
-                        analysis=analysis, advice=advice, advice_confidence=advice_conf, advices=advices_clean,
+                        analysis=analysis, advices=advices_clean,
                         score_exact_home=score_home, score_exact_away=score_away,
-                        score_exact_prob=score_prob, score_exact_source=score_source,
+                        score_exact_prob=score_prob,
+                        sport_key=sport_key,
                     ))
 
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(2.5)
             except Exception as e:
                 print(f"⚠️ build_all_candidates: {e}")
+
+    print(f"🏠 Candidats totaux : {len(candidates)}")
     return candidates
 
 # =========================================================
-# CONSTRUCTION DES TICKETS
+# TICKETS
 # =========================================================
 def candidate_to_selection(c: Candidate) -> Selection:
     return Selection(
         event_id=c.event_id, league=c.league, home=c.home, away=c.away,
         kickoff=c.kickoff, market=c.market, pick_label=c.pick_label,
         odds=c.odds, model_prob=c.prob, edge=c.edge,
-        bookmaker="The Odds API" if c.real_odd else "Triple Fusion",
-        real_odd=c.real_odd, analysis=c.analysis, advice=c.advice,
-        advice_confidence=c.advice_confidence, advices=c.advices,
-        has_context=c.has_context, prob_gemini=c.prob_gemini,
-        prob_dixon=c.prob_dixon, prob_bzzoiro=c.prob_bzzoiro,
-        agreement_emoji=c.agreement_emoji, agreement_delta=c.agreement_delta,
+        bookmaker="The Odds API" if c.real_odd else "Estimation",
+        real_odd=c.real_odd, analysis=c.analysis, advices=c.advices,
+        has_context=c.has_context,
+        prob_gemini=c.prob_gemini, prob_dixon=c.prob_dixon, prob_bzzoiro=c.prob_bzzoiro,
         bzz_confidence=c.bzz_confidence,
         score_exact_home=c.score_exact_home, score_exact_away=c.score_exact_away,
-        score_exact_prob=c.score_exact_prob, score_exact_source=c.score_exact_source,
-        prob_stats=c.prob_stats, stats_home=c.stats_home, stats_away=c.stats_away,
+        score_exact_prob=c.score_exact_prob,
     )
 
-def build_safe_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
-    pool = [c for c in candidates if c.market == "Double Chance"
-            and SAFE_MIN_PROB <= c.prob <= SAFE_MAX_PROB
-            and SAFE_MIN_LEG_ODDS <= c.odds <= SAFE_MAX_LEG_ODDS]
+def build_odds3_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
+    """Odds +3 : Top 5, cotes réelles OBLIGATOIRES, total 3.0-4.0"""
+    pool = []
+    for c in candidates:
+        if not is_top_league(c.league, c.sport_key):
+            continue
+        if c.real_odd is None:
+            continue
+        if c.market not in ("Double Chance", "Over/Under", "BTTS", "1X2"):
+            continue
+        if c.prob < ODDS3_MIN_PROB_PER_LEG:
+            continue
+        if not (ODDS3_MIN_LEG_ODDS <= c.odds <= ODDS3_MAX_LEG_ODDS):
+            continue
+        pool.append(c)
+
+    print(f"  → Odds +3 : {len(pool)} candidats (Top 5 + cote réelle)")
+
     by_event = {}
     for c in pool:
         if c.event_id not in by_event or c.prob > by_event[c.event_id].prob:
             by_event[c.event_id] = c
-    pool = list(by_event.values())
-    pool.sort(key=lambda x: x.prob, reverse=True)
-    if not pool:
+    pool = sorted(by_event.values(), key=lambda x: x.prob, reverse=True)
+
+    if len(pool) < 2:
         return None
-    legs, used_events, used_leagues, combined_odds, combined_prob = [], set(), set(), 1.0, 1.0
+
+    legs, used = [], set()
+    combined_odds, combined_prob = 1.0, 1.0
     for c in pool:
-        if len(legs) >= SAFE_MAX_LEGS:
+        if len(legs) >= ODDS3_MAX_LEGS:
             break
-        if c.event_id in used_events:
-            continue
-        if c.league in used_leagues and len(legs) >= 2:
+        if c.event_id in used:
             continue
         next_odds = combined_odds * c.odds
-        if next_odds > SAFE_MAX_TOTAL * 1.15 and legs:
+        if next_odds > ODDS3_MAX_ODDS and legs:
             continue
         legs.append(candidate_to_selection(c))
-        used_events.add(c.event_id)
-        used_leagues.add(c.league)
+        used.add(c.event_id)
         combined_odds = next_odds
         combined_prob *= c.prob
-        if combined_odds >= SAFE_MIN_TOTAL:
+        if combined_odds >= ODDS3_MIN_ODDS:
             break
-    if not legs or combined_odds < SAFE_MIN_TOTAL or combined_odds > SAFE_MAX_TOTAL * 1.25:
-        return None
-    return Coupon("Ticket Sécurisé", f"Cote {SAFE_MIN_TOTAL} - {SAFE_MAX_TOTAL} • DC sûrs",
-                  "🔒", legs, round(combined_odds, 2), round(combined_prob, 4))
 
-def build_balanced_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
-    market_types = ["Over/Under", "BTTS", "Double Chance", "1X2"]
-    pool_all = [c for c in candidates if c.market in market_types
-                and BAL_MIN_PROB <= c.prob <= BAL_MAX_PROB
-                and BAL_MIN_LEG_ODDS <= c.odds <= BAL_MAX_LEG_ODDS]
-    print(f"  → Ticket Équilibré: {len(pool_all)} candidates initiales")
-    if not pool_all:
-        print("  → Ticket Équilibré: Aucun candidat dans les critères")
+    if combined_odds < ODDS3_MIN_ODDS or combined_odds > ODDS3_MAX_ODDS:
+        print(f"  → Odds +3 : cote {combined_odds:.2f} hors fourchette")
         return None
-    legs, used_events, used_leagues = [], set(), set()
-    for mkt in market_types:
-        pool_mkt = [c for c in pool_all if c.market == mkt]
-        by_event = {}
-        for c in pool_mkt:
-            if c.event_id not in by_event or c.prob > by_event[c.event_id].prob:
-                by_event[c.event_id] = c
-        pool_mkt = list(by_event.values())
-        pool_mkt.sort(key=lambda x: (x.prob, x.edge), reverse=True)
-        added = 0
-        for c in pool_mkt:
-            if added >= 2:
-                break
-            if c.event_id in used_events:
-                continue
-            if c.league in used_leagues and added >= 1:
-                continue
-            legs.append(candidate_to_selection(c))
-            used_events.add(c.event_id)
-            used_leagues.add(c.league)
-            added += 1
-    print(f"  → Ticket Équilibré: {len(legs)} legs préliminaires")
-    if not legs:
+    if len(legs) < 2:
         return None
+
+    print(f"  → Odds +3 OK : {len(legs)} legs, cote {combined_odds:.2f}")
+    return Coupon("Odds +3", f"Cote {ODDS3_MIN_ODDS}-{ODDS3_MAX_ODDS} • Top 5 + cotes réelles",
+                  "🎯", legs, round(combined_odds, 2), round(combined_prob, 4))
+
+def build_odds10_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
+    """Odds +10 : ligues obscures, mix marchés"""
+    pool = []
+    for c in candidates:
+        if not is_obscure_league(c.league, c.sport_key):
+            continue
+        if c.market not in ("Double Chance", "Over/Under", "BTTS", "1X2"):
+            continue
+        if c.prob < ODDS10_MIN_PROB_PER_LEG:
+            continue
+        if not (ODDS10_MIN_LEG_ODDS <= c.odds <= ODDS10_MAX_LEG_ODDS):
+            continue
+        pool.append(c)
+
+    print(f"  → Odds +10 : {len(pool)} candidats (obscures)")
+
+    by_event = {}
+    for c in pool:
+        if c.event_id not in by_event or c.prob > by_event[c.event_id].prob:
+            by_event[c.event_id] = c
+    pool = sorted(by_event.values(), key=lambda x: (x.prob, x.edge if x.edge > 0 else 0), reverse=True)
+
+    if len(pool) < 3:
+        return None
+
+    legs, used = [], set()
     combined_odds, combined_prob = 1.0, 1.0
-    for s in legs:
-        combined_odds *= s.odds
-        combined_prob *= s.final_prob()
-    while combined_odds > BAL_MAX_TOTAL * 1.25 and len(legs) > 3:
-        removed = legs.pop()
-        combined_odds /= removed.odds
-        combined_prob /= removed.final_prob()
-    print(f"  → Ticket Équilibré: {len(legs)} legs, cote {combined_odds:.2f}")
-    if combined_odds < 1.70:
-        print(f"  → Ticket Équilibré: REJETÉ (cote {combined_odds:.2f} < 1.70)")
-        return None
-    if combined_odds > BAL_MAX_TOTAL * 1.25:
-        return None
-    return Coupon("Ticket Équilibré", "Cote 2.0 - 6.0 • Multi-marchés", "⚖️",
-                  legs, round(combined_odds, 2), round(combined_prob, 4))
-
-def build_value_coupon(candidates: list[Candidate]) -> Optional[Coupon]:
-    pool = [c for c in candidates if is_obscure_league(c.league)
-            and c.market in ("Double Chance", "1X2", "Over/Under", "BTTS")
-            and VALUE_MIN_LEG_ODDS <= c.odds <= VALUE_MAX_LEG_ODDS]
-    print(f"  → Value après filtres marché/cote : {len(pool)}")
-
-    def qualifies(c: Candidate) -> bool:
-        if c.real_odd is not None:
-            return c.edge >= 0.01
-        return c.prob >= 0.80
-    pool = [c for c in pool if qualifies(c)]
-
-    def n_sources(c: Candidate) -> int:
-        return sum([1 for x in (c.has_context, c.prob_dixon > 0, c.prob_bzzoiro > 0, c.prob_gemini > 0) if x])
-    pool = [c for c in pool if n_sources(c) >= 2]
-
-    strict = [c for c in pool if VALUE_MIN_PROB <= c.prob <= VALUE_MAX_PROB]
-
-    def dedup(pool_list):
-        by_ev = {}
-        for c in pool_list:
-            if c.event_id not in by_ev or c.prob > by_ev[c.event_id].prob:
-                by_ev[c.event_id] = c
-        return list(by_ev.values())
-    strict = dedup(strict)
-
-    def score(c):
-        edge_score = c.edge if c.edge > 0 else 0.0
-        return (c.prob, edge_score, c.bzz_confidence * 0.001)
-    strict.sort(key=score, reverse=True)
-    selected = strict[:VALUE_TOP_N]
-
-    if len(selected) < VALUE_TOP_N:
-        used_ids = {c.event_id for c in selected}
-        fallback = [c for c in pool if VALUE_FALLBACK_MIN_PROB <= c.prob < VALUE_MIN_PROB and c.event_id not in used_ids]
-        fallback = dedup(fallback)
-        fallback.sort(key=score, reverse=True)
-        for c in fallback:
-            if len(selected) >= VALUE_TOP_N:
-                break
-            selected.append(c)
-    print(f"  → Ticket Value FINAL : {len(selected)} paris retenus")
-    if not selected:
-        return None
-    combined_odds, combined_prob = 1.0, 1.0
-    for c in selected:
+    for c in pool:
+        if len(legs) >= ODDS10_MAX_LEGS:
+            break
+        if c.event_id in used:
+            continue
+        legs.append(candidate_to_selection(c))
+        used.add(c.event_id)
         combined_odds *= c.odds
         combined_prob *= c.prob
-    return Coupon("Ticket Value", f"Top {len(selected)} • Ligues obscures", "💎",
-                  [candidate_to_selection(c) for c in selected],
-                  round(combined_odds, 2), round(combined_prob, 4), is_list=True)
+        if combined_odds >= ODDS10_MIN_ODDS:
+            break
 
-# === MOTEUR ELITE BBTS+2.5 ===
-def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
-    engine = STATE.get("btts_engine")
-    if not engine or not engine.is_ready():
-        print("  → BBTS+2.5 ELITE : moteur non disponible")
+    if combined_odds < ODDS10_MIN_ODDS:
+        return None
+    if len(legs) < 3:
         return None
 
-    print(f"  → BBTS+2.5 ELITE : analyse de {len(matches)} matchs")
+    print(f"  → Odds +10 OK : {len(legs)} legs, cote {combined_odds:.2f}")
+    return Coupon("Odds +10", f"Cote ≥ {ODDS10_MIN_ODDS} • Ligues obscures",
+                  "🔥", legs, round(combined_odds, 2), round(combined_prob, 4))
+
+def build_mtft_coupon(matches: list[dict]) -> Optional[Coupon]:
+    """MT-Fin : Monte Carlo 1000 sims, 3 matchs exactement, Top 5"""
+    if not STATE.get("dixon_model"):
+        print("  → MT-Fin : Dixon non disponible")
+        return None
+
+    print(f"  → MT-Fin : analyse de {len(matches)} matchs (Monte Carlo x{MTFIN_SIMULATIONS})")
 
     picks = []
     for fx in matches:
-        home = fx.get("home", "")
-        away = fx.get("away", "")
-        if not home or not away:
+        home, away = fx["home"], fx["away"]
+        league = fx.get("league", "")
+        sport_key = fx.get("odds_sport_key", "")
+        if not is_top_league(league, sport_key):
+            continue
+        if not is_match_upcoming(fx.get("kickoff", "")):
             continue
 
-        real_odds = fx.get("real_odds", {}) or {}
-        bzz_markets = fx.get("bzz_markets", {}) or {}
-        btts_odd = real_odds.get("btts_yes")
-        over_odd = real_odds.get("over_2.5")
-
-        combined_real_prob = 0.0
-        source = ""
-
-        if btts_odd and over_odd and btts_odd > 1.01 and over_odd > 1.01:
-            if btts_odd > BTTS_MAX_BOOK_BTTS or over_odd > BTTS_MAX_BOOK_O25:
-                continue
-            btts_implied = (1.0 / btts_odd) * 0.95
-            over_implied = (1.0 / over_odd) * 0.95
-            combined_real_prob = min(btts_implied, over_implied) * 0.92
-            source = "bookmaker"
-        else:
-            bzz_btts_over_25 = bzz_markets.get("btts_over_25")
-            if not bzz_btts_over_25:
-                continue
-            try:
-                combined_real_prob = float(bzz_btts_over_25) / 100.0
-            except (ValueError, TypeError):
-                continue
-            combined_real_prob = combined_real_prob * 0.90
-            source = "bzzoiro"
-
-        if combined_real_prob < BTTS_MIN_PROB:
+        try:
+            dixon = STATE["dixon_model"].predict_all(home, away)
+        except Exception:
+            dixon = None
+        if not dixon:
             continue
 
-        # === FILTRE STATS ENGINE (optionnel si équipe inconnue) ===
-        analysis = engine.analyze_match(home, away)
-        engine_stats = None
-        
-        if analysis:
-            hs = analysis["home_stats"]
-            as_ = analysis["away_stats"]
+        lam_h = dixon.get("lambda_home", 1.3)
+        lam_a = dixon.get("lambda_away", 1.1)
+        htft_probs = simulate_htft(lam_h, lam_a, MTFIN_SIMULATIONS)
+        pick, prob = best_htft(htft_probs)
 
-            # On filtre SEULEMENT si le moteur connaît les 2 équipes
-            if hs["scored_pct"] < BTTS_MIN_SCORED or as_["scored_pct"] < BTTS_MIN_SCORED:
-                continue
-            if hs["conceded_pct"] < BTTS_MIN_CONCEDED or as_["conceded_pct"] < BTTS_MIN_CONCEDED:
-                continue
-            if hs["btts_over25_pct"] < BTTS_MIN_STATS or as_["btts_over25_pct"] < BTTS_MIN_STATS:
-                continue
-            if analysis["avg_total_goals"] < BTTS_MIN_AVG_GOALS:
-                continue
-            engine_stats = analysis
-        else:
-            # Équipe inconnue → on fait confiance à Bzzoiro, on continue
-            pass
-
-        # === FILTRE DIXON (optionnel) ===
-        dixon_prob = 0.0
-        if STATE.get("dixon_model"):
-            try:
-                dixon = STATE["dixon_model"].predict_all(home, away)
-                if dixon:
-                    dixon_prob = dixon.get("btts_over_25", 0)
-                    if dixon_prob > 0 and dixon_prob < BTTS_MIN_DIXON:
-                        continue
-            except Exception:
-                pass
+        if not pick or prob < MTFIN_MIN_PROB:
+            continue
 
         picks.append({
-            "match": fx, "home": home, "away": away,
-            "real_prob": combined_real_prob,
-            "btts_odd": btts_odd or 0.0,
-            "over_odd": over_odd or 0.0,
-            "engine_stats": engine_stats,
-            "dixon_prob": dixon_prob,
-            "source": source,
+            "home": home, "away": away, "league": league,
+            "kickoff": fx.get("kickoff", ""), "event_id": fx.get("event_id", ""),
+            "htft_pick": pick, "htft_prob": prob,
         })
 
-    print(f"  → BBTS+2.5 ELITE : {len(picks)} matchs valident les conditions")
+    print(f"  → MT-Fin : {len(picks)} matchs ≥ {MTFIN_MIN_PROB*100:.0f}%")
 
-    if not picks:
-        print("  → BBTS+2.5 ELITE : 0 ticket aujourd'hui")
+    if len(picks) < MTFIN_TOP_N:
+        print(f"  → MT-Fin : besoin de {MTFIN_TOP_N} matchs, seulement {len(picks)}")
         return None
 
-    picks.sort(key=lambda x: x["real_prob"], reverse=True)
-    top = picks[:BTTS_TOP_N]
+    picks.sort(key=lambda x: x["htft_prob"], reverse=True)
+    top = picks[:MTFIN_TOP_N]
 
     legs = []
     for p in top:
-        fx = p["match"]
-        if p["source"] == "bookmaker":
-            display_odd = round(p["btts_odd"] * p["over_odd"] * 0.85, 2)
-            bookmaker_label = "ELITE (bookmaker+stats+dixon)"
-        else:
-            display_odd = round(1.0 / p["real_prob"], 2)
-            bookmaker_label = "ELITE (bzzoiro+stats+dixon)"
-
+        est_odd = round(1.0 / p["htft_prob"], 2) if p["htft_prob"] > 0 else 3.5
         sel = Selection(
-            event_id=fx.get("event_id", f"{p['home']}_{p['away']}"),
-            league=fx.get("league", ""),
-            home=p["home"], away=p["away"],
-            kickoff=fx.get("kickoff", ""),
-            market="BTTS+O2.5",
-            pick_label="BTTS + Plus de 2.5 buts",
-            odds=display_odd,
-            model_prob=p["real_prob"],
-            edge=(p["real_prob"] * display_odd) - 1.0,
-            bookmaker=bookmaker_label,
-            real_odd=display_odd,
-            has_context=True,
-            prob_dixon=p["dixon_prob"],
-            prob_stats=p["real_prob"],
-            stats_home=p["engine_stats"]["home_stats"] if p["engine_stats"] else None,
-            stats_away=p["engine_stats"]["away_stats"] if p["engine_stats"] else None,
+            event_id=p["event_id"], league=p["league"], home=p["home"], away=p["away"],
+            kickoff=p["kickoff"], market="MT-Fin",
+            pick_label=f"Mi-temps/Fin : {p['htft_pick']}",
+            odds=est_odd, model_prob=p["htft_prob"], edge=-1.0,
+            bookmaker="Monte Carlo Dixon",
+            htft_pick=p["htft_pick"], htft_prob=p["htft_prob"],
         )
         legs.append(sel)
-
-        print(f"     🥇 {p['home']} vs {p['away']} : {p['real_prob']*100:.1f}% [{p['source']}]")
-        if p["engine_stats"]:
-            print(f"        Stats : {p['home'][:15]} marque {p['engine_stats']['home_stats']['scored_pct']*100:.0f}% • encaisse {p['engine_stats']['home_stats']['conceded_pct']*100:.0f}%")
-            print(f"        Stats : {p['away'][:15]} marque {p['engine_stats']['away_stats']['scored_pct']*100:.0f}% • encaisse {p['engine_stats']['away_stats']['conceded_pct']*100:.0f}%")
-        print(f"        Dixon : {p['dixon_prob']*100:.0f}% BTTS+O2.5")
+        print(f"     🥇 {p['home']} vs {p['away']} : {p['htft_pick']} ({p['htft_prob']*100:.1f}%)")
 
     combined_odds = 1.0
     combined_prob = 1.0
@@ -1302,19 +1010,97 @@ def build_btts_over_coupon(matches: list[dict]) -> Optional[Coupon]:
         combined_odds *= s.odds
         combined_prob *= s.final_prob()
 
-    return Coupon("BBTS+2.5", f"ELITE • {len(legs)} matchs haute confiance", "🎯",
-                  legs, round(combined_odds, 2), round(combined_prob, 4), is_list=True)
+    return Coupon("MT-Fin", "Mi-Temps/Fin • 3 matchs (Monte Carlo)",
+                  "⏱", legs, round(combined_odds, 2), round(combined_prob, 4), is_list=True)
+
+def build_score_exact_coupon(matches: list[dict]) -> Optional[Coupon]:
+    """Score Exact : 6 scores cibles, toutes ligues, 3 matchs"""
+    if not STATE.get("dixon_model"):
+        print("  → Score Exact : Dixon non disponible")
+        return None
+
+    print(f"  → Score Exact : analyse de {len(matches)} matchs")
+
+    picks = []
+    for fx in matches:
+        home, away = fx["home"], fx["away"]
+        if not is_match_upcoming(fx.get("kickoff", "")):
+            continue
+
+        try:
+            dixon = STATE["dixon_model"].predict_all(home, away)
+        except Exception:
+            dixon = None
+        if not dixon:
+            continue
+
+        lam_h = dixon.get("lambda_home", 1.3)
+        lam_a = dixon.get("lambda_away", 1.1)
+
+        def pmf(lam, k):
+            return (math.exp(-lam) * lam**k) / math.factorial(k)
+
+        score_probs = {}
+        for (h, a) in SCORE_EXACT_TARGETS:
+            score_probs[(h, a)] = pmf(lam_h, h) * pmf(lam_a, a)
+
+        cumulative = sum(score_probs.values())
+        if cumulative < SCORE_EXACT_MIN_PROB:
+            continue
+
+        best_score = max(score_probs.items(), key=lambda x: x[1])
+        (bh, ba), bp = best_score
+
+        picks.append({
+            "home": home, "away": away, "league": fx.get("league", ""),
+            "kickoff": fx.get("kickoff", ""), "event_id": fx.get("event_id", ""),
+            "best_score": (bh, ba), "best_score_prob": bp,
+            "cumulative_prob": cumulative,
+        })
+
+    print(f"  → Score Exact : {len(picks)} matchs ≥ {SCORE_EXACT_MIN_PROB*100:.0f}% cumulé")
+
+    if len(picks) < SCORE_EXACT_TOP_N:
+        print(f"  → Score Exact : besoin de {SCORE_EXACT_TOP_N}, seulement {len(picks)}")
+        return None
+
+    picks.sort(key=lambda x: x["best_score_prob"], reverse=True)
+    top = picks[:SCORE_EXACT_TOP_N]
+
+    legs = []
+    for p in top:
+        bh, ba = p["best_score"]
+        est_odd = round(1.0 / p["best_score_prob"], 2) if p["best_score_prob"] > 0 else 10.0
+        sel = Selection(
+            event_id=p["event_id"], league=p["league"], home=p["home"], away=p["away"],
+            kickoff=p["kickoff"], market="Score Exact",
+            pick_label=f"Score exact : {bh}-{ba}",
+            odds=est_odd, model_prob=p["best_score_prob"], edge=-1.0,
+            bookmaker="Dixon Poisson",
+            score_exact_home=bh, score_exact_away=ba, score_exact_prob=p["best_score_prob"],
+        )
+        legs.append(sel)
+        print(f"     ⚽ {p['home']} vs {p['away']} : {bh}-{ba} ({p['best_score_prob']*100:.1f}%)")
+
+    combined_odds = 1.0
+    combined_prob = 1.0
+    for s in legs:
+        combined_odds *= s.odds
+        combined_prob *= s.final_prob()
+
+    return Coupon("Score Exact", "3 matchs • 6 scores cibles",
+                  "⚽", legs, round(combined_odds, 2), round(combined_prob, 4), is_list=True)
 
 def build_all_coupons(candidates: list[Candidate], matches: list[dict] = None) -> list[Coupon]:
     coupons = []
-    if c := build_safe_coupon(candidates):
+    if c := build_odds3_coupon(candidates):
         coupons.append(c)
-    if c := build_balanced_coupon(candidates):
-        coupons.append(c)
-    if c := build_value_coupon(candidates):
+    if c := build_odds10_coupon(candidates):
         coupons.append(c)
     if matches:
-        if c := build_btts_over_coupon(matches):
+        if c := build_mtft_coupon(matches):
+            coupons.append(c)
+        if c := build_score_exact_coupon(matches):
             coupons.append(c)
     return coupons
 
@@ -1330,58 +1116,53 @@ def format_header():
         f"<i>📅 {today_pretty()} • 🇨🇮 Côte d’Ivoire</i>"
     )
 
-def format_selection_block(s: Selection, idx: int, compact: bool = False, hide_analysis: bool = False, hide_advices: bool = False):
-    dt = parse_dt_safe(s.kickoff)
-    day_tag = ""
-    if dt:
-        today = datetime.now(TZ).date()
-        if dt.date() == today:
-            day_tag = "📍 <b>Aujourd'hui</b> "
-        elif dt.date() == today + timedelta(days=1):
-            day_tag = "📅 <b>Demain</b> "
+def format_selection_block(s: Selection, idx: int) -> str:
     prob_pct = s.final_prob() * 100
     ctx_badge = " ✅ <i>H2H</i>" if s.has_context else ""
-    agreement = ""
-    if s.agreement_emoji == "🤝🤝":
-        agreement = " 🤝🤝 <b>TRIPLE CONSENSUS</b>"
-    elif s.agreement_emoji == "🤝":
-        agreement = " 🤝 <b>consensus</b>"
-    elif s.agreement_emoji == "⚠️":
-        agreement = " ⚠️"
     bzz_badge = f" 🔮{s.bzz_confidence:.0f}" if s.bzz_confidence > 0 else ""
 
     lines = [
         f"<b>┌─ #{idx} {s.home} vs {s.away}</b>",
-        f"│ {day_tag}🕐 <b>{kickoff_local(s.kickoff)}</b> • {s.league}",
+        f"│ 🕐 <b>{kickoff_local(s.kickoff)}</b> • {s.league}",
         f"│ 🎯 <b>{s.pick_label}</b>  <i>({s.market})</i>",
-        f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}{ctx_badge}{bzz_badge}{agreement}",
+        f"│ 📊 Proba : <b>{prob_pct:.1f}%</b> {prob_bar(s.final_prob())}{ctx_badge}{bzz_badge}",
     ]
-    src_parts = []
+    src = []
     if s.prob_gemini > 0:
-        src_parts.append(f"G:{s.prob_gemini*100:.0f}%")
+        src.append(f"G:{s.prob_gemini*100:.0f}%")
     if s.prob_dixon > 0:
-        src_parts.append(f"D:{s.prob_dixon*100:.0f}%")
+        src.append(f"D:{s.prob_dixon*100:.0f}%")
     if s.prob_bzzoiro > 0:
-        src_parts.append(f"B:{s.prob_bzzoiro*100:.0f}%")
-    if src_parts:
-        lines.append(f"│    <i>{' × '.join(src_parts)}</i>")
+        src.append(f"B:{s.prob_bzzoiro*100:.0f}%")
+    if src:
+        lines.append(f"│    <i>{' × '.join(src)}</i>")
 
-    if s.stats_home and s.stats_away:
-        h = s.stats_home
-        a = s.stats_away
-        lines.append(f"│")
-        lines.append(f"│ 📊 <b>{s.home[:18]}</b> : +{h.get('goals_for_avg',0):.1f} buts/m • {h.get('scored_pct',0)*100:.0f}% marque • {h.get('conceded_pct',0)*100:.0f}% encaisse • {h.get('btts_over25_pct',0)*100:.0f}% BTTS+O2.5")
-        lines.append(f"│ 📊 <b>{s.away[:18]}</b> : +{a.get('goals_for_avg',0):.1f} buts/m • {a.get('scored_pct',0)*100:.0f}% marque • {a.get('conceded_pct',0)*100:.0f}% encaisse • {a.get('btts_over25_pct',0)*100:.0f}% BTTS+O2.5")
-
+    if s.htft_pick:
+        lines.append(f"│ ⏱ <b>MT/Fin</b> : {s.htft_pick}")
     if s.score_exact_home >= 0 and s.score_exact_away >= 0:
-        prob_txt = f" ({s.score_exact_prob*100:.1f}%)" if s.score_exact_prob > 0 else ""
-        lines.append(f"│ ⚽ <b>Score exact</b> : {s.score_exact_home}-{s.score_exact_away}{prob_txt}")
+        lines.append(f"│ ⚽ <b>Score exact</b> : {s.score_exact_home}-{s.score_exact_away}")
+
     if s.real_odd:
-        lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b> <i>(combinée bookmaker)</i>")
+        lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b> <i>(réelle)</i>")
     else:
         lines.append(f"│ 💰 Cote : <b>{s.odds}</b>")
-    if s.edge > 0.05:
-        lines.append(f"│ 💎 <b>Edge</b> : +{s.edge*100:.1f}%")
+
+    # === Avis IA toujours affiché ===
+    if s.analysis:
+        lines.append(f"│")
+        lines.append(f"│ 🧠 <b>Avis IA</b> :")
+        lines.append(f"│ 💬 <i>{s.analysis[:300]}</i>")
+    if s.advices:
+        lines.append(f"│ 💡 <b>Conseils IA</b> :")
+        for a in s.advices:
+            txt = a.get("text", "").strip()
+            if not txt:
+                continue
+            conf = a.get("confidence", 0)
+            if conf > 0:
+                lines.append(f"│    • {txt}  {confidence_bar(conf)} <b>{conf}%</b>")
+            else:
+                lines.append(f"│    • {txt}")
 
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
@@ -1392,11 +1173,10 @@ def format_coupon(c: Coupon) -> str:
             format_header(), "",
             f"<b>{c.emoji} {c.name.upper()}</b>",
             f"<i>{c.subtitle}</i>", "",
-            f"<b>🎯 {len(c.legs)} pronostics (valeur)</b>", "",
+            f"<b>🎯 {len(c.legs)} pronostics</b>", "",
         ]
         for i, s in enumerate(c.legs, 1):
-            hide_ana = (c.name == "Ticket Value")
-            lines.append(format_selection_block(s, i, compact=False, hide_analysis=hide_ana, hide_advices=False))
+            lines.append(format_selection_block(s, i))
             lines.append("")
         lines.append(f"<i>{PUBLIC_FOOTER}</i>")
         return "\n".join(lines)
@@ -1413,7 +1193,7 @@ def format_coupon(c: Coupon) -> str:
         f"<b>┗━━━━━━━━━━━━━━━┛</b>", "",
     ]
     for i, s in enumerate(c.legs, 1):
-        lines.append(format_selection_block(s, i, compact=False))
+        lines.append(format_selection_block(s, i))
         lines.append("")
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
@@ -1425,9 +1205,9 @@ def format_coupons_ready():
     for c in STATE["coupons"]:
         n = len(c.legs)
         if c.is_list:
-            lignes.append(f"{c.emoji} <b>{c.name}</b>\n   • {n} pronostics (liste)")
+            lignes.append(f"{c.emoji} <b>{c.name}</b>\n   • {n} pronostics")
         else:
-            lignes.append(f"{c.emoji} <b>{c.name}</b>\n   • {n} paris • Cote <b>{c.combined_odds}</b> • Proba <b>{c.combined_prob*100:.0f}%</b>")
+            lignes.append(f"{c.emoji} <b>{c.name}</b>\n   • {n} paris • Cote <b>{c.combined_odds}</b>")
     return f"{format_header()}\n\n<b>🔔 COUPONS DU JOUR PRÊTS !</b>\n\n<b>{len(STATE['coupons'])} coupon(s) disponible(s) :</b>\n\n" + "\n\n".join(lignes) + "\n\n<i>👇 Clique sur le bouton du ticket qui t'intéresse</i>"
 
 def format_bilan(tracker):
@@ -1562,15 +1342,13 @@ async def debug_cmd(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
     d = STATE["debug"]
-    engine_status = "✅" if STATE.get("btts_engine") and STATE["btts_engine"].is_ready() else "❌"
     txt = (
         f"<b>🔍 DEBUG</b>\n\n"
         f"Dixon : <b>{'✅' if STATE['dixon_model'] else '❌'}</b>\n"
         f"Bzzoiro : <b>{'✅' if BZZOIRO_API_KEY else '❌'}</b>\n"
-        f"BTTS Engine : <b>{engine_status}</b>\n"
         f"Odds events : <b>{d.get('odds_events', 0)}</b>\n"
         f"Bzzoiro direct : <b>{d.get('bzz_predictions', 0)}</b>\n"
-        f"Matchs finaux : <b>{d.get('matched', 0)}</b>\n"
+        f"Matchs analysés : <b>{d.get('matched', 0)}</b>\n"
         f"Candidats : <b>{d.get('candidates', 0)}</b>\n"
         f"Coupons : <b>{d.get('coupons', 0)}</b>"
     )
@@ -1583,33 +1361,33 @@ async def send_coupon(message, name):
     else:
         await safe_answer(message, "Aucun coupon pour ce profil.")
 
-@dp.message(F.text == BTN_SAFE)
-async def btn_safe(message: Message):
+@dp.message(F.text == BTN_ODDS3)
+async def btn_odds3(message: Message):
     if message.from_user.id != ADMIN_ID and not is_subscribed(message.from_user.id):
         await message.answer(f"❌ {get_subscription_message(message.from_user.id)}")
         return
-    await send_coupon(message, "Ticket Sécurisé")
+    await send_coupon(message, "Odds +3")
 
-@dp.message(F.text == BTN_BAL)
-async def btn_bal(message: Message):
+@dp.message(F.text == BTN_ODDS10)
+async def btn_odds10(message: Message):
     if message.from_user.id != ADMIN_ID and not is_subscribed(message.from_user.id):
         await message.answer(f"❌ {get_subscription_message(message.from_user.id)}")
         return
-    await send_coupon(message, "Ticket Équilibré")
+    await send_coupon(message, "Odds +10")
 
-@dp.message(F.text == BTN_VAR)
-async def btn_var(message: Message):
+@dp.message(F.text == BTN_MTFT)
+async def btn_mtft(message: Message):
     if message.from_user.id != ADMIN_ID and not is_subscribed(message.from_user.id):
         await message.answer(f"❌ {get_subscription_message(message.from_user.id)}")
         return
-    await send_coupon(message, "Ticket Value")
+    await send_coupon(message, "MT-Fin")
 
-@dp.message(F.text == BTN_BTTS)
-async def btn_btts(message: Message):
+@dp.message(F.text == BTN_SCOREEXACT)
+async def btn_scoreexact(message: Message):
     if message.from_user.id != ADMIN_ID and not is_subscribed(message.from_user.id):
         await message.answer(f"❌ {get_subscription_message(message.from_user.id)}")
         return
-    await send_coupon(message, "BBTS+2.5")
+    await send_coupon(message, "Score Exact")
 
 @dp.message(F.text == BTN_BILAN)
 async def btn_bilan(message: Message):
@@ -1651,15 +1429,17 @@ async def scan():
         if not odds_events and not bzz_predictions:
             STATE["coupons"] = []
             STATE["candidates"] = []
-            print("⚠️ Scan annulé : 0 events Odds API ET 0 prédictions Bzzoiro.")
+            print("⚠️ Scan annulé : 0 source.")
             return
 
         if not odds_events:
-            print(f"⚠️ Odds API vide. On continue avec {len(bzz_predictions)} prédictions Bzzoiro uniquement.")
+            print(f"⚠️ Odds API vide. On continue avec {len(bzz_predictions)} prédictions Bzzoiro.")
 
         matches = []
         if bzz_predictions:
             for bzz in bzz_predictions:
+                if not is_match_upcoming(bzz.get("kickoff", "")):
+                    continue
                 matched_odds = None
                 h_norm = normalize_name(bzz["home"])
                 a_norm = normalize_name(bzz["away"])
@@ -1674,29 +1454,19 @@ async def scan():
                     bzz_copy["real_odds"] = extract_real_odds(matched_odds)
                     bzz_copy["has_odds"] = True
                     bzz_copy["odds_sport_key"] = matched_odds.get("sport_key", "")
+                    bzz_copy["league"] = matched_odds.get("sport_title", bzz.get("league", ""))
                 matches.append(bzz_copy)
 
         if not matches:
-            odds_matches = build_matches_from_odds(odds_events)
-            if not odds_matches:
-                STATE["coupons"] = []
-                STATE["candidates"] = []
-                return
-            if get_bzzoiro_best_matches and BZZOIRO_API_KEY:
-                try:
-                    matches = await get_bzzoiro_best_matches(odds_matches, min_confidence=BZZ_MIN_CONFIDENCE)
-                    matches = matches[:BZZ_MAX_MATCHES]
-                except Exception:
-                    matches = odds_matches[:MAX_MATCHES_TO_ANALYZE]
-            else:
-                matches = odds_matches[:MAX_MATCHES_TO_ANALYZE]
+            matches = build_matches_from_odds(odds_events)
 
         if not matches:
             STATE["coupons"] = []
             STATE["candidates"] = []
             return
 
-        matches = filter_and_rank_matches(matches)
+        print(f"📋 {len(matches)} matchs éligibles (kickoff > +30min)")
+
         contexts = {}
         try:
             contexts = await enrich_matches(matches)
@@ -1716,7 +1486,12 @@ async def scan():
             "candidates": len(candidates),
             "coupons": len(STATE["coupons"]),
         }
-        print(f"──────── RÉSUMÉ ────────\nCandidats : {len(candidates)}\nCoupons : {len(STATE['coupons'])}\n────────────────────────")
+        print(f"──────── RÉSUMÉ ────────")
+        print(f"Candidats : {len(candidates)}")
+        print(f"Coupons : {len(STATE['coupons'])}")
+        for c in STATE["coupons"]:
+            print(f"  • {c.name} : {len(c.legs)} legs, cote {c.combined_odds}")
+        print("────────────────────────")
 
 # =========================================================
 # LIFESPAN
@@ -1744,21 +1519,13 @@ async def lifespan(app: FastAPI):
                       id="daily_broadcast", replace_existing=True)
     scheduler.start()
     bot_task = asyncio.create_task(dp.start_polling(bot))
-    print("✅ Bot Telegram démarré.")
+    print(f"✅ Bot démarré. Scan auto à {NOTIFY_HOUR:02d}h{NOTIFY_MINUTE:02d}")
 
     async def background_bootstrap():
         try:
             if download_and_train:
                 STATE["dixon_model"] = await download_and_train()
                 print(f"✅ Dixon-Coles actif ({len(STATE['dixon_model'].teams) if STATE['dixon_model'] else 0} équipes)")
-
-            if _BTTS_ENGINE_AVAILABLE and load_btts_engine:
-                print("📊 Chargement du moteur BBTS+2.5 ELITE...")
-                STATE["btts_engine"] = await load_btts_engine()
-                if STATE["btts_engine"]:
-                    print("✅ Moteur BBTS+2.5 prêt")
-                else:
-                    print("⚠️ Moteur BBTS+2.5 indisponible")
 
             await asyncio.sleep(5)
             if NOTIFY_ON_STARTUP:
