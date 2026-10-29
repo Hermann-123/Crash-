@@ -210,7 +210,6 @@ def kickoff_local(iso_str) -> str:
     return dt.strftime("%d/%m %H:%M")
 
 def is_match_upcoming(kickoff_str, min_minutes: int = KICKOFF_MIN_MINUTES_AHEAD) -> bool:
-    """Permissif : si kickoff illisible ou vide, on garde le match."""
     if not kickoff_str:
         return True
     dt = parse_dt_safe(kickoff_str)
@@ -281,8 +280,7 @@ def simulate_htft(lambda_home: float, lambda_away: float, n_sims: int = MTFIN_SI
 def best_htft(probs: dict) -> tuple[str, float]:
     if not probs:
         return ("", 0.0)
-    best = max(probs.items(), key=lambda x: x[1])
-    return best
+    return max(probs.items(), key=lambda x: x[1])
 
 W_GEMINI = 0.35
 W_DIXON = 0.25
@@ -652,7 +650,6 @@ async def enrich_matches(matches: list[dict]) -> dict:
                 ctx = await enrich_match_with_bzzoiro(home, away, date_iso)
             if ctx and ctx.get("available"):
                 contexts[fx["event_id"]] = ctx
-                print(f"  ✅ {home} vs {away} — H2H:{ctx.get('h2h', {}).get('total_matches', 0)}")
             await asyncio.sleep(0.2)
         except Exception:
             pass
@@ -675,8 +672,6 @@ async def build_all_candidates(matches, used_today, contexts=None):
                 kickoff = fx["kickoff"]
                 sport_key = fx.get("odds_sport_key", "")
                 if event_id in used_today:
-                    continue
-                if not is_match_upcoming(kickoff):
                     continue
 
                 print(f"  [{idx+1}/{min(len(ordered), GEMINI_MAX_CALLS_PER_SCAN)}] {home} vs {away}")
@@ -909,8 +904,6 @@ def build_mtft_coupon(matches: list[dict]) -> Optional[Coupon]:
         sport_key = fx.get("odds_sport_key", "")
         if not is_top_league(league, sport_key):
             continue
-        if not is_match_upcoming(fx.get("kickoff", "")):
-            continue
 
         try:
             dixon = STATE["dixon_model"].predict_all(home, away)
@@ -975,8 +968,6 @@ def build_score_exact_coupon(matches: list[dict]) -> Optional[Coupon]:
     picks = []
     for fx in matches:
         home, away = fx["home"], fx["away"]
-        if not is_match_upcoming(fx.get("kickoff", "")):
-            continue
 
         try:
             dixon = STATE["dixon_model"].predict_all(home, away)
@@ -1377,13 +1368,8 @@ async def scan():
             print(f"⚠️ Odds API vide. On continue avec {len(bzz_predictions)} prédictions Bzzoiro.")
 
         matches = []
-        rejected_kickoff = 0
         if bzz_predictions:
             for bzz in bzz_predictions:
-                kickoff = bzz.get("kickoff", "")
-                if not is_match_upcoming(kickoff):
-                    rejected_kickoff += 1
-                    continue
                 matched_odds = None
                 h_norm = normalize_name(bzz["home"])
                 a_norm = normalize_name(bzz["away"])
@@ -1400,9 +1386,6 @@ async def scan():
                     bzz_copy["odds_sport_key"] = matched_odds.get("sport_key", "")
                     bzz_copy["league"] = matched_odds.get("sport_title", bzz.get("league", ""))
                 matches.append(bzz_copy)
-
-            if rejected_kickoff > 0:
-                print(f"⚠️ {rejected_kickoff}/{len(bzz_predictions)} rejetés (kickoff passé)")
 
         if not matches:
             matches = build_matches_from_odds(odds_events)
