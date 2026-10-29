@@ -1,5 +1,5 @@
 """
-Bzzoiro Direct — Version finale avec fallback kickoff +3h.
+Bzzoiro Direct — Filtre les matchs terminés/live + date fiable.
 """
 from __future__ import annotations
 
@@ -49,7 +49,6 @@ def _parse_markets(mk):
         return {}
 
     result = {}
-
     mr = mk.get("match_result")
     if isinstance(mr, dict):
         h = _safe_float(mr.get("prob_home"))
@@ -91,6 +90,48 @@ def _parse_markets(mk):
     return result
 
 
+def _is_finished_or_live(ev: dict, pred: dict) -> bool:
+    """Retourne True si le match est terminé ou en cours (à rejeter)."""
+    if isinstance(ev, dict):
+        for k in ["status", "state", "match_status", "live_status"]:
+            v = str(ev.get(k, "")).lower().strip()
+            if v in ("finished", "ft", "ended", "final", "completed", "live", "in_progress", "inprogress", "ht", "1h", "2h", "playing"):
+                return True
+        for k in ["finished", "is_finished", "is_live", "live", "ended"]:
+            if ev.get(k) is True:
+                return True
+        if ev.get("home_score") is not None and ev.get("away_score") is not None:
+            return True
+        if ev.get("score_home") is not None and ev.get("score_away") is not None:
+            return True
+
+    if isinstance(pred, dict):
+        for k in ["status", "state", "match_status"]:
+            v = str(pred.get(k, "")).lower().strip()
+            if v in ("finished", "ft", "ended", "final", "completed", "live", "in_progress"):
+                return True
+        for k in ["finished", "is_finished", "is_live", "live"]:
+            if pred.get(k) is True:
+                return True
+
+    return False
+
+
+def _extract_match_date(ev: dict, pred: dict) -> str:
+    """Retourne juste la date (YYYY-MM-DD) du match."""
+    for source in [ev, pred]:
+        if not isinstance(source, dict):
+            continue
+        for k in ["commence_time", "kickoff", "start_time", "match_date", "date", "datetime", "start"]:
+            v = source.get(k)
+            if v:
+                s = str(v)
+                m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
+                if m:
+                    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
     if not BZZOIRO_API_KEY:
         print("⚠️ BZZOIRO_API_KEY manquante")
@@ -115,18 +156,23 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
         return []
 
     enriched = []
+    rejected_status = 0
 
     for idx, pred in enumerate(preds):
         if not isinstance(pred, dict):
             continue
 
+        ev = pred.get("event") or {}
+
+        if _is_finished_or_live(ev, pred):
+            rejected_status += 1
+            continue
+
         mk = pred.get("markets")
         parsed = _parse_markets(mk)
+        if not parsed:
+            continue
 
-        if idx < 3:
-            print(f"🔍#{idx}: {len(parsed)} marchés parsés")
-
-        ev = pred.get("event") or {}
         home = ""
         away = ""
         league = ""
@@ -144,33 +190,18 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
                     break
             league = ev.get("league_name") or ev.get("league") or ""
 
-        if not home:
-            for k in ["home_team", "home", "team_a"]:
-                if pred.get(k):
-                    home = str(pred[k])
-                    break
-        if not away:
-            for k in ["away_team", "away", "team_b"]:
-                if pred.get(k):
-                    away = str(pred[k])
-                    break
-
         if not home or not away:
             continue
 
-        if not parsed:
-            continue
-
-        # === FIX : fallback kickoff +3h ===
-        # Bzzoiro ne fournit PAS de vrai kickoff → on met +3h
-        kickoff = (datetime.now() + timedelta(hours=3)).isoformat()
+        match_date = _extract_match_date(ev, pred)
 
         enriched.append({
             "event_id": f"bzz_{pred.get('id', idx)}",
             "home": home,
             "away": away,
             "league": league,
-            "kickoff": kickoff,
+            "kickoff": match_date,
+            "match_date": match_date,
             "bzz_markets": parsed,
             "bzz_confidence": 70.0,
             "bzz_raw": pred,
@@ -180,9 +211,12 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
             "odds_sport_key": "",
         })
 
+    if rejected_status > 0:
+        print(f"🚫 {rejected_status} rejetés (matchs terminés/live)")
+
     print(f"🔮 Bzzoiro : {len(enriched)} retenues")
 
     for p in enriched[:3]:
-        print(f"   ✅ [{p['bzz_confidence']:.0f}%] {p['home']} vs {p['away']} • kickoff={p['kickoff']}")
+        print(f"   ✅ [{p['bzz_confidence']:.0f}%] {p['home']} vs {p['away']} • 📅 {p['match_date']}")
 
     return enriched
