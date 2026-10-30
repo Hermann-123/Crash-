@@ -56,6 +56,14 @@ except Exception as e:
     print(f"❌ odds_fallback: {e}")
 
 try:
+    from api_football import fetch_fixtures_today as af_fetch_fixtures, fetch_all_odds as af_fetch_odds
+    print("✅ api_football chargé")
+except Exception as e:
+    af_fetch_fixtures = None
+    af_fetch_odds = None
+    print(f"❌ api_football: {e}")
+
+try:
     from dixon_coles import download_and_train
 except Exception as e:
     download_and_train = None
@@ -66,6 +74,7 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
 INFERSPORTS_API_KEY = os.getenv("INFERSPORTS_API_KEY", "")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 
@@ -1007,11 +1016,32 @@ def build_draw_coupon(pool):
                   round(co,2), round(cp,4), is_list=True, show_analysis=False)
 
 def build_all_coupons(pool):
+    """
+    RÈGLE : 1 match ne peut apparaître que dans 1 seul ticket.
+    Ordre de priorité : moteurs les plus exigeants d'abord.
+    """
     coupons = []
-    if c := build_odds3_coupon(pool): coupons.append(c)
-    if c := build_odds10_coupon(pool): coupons.append(c)
-    if c := build_mtft_coupon(pool): coupons.append(c)
-    if c := build_draw_coupon(pool): coupons.append(c)
+    used_ids = set()
+
+    def fresh():
+        return [md for md in pool if md.event_id not in used_ids]
+
+    if c := build_odds3_coupon(fresh()):
+        coupons.append(c)
+        used_ids.update(s.event_id for s in c.legs)
+
+    if c := build_odds10_coupon(fresh()):
+        coupons.append(c)
+        used_ids.update(s.event_id for s in c.legs)
+
+    if c := build_draw_coupon(fresh()):
+        coupons.append(c)
+        used_ids.update(s.event_id for s in c.legs)
+
+    if c := build_mtft_coupon(fresh()):
+        coupons.append(c)
+        used_ids.update(s.event_id for s in c.legs)
+
     return coupons
 
 def format_header():
@@ -1247,85 +1277,173 @@ async def scan():
             print("⚠️ 0 source")
             return
 
-        pool = await build_match_pool(bzz_preds, odds_events)
-        print(f"📋 Pool : {len(pool)} matchs")
+        # === POOL A : matchs avec COTES réelles (value betting) ===
+        pool_with_odds = []
 
-        # === FALLBACK BZZOIRO ODDS si Odds API vide ===
-        bzz_odds_count = 0
-        if not odds_events and fetch_bzzoiro_odds:
-            bzz_ids = []
-            for md in pool:
-                if md.event_id.startswith("bzz_"):
-                    try: bzz_ids.append(int(md.event_id.replace("bzz_", "")))
-                    except ValueError: pass
-            if bzz_ids:
-                print(f"📊 Récupération cotes Bzzoiro pour {len(bzz_ids)} matchs...")
-                bzz_odds_map = await fetch_bzzoiro_odds(bzz_ids)
-                bzz_odds_count = len(bzz_odds_map)
-                for md in pool:
-                    try: eid = int(md.event_id.replace("bzz_", ""))
-                    except ValueError: continue
-                    if eid in bzz_odds_map:
-                        md.real_odds = bzz_odds_map[eid]
-                        md.bzz_odds_source = "bzzoiro"
+        # ⭐ PRIORITÉ 1 : API-Football (fixtures + cotes réelles)
+        if af_fetch_fixtures and af_fetch_odds and API_FOOTBALL_KEY:
+            print("🔄 Chargement API-Football...")
+            today_iso = datetime.now(TZ).strftime("%Y-%m-%d")
+            try:
+                fixtures = await af_fetch_fixtures(today_iso)
+            except Exception as _e:
+                print(f"⚠️ API-Football fixtures crash: {_e}")
+                fixtures = []
 
-        # === FALLBACK INFERSPORTS si Bzzoiro n'a rien donné ===
-        print(f"🔎 DEBUG FALLBACK: odds_events={len(odds_events)}, bzz_odds_count={bzz_odds_count}, fetch_infer_odds={'OUI' if fetch_infer_odds else 'NON (None)'}")
-        if not odds_events and bzz_odds_count == 0 and fetch_infer_odds:
+            if fixtures:
+                print(f"📊 API-Football : {len(fixtures)} fixtures à traiter")
+                af_odds_map = await af_fetch_odds(fixtures)
+
+                for fx in fixtures:
+                    if fx["event_id"] not in af_odds_map:
+                        continue
+                    odds_data = af_odds_map[fx["event_id"]]
+
+                    bzz_match = None
+                    for bz in bzz_preds:
+                        if normalize_name(bz["home"]) == normalize_name(fx["home"]) and \
+                           normalize_name(bz["away"]) == normalize_name(fx["away"]):
+                            bzz_match = bz
+                            break
+
+                    md = MatchData(
+                        event_id=fx["event_id"],
+                        league=fx.get("league", ""),
+                        home=fx["home"],
+                        away=fx["away"],
+                        kickoff=fx.get("kickoff", ""),
+                        real_odds=odds_data,
+                        bzz_markets=bzz_match.get("bzz_markets", {}) if bzz_match else {},
+                        bzz_confidence=bzz_match.get("bzz_confidence", 0) if bzz_match else 0,
+                        bzz_odds_source="api_football",
+                    )
+                    pool_with_odds.append(md)
+
+                print(f"✅ API-Football : {len(pool_with_odds)} matchs avec vraies cotes prêts")
+
+        # 🟡 PRIORITÉ 2 : The Odds API (si dispo)
+        if not pool_with_odds and odds_events:
+            pool_api = await build_match_pool([], odds_events)
+            for md in pool_api:
+                if any((md.real_odds or {}).values()):
+                    pool_with_odds.append(md)
+            if pool_with_odds:
+                print(f"✅ The Odds API : {len(pool_with_odds)} matchs avec vraies cotes")
+
+        # 🟢 PRIORITÉ 3 : InferSports (si rien d'autre)
+        if not pool_with_odds and fetch_infer_odds:
             print("🔄 Fallback InferSports...")
-            matches_for_infer = [
-                {"event_id": md.event_id, "home": md.home, "away": md.away, "kickoff": md.kickoff}
-                for md in pool if not any((md.real_odds or {}).values())
-            ]
-            if matches_for_infer:
-                infer_map = await fetch_infer_odds(matches_for_infer)
-                for md in pool:
-                    if md.event_id in infer_map:
-                        md.real_odds = infer_map[md.event_id]
+            today_iso2 = datetime.now(TZ).strftime("%Y-%m-%d")
+            try:
+                import httpx as _hx
+                async with _hx.AsyncClient(timeout=20.0) as _c:
+                    _h = {"Accept": "application/json"}
+                    if INFERSPORTS_API_KEY:
+                        _h["Authorization"] = f"Bearer {INFERSPORTS_API_KEY}"
+                    _r = await _c.get("https://api.infersports.dev/v1/events",
+                                      headers=_h,
+                                      params={"date": today_iso2, "sport": "football"},
+                                      timeout=20.0)
+                    _data = _r.json() if _r.status_code == 200 else {}
+                    infer_events = _data.get("data", []) if isinstance(_data, dict) else []
+            except Exception as _e:
+                print(f"⚠️ InferSports events crash: {_e}")
+                infer_events = []
+
+            if infer_events:
+                infer_matches = []
+                for ev in infer_events:
+                    ht = ev.get("home_team", {}) if isinstance(ev.get("home_team"), dict) else {}
+                    at = ev.get("away_team", {}) if isinstance(ev.get("away_team"), dict) else {}
+                    lg = ev.get("league", {}) if isinstance(ev.get("league"), dict) else {}
+                    if not ht.get("name") or not at.get("name"):
+                        continue
+                    infer_matches.append(MatchData(
+                        event_id=ev.get("id", ""),
+                        league=lg.get("name", ""),
+                        home=ht.get("name", ""),
+                        away=at.get("name", ""),
+                        kickoff=ev.get("scheduled_at", ""),
+                        real_odds={},
+                        bzz_markets={},
+                        bzz_confidence=0,
+                    ))
+
+                matches_for_odds = [
+                    {"event_id": md.event_id, "home": md.home, "away": md.away, "kickoff": md.kickoff}
+                    for md in infer_matches
+                ]
+                infer_odds_map = await fetch_infer_odds(matches_for_odds)
+                for md in infer_matches:
+                    if md.event_id in infer_odds_map:
+                        md.real_odds = infer_odds_map[md.event_id]
                         md.bzz_odds_source = "infersports"
-                bzz_odds_count += len(infer_map)
-                print(f"📊 InferSports odds : {len(infer_map)}/{len(matches_for_infer)} matchs")
+                        pool_with_odds.append(md)
 
-        if not pool:
-            STATE["coupons"] = []
-            return
+        # === POOL B : matchs avec DIXON (MT-Fin) ===
+        pool_dixon = []
+        if STATE.get("dixon_model"):
+            for bz in bzz_preds:
+                if any(normalize_name(md.home) == normalize_name(bz["home"]) and
+                       normalize_name(md.away) == normalize_name(bz["away"]) for md in pool_with_odds):
+                    continue
+                md = MatchData(
+                    event_id=bz["event_id"],
+                    league=bz.get("league", ""),
+                    home=bz["home"], away=bz["away"],
+                    kickoff=bz.get("kickoff", ""),
+                    real_odds={},
+                    bzz_markets=bz.get("bzz_markets", {}),
+                    bzz_confidence=bz.get("bzz_confidence", 0),
+                )
+                try:
+                    pred = STATE["dixon_model"].predict_all(md.home, md.away)
+                    if pred:
+                        md.dixon_pred = pred
+                        pool_dixon.append(md)
+                except:
+                    pass
 
-        # === SÉLECTION INTELLIGENTE AVANT GEMINI ===
-        pool_usable = [md for md in pool if filter_no_hope(md)]
-        removed = len(pool) - len(pool_usable)
-        if removed > 0:
-            print(f"🗑 {removed} matchs retirés (aucune donnée)")
+        print(f"📋 Pool A (cotes réelles) : {len(pool_with_odds)} matchs")
+        print(f"📋 Pool B (Dixon only) : {len(pool_dixon)} matchs")
 
-        if not pool_usable:
+        pool_with_odds.sort(key=prescore_match, reverse=True)
+        pool_dixon.sort(key=prescore_match, reverse=True)
+
+        top_A = pool_with_odds[:15]
+        top_B = pool_dixon[:5]
+        top_pool = top_A + top_B
+
+        print(f"🏆 Top Pool A (cotes) :")
+        for md in top_A[:5]:
+            print(f"   [{prescore_match(md)}/100] {md.home} vs {md.away} ({md.league})")
+        print(f"🏆 Top Pool B (Dixon) :")
+        for md in top_B[:3]:
+            print(f"   [{prescore_match(md)}/100] {md.home} vs {md.away} ({md.league})")
+
+        if not top_pool:
             print("⚠️ Aucun match exploitable")
             STATE["coupons"] = []
             return
 
-        pool_usable.sort(key=prescore_match, reverse=True)
-
-        print(f"🏆 Top 5 matchs à analyser :")
-        for md in pool_usable[:5]:
-            print(f"   [{prescore_match(md)}/100] {md.home} vs {md.away}")
-
-        top_pool = pool_usable[:GEMINI_MAX_CALLS_PER_SCAN]
-        others = pool_usable[GEMINI_MAX_CALLS_PER_SCAN:]
-        print(f"🧠 Gemini sur {len(top_pool)} meilleurs (sur {len(pool_usable)})")
+        print(f"🧠 Gemini sur {len(top_pool)} matchs ({len(top_A)} cotes + {len(top_B)} Dixon)")
 
         await enrich_and_analyze(top_pool)
-        final_pool = top_pool + others
+        final_pool = top_pool
 
         STATE["coupons"] = build_all_coupons(final_pool)
         mark_picks_used([s for c in STATE["coupons"] for s in c.legs])
         STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
         STATE["debug"] = {
             "odds_events": len(odds_events),
-            "bzz_odds": bzz_odds_count,
+            "bzz_odds": len(pool_with_odds),
             "bzz_predictions": len(bzz_preds),
-            "pool": len(pool),
+            "pool": len(final_pool),
             "coupons": len(STATE["coupons"])
         }
         print(f"──────── RÉSUMÉ ────────")
-        print(f"Pool : {len(pool)}")
+        print(f"Pool A (cotes) : {len(pool_with_odds)}")
+        print(f"Pool B (Dixon) : {len(pool_dixon)}")
         print(f"Coupons : {len(STATE['coupons'])}")
         for c in STATE["coupons"]:
             print(f"  • {c.name} : {len(c.legs)} legs, cote {c.combined_odds}")
