@@ -1,5 +1,5 @@
 """
-Bzzoiro Direct — Filtre matchs terminés + garde kickoff_full si dispo.
+Bzzoiro Direct — Filtre matchs terminés + extrait date réelle.
 """
 from __future__ import annotations
 
@@ -85,7 +85,7 @@ def _parse_markets(mk):
     return result
 
 
-def _is_finished_or_live(ev: dict, pred: dict) -> bool:
+def _is_finished_or_live(ev, pred):
     if isinstance(ev, dict):
         for k in ["status", "state", "match_status", "live_status"]:
             v = str(ev.get(k, "")).lower().strip()
@@ -109,8 +109,8 @@ def _is_finished_or_live(ev: dict, pred: dict) -> bool:
     return False
 
 
-def _extract_kickoff(ev: dict, pred: dict):
-    """Retourne (kickoff_full_iso, date_only). kickoff_full vide si pas dispo."""
+def _extract_kickoff(ev, pred):
+    """Retourne (kickoff_iso_si_dispo, date_only_yyyy_mm_dd)."""
     for source in [ev, pred]:
         if not isinstance(source, dict):
             continue
@@ -119,10 +119,9 @@ def _extract_kickoff(ev: dict, pred: dict):
             if not v:
                 continue
             s = str(v)
-            # Full ISO datetime ?
             if re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", s):
-                return s, re.search(r"(\d{4}-\d{2}-\d{2})", s).group(1)
-            # Date only ?
+                m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+                return s, m.group(1) if m else ""
             m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
             if m:
                 return "", m.group(1)
@@ -133,9 +132,7 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
     if not BZZOIRO_API_KEY:
         print("⚠️ BZZOIRO_API_KEY manquante")
         return []
-
     print(f"🔮 Bzzoiro : fetching...")
-
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
             data = await _get(client, "/predictions/", {
@@ -147,14 +144,11 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
     except Exception as e:
         print(f"❌ Fetch crash: {e}")
         return []
-
     print(f"🔮 Bzzoiro : {len(preds)} brutes")
     if not preds:
         return []
-
     enriched = []
     rejected_status = 0
-
     for idx, pred in enumerate(preds):
         if not isinstance(pred, dict):
             continue
@@ -162,16 +156,13 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
         if _is_finished_or_live(ev, pred):
             rejected_status += 1
             continue
-
         mk = pred.get("markets")
         parsed = _parse_markets(mk)
         if not parsed:
             continue
-
         home = ""
         away = ""
         league = ""
-
         if isinstance(ev, dict):
             for k in ["home_team", "home", "team_a", "homeTeam"]:
                 v = ev.get(k)
@@ -184,12 +175,9 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
                     away = v if isinstance(v, str) else (v.get("name", "") if isinstance(v, dict) else str(v))
                     break
             league = ev.get("league_name") or ev.get("league") or ""
-
         if not home or not away:
             continue
-
         kickoff_full, match_date = _extract_kickoff(ev, pred)
-
         enriched.append({
             "event_id": f"bzz_{pred.get('id', idx)}",
             "home": home,
@@ -205,10 +193,8 @@ async def fetch_bzzoiro_predictions_direct(min_confidence=65.0):
             "real_odds": {},
             "odds_sport_key": "",
         })
-
     if rejected_status > 0:
         print(f"🚫 {rejected_status} rejetés (terminés/live)")
-
     print(f"🔮 Bzzoiro : {len(enriched)} retenues")
     for p in enriched[:3]:
         print(f"   ✅ [{p['bzz_confidence']:.0f}%] {p['home']} vs {p['away']} • {p['kickoff']}")
