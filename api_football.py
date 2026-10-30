@@ -24,7 +24,7 @@ async def fetch_odds_for_date(date_str: str) -> dict:
     print(f"📊 API-Football : Chargement des cotes du {date_str} (Toutes ligues)...")
     
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # On va chercher toutes les pages disponibles
+        # On boucle sur les pages pour tout récupérer
         for page in range(1, 31):
             try:
                 r = await client.get(
@@ -33,7 +33,8 @@ async def fetch_odds_for_date(date_str: str) -> dict:
                     params={"date": date_str, "page": page, "timezone": "UTC"}
                 )
                 if r.status_code == 429:
-                    await asyncio.sleep(5)
+                    print("⏳ Limite API atteinte, pause de 10s...")
+                    await asyncio.sleep(10)
                     continue
                 if r.status_code >= 400: break
                     
@@ -43,7 +44,6 @@ async def fetch_odds_for_date(date_str: str) -> dict:
 
                 for item in response:
                     league_name = item.get("league", {}).get("name", "")
-                    
                     fixture = item.get("fixture", {})
                     fixture_id = fixture.get("id")
                     
@@ -51,6 +51,7 @@ async def fetch_odds_for_date(date_str: str) -> dict:
                     home_name = teams.get("home", {}).get("name")
                     away_name = teams.get("away", {}).get("name")
                     
+                    # 🛡️ SÉCURITÉ ANTI-FANTÔME (Fini les " vs ")
                     if not fixture_id or not home_name or not away_name: continue
 
                     # Filtre strict : on ne garde que les matchs NON COMMENCÉS
@@ -89,7 +90,6 @@ async def fetch_odds_for_date(date_str: str) -> dict:
                         if odds_data["home"] and odds_data["draw"] and odds_data["away"]:
                             break
                     
-                    # ON GARDE TOUS LES MATCHS AVEC COTES (Même les favoris, c'est main.py qui filtrera)
                     if odds_data["home"] or odds_data["away"]:
                         event_id = f"af_{fixture_id}"
                         results[event_id] = {
