@@ -1,0 +1,131 @@
+"""
+Odds Fallback — InferSports (avec clé API)
+Récupère les cotes 1X2 + O/U via l'API asiatique quand The Odds API et Bzzoiro sont vides.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import httpx
+from typing import Optional
+
+INFER_BASE = "https://api.infersports.dev"
+INFER_API_KEY = os.getenv("INFERSPORTS_API_KEY", "")  # La clé sera lue depuis Render
+CACHE: dict = {}
+
+
+def _headers() -> dict:
+    """Retourne les headers, avec l'authentification si la clé est présente."""
+    h = {}
+    if INFER_API_KEY:
+        h["Authorization"] = f"Bearer {INFER_API_KEY}"
+    return h
+
+
+async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dict:
+    try:
+        r = await client.get(f"{INFER_BASE}{path}", headers=_headers(), params=params or {}, timeout=15.0)
+        if r.status_code >= 400:
+            print(f"⚠️ InferSports {path} -> {r.status_code}")
+            return {}
+        return r.json()
+    except Exception as e:
+        print(f"⚠️ InferSports {path} crash: {e}")
+        return {}
+
+
+def _safe_float(v) -> Optional[float]:
+    """Convertit une cote (decimal) en float > 1.01 sinon None."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        return f if f > 1.01 else None
+    except (ValueError, TypeError):
+        return None
+
+
+async def fetch_event_odds(client: httpx.AsyncClient, event_name: str, date: str) -> dict:
+    """
+    Cherche le match sur InferSports et retourne les cotes normalisées.
+    Format retour : {home, draw, away, over_2.5, under_2.5, btts_yes, btts_no}
+    """
+    cache_key = f"{event_name}_{date}"
+    if cache_key in CACHE:
+        return CACHE[cache_key]
+
+    # 1. Chercher l'événement
+    events = await _get(client, "/v1/events", {"date": date, "sport": "football"})
+    if not events or not isinstance(events, list):
+        CACHE[cache_key] = {}
+        return {}
+
+    # Matching simple par nom (à améliorer si besoin)
+    target = event_name.lower().replace(" ", "")
+    event_id = None
+    for ev in events:
+        name = (ev.get("name") or "").lower().replace(" ", "")
+        if target in name or name in target:
+            event_id = ev.get("id")
+            break
+
+    if not event_id:
+        CACHE[cache_key] = {}
+        return {}
+
+    # 2. Récupérer les cotes
+    odds_data = await _get(client, f"/v1/events/{event_id}/odds", {"format": "decimal"})
+    if not odds_data:
+        CACHE[cache_key] = {}
+        return {}
+
+    result = {
+        "home": None, "draw": None, "away": None,
+        "over_2.5": None, "under_2.5": None,
+        "btts_yes": None, "btts_no": None
+    }
+
+    # Parser selon le format InferSports
+    markets = odds_data if isinstance(odds_data, dict) else {}
+    if "markets" in markets:
+        markets = markets["markets"]
+
+    # 1X2
+    h2h = markets.get("1x2") or markets.get("moneyline") or {}
+    if isinstance(h2h, dict):
+        result["home"] = _safe_float(h2h.get("home"))
+        result["draw"] = _safe_float(h2h.get("draw"))
+        result["away"] = _safe_float(h2h.get("away"))
+
+    # Over/Under 2.5
+    totals = markets.get("totals") or markets.get("over_under") or {}
+    if isinstance(totals, dict):
+        result["over_2.5"] = _safe_float(totals.get("over_2.5"))
+        result["under_2.5"] = _safe_float(totals.get("under_2.5"))
+
+    # BTTS (si dispo)
+    btts = markets.get("btts") or {}
+    if isinstance(btts, dict):
+        result["btts_yes"] = _safe_float(btts.get("yes"))
+        result["btts_no"] = _safe_float(btts.get("no"))
+
+    CACHE[cache_key] = result
+    return result
+
+
+async def fetch_all_odds(matches: list[dict]) -> dict:
+    """
+    matches = [{"event_id": "bzz_123", "home": "X", "away": "Y", "kickoff": "2026-10-30"}]
+    Retourne {event_id: {home, draw, ...}}
+    """
+    results = {}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        for m in matches[:30]:  # limite pour ne pas exploser le temps
+            event_name = f"{m['home']} vs {m['away']}"
+            date = m.get("kickoff", "")[:10]  # YYYY-MM-DD
+            odds = await fetch_event_odds(client, event_name, date)
+            if odds and any(v for v in odds.values()):
+                results[m["event_id"]] = odds
+            await asyncio.sleep(0.2)
+    print(f"📊 InferSports odds : {len(results)}/{len(matches)} matchs avec cotes")
+    return results
