@@ -1,183 +1,131 @@
 """
-API-Football v3 — Version respectueuse du rate limit (10 req/min gratuit).
+API-Football v3 — Récupération massive des cotes par date (ultra-optimisé).
+Utilise 5 requêtes pour récupérer des dizaines de matchs avec cotes.
 """
 from __future__ import annotations
-
 import asyncio
 import os
 from typing import Optional
-
 import httpx
 
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
-_CACHE: dict = {}
 
-# ⚠️ Rate limit gratuit = 10 req/minute
-# On limite à 8 fixtures par scan = 1 (fixtures) + 8 (odds) = 9 requêtes
-# Avec sleep 7.5s entre chaque = 60s pour 8 odds
-MAX_FIXTURES_ODDS = 8
-SLEEP_BETWEEN_ODDS = 7.5
-
+# On exclut le Top 5 (Anti-Vague)
+TOP_LEAGUES_TO_EXCLUDE = ["Premier League", "Ligue 1", "La Liga", "Serie A", "Bundesliga"]
 
 def _headers() -> dict:
     return {"x-apisports-key": API_FOOTBALL_KEY}
 
-
 def _safe_float(v) -> Optional[float]:
-    if v is None:
-        return None
+    if v is None: return None
     try:
         f = float(v)
         return f if f > 1.01 else None
-    except (ValueError, TypeError):
-        return None
+    except (ValueError, TypeError): return None
 
-
-async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dict:
-    try:
-        r = await client.get(f"{API_FOOTBALL_BASE}{path}", headers=_headers(),
-                             params=params or {}, timeout=20.0)
-        if r.status_code == 429:
-            print(f"⚠️ API-Football {path} -> 429 (rate limit)")
-            return {"_rate_limited": True}
-        if r.status_code >= 400:
-            print(f"⚠️ API-Football {path} -> {r.status_code} | {r.text[:100]}")
-            return {}
-        return r.json() if r.text else {}
-    except Exception as e:
-        print(f"⚠️ API-Football {path} crash: {e}")
-        return {}
-
-
-async def fetch_fixtures_today(date_str: str) -> list:
-    """Fixtures du jour NON commencées."""
-    cache_key = f"fixtures_{date_str}"
-    if cache_key in _CACHE:
-        return _CACHE[cache_key]
-
-    async with httpx.AsyncClient(timeout=25.0) as client:
-        data = await _get(client, "/fixtures", {"date": date_str, "timezone": "UTC"})
-
-    response = data.get("response", []) if isinstance(data, dict) else []
-    fixtures = []
-
-    for f in response:
-        fx = f.get("fixture", {})
-        status = fx.get("status", {}).get("short", "")
-        if status != "NS":
-            continue
-
-        fixture_id = fx.get("id")
-        teams = f.get("teams", {})
-        league = f.get("league", {})
-        home = teams.get("home", {}).get("name", "")
-        away = teams.get("away", {}).get("name", "")
-        if not home or not away or not fixture_id:
-            continue
-
-        fixtures.append({
-            "event_id": f"af_{fixture_id}",
-            "fixture_id": fixture_id,
-            "home": home,
-            "away": away,
-            "league": league.get("name", ""),
-            "country": league.get("country", ""),
-            "kickoff": fx.get("date", ""),
-        })
-
-    _CACHE[cache_key] = fixtures
-    print(f"📊 API-Football : {len(fixtures)} fixtures NS le {date_str}")
-    return fixtures
-
-
-async def fetch_fixture_odds(fixture_id: int) -> dict:
-    """Récupère les cotes pour un fixture."""
-    cache_key = f"odds_{fixture_id}"
-    if cache_key in _CACHE:
-        return _CACHE[cache_key]
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        data = await _get(client, "/odds", {"fixture": fixture_id})
-
-    if data.get("_rate_limited"):
-        return {}
-
-    result = {
-        "home": None, "draw": None, "away": None,
-        "over_2.5": None, "under_2.5": None,
-        "btts_yes": None, "btts_no": None,
-    }
-
-    response = data.get("response", []) if isinstance(data, dict) else []
-    if not response:
-        _CACHE[cache_key] = {}
-        return {}
-
-    for item in response:
-        for bk in item.get("bookmakers", []):
-            for bet in bk.get("bets", []):
-                bet_name = (bet.get("name") or "").lower()
-                values = bet.get("values", [])
-
-                if "match winner" in bet_name:
-                    for v in values:
-                        val = (v.get("value") or "").lower()
-                        odd = _safe_float(v.get("odd"))
-                        if val == "home" and result["home"] is None:
-                            result["home"] = odd
-                        elif val == "draw" and result["draw"] is None:
-                            result["draw"] = odd
-                        elif val == "away" and result["away"] is None:
-                            result["away"] = odd
-
-                elif ("over/under" in bet_name or "goals over/under" in bet_name) and "2.5" in bet_name:
-                    for v in values:
-                        val = (v.get("value") or "").lower()
-                        odd = _safe_float(v.get("odd"))
-                        if ("over" in val) and result["over_2.5"] is None:
-                            result["over_2.5"] = odd
-                        elif ("under" in val) and result["under_2.5"] is None:
-                            result["under_2.5"] = odd
-
-                elif "both teams" in bet_name:
-                    for v in values:
-                        val = (v.get("value") or "").lower()
-                        odd = _safe_float(v.get("odd"))
-                        if val == "yes" and result["btts_yes"] is None:
-                            result["btts_yes"] = odd
-                        elif val == "no" and result["btts_no"] is None:
-                            result["btts_no"] = odd
-
-            if result["home"] and result["draw"] and result["away"]:
-                _CACHE[cache_key] = result
-                return result
-
-    _CACHE[cache_key] = result
-    return result if any(result.values()) else {}
-
-
-async def fetch_all_odds(fixtures: list[dict]) -> dict:
-    """Récupère les cotes pour un MAX de 8 fixtures (respecte rate limit)."""
+async def fetch_odds_for_date(date_str: str) -> dict:
+    """
+    Récupère toutes les cotes de la journée en 5 requêtes max.
+    Retourne un dictionnaire prêt pour le bot.
+    """
     if not API_FOOTBALL_KEY:
-        print("⚠️ API-Football : pas de clé API_FOOTBALL_KEY")
+        print("⚠️ API-Football : pas de clé")
         return {}
 
     results = {}
-    limited = fixtures[:MAX_FIXTURES_ODDS]
+    print(f"📊 API-Football : Chargement des cotes du {date_str}...")
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # On demande les 5 premières pages d'odds (environ 50 à 100 matchs couverts)
+        for page in range(1, 6):
+            try:
+                r = await client.get(
+                    f"{API_FOOTBALL_BASE}/odds", 
+                    headers=_headers(), 
+                    params={"date": date_str, "page": page, "timezone": "UTC"}
+                )
+                
+                if r.status_code == 429:
+                    print("⏳ Limite API atteinte. Pause de 10s...")
+                    await asyncio.sleep(10)
+                    continue # On réessaie
+                
+                if r.status_code >= 400:
+                    break
+                    
+                data = r.json()
+                response = data.get("response", [])
+                if not response:
+                    break # Plus de matchs sur cette page
 
-    print(f"📊 API-Football : {len(limited)} fixtures (limite rate-limit), ~{len(limited)*SLEEP_BETWEEN_ODDS:.0f}s")
+                for item in response:
+                    league_name = item.get("league", {}).get("name", "")
+                    
+                    # FILTRE ANTI-VAGUE : On jette les grands championnats
+                    if any(top in league_name for top in TOP_LEAGUES_TO_EXCLUDE):
+                        continue
 
-    for idx, fx in enumerate(limited):
-        fid = fx.get("fixture_id")
-        if not fid:
-            continue
-        odds = await fetch_fixture_odds(fid)
-        if odds and any(v for v in odds.values()):
-            results[fx["event_id"]] = odds
-        # ⚠️ Sleep SAUF pour le dernier
-        if idx < len(limited) - 1:
-            await asyncio.sleep(SLEEP_BETWEEN_ODDS)
+                    fixture = item.get("fixture", {})
+                    fixture_id = fixture.get("id")
+                    
+                    if not fixture_id:
+                        continue
 
-    print(f"📊 API-Football odds : {len(results)}/{len(limited)} matchs avec cotes")
+                    # Parsing des bookmakers
+                    odds_data = {"home": None, "draw": None, "away": None, "over_2.5": None, "under_2.5": None, "btts_yes": None, "btts_no": None}
+                    
+                    for bk in item.get("bookmakers", []):
+                        for bet in bk.get("bets", []):
+                            bet_name = (bet.get("name") or "").lower()
+                            values = bet.get("values", [])
+                            
+                            if "match winner" in bet_name:
+                                for v in values:
+                                    val = (v.get("value") or "").lower()
+                                    odd = _safe_float(v.get("odd"))
+                                    if val == "home" and not odds_data["home"]: odds_data["home"] = odd
+                                    elif val == "draw" and not odds_data["draw"]: odds_data["draw"] = odd
+                                    elif val == "away" and not odds_data["away"]: odds_data["away"] = odd
+                            
+                            elif ("over/under" in bet_name or "goals over/under" in bet_name) and "2.5" in bet_name:
+                                for v in values:
+                                    val = (v.get("value") or "").lower()
+                                    odd = _safe_float(v.get("odd"))
+                                    if "over" in val and not odds_data["over_2.5"]: odds_data["over_2.5"] = odd
+                                    elif "under" in val and not odds_data["under_2.5"]: odds_data["under_2.5"] = odd
+                            
+                            elif "both teams" in bet_name:
+                                for v in values:
+                                    val = (v.get("value") or "").lower()
+                                    odd = _safe_float(v.get("odd"))
+                                    if val == "yes" and not odds_data["btts_yes"]: odds_data["btts_yes"] = odd
+                                    elif val == "no" and not odds_data["btts_no"]: odds_data["btts_no"] = odd
+
+                        # Si on a le 1X2 complet, on s'arrête pour ce match
+                        if odds_data["home"] and odds_data["draw"] and odds_data["away"]:
+                            break
+                    
+                    # On garde le match SEULEMENT si le favori n'est pas trop évident (< 1.30)
+                    if odds_data["home"] or odds_data["away"]:
+                        min_odd = min([x for x in [odds_data["home"], odds_data["away"]] if x] or [10])
+                        if min_odd >= 1.30:
+                            event_id = f"af_{fixture_id}"
+                            results[event_id] = {
+                                "event_id": event_id,
+                                "fixture_id": fixture_id,
+                                "home": item.get("teams", {}).get("home", {}).get("name", ""),
+                                "away": item.get("teams", {}).get("away", {}).get("name", ""),
+                                "league": league_name,
+                                "kickoff": fixture.get("date", ""),
+                                "odds": odds_data
+                            }
+                
+                await asyncio.sleep(1) # Petite pause entre les pages
+                
+            except Exception as e:
+                print(f"⚠️ API-Football crash page {page}: {e}")
+                break
+
+    print(f"📊 API-Football : {len(results)} matchs avec cotes trouvés (Hors Top 5).")
     return results
