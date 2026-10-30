@@ -6,7 +6,6 @@ import httpx
 
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
-TOP_LEAGUES_TO_EXCLUDE = ["Premier League", "Ligue 1", "La Liga", "Serie A", "Bundesliga"]
 
 def _headers() -> dict:
     return {"x-apisports-key": API_FOOTBALL_KEY}
@@ -22,11 +21,11 @@ async def fetch_odds_for_date(date_str: str) -> dict:
     if not API_FOOTBALL_KEY: return {}
 
     results = {}
-    print(f"📊 API-Football : Chargement des cotes du {date_str}...")
+    print(f"📊 API-Football : Chargement des cotes du {date_str} (Toutes ligues)...")
     
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # On monte à 10 pages pour avoir un maximum de matchs
-        for page in range(1, 11):
+        # On va chercher toutes les pages disponibles
+        for page in range(1, 31):
             try:
                 r = await client.get(
                     f"{API_FOOTBALL_BASE}/odds", 
@@ -34,7 +33,7 @@ async def fetch_odds_for_date(date_str: str) -> dict:
                     params={"date": date_str, "page": page, "timezone": "UTC"}
                 )
                 if r.status_code == 429:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(5)
                     continue
                 if r.status_code >= 400: break
                     
@@ -44,18 +43,19 @@ async def fetch_odds_for_date(date_str: str) -> dict:
 
                 for item in response:
                     league_name = item.get("league", {}).get("name", "")
-                    if any(top in league_name for top in TOP_LEAGUES_TO_EXCLUDE): continue
-
+                    
                     fixture = item.get("fixture", {})
                     fixture_id = fixture.get("id")
                     
-                    # 🛡️ CORRECTION DU BUG : Vérification stricte des noms
                     teams = item.get("teams", {})
                     home_name = teams.get("home", {}).get("name")
                     away_name = teams.get("away", {}).get("name")
                     
-                    if not fixture_id or not home_name or not away_name:
-                        continue # On jette immédiatement le match s'il n'y a pas les noms
+                    if not fixture_id or not home_name or not away_name: continue
+
+                    # Filtre strict : on ne garde que les matchs NON COMMENCÉS
+                    status = fixture.get("status", {}).get("short", "")
+                    if status not in ["NS", "TBD"]: continue
 
                     odds_data = {"home": None, "draw": None, "away": None, "over_2.5": None, "under_2.5": None, "btts_yes": None, "btts_no": None}
                     
@@ -89,21 +89,20 @@ async def fetch_odds_for_date(date_str: str) -> dict:
                         if odds_data["home"] and odds_data["draw"] and odds_data["away"]:
                             break
                     
+                    # ON GARDE TOUS LES MATCHS AVEC COTES (Même les favoris, c'est main.py qui filtrera)
                     if odds_data["home"] or odds_data["away"]:
-                        min_odd = min([x for x in [odds_data["home"], odds_data["away"]] if x] or [10])
-                        if min_odd >= 1.30:
-                            event_id = f"af_{fixture_id}"
-                            results[event_id] = {
-                                "event_id": event_id,
-                                "fixture_id": fixture_id,
-                                "home": home_name,
-                                "away": away_name,
-                                "league": league_name,
-                                "kickoff": fixture.get("date", ""),
-                                "odds": odds_data
-                            }
-                await asyncio.sleep(1)
+                        event_id = f"af_{fixture_id}"
+                        results[event_id] = {
+                            "event_id": event_id,
+                            "fixture_id": fixture_id,
+                            "home": home_name,
+                            "away": away_name,
+                            "league": league_name,
+                            "kickoff": fixture.get("date", ""),
+                            "odds": odds_data
+                        }
+                await asyncio.sleep(0.5)
             except Exception:
                 break
-    print(f"📊 API-Football : {len(results)} matchs valides avec cotes (Hors Top 5).")
+    print(f"📊 API-Football : {len(results)} matchs valides avec cotes (Toutes ligues).")
     return results
