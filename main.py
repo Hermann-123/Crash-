@@ -32,28 +32,34 @@ except Exception as e:
 
 try:
     from bzzoiro_data import enrich_match_with_bzzoiro
-except Exception:
+except Exception as e:
     enrich_match_with_bzzoiro = None
+    print(f"❌ bzzoiro_data: {e}")
 
 try:
     from bzzoiro_predictions_direct import fetch_bzzoiro_predictions_direct
-except Exception:
+except Exception as e:
     fetch_bzzoiro_predictions_direct = None
+    print(f"❌ bzzoiro_predictions_direct: {e}")
 
 try:
     from bzzoiro_odds import fetch_all_odds as fetch_bzzoiro_odds
-except Exception:
+except Exception as e:
     fetch_bzzoiro_odds = None
+    print(f"❌ bzzoiro_odds: {e}")
 
 try:
     from odds_fallback import fetch_all_odds as fetch_infer_odds
-except Exception:
+    print("✅ odds_fallback chargé")
+except Exception as e:
     fetch_infer_odds = None
+    print(f"❌ odds_fallback: {e}")
 
 try:
     from dixon_coles import download_and_train
-except Exception:
+except Exception as e:
     download_and_train = None
+    print(f"❌ dixon_coles: {e}")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
@@ -532,7 +538,6 @@ async def build_match_pool(bzz_preds, odds_events):
     return pool
 
 def prescore_match(md) -> int:
-    """Score préliminaire SANS Gemini, pour trier le pool avant enrichissement."""
     score = 0
     if md.real_odds:
         n_odds = sum(1 for v in md.real_odds.values() if v)
@@ -555,7 +560,6 @@ def prescore_match(md) -> int:
 
 
 def filter_no_hope(md) -> bool:
-    """True = match à garder, False = à retirer (aucune donnée exploitable)."""
     has_odds = md.real_odds and any(v for v in md.real_odds.values())
     has_bzz = md.bzz_markets and any(v for v in md.bzz_markets.values())
     has_dixon = md.dixon_pred is not None
@@ -1266,6 +1270,7 @@ async def scan():
                         md.bzz_odds_source = "bzzoiro"
 
         # === FALLBACK INFERSPORTS si Bzzoiro n'a rien donné ===
+        print(f"🔎 DEBUG FALLBACK: odds_events={len(odds_events)}, bzz_odds_count={bzz_odds_count}, fetch_infer_odds={'OUI' if fetch_infer_odds else 'NON (None)'}")
         if not odds_events and bzz_odds_count == 0 and fetch_infer_odds:
             print("🔄 Fallback InferSports...")
             matches_for_infer = [
@@ -1279,6 +1284,7 @@ async def scan():
                         md.real_odds = infer_map[md.event_id]
                         md.bzz_odds_source = "infersports"
                 bzz_odds_count += len(infer_map)
+                print(f"📊 InferSports odds : {len(infer_map)}/{len(matches_for_infer)} matchs")
 
         if not pool:
             STATE["coupons"] = []
