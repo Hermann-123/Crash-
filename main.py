@@ -24,6 +24,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
 
+# --- IMPORTS ---
 try:
     from gemini_predictor import predict_match_probas
 except Exception as e:
@@ -42,25 +43,12 @@ except Exception as e:
     fetch_bzzoiro_predictions_direct = None
     print(f"❌ bzzoiro_predictions_direct: {e}")
 
+# ⭐ NOUVEL IMPORT OPTIMISÉ API-FOOTBALL
 try:
-    from bzzoiro_odds import fetch_all_odds as fetch_bzzoiro_odds
-except Exception as e:
-    fetch_bzzoiro_odds = None
-    print(f"❌ bzzoiro_odds: {e}")
-
-try:
-    from odds_fallback import fetch_all_odds as fetch_infer_odds
-    print("✅ odds_fallback chargé")
-except Exception as e:
-    fetch_infer_odds = None
-    print(f"❌ odds_fallback: {e}")
-
-try:
-    from api_football import fetch_fixtures_today as af_fetch_fixtures, fetch_all_odds as af_fetch_odds
+    from api_football import fetch_odds_for_date as af_fetch_odds_date
     print("✅ api_football chargé")
 except Exception as e:
-    af_fetch_fixtures = None
-    af_fetch_odds = None
+    af_fetch_odds_date = None
     print(f"❌ api_football: {e}")
 
 try:
@@ -69,19 +57,16 @@ except Exception as e:
     download_and_train = None
     print(f"❌ dixon_coles: {e}")
 
+# --- VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
-INFERSPORTS_API_KEY = os.getenv("INFERSPORTS_API_KEY", "")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 
-try:
-    ADMIN_ID = int(TELEGRAM_ADMIN_ID)
-except ValueError:
-    ADMIN_ID = 0
+try: ADMIN_ID = int(TELEGRAM_ADMIN_ID)
+except ValueError: ADMIN_ID = 0
 
 NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "10"))
 NOTIFY_MINUTE = int(os.getenv("NOTIFY_MINUTE", "0"))
@@ -96,24 +81,22 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • 4 Moteurs")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "20"))
+# On monte à 30 appels Gemini pour couvrir les besoins des 4 tickets (16 matchs requis)
+GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "30"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
 # MOTEUR 1 : ODDS +3
 ODDS3_MIN_SCORE = 80
-ODDS3_FALLBACK_SCORE = 75
 ODDS3_MIN_ODDS = 3.0
 ODDS3_MAX_ODDS = 4.5
 ODDS3_MIN_LEG_ODDS = 1.55
 ODDS3_MAX_LEG_ODDS = 2.20
-ODDS3_MIN_LEG_ODDS_ABS = 1.25
 ODDS3_MIN_VALUE = 0.05
 ODDS3_MIN_LEGS = 2
 ODDS3_MAX_LEGS = 3
 
 # MOTEUR 2 : ODDS +10
 ODDS10_MIN_SCORE = 80
-ODDS10_FALLBACK_SCORE = 75
 ODDS10_MIN_ODDS = 10.0
 ODDS10_MIN_LEG_ODDS = 1.35
 ODDS10_MAX_LEG_ODDS = 1.65
@@ -126,16 +109,13 @@ ODDS10_MAX_SAME_LEAGUE = 2
 
 # MOTEUR 3 : MT-FIN
 MTFIN_MIN_SCORE = 80
-MTFIN_FALLBACK_SCORE = 75
 MTFIN_MIN_PROB = 0.40
 MTFIN_TOP_N = 3
 MTFIN_SIMULATIONS = 2000
 MTFIN_FIRST_HALF_RATIO = 0.45
-MTFIN_MIN_COMBINED_ODDS = 1.35
 
 # MOTEUR 4 : MATCH NUL
 DRAW_MIN_SCORE = 80
-DRAW_FALLBACK_SCORE = 75
 DRAW_MIN_PROB = 0.28
 DRAW_GEMINI_MIN_PROB = 0.22
 DRAW_MIN_ODD = 3.10
@@ -146,41 +126,19 @@ DRAW_MAX_AWAY_ODD = 4.50
 DRAW_TOP_N = 3
 
 TELEGRAM_MAX_LEN = 3800
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN manquant")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY manquant")
-if not ADMIN_ID:
-    raise RuntimeError("TELEGRAM_ADMIN_ID manquant")
-
 TZ = ZoneInfo(NOTIFY_TZ)
-ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-SOCCER_KEYS = [
-    "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
-    "soccer_germany_bundesliga", "soccer_france_ligue_one",
-    "soccer_uefa_champs_league", "soccer_uefa_europa_league",
-    "soccer_efl_champ", "soccer_efl_league_one",
-    "soccer_spain_la_liga2", "soccer_italy_serie_b",
-    "soccer_germany_bundesliga2", "soccer_france_ligue_two",
-    "soccer_netherlands_eredivisie", "soccer_netherlands_eerste_divisie",
-    "soccer_portugal_primeira_liga", "soccer_belgium_first_div",
-    "soccer_turkey_super_league", "soccer_greece_super_league",
-    "soccer_scotland_premiership",
-    "soccer_brazil_campeonato", "soccer_argentina_primera_division",
-    "soccer_usa_mls", "soccer_mexico_ligamx", "soccer_japan_j_league",
-]
+if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
+    raise RuntimeError("Variables d'environnement manquantes")
 
+# --- FONCTIONS UTILITAIRES ---
 def today_pretty():
-    months = {1:"janvier",2:"février",3:"mars",4:"avril",5:"mai",6:"juin",
-              7:"juillet",8:"août",9:"septembre",10:"octobre",11:"novembre",12:"décembre"}
     d = datetime.now(TZ)
+    months = {1:"janvier",2:"février",3:"mars",4:"avril",5:"mai",6:"juin",7:"juillet",8:"août",9:"septembre",10:"octobre",11:"novembre",12:"décembre"}
     return f"{d.day} {months[d.month]} {d.year}"
 
 def normalize_name(s: str) -> str:
-    if not s:
-        return ""
+    if not s: return ""
     s = str(s).lower().strip()
     s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
     for sfx in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
@@ -189,37 +147,18 @@ def normalize_name(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 def parse_dt_safe(s) -> Optional[datetime]:
-    if not s:
-        return None
-    if isinstance(s, (int, float)):
-        try:
-            return datetime.fromtimestamp(int(s), tz=ZoneInfo("UTC")).astimezone(TZ)
-        except Exception:
-            return None
-    s = str(s).strip()
-    if not s:
-        return None
-    s = re.sub(r"(\.\d{6})\d+", r"\1", s).replace("Z", "+00:00")
+    if not s: return None
     try:
+        s = str(s).replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=ZoneInfo("UTC"))
         return dt.astimezone(TZ)
-    except Exception:
-        return None
+    except: return None
 
 def format_kickoff(kickoff_str) -> str:
-    if not kickoff_str:
-        return "?"
-    s = str(kickoff_str).strip()
-    dt = parse_dt_safe(s)
-    if dt:
-        if "T" in s or (" " in s and len(s) > 10):
-            return dt.strftime("%d/%m %H:%M")
-        return dt.strftime("%d/%m")
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
-    if m:
-        return f"{m.group(3)}/{m.group(2)}"
+    if not kickoff_str: return "?"
+    dt = parse_dt_safe(kickoff_str)
+    if dt: return dt.strftime("%d/%m %H:%M")
     return "?"
 
 def prob_bar(p: float) -> str:
@@ -236,8 +175,7 @@ def quality_bar(score: int) -> str:
     return "⭐"
 
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
-    if len(text) <= max_len:
-        return [text]
+    if len(text) <= max_len: return [text]
     parts, current = [], ""
     for line in text.split("\n"):
         if len(current) + len(line) + 1 > max_len:
@@ -262,8 +200,7 @@ def _binomial_sample(n: int, p: float) -> int:
 def simulate_htft(lambda_home: float, lambda_away: float, n_sims: int = MTFIN_SIMULATIONS) -> dict:
     counts = {}
     for _ in range(n_sims):
-        hg = _poisson_sample(lambda_home)
-        ag = _poisson_sample(lambda_away)
+        hg, ag = _poisson_sample(lambda_home), _poisson_sample(lambda_away)
         ht_hg = _binomial_sample(hg, MTFIN_FIRST_HALF_RATIO)
         ht_ag = _binomial_sample(ag, MTFIN_FIRST_HALF_RATIO)
         ht_res = "V1" if ht_hg > ht_ag else ("X" if ht_hg == ht_ag else "V2")
@@ -271,45 +208,6 @@ def simulate_htft(lambda_home: float, lambda_away: float, n_sims: int = MTFIN_SI
         key = f"{ht_res}/{ft_res}"
         counts[key] = counts.get(key, 0) + 1
     return {k: round(v / n_sims, 4) for k, v in counts.items()}
-
-W_GEMINI = 0.35
-W_DIXON = 0.25
-W_BZZOIRO = 0.40
-
-def combine_sources(gem, dixon, bzz):
-    result = {}
-    g, d, b = {}, {}, {}
-    for k in ["victoire_home", "match_nul", "victoire_away", "over_2.5", "under_2.5",
-              "over_3.5", "btts_yes", "btts_no", "btts_over_25"]:
-        v = gem.get(k)
-        if v is not None:
-            try: g[k] = max(0, min(1, float(v) / 100.0))
-            except: pass
-    if dixon:
-        d = {"victoire_home": dixon.get("p_home",0), "match_nul": dixon.get("p_draw",0),
-             "victoire_away": dixon.get("p_away",0), "over_2.5": dixon.get("over_2.5",0),
-             "under_2.5": dixon.get("under_2.5",0), "over_3.5": dixon.get("over_3.5",0),
-             "btts_yes": dixon.get("btts_yes",0), "btts_no": dixon.get("btts_no",0)}
-    if bzz:
-        for k in list(g.keys()) + ["btts_over_25"]:
-            v = bzz.get(k)
-            if v is not None:
-                try: b[k] = max(0, min(1, float(v) / 100.0))
-                except: pass
-    all_k = set(g) | set(d) | set(b)
-    for k in all_k:
-        tw, tv = 0.0, 0.0
-        if k in g: tv += W_GEMINI * g[k]; tw += W_GEMINI
-        if k in d and d[k] > 0: tv += W_DIXON * d[k]; tw += W_DIXON
-        if k in b: tv += W_BZZOIRO * b[k]; tw += W_BZZOIRO
-        if tw > 0: result[k] = tv / tw
-    if "victoire_home" in result and "match_nul" in result:
-        result["double_chance_1X"] = result["victoire_home"] + result["match_nul"]
-    if "victoire_home" in result and "victoire_away" in result:
-        result["double_chance_12"] = result["victoire_home"] + result["victoire_away"]
-    if "match_nul" in result and "victoire_away" in result:
-        result["double_chance_X2"] = result["match_nul"] + result["victoire_away"]
-    return result
 
 @dataclass
 class MatchData:
@@ -351,9 +249,6 @@ class Selection:
     advices: list = None
     htft_pick: str = ""
     prob_sources_agreement: str = ""
-
-    def final_prob(self) -> float:
-        return self.model_prob
 
 @dataclass
 class Coupon:
@@ -438,141 +333,24 @@ def save_tracker(data):
         with open(LOCAL_DB, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
     except: pass
 
-def load_used_today():
-    today = datetime.now(TZ).strftime("%Y-%m-%d")
-    u = STATE["tracker"].get("used_today", {})
-    if u.get("date") != today: return set()
-    return set(u.get("ids", []))
-
-def save_used_today(ids):
-    today = datetime.now(TZ).strftime("%Y-%m-%d")
-    ex = STATE["tracker"].get("used_today", {})
-    merged = (set(ex.get("ids", [])) | ids) if ex.get("date") == today else ids
-    STATE["tracker"]["used_today"] = {"date": today, "ids": list(merged)}
-    save_tracker(STATE["tracker"])
-
-def mark_picks_used(selections):
-    if selections: save_used_today({s.event_id for s in selections})
-
 def record_coupons(coupons, date_str):
     tracker = STATE["tracker"]
     existing = {c["id"] for c in tracker["coupons"]}
     for c in coupons:
         cid = f"{date_str}-{c.name}"
         if cid in existing: continue
-        legs = [{"event_id": s.event_id, "home": s.home, "away": s.away,
-                 "market": s.market, "pick_label": s.pick_label, "odds": s.odds,
-                 "kickoff": s.kickoff, "result": "pending"} for s in c.legs]
-        tracker["coupons"].append({"id": cid, "date": date_str, "name": c.name,
-                                   "combined_odds": c.combined_odds, "legs": legs, "status": "pending"})
+        legs = [{"event_id": s.event_id, "home": s.home, "away": s.away, "market": s.market, "pick_label": s.pick_label, "odds": s.odds, "kickoff": s.kickoff, "result": "pending"} for s in c.legs]
+        tracker["coupons"].append({"id": cid, "date": date_str, "name": c.name, "combined_odds": c.combined_odds, "legs": legs, "status": "pending"})
     tracker["coupons"] = tracker["coupons"][-500:]
     save_tracker(tracker)
 
-async def fetch_odds_api_league(client, sport_key):
-    try:
-        r = await client.get(f"{ODDS_API_BASE}/sports/{sport_key}/odds", params={
-            "apiKey": ODDS_API_KEY, "regions": "eu", "markets": "h2h,totals,btts",
-            "oddsFormat": "decimal"}, timeout=30.0)
-        if r.status_code >= 400: return []
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except: return []
-
-async def fetch_all_odds_events():
-    events = []
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        for k in SOCCER_KEYS:
-            events.extend(await fetch_odds_api_league(client, k))
-            await asyncio.sleep(0.15)
-    print(f"💰 Odds API : {len(events)} events")
-    return events
-
-def extract_real_odds(ev):
-    res = {"home": None, "draw": None, "away": None, "over_2.5": None,
-           "under_2.5": None, "btts_yes": None, "btts_no": None}
-    h, a = ev.get("home_team",""), ev.get("away_team","")
-    for bk in ev.get("bookmakers", []) or []:
-        for m in bk.get("markets", []) or []:
-            k = m.get("key","")
-            for o in m.get("outcomes", []) or []:
-                try: p = float(o.get("price", 0))
-                except: continue
-                if p <= 1.01: continue
-                n = o.get("name","")
-                if k == "h2h":
-                    if n == h and res["home"] is None: res["home"] = p
-                    elif n == a and res["away"] is None: res["away"] = p
-                    elif "draw" in n.lower() and res["draw"] is None: res["draw"] = p
-                elif k == "totals" and o.get("point") == 2.5:
-                    if "over" in n.lower() and res["over_2.5"] is None: res["over_2.5"] = p
-                    elif "under" in n.lower() and res["under_2.5"] is None: res["under_2.5"] = p
-                elif k == "btts":
-                    if "yes" in n.lower() and res["btts_yes"] is None: res["btts_yes"] = p
-                    elif "no" in n.lower() and res["btts_no"] is None: res["btts_no"] = p
-    return res
-
-async def build_match_pool(bzz_preds, odds_events):
-    pool = []
-    used_events = set()
-    for bzz in bzz_preds:
-        matched = None
-        hn, an = normalize_name(bzz["home"]), normalize_name(bzz["away"])
-        for ev in odds_events:
-            eh, ea = normalize_name(ev.get("home_team","")), normalize_name(ev.get("away_team",""))
-            if (hn in eh or eh in hn) and (an in ea or ea in an):
-                matched = ev; break
-        md = MatchData(
-            event_id=bzz["event_id"], league=bzz.get("league",""),
-            home=bzz["home"], away=bzz["away"], kickoff=bzz.get("kickoff",""),
-            real_odds=extract_real_odds(matched) if matched else {},
-            bzz_markets=bzz.get("bzz_markets", {}),
-            bzz_confidence=bzz.get("bzz_confidence", 0),
-            sport_key=matched.get("sport_key","") if matched else "",
-        )
-        if matched:
-            used_events.add(matched.get("id"))
-            if matched.get("commence_time"):
-                md.kickoff = matched["commence_time"]
-        pool.append(md)
-    for ev in odds_events:
-        if ev.get("id") in used_events: continue
-        h, a = ev.get("home_team",""), ev.get("away_team","")
-        if not h or not a: continue
-        pool.append(MatchData(
-            event_id=ev.get("id",""), league=ev.get("sport_title",""),
-            home=h, away=a, kickoff=ev.get("commence_time",""),
-            real_odds=extract_real_odds(ev), bzz_markets={}, bzz_confidence=0,
-            sport_key=ev.get("sport_key",""),
-        ))
-    return pool
-
 def prescore_match(md) -> int:
     score = 0
-    if md.real_odds:
-        n_odds = sum(1 for v in md.real_odds.values() if v)
-        score += n_odds * 3
-    if md.bzz_markets:
-        n_markets = len([k for k in md.bzz_markets if md.bzz_markets[k]])
-        score += min(n_markets * 2, 15)
+    if md.real_odds: score += 25
+    if md.bzz_markets: score += 15
     if md.dixon_pred: score += 15
     if md.has_h2h: score += 10
-    home = md.real_odds.get("home")
-    away = md.real_odds.get("away")
-    if home and away:
-        if 1.60 <= home <= 3.50 and 1.60 <= away <= 3.50:
-            score += 10
-        elif min(home, away) < 1.30:
-            score -= 5
-    if md.real_odds.get("over_2.5"): score += 5
-    if md.real_odds.get("btts_yes"): score += 5
-    return max(0, min(100, score))
-
-
-def filter_no_hope(md) -> bool:
-    has_odds = md.real_odds and any(v for v in md.real_odds.values())
-    has_bzz = md.bzz_markets and any(v for v in md.bzz_markets.values())
-    has_dixon = md.dixon_pred is not None
-    return has_odds or has_bzz or has_dixon
+    return score
 
 async def enrich_and_analyze(pool):
     async with httpx.AsyncClient(timeout=40.0) as client:
@@ -586,529 +364,256 @@ async def enrich_and_analyze(pool):
                     ctx = await enrich_match_with_bzzoiro(md.home, md.away, date_iso)
                     if ctx and ctx.get("available"):
                         md.has_h2h = True
-                        md.h2h_data = ctx.get("h2h", {})
+                
                 if predict_match_probas:
                     pred = await predict_match_probas(client, md.home, md.away, md.league, md.kickoff, context=ctx)
                     if pred and "markets" in pred:
                         md.gemini_markets = pred.get("markets", {})
                         md.analysis = pred.get("analysis", "")
-                        adv = []
+                        md.advices = []
                         for a in (pred.get("advices") or [])[:2]:
                             if isinstance(a, dict) and a.get("text"):
                                 try: c = int(a.get("confidence", 0))
                                 except: c = 0
-                                adv.append({"text": str(a["text"]).strip(), "confidence": c})
-                        md.advices = adv
+                                md.advices.append({"text": str(a["text"]).strip(), "confidence": c})
+                
                 if STATE.get("dixon_model"):
                     try: md.dixon_pred = STATE["dixon_model"].predict_all(md.home, md.away)
                     except: pass
+                
                 await asyncio.sleep(1.5)
             except Exception as e:
                 print(f"  ⚠️ {e}")
 
 def compute_probability(md, market_key):
     gem = dix = bzz = 0.0
-    if md.gemini_markets:
-        v = md.gemini_markets.get(market_key)
-        if v is not None:
-            try: gem = float(v) / 100.0
-            except: pass
+    if md.gemini_markets and md.gemini_markets.get(market_key) is not None:
+        try: gem = float(md.gemini_markets[market_key]) / 100.0
+        except: pass
     if md.dixon_pred:
-        dk = {"victoire_home":"p_home","match_nul":"p_draw","victoire_away":"p_away",
-              "over_2.5":"over_2.5","under_2.5":"under_2.5","over_3.5":"over_3.5",
-              "btts_yes":"btts_yes","btts_no":"btts_no"}.get(market_key)
+        dk = {"victoire_home":"p_home","match_nul":"p_draw","victoire_away":"p_away","over_2.5":"over_2.5","under_2.5":"under_2.5","over_3.5":"over_3.5","btts_yes":"btts_yes","btts_no":"btts_no"}.get(market_key)
         if dk: dix = md.dixon_pred.get(dk, 0)
-    if md.bzz_markets:
-        v = md.bzz_markets.get(market_key)
-        if v is not None:
-            try: bzz = float(v) / 100.0
-            except: pass
+    if md.bzz_markets and md.bzz_markets.get(market_key) is not None:
+        try: bzz = float(md.bzz_markets[market_key]) / 100.0
+        except: pass
+    
     sources = [x for x in (gem, dix, bzz) if x > 0]
     if not sources: return 0.0, gem, dix, bzz, ""
     final = sum(sources) / len(sources)
+    
+    emoji = ""
     if len(sources) >= 2:
         delta = max(sources) - min(sources)
         if len(sources) == 3 and delta <= 0.10: emoji = "🤝🤝"
         elif delta <= 0.10: emoji = "🤝"
         elif delta >= 0.15: emoji = "⚠️"
-        else: emoji = ""
-    else: emoji = ""
     return final, gem, dix, bzz, emoji
 
-def compute_quality_odds3(md, market_key, prob, real_odd, value):
-    pts = 0
-    if real_odd: pts += 15
-    h2h_pts = 10 if md.has_h2h else 0
-    dixon_pts = 10 if md.dixon_pred else 0
-    pts += h2h_pts + dixon_pts + (20 - h2h_pts - dixon_pts)
-    if md.bzz_markets: pts += 5
-    _, g, d, b, emoji = compute_probability(md, market_key)
-    n = sum(1 for x in (g, d, b) if x > 0)
-    if n >= 3: pts += 25
-    elif n == 2: pts += 15
-    if value >= 0.10: pts += 20
-    elif value >= 0.07: pts += 15
-    elif value >= 0.05: pts += 10
-    elif value >= 0.03: pts += 5
-    if 1.60 <= real_odd <= 2.20: pts += 15
-    elif 1.55 <= real_odd < 1.60: pts += 12
-    elif 1.40 <= real_odd < 1.55: pts += 10
-    elif real_odd < 1.30: pts -= 10
-    return max(0, min(100, pts))
+# --- MOTEURS ---
 
 def build_odds3_coupon(pool):
     candidates = []
     for md in pool:
-        for market_key, (label, mkt_type) in {
-            "btts_yes": ("BTTS Oui", "BTTS"),
-            "btts_no": ("BTTS Non", "BTTS"),
-            "over_2.5": ("Over 2.5 buts", "O/U"),
-            "under_2.5": ("Under 2.5 buts", "O/U"),
-            "double_chance_1X": ("DC 1X", "DC"),
-            "double_chance_X2": ("DC X2", "DC"),
-            "victoire_home": (f"Victoire {md.home}", "1X2"),
-            "victoire_away": (f"Victoire {md.away}", "1X2"),
-        }.items():
+        for market_key, (label, mkt_type) in {"btts_yes": ("BTTS Oui", "BTTS"), "btts_no": ("BTTS Non", "BTTS"), "over_2.5": ("Over 2.5", "O/U"), "under_2.5": ("Under 2.5", "O/U")}.items():
             prob, g, d, b, emoji = compute_probability(md, market_key)
-            if prob <= 0: continue
-            if emoji == "⚠️": continue
-            real_odd = None
-            if market_key == "victoire_home": real_odd = md.real_odds.get("home")
-            elif market_key == "victoire_away": real_odd = md.real_odds.get("away")
-            elif market_key == "over_2.5": real_odd = md.real_odds.get("over_2.5")
-            elif market_key == "under_2.5": real_odd = md.real_odds.get("under_2.5")
-            elif market_key == "btts_yes": real_odd = md.real_odds.get("btts_yes")
-            elif market_key == "btts_no": real_odd = md.real_odds.get("btts_no")
-
-            if real_odd is None:
-                real_odd = 1.0 / prob if prob > 0 else None
-                if real_odd is None: continue
-                is_estimated = True
-            else:
-                is_estimated = False
-
-            if real_odd < ODDS3_MIN_LEG_ODDS_ABS: continue
-            if not (ODDS3_MIN_LEG_ODDS <= real_odd <= ODDS3_MAX_LEG_ODDS): continue
+            if prob <= 0 or emoji == "⚠️": continue
+            
+            real_odd = md.real_odds.get(market_key)
+            if not real_odd or not (ODDS3_MIN_LEG_ODDS <= real_odd <= ODDS3_MAX_LEG_ODDS): continue
             if prob < 0.50: continue
+            
+            value = (prob * real_odd) - 1.0
+            if value < ODDS3_MIN_VALUE: continue
+            
+            pts = 15 + 20 + (10 if md.has_h2h else 0) + (10 if md.dixon_pred else 0) + 5
+            n = sum(1 for x in (g, d, b) if x > 0)
+            pts += 25 if n >= 3 else 15
+            pts += 20 if value >= 0.10 else (15 if value >= 0.07 else 10)
+            if 1.60 <= real_odd <= 2.20: pts += 15
+            elif 1.55 <= real_odd < 1.60: pts += 12
+            
+            if pts < ODDS3_MIN_SCORE: continue
+            candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, mkt_type, label, real_odd, prob, real_odd, value, pts, g, d, b, md.analysis, md.advices, "", emoji))
 
-            if is_estimated:
-                value = 0.0
-            else:
-                value = (prob * real_odd) - 1.0
-                if value < ODDS3_MIN_VALUE: continue
+    candidates.sort(key=lambda x: (x.quality, x.value), reverse=True)
+    unique = {}
+    for c in candidates:
+        if c.event_id not in unique: unique[c.event_id] = c
+    valid = list(unique.values())
 
-            quality = compute_quality_odds3(md, market_key, prob, real_odd, value)
-            if is_estimated: quality -= 5
-
-            candidates.append(Selection(
-                event_id=md.event_id, league=md.league, home=md.home, away=md.away,
-                kickoff=md.kickoff, market=mkt_type, pick_label=label,
-                odds=round(real_odd, 2), model_prob=round(prob, 4),
-                real_odd=real_odd if not is_estimated else None,
-                value=round(value, 4), quality=quality,
-                prob_gemini=round(g, 3), prob_dixon=round(d, 3), prob_bzzoiro=round(b, 3),
-                analysis=md.analysis, advices=md.advices,
-                prob_sources_agreement=emoji,
-            ))
-
-    print(f"  → Odds +3 : {len(candidates)} candidats bruts")
-    valid = [c for c in candidates if c.quality >= ODDS3_MIN_SCORE]
-    if not valid:
-        valid = [c for c in candidates if c.quality >= 50]
-        if valid: print(f"  → Odds +3 : fallback à 50 ({len(valid)} retenus)")
-
-    if not valid:
-        scores = sorted([c.quality for c in candidates], reverse=True)
-        print(f"  → Odds +3 : 0 qualifié (max scores: {scores[:3]})")
-        return None
-
-    valid.sort(key=lambda x: (x.quality, x.value), reverse=True)
-    by_event = {}
-    for c in valid:
-        if c.event_id not in by_event: by_event[c.event_id] = c
-    valid = list(by_event.values())
-    valid.sort(key=lambda x: (x.quality, x.value), reverse=True)
-
-    legs, used_events, used_markets, used_leagues = [], set(), set(), set()
+    legs, used_ev, used_mk, used_lg = [], set(), set(), set()
     odds, prob = 1.0, 1.0
     for c in valid:
         if len(legs) >= ODDS3_MAX_LEGS: break
-        if c.event_id in used_events: continue
-        if c.market in used_markets: continue
-        if c.league in used_leagues and len(legs) >= 2: continue
-        next_o = odds * c.odds
-        if next_o > ODDS3_MAX_ODDS and legs: continue
+        if c.event_id in used_ev or c.market in used_mk or (c.league in used_lg and len(legs) >= 2): continue
+        if odds * c.odds > ODDS3_MAX_ODDS and legs: continue
+        
         legs.append(c)
-        used_events.add(c.event_id)
-        used_markets.add(c.market)
-        used_leagues.add(c.league)
-        odds = next_o
-        prob *= c.model_prob
+        used_ev.add(c.event_id); used_mk.add(c.market); used_lg.add(c.league)
+        odds *= c.odds; prob *= c.model_prob
         if odds >= ODDS3_MIN_ODDS and len(legs) >= ODDS3_MIN_LEGS: break
-
-    if len(legs) < ODDS3_MIN_LEGS or odds < ODDS3_MIN_ODDS:
-        print(f"  → Odds +3 : seulement {len(legs)} legs, cote {odds:.2f}")
-        return None
-
-    print(f"  → Odds +3 OK : {len(legs)} legs, cote {odds:.2f}")
-    return Coupon("Odds +3", f"Cote {ODDS3_MIN_ODDS}-{ODDS3_MAX_ODDS} • Anti-Vague",
-                  "🎯", legs, round(odds, 2), round(prob, 4), show_analysis=True)
-
-def compute_quality_odds10(md, market_key, prob, real_odd, value):
-    pts = 0
-    if real_odd: pts += 15
-    h2h_pts = 10 if md.has_h2h else 0
-    dixon_pts = 10 if md.dixon_pred else 0
-    pts += h2h_pts + dixon_pts + (20 - h2h_pts - dixon_pts)
-    if md.bzz_markets: pts += 5
-    _, g, d, b, emoji = compute_probability(md, market_key)
-    n = sum(1 for x in (g,d,b) if x > 0)
-    if n >= 3: pts += 25
-    elif n == 2: pts += 15
-    if prob >= 0.75: pts += 20
-    elif prob >= 0.68: pts += 10
-    if value >= 0.05: pts += 10
-    elif value >= 0.03: pts += 5
-    pts += 5
-    return max(0, min(100, pts))
+        
+    if len(legs) >= ODDS3_MIN_LEGS and odds >= ODDS3_MIN_ODDS:
+        print(f"  → Odds +3 OK : {len(legs)} legs, cote {odds:.2f}")
+        return Coupon("Odds +3", f"Cote {ODDS3_MIN_ODDS}-{ODDS3_MAX_ODDS}", "🎯", legs, round(odds, 2), round(prob, 4), show_analysis=True)
+    print("  → Odds +3 : 0 match qualifié")
+    return None
 
 def build_odds10_coupon(pool):
     candidates = []
     for md in pool:
-        home_odd = md.real_odds.get("home")
-        away_odd = md.real_odds.get("away")
-        if home_odd and home_odd < 1.30: continue
-        if away_odd and away_odd < 1.30: continue
-
-        for market_key, (label, mkt_type) in {
-            "btts_yes": ("BTTS Oui", "BTTS"),
-            "over_2.5": ("Over 2.5 buts", "O/U"),
-            "under_2.5": ("Under 2.5 buts", "O/U"),
-            "double_chance_1X": ("DC 1X", "DC"),
-            "double_chance_X2": ("DC X2", "DC"),
-            "victoire_home": (f"Victoire {md.home}", "1X2"),
-            "victoire_away": (f"Victoire {md.away}", "1X2"),
-        }.items():
+        for market_key, (label, mkt_type) in {"btts_yes": ("BTTS Oui", "BTTS"), "over_2.5": ("Over 2.5", "O/U"), "under_2.5": ("Under 2.5", "O/U")}.items():
             prob, g, d, b, emoji = compute_probability(md, market_key)
-            if prob < ODDS10_MIN_PROB: continue
-            if emoji == "⚠️": continue
-            real_odd = None
-            if market_key == "victoire_home": real_odd = home_odd
-            elif market_key == "victoire_away": real_odd = away_odd
-            elif market_key == "over_2.5": real_odd = md.real_odds.get("over_2.5")
-            elif market_key == "under_2.5": real_odd = md.real_odds.get("under_2.5")
-            elif market_key == "btts_yes": real_odd = md.real_odds.get("btts_yes")
-            if real_odd is None:
-                real_odd = 1.0 / prob if prob > 0 else None
-                if real_odd is None: continue
-                is_est = True
-            else:
-                is_est = False
+            if prob < ODDS10_MIN_PROB or emoji == "⚠️": continue
+            
+            real_odd = md.real_odds.get(market_key)
+            if not real_odd or not (ODDS10_MIN_LEG_ODDS <= real_odd <= ODDS10_MAX_LEG_ODDS): continue
+            
+            value = (prob * real_odd) - 1.0
+            if value < ODDS10_MIN_VALUE: continue
+            
+            pts = 15 + 20 + (10 if md.has_h2h else 0) + (10 if md.dixon_pred else 0) + 5
+            n = sum(1 for x in (g, d, b) if x > 0)
+            pts += 25 if n >= 3 else 15
+            if prob >= 0.75: pts += 20
+            elif prob >= 0.68: pts += 10
+            if value >= 0.05: pts += 10
+            
+            if pts < ODDS10_MIN_SCORE: continue
+            candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, mkt_type, label, real_odd, prob, real_odd, value, pts, g, d, b))
 
-            if not is_est:
-                if not (ODDS10_MIN_LEG_ODDS <= real_odd <= ODDS10_MAX_LEG_ODDS): continue
-                value = (prob * real_odd) - 1.0
-                if value < ODDS10_MIN_VALUE: continue
-            else:
-                if not (1.10 <= real_odd <= 1.55): continue
-                value = 0.0
+    candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
+    unique = {}
+    for c in candidates:
+        if c.event_id not in unique or c.quality > unique[c.event_id].quality: unique[c.event_id] = c
+    valid = list(unique.values())
 
-            quality = compute_quality_odds10(md, market_key, prob, real_odd, value)
-            candidates.append(Selection(
-                event_id=md.event_id, league=md.league, home=md.home, away=md.away,
-                kickoff=md.kickoff, market=mkt_type, pick_label=label,
-                odds=round(real_odd,2), model_prob=round(prob,4),
-                real_odd=real_odd if not is_est else None,
-                value=round(value,4), quality=quality,
-                prob_gemini=round(g,3), prob_dixon=round(d,3), prob_bzzoiro=round(b,3),
-            ))
-
-    print(f"  → Odds +10 : {len(candidates)} candidats bruts")
-    valid = [c for c in candidates if c.quality >= ODDS10_MIN_SCORE]
-    if not valid:
-        valid = [c for c in candidates if c.quality >= 50]
-        if valid: print(f"  → Odds +10 : fallback à 50 ({len(valid)} retenus)")
-
-    if not valid:
-        scores = sorted([c.quality for c in candidates], reverse=True)
-        print(f"  → Odds +10 : 0 qualifié (max scores: {scores[:3]})")
-        return None
-
-    by_event = {}
-    for c in valid:
-        if c.event_id not in by_event or c.quality > by_event[c.event_id].quality:
-            by_event[c.event_id] = c
-    valid = list(by_event.values())
-    valid.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
-
-    legs, used_events = [], set()
-    market_count = {}
-    league_count = {}
+    legs, used_ev, mkt_c, lg_c = [], set(), {}, {}
     odds, prob = 1.0, 1.0
-
     for c in valid:
         if len(legs) >= ODDS10_MAX_LEGS: break
-        if c.event_id in used_events: continue
-        if market_count.get(c.market, 0) >= ODDS10_MAX_SAME_MARKET: continue
-        if league_count.get(c.league, 0) >= ODDS10_MAX_SAME_LEAGUE: continue
+        if c.event_id in used_ev or mkt_c.get(c.market, 0) >= 2 or lg_c.get(c.league, 0) >= 2: continue
+        
         legs.append(c)
-        used_events.add(c.event_id)
-        market_count[c.market] = market_count.get(c.market, 0) + 1
-        league_count[c.league] = league_count.get(c.league, 0) + 1
-        odds *= c.odds
-        prob *= c.model_prob
+        used_ev.add(c.event_id)
+        mkt_c[c.market] = mkt_c.get(c.market, 0) + 1
+        lg_c[c.league] = lg_c.get(c.league, 0) + 1
+        odds *= c.odds; prob *= c.model_prob
+        
         if odds >= ODDS10_MIN_ODDS and len(legs) >= ODDS10_MIN_LEGS: break
 
-    if len(legs) < ODDS10_MIN_LEGS or odds < ODDS10_MIN_ODDS:
-        print(f"  → Odds +10 : {len(legs)} legs, cote {odds:.2f} → rejeté")
-        return None
-
-    print(f"  → Odds +10 OK : {len(legs)} legs, cote {odds:.2f}")
-    return Coupon("Odds +10", f"Cote ≥ {ODDS10_MIN_ODDS} • Stabilité",
-                  "🔥", legs, round(odds,2), round(prob,4), show_analysis=False)
+    if len(legs) >= ODDS10_MIN_LEGS and odds >= ODDS10_MIN_ODDS:
+        print(f"  → Odds +10 OK : {len(legs)} legs, cote {odds:.2f}")
+        return Coupon("Odds +10", f"Cote ≥ {ODDS10_MIN_ODDS}", "🔥", legs, round(odds, 2), round(prob, 4), show_analysis=False)
+    print("  → Odds +10 : 0 match qualifié")
+    return None
 
 def build_mtft_coupon(pool):
-    if not STATE.get("dixon_model"):
-        print("  → MT-Fin : Dixon non disponible")
-        return None
-
+    if not STATE.get("dixon_model"): return None
     picks = []
     for md in pool:
         if not md.dixon_pred: continue
-        if md.real_odds.get("home") and md.real_odds["home"] < 1.30: continue
-        if md.real_odds.get("away") and md.real_odds["away"] < 1.30: continue
-
-        lam_h = md.dixon_pred.get("lambda_home", 1.3)
-        lam_a = md.dixon_pred.get("lambda_away", 1.1)
-        htft_probs = simulate_htft(lam_h, lam_a)
-        if not htft_probs: continue
-
+        if (md.real_odds.get("home") and md.real_odds["home"] < 1.35) or (md.real_odds.get("away") and md.real_odds["away"] < 1.35): continue
+        
+        htft_probs = simulate_htft(md.dixon_pred.get("lambda_home", 1.3), md.dixon_pred.get("lambda_away", 1.1))
         best_pick, best_prob = None, 0.0
         for combo in ("V1/V1", "V2/V2"):
             p = htft_probs.get(combo, 0)
-            if p > best_prob:
-                best_prob = p; best_pick = combo
-
+            if p > best_prob: best_prob = p; best_pick = combo
+        
         if not best_pick or best_prob < MTFIN_MIN_PROB: continue
-
-        score = 0
-        if md.dixon_pred: score += 15
-        if md.has_h2h: score += 10
-        if md.gemini_markets: score += 10
-        if best_prob >= 0.65: score += 30
-        elif best_prob >= 0.55: score += 20
-        score += 15
-        if md.has_h2h: score += 5
-        score += 10
-
-        if score < MTFIN_MIN_SCORE:
-            if score < MTFIN_FALLBACK_SCORE: continue
-
-        picks.append({
-            "md": md, "pick": best_pick, "prob": best_prob, "score": score,
-        })
-
-    print(f"  → MT-Fin : {len(picks)} matchs valides")
-    if len(picks) < MTFIN_TOP_N:
-        print(f"  → MT-Fin : besoin de {MTFIN_TOP_N}, seulement {len(picks)}")
-        return None
+        
+        pts = 15 + (10 if md.has_h2h else 0) + 10 + (30 if best_prob >= 0.65 else 20) + 15 + 10
+        if pts < MTFIN_MIN_SCORE: continue
+        picks.append({"md": md, "pick": best_pick, "prob": best_prob, "score": pts})
 
     picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
-
-    top, used_leagues = [], set()
-    for p in picks:
-        if len(top) >= MTFIN_TOP_N: break
-        lg = p["md"].league
-        if lg in used_leagues and len(top) < MTFIN_TOP_N - 1: continue
-        top.append(p)
-        used_leagues.add(lg)
-
+    top = picks[:MTFIN_TOP_N]
     if len(top) < MTFIN_TOP_N:
-        top = picks[:MTFIN_TOP_N]
-
+        print(f"  → MT-Fin : besoin de 3, seulement {len(top)}")
+        return None
+    
     legs = []
     for p in top:
         md = p["md"]
-        est_odd = round(1.0 / p["prob"], 2) if p["prob"] > 0 else 3.5
-        legs.append(Selection(
-            event_id=md.event_id, league=md.league, home=md.home, away=md.away,
-            kickoff=md.kickoff, market="MT-Fin",
-            pick_label=f"Mi-temps/Fin : {p['pick']}",
-            odds=est_odd, model_prob=p["prob"], real_odd=None,
-            value=-1.0, quality=p["score"],
-            htft_pick=p["pick"],
-        ))
-        print(f"     🥇 {md.home} vs {md.away} : {p['pick']} ({p['prob']*100:.1f}%)")
-
+        legs.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, "MT-Fin", f"MT/Fin : {p['pick']}", round(1.0/p["prob"], 2), p["prob"], None, -1.0, p["score"], htft_pick=p["pick"]))
+        
     co, cp = 1.0, 1.0
     for s in legs: co *= s.odds; cp *= s.model_prob
-    return Coupon("MT-Fin", "3 matchs Bookmaker Blind", "⏱", legs,
-                  round(co,2), round(cp,4), is_list=True, show_analysis=False)
+    print(f"  → MT-Fin OK : {len(legs)} matchs.")
+    return Coupon("MT-Fin", "3 matchs Dixon", "⏱", legs, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
 
 def build_draw_coupon(pool):
     candidates = []
     for md in pool:
-        home_odd = md.real_odds.get("home")
-        away_odd = md.real_odds.get("away")
-        draw_odd = md.real_odds.get("draw")
-
-        if home_odd and not (DRAW_MIN_HOME_ODD <= home_odd <= DRAW_MAX_HOME_ODD): continue
-        if away_odd and not (DRAW_MIN_AWAY_ODD <= away_odd <= DRAW_MAX_AWAY_ODD): continue
-        if draw_odd and draw_odd < DRAW_MIN_ODD: continue
-
         prob_draw, g, d, b, emoji = compute_probability(md, "match_nul")
-        if prob_draw < DRAW_MIN_PROB: continue
-        if g > 0 and g < DRAW_GEMINI_MIN_PROB: continue
-        if emoji == "⚠️": continue
-
-        score = 0
-        if home_odd and away_odd:
-            if 2.20 <= min(home_odd, away_odd) and max(home_odd, away_odd) <= 3.50: score += 30
-            elif 1.80 <= min(home_odd, away_odd): score += 20
-        else:
-            if prob_draw >= 0.30 and g >= 0.28: score += 20
-            elif prob_draw >= 0.28: score += 12
-        if prob_draw >= 0.33: score += 25
-        elif prob_draw >= 0.28: score += 18
-        if g >= 0.30: score += 20
-        elif g >= 0.25: score += 12
-        if d >= 0.28: score += 10
-        if md.has_h2h: score += 5
-        score += 10
-
-        if score < DRAW_MIN_SCORE and score < DRAW_FALLBACK_SCORE: continue
-
-        used_odd = draw_odd if draw_odd else (1.0 / prob_draw if prob_draw > 0 else 3.0)
-        candidates.append(Selection(
-            event_id=md.event_id, league=md.league, home=md.home, away=md.away,
-            kickoff=md.kickoff, market="Match Nul",
-            pick_label="Match Nul (X)",
-            odds=round(used_odd,2), model_prob=round(prob_draw,4),
-            real_odd=draw_odd, value=round((prob_draw * used_odd) - 1.0, 4),
-            quality=score,
-            prob_gemini=round(g,3), prob_dixon=round(d,3), prob_bzzoiro=round(b,3),
-        ))
-
-    print(f"  → Match Nul : {len(candidates)} candidats")
-    valid = [c for c in candidates if c.quality >= DRAW_MIN_SCORE]
-    if not valid:
-        valid = [c for c in candidates if c.quality >= 60]
-    if not valid:
-        print(f"  → Match Nul : 0 match qualifié")
-        return None
-
-    by_event = {}
-    for c in valid:
-        if c.event_id not in by_event or c.quality > by_event[c.event_id].quality:
-            by_event[c.event_id] = c
-    valid = list(by_event.values())
-    valid.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
-
-    top = valid[:DRAW_TOP_N]
+        if prob_draw < DRAW_MIN_PROB or (g > 0 and g < DRAW_GEMINI_MIN_PROB) or emoji == "⚠️": continue
+        
+        home_odd, away_odd = md.real_odds.get("home"), md.real_odds.get("away")
+        draw_odd = md.real_odds.get("draw")
+        if not draw_odd or draw_odd < DRAW_MIN_ODD: continue
+        if (home_odd and home_odd < 1.80) or (away_odd and away_odd < 1.80): continue
+        
+        pts = 30 + (25 if prob_draw >= 0.33 else 18) + (20 if g >= 0.30 else 12) + 10 + (5 if md.has_h2h else 0) + 10
+        if pts < DRAW_MIN_SCORE: continue
+        
+        candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, "Match Nul", "Nul", draw_odd, prob_draw, draw_odd, (prob_draw*draw_odd)-1, pts))
+        
+    candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
+    top = candidates[:DRAW_TOP_N]
     if len(top) < DRAW_TOP_N:
-        print(f"  → Match Nul : besoin de {DRAW_TOP_N}, seulement {len(top)}")
+        print(f"  → Match Nul : besoin de 3, seulement {len(top)}")
         return None
-
+    
     co, cp = 1.0, 1.0
     for s in top: co *= s.odds; cp *= s.model_prob
     print(f"  → Match Nul OK : {len(top)} nuls, cote {co:.2f}")
-    return Coupon("Match Nul", f"3 nuls combinés", "🤝", top,
-                  round(co,2), round(cp,4), is_list=True, show_analysis=False)
+    return Coupon("Match Nul", "3 nuls combinés", "🤝", top, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
 
 def build_all_coupons(pool):
-    """
-    RÈGLE : 1 match ne peut apparaître que dans 1 seul ticket.
-    Ordre de priorité : moteurs les plus exigeants d'abord.
-    """
     coupons = []
     used_ids = set()
+    def fresh(): return [md for md in pool if md.event_id not in used_ids]
 
-    def fresh():
-        return [md for md in pool if md.event_id not in used_ids]
-
-    if c := build_odds3_coupon(fresh()):
-        coupons.append(c)
-        used_ids.update(s.event_id for s in c.legs)
-
+    # ON COMMENCE PAR ODDS +10 (car il demande 6-8 matchs, c'est le plus dur)
     if c := build_odds10_coupon(fresh()):
-        coupons.append(c)
-        used_ids.update(s.event_id for s in c.legs)
-
+        coupons.append(c); used_ids.update(s.event_id for s in c.legs)
+    
+    # PUIS ODDS +3
+    if c := build_odds3_coupon(fresh()):
+        coupons.append(c); used_ids.update(s.event_id for s in c.legs)
+    
+    # PUIS MATCH NUL
     if c := build_draw_coupon(fresh()):
-        coupons.append(c)
-        used_ids.update(s.event_id for s in c.legs)
-
+        coupons.append(c); used_ids.update(s.event_id for s in c.legs)
+    
+    # ENFIN MT-FIN
     if c := build_mtft_coupon(fresh()):
-        coupons.append(c)
-        used_ids.update(s.event_id for s in c.legs)
+        coupons.append(c); used_ids.update(s.event_id for s in c.legs)
 
     return coupons
 
+# --- FORMATAGE TELEGRAM ---
 def format_header():
-    return (f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            f"     <b>⚡ {BRAND_NAME.upper()} ⚡</b>\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-            f"<i>{BRAND_TAGLINE}</i>\n"
-            f"<i>📅 {today_pretty()} • 🇨🇮 Côte d’Ivoire</i>")
+    return f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n     <b>⚡ {BRAND_NAME.upper()} ⚡</b>\n<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n<i>{BRAND_TAGLINE}</i>\n<i>📅 {today_pretty()} • 🇨🇮 Côte d’Ivoire</i>"
 
 def format_selection_block(s, idx, show_analysis):
-    lines = [
-        f"<b>┌─ #{idx} {s.home} vs {s.away}</b>",
-        f"│ 📅 <b>{format_kickoff(s.kickoff)}</b> • {s.league}",
-        f"│ 🎯 <b>{s.pick_label}</b>",
-        f"│ 📊 Proba : <b>{s.model_prob*100:.1f}%</b> {prob_bar(s.model_prob)}",
-    ]
-    if s.quality > 0:
-        lines.append(f"│ ⭐ Qualité : <b>{s.quality}/100</b> {quality_bar(s.quality)}")
-    if s.prob_sources_agreement:
-        lines.append(f"│ 🤝 Consensus : {s.prob_sources_agreement}")
-    if s.htft_pick:
-        lines.append(f"│ ⏱ MT/Fin : <b>{s.htft_pick}</b>")
-    if s.real_odd:
-        lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b>")
-    else:
-        lines.append(f"│ 💰 Cote : <b>{s.odds}</b> <i>(estimée)</i>")
-    if s.value > 0:
-        lines.append(f"│ 💎 Value : <b>+{s.value*100:.1f}%</b>")
-    if s.prob_gemini > 0 or s.prob_dixon > 0 or s.prob_bzzoiro > 0:
-        src = []
-        if s.prob_gemini > 0: src.append(f"G:{s.prob_gemini*100:.0f}%")
-        if s.prob_dixon > 0: src.append(f"D:{s.prob_dixon*100:.0f}%")
-        if s.prob_bzzoiro > 0: src.append(f"B:{s.prob_bzzoiro*100:.0f}%")
-        if src: lines.append(f"│ <i>{' × '.join(src)}</i>")
-    if show_analysis and s.analysis:
-        lines.append(f"│")
-        lines.append(f"│ 🧠 <b>Avis IA</b> :")
-        lines.append(f"│ 💬 <i>{s.analysis[:250]}</i>")
-    if show_analysis and s.advices:
-        lines.append(f"│ 💡 Conseils :")
-        for a in s.advices:
-            t = a.get("text","").strip()
-            if t: lines.append(f"│  • {t}")
+    lines = [f"<b>┌─ #{idx} {s.home} vs {s.away}</b>", f"│ 📅 <b>{format_kickoff(s.kickoff)}</b> • {s.league}", f"│ 🎯 <b>{s.pick_label}</b>", f"│ 📊 Proba : <b>{s.model_prob*100:.1f}%</b> {prob_bar(s.model_prob)}"]
+    if s.quality > 0: lines.append(f"│ ⭐ Qualité : <b>{s.quality}/100</b> {quality_bar(s.quality)}")
+    if s.htft_pick: lines.append(f"│ ⏱ MT/Fin : <b>{s.htft_pick}</b>")
+    lines.append(f"│ 💰 Cote : <b>{s.real_odd or s.odds}</b>")
+    if s.value > 0: lines.append(f"│ 💎 Value : <b>+{s.value*100:.1f}%</b>")
+    if show_analysis and s.analysis: lines.append(f"│\n│ 🧠 <b>Avis IA</b> :\n│ 💬 <i>{s.analysis[:250]}</i>")
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
 def format_coupon(c):
-    show_ana = getattr(c, "show_analysis", False)
     if c.is_list:
-        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>",
-                 f"<i>{c.subtitle}</i>", "", f"<b>🎯 {len(c.legs)} pronostics</b>", ""]
-        for i, s in enumerate(c.legs, 1):
-            lines.append(format_selection_block(s, i, show_ana))
-            lines.append("")
-        lines.append(f"<i>{PUBLIC_FOOTER}</i>")
-        return "\n".join(lines)
-    prob_level = "🟢 Faible" if c.combined_prob >= 0.40 else "🟡 Modéré" if c.combined_prob >= 0.15 else "🔴 Élevé"
-    lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>",
-             f"<i>{c.subtitle}</i>", "",
-             f"<b>┏━━━━━━━━━━━━━━━┓</b>",
-             f"<b>┃ 🎫 Cote : {c.combined_odds}</b>",
-             f"<b>┃ 📈 Proba : {c.combined_prob*100:.1f}%</b>",
-             f"<b>┃ 🎯 {prob_level}</b>",
-             f"<b>┗━━━━━━━━━━━━━━━┛</b>", ""]
-    for i, s in enumerate(c.legs, 1):
-        lines.append(format_selection_block(s, i, show_ana))
-        lines.append("")
+        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", "", f"<b>🎯 {len(c.legs)} pronostics</b>", ""]
+        for i, s in enumerate(c.legs, 1): lines.append(format_selection_block(s, i, getattr(c, "show_analysis", False)) + "\n")
+    else:
+        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", "", f"<b>┏━━━━━━━━━━━━━━━┓</b>", f"<b>┃ 🎫 Cote : {c.combined_odds}</b>", f"<b>┃ 📈 Proba : {c.combined_prob*100:.1f}%</b>", f"<b>┗━━━━━━━━━━━━━━━┛</b>", ""]
+        for i, s in enumerate(c.legs, 1): lines.append(format_selection_block(s, i, getattr(c, "show_analysis", False)) + "\n")
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
 
@@ -1117,11 +622,7 @@ def format_coupons_ready():
         return f"{format_header()}\n\n<b>📭 Aucun coupon aujourd'hui</b>"
     lignes = []
     for c in STATE["coupons"]:
-        n = len(c.legs)
-        if c.is_list:
-            lignes.append(f"{c.emoji} <b>{c.name}</b> • {n} pronostics")
-        else:
-            lignes.append(f"{c.emoji} <b>{c.name}</b> • {n} paris • Cote <b>{c.combined_odds}</b>")
+        lignes.append(f"{c.emoji} <b>{c.name}</b> • {len(c.legs)} paris • Cote <b>{c.combined_odds}</b>")
     return f"{format_header()}\n\n<b>🔔 COUPONS DU JOUR !</b>\n\n" + "\n\n".join(lignes)
 
 def format_bilan(tracker):
@@ -1161,51 +662,17 @@ async def broadcast_after_scan():
                 await asyncio.sleep(0.3)
         except: pass
 
+# --- HANDLERS ---
 @dp.message(Command("start"))
 async def start_cmd(m):
-    if m.from_user.id == ADMIN_ID:
-        await safe_answer(m, f"{format_header()}\n\n<b>👋 Admin</b>\n/scan pour analyser.", reply_markup=ADMIN_KEYBOARD)
-    else:
-        await safe_answer(m, f"{format_header()}\n\n{get_subscription_message(m.from_user.id)}", reply_markup=USER_KEYBOARD)
-
-@dp.message(Command("keygen"))
-async def keygen(m):
-    if m.from_user.id != ADMIN_ID: return
-    a = m.text.split()
-    if len(a) != 2: await m.answer("Usage: /keygen [1m|1s|60]"); return
-    d, days = a[1].lower(), 0
-    if d.endswith("m"): days = int(d[:-1])*30
-    elif d.endswith("s"): days = int(d[:-1])*7
-    else: days = int(d)
-    if days <= 0: await m.answer("❌"); return
-    k = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
-    STATE["keys"][k] = {"days": days, "used": False, "created_at": datetime.now(TZ).isoformat()}
-    save_json(KEYS_DB, STATE["keys"])
-    await m.answer(f"🔑 <code>{k}</code> • {days}j", parse_mode="HTML")
-
-@dp.message(Command("activate", "vip", "cle", "key"))
-async def activate_cmd(m):
-    a = m.text.split()
-    if len(a) != 2: await m.answer("Usage: /activate <clé>"); return
-    await process_act(m, a[1].strip().upper())
-
-@dp.message(F.text.regexp(r"^[A-Z0-9]{8}$"))
-async def raw_key(m): await process_act(m, m.text.strip().upper())
-
-async def process_act(m, k):
-    if k not in STATE["keys"]: await m.answer("❌ Invalide."); return
-    kd = STATE["keys"][k]
-    if kd.get("used"): await m.answer("❌ Déjà utilisée."); return
-    d = kd["days"]; exp = datetime.now(TZ) + timedelta(days=d)
-    STATE["users"][str(m.from_user.id)] = {"expires_at": exp.isoformat(), "key_used": k}
-    kd["used"] = True; kd["used_by"] = str(m.from_user.id); kd["used_at"] = datetime.now(TZ).isoformat()
-    save_json(KEYS_DB, STATE["keys"]); save_json(USERS_DB, STATE["users"])
-    await m.answer(f"✅ Actif jusqu'au {exp.strftime('%d/%m/%Y')}", parse_mode="HTML", reply_markup=USER_KEYBOARD)
+    kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
+    msg = f"{format_header()}\n\n<b>👋 Admin</b>\n/scan pour analyser." if m.from_user.id == ADMIN_ID else f"{format_header()}\n\n{get_subscription_message(m.from_user.id)}"
+    await safe_answer(m, msg, reply_markup=kb)
 
 @dp.message(Command("scan"))
 async def scan_cmd(m):
     if m.from_user.id != ADMIN_ID: return
-    await safe_answer(m, "⏳ Analyse en cours (3-5 min)...")
+    await safe_answer(m, "⏳ Analyse des matchs en cours...")
     await scan()
     await broadcast_after_scan()
 
@@ -1213,237 +680,95 @@ async def scan_cmd(m):
 async def debug_cmd(m):
     if m.from_user.id != ADMIN_ID: return
     d = STATE["debug"]
-    await safe_answer(m, f"<b>🔍 DEBUG</b>\n\nDixon : {'✅' if STATE['dixon_model'] else '❌'}\nOdds : {d.get('odds_events',0)}\nBzzoiro odds : {d.get('bzz_odds',0)}\nBzzoiro : {d.get('bzz_predictions',0)}\nPool : {d.get('pool',0)}\nCoupons : {d.get('coupons',0)}")
+    await safe_answer(m, f"<b>🔍 DEBUG</b>\n\nDixon : {'✅' if STATE['dixon_model'] else '❌'}\nPool total : {d.get('pool',0)}\nMatchs avec cotes : {d.get('bzz_odds',0)}\nCoupons : {d.get('coupons',0)}")
+
+@dp.message(F.text == BTN_ODDS3)
+async def b_odds3(m): await send_coupon(m, "Odds +3")
+@dp.message(F.text == BTN_ODDS10)
+async def b_odds10(m): await send_coupon(m, "Odds +10")
+@dp.message(F.text == BTN_MTFT)
+async def b_mtft(m): await send_coupon(m, "MT-Fin")
+@dp.message(F.text == BTN_DRAW)
+async def b_draw(m): await send_coupon(m, "Match Nul")
 
 async def send_coupon(m, name):
     c = next((x for x in STATE["coupons"] if x.name == name), None)
     if c: await safe_answer(m, format_coupon(c))
-    else: await safe_answer(m, "Aucun coupon aujourd'hui.")
-
-@dp.message(F.text == BTN_ODDS3)
-async def b_odds3(m):
-    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
-        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
-    await send_coupon(m, "Odds +3")
-
-@dp.message(F.text == BTN_ODDS10)
-async def b_odds10(m):
-    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
-        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
-    await send_coupon(m, "Odds +10")
-
-@dp.message(F.text == BTN_MTFT)
-async def b_mtft(m):
-    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
-        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
-    await send_coupon(m, "MT-Fin")
-
-@dp.message(F.text == BTN_DRAW)
-async def b_draw(m):
-    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
-        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
-    await send_coupon(m, "Match Nul")
+    else: await safe_answer(m, f"Aucun coupon {name} aujourd'hui.")
 
 @dp.message(F.text == BTN_BILAN)
-async def b_bilan(m):
-    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
-        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
-    await safe_answer(m, format_bilan(STATE["tracker"]))
-
+async def b_bilan(m): await safe_answer(m, format_bilan(STATE["tracker"]))
 @dp.message(F.text == BTN_SCAN)
-async def b_scan(m):
-    if m.from_user.id != ADMIN_ID: return
-    await scan_cmd(m)
-
+async def b_scan(m): await scan_cmd(m)
 @dp.message(F.text == BTN_ACTIVATE)
 async def b_act(m): await m.answer("🔑 /activate VOTRE_CLE")
-
 @dp.message(F.text == "⚙️ Debug")
-async def b_debug(m):
-    if m.from_user.id != ADMIN_ID: return
-    await debug_cmd(m)
+async def b_debug(m): await debug_cmd(m)
 
+# --- SCAN PRINCIPAL (Logique des Paniers) ---
 async def scan():
     async with STATE["scan_lock"]:
+        # 1. Prédictions Bzzoiro
         bzz_preds = []
         if fetch_bzzoiro_predictions_direct and BZZOIRO_API_KEY:
             try: bzz_preds = await fetch_bzzoiro_predictions_direct(min_confidence=BZZ_NATIVE_CONFIDENCE)
-            except Exception as e: print(f"⚠️ Bzz: {e}")
+            except: pass
 
-        odds_events = await fetch_all_odds_events()
+        # 2. Cotes massives API-Football
+        today_iso = datetime.now(TZ).strftime("%Y-%m-%d")
+        af_matches = {}
+        if af_fetch_odds_date and API_FOOTBALL_KEY:
+            af_matches = await af_fetch_odds_date(today_iso)
 
-        if not odds_events and not bzz_preds:
+        if not af_matches and not bzz_preds:
+            print("⚠️ Aucune donnée source.")
             STATE["coupons"] = []
-            print("⚠️ 0 source")
             return
 
-        # === POOL A : matchs avec COTES réelles (value betting) ===
-        pool_with_odds = []
+        # 3. Fusion des Paniers
+        pool = []
+        used_ids = set()
+        
+        # Ajout des matchs API-Football (avec cotes)
+        for eid, data in af_matches.items():
+            bzz_match = next((b for b in bzz_preds if normalize_name(b["home"]) == normalize_name(data["home"]) and normalize_name(b["away"]) == normalize_name(data["away"])), None)
+            md = MatchData(
+                event_id=eid, league=data["league"], home=data["home"], away=data["away"], kickoff=data["kickoff"],
+                real_odds=data["odds"], bzz_markets=bzz_match.get("bzz_markets", {}) if bzz_match else {},
+                bzz_confidence=bzz_match.get("bzz_confidence", 0) if bzz_match else 0, sport_key="api_football"
+            )
+            pool.append(md)
+            used_ids.add(eid)
 
-        # ⭐ PRIORITÉ 1 : API-Football (fixtures + cotes réelles)
-        if af_fetch_fixtures and af_fetch_odds and API_FOOTBALL_KEY:
-            print("🔄 Chargement API-Football...")
-            today_iso = datetime.now(TZ).strftime("%Y-%m-%d")
-            try:
-                fixtures = await af_fetch_fixtures(today_iso)
-            except Exception as _e:
-                print(f"⚠️ API-Football fixtures crash: {_e}")
-                fixtures = []
-
-            if fixtures:
-                print(f"📊 API-Football : {len(fixtures)} fixtures à traiter")
-                af_odds_map = await af_fetch_odds(fixtures)
-
-                for fx in fixtures:
-                    if fx["event_id"] not in af_odds_map:
-                        continue
-                    odds_data = af_odds_map[fx["event_id"]]
-
-                    bzz_match = None
-                    for bz in bzz_preds:
-                        if normalize_name(bz["home"]) == normalize_name(fx["home"]) and \
-                           normalize_name(bz["away"]) == normalize_name(fx["away"]):
-                            bzz_match = bz
-                            break
-
-                    md = MatchData(
-                        event_id=fx["event_id"],
-                        league=fx.get("league", ""),
-                        home=fx["home"],
-                        away=fx["away"],
-                        kickoff=fx.get("kickoff", ""),
-                        real_odds=odds_data,
-                        bzz_markets=bzz_match.get("bzz_markets", {}) if bzz_match else {},
-                        bzz_confidence=bzz_match.get("bzz_confidence", 0) if bzz_match else 0,
-                        bzz_odds_source="api_football",
-                    )
-                    pool_with_odds.append(md)
-
-                print(f"✅ API-Football : {len(pool_with_odds)} matchs avec vraies cotes prêts")
-
-        # 🟡 PRIORITÉ 2 : The Odds API (si dispo)
-        if not pool_with_odds and odds_events:
-            pool_api = await build_match_pool([], odds_events)
-            for md in pool_api:
-                if any((md.real_odds or {}).values()):
-                    pool_with_odds.append(md)
-            if pool_with_odds:
-                print(f"✅ The Odds API : {len(pool_with_odds)} matchs avec vraies cotes")
-
-        # 🟢 PRIORITÉ 3 : InferSports (si rien d'autre)
-        if not pool_with_odds and fetch_infer_odds:
-            print("🔄 Fallback InferSports...")
-            today_iso2 = datetime.now(TZ).strftime("%Y-%m-%d")
-            try:
-                import httpx as _hx
-                async with _hx.AsyncClient(timeout=20.0) as _c:
-                    _h = {"Accept": "application/json"}
-                    if INFERSPORTS_API_KEY:
-                        _h["Authorization"] = f"Bearer {INFERSPORTS_API_KEY}"
-                    _r = await _c.get("https://api.infersports.dev/v1/events",
-                                      headers=_h,
-                                      params={"date": today_iso2, "sport": "football"},
-                                      timeout=20.0)
-                    _data = _r.json() if _r.status_code == 200 else {}
-                    infer_events = _data.get("data", []) if isinstance(_data, dict) else []
-            except Exception as _e:
-                print(f"⚠️ InferSports events crash: {_e}")
-                infer_events = []
-
-            if infer_events:
-                infer_matches = []
-                for ev in infer_events:
-                    ht = ev.get("home_team", {}) if isinstance(ev.get("home_team"), dict) else {}
-                    at = ev.get("away_team", {}) if isinstance(ev.get("away_team"), dict) else {}
-                    lg = ev.get("league", {}) if isinstance(ev.get("league"), dict) else {}
-                    if not ht.get("name") or not at.get("name"):
-                        continue
-                    infer_matches.append(MatchData(
-                        event_id=ev.get("id", ""),
-                        league=lg.get("name", ""),
-                        home=ht.get("name", ""),
-                        away=at.get("name", ""),
-                        kickoff=ev.get("scheduled_at", ""),
-                        real_odds={},
-                        bzz_markets={},
-                        bzz_confidence=0,
-                    ))
-
-                matches_for_odds = [
-                    {"event_id": md.event_id, "home": md.home, "away": md.away, "kickoff": md.kickoff}
-                    for md in infer_matches
-                ]
-                infer_odds_map = await fetch_infer_odds(matches_for_odds)
-                for md in infer_matches:
-                    if md.event_id in infer_odds_map:
-                        md.real_odds = infer_odds_map[md.event_id]
-                        md.bzz_odds_source = "infersports"
-                        pool_with_odds.append(md)
-
-        # === POOL B : matchs avec DIXON (MT-Fin) ===
-        pool_dixon = []
+        # Ajout des matchs Dixon (s'ils ne sont pas déjà dans API-Football)
         if STATE.get("dixon_model"):
             for bz in bzz_preds:
-                if any(normalize_name(md.home) == normalize_name(bz["home"]) and
-                       normalize_name(md.away) == normalize_name(bz["away"]) for md in pool_with_odds):
-                    continue
-                md = MatchData(
-                    event_id=bz["event_id"],
-                    league=bz.get("league", ""),
-                    home=bz["home"], away=bz["away"],
-                    kickoff=bz.get("kickoff", ""),
-                    real_odds={},
-                    bzz_markets=bz.get("bzz_markets", {}),
-                    bzz_confidence=bz.get("bzz_confidence", 0),
-                )
-                try:
-                    pred = STATE["dixon_model"].predict_all(md.home, md.away)
-                    if pred:
-                        md.dixon_pred = pred
-                        pool_dixon.append(md)
-                except:
-                    pass
+                if bz["event_id"] in used_ids: continue
+                md = MatchData(bz["event_id"], bz.get("league", ""), bz["home"], bz["away"], bz.get("kickoff", ""), {}, bz.get("bzz_markets", {}), bz.get("bzz_confidence", 0))
+                pred = STATE["dixon_model"].predict_all(md.home, md.away)
+                if pred:
+                    md.dixon_pred = pred
+                    pool.append(md)
+                    used_ids.add(md.event_id)
 
-        print(f"📋 Pool A (cotes réelles) : {len(pool_with_odds)} matchs")
-        print(f"📋 Pool B (Dixon only) : {len(pool_dixon)} matchs")
+        print(f"📋 Pool total : {len(pool)} matchs (Cotes: {len(af_matches)}, Dixon-only: {len(pool)-len(af_matches)})")
+        
+        # 4. Trier pour garder les meilleurs candidats pour Gemini
+        pool.sort(key=prescore_match, reverse=True)
+        top_pool = pool[:GEMINI_MAX_CALLS_PER_SCAN]
 
-        pool_with_odds.sort(key=prescore_match, reverse=True)
-        pool_dixon.sort(key=prescore_match, reverse=True)
-
-        top_A = pool_with_odds[:15]
-        top_B = pool_dixon[:5]
-        top_pool = top_A + top_B
-
-        print(f"🏆 Top Pool A (cotes) :")
-        for md in top_A[:5]:
-            print(f"   [{prescore_match(md)}/100] {md.home} vs {md.away} ({md.league})")
-        print(f"🏆 Top Pool B (Dixon) :")
-        for md in top_B[:3]:
-            print(f"   [{prescore_match(md)}/100] {md.home} vs {md.away} ({md.league})")
-
-        if not top_pool:
-            print("⚠️ Aucun match exploitable")
-            STATE["coupons"] = []
-            return
-
-        print(f"🧠 Gemini sur {len(top_pool)} matchs ({len(top_A)} cotes + {len(top_B)} Dixon)")
-
+        # 5. Analyse Gemini
         await enrich_and_analyze(top_pool)
-        final_pool = top_pool
 
-        STATE["coupons"] = build_all_coupons(final_pool)
-        mark_picks_used([s for c in STATE["coupons"] for s in c.legs])
-        STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
+        # 6. Création des 4 tickets
+        STATE["coupons"] = build_all_coupons(top_pool)
+        
         STATE["debug"] = {
-            "odds_events": len(odds_events),
-            "bzz_odds": len(pool_with_odds),
-            "bzz_predictions": len(bzz_preds),
-            "pool": len(final_pool),
+            "pool": len(pool),
+            "bzz_odds": len(af_matches),
             "coupons": len(STATE["coupons"])
         }
         print(f"──────── RÉSUMÉ ────────")
-        print(f"Pool A (cotes) : {len(pool_with_odds)}")
-        print(f"Pool B (Dixon) : {len(pool_dixon)}")
         print(f"Coupons : {len(STATE['coupons'])}")
         for c in STATE["coupons"]:
             print(f"  • {c.name} : {len(c.legs)} legs, cote {c.combined_odds}")
@@ -1465,8 +790,7 @@ async def lifespan(app):
     print("✅ Bot prêt.")
 
     scheduler = AsyncIOScheduler(timezone=TZ)
-    scheduler.add_job(daily_broadcast, CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ),
-                      id="daily", replace_existing=True)
+    scheduler.add_job(daily_broadcast, CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ), id="daily", replace_existing=True)
     scheduler.start()
     bot_task = asyncio.create_task(dp.start_polling(bot))
     print(f"✅ Scan à {NOTIFY_HOUR:02d}h{NOTIFY_MINUTE:02d}")
