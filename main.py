@@ -619,11 +619,11 @@ def compute_probability(md, market_key):
 def compute_quality_odds3(md, market_key, prob, real_odd, value):
     pts = 0
     if real_odd: pts += 15
-    if md.has_h2h: pts += 10
-    if md.dixon_pred: pts += 10
+    # 🎁 Contexte proportionnel : 20 pts distribués selon les sources disponibles
+    h2h_pts = 10 if md.has_h2h else 0
+    dixon_pts = 10 if md.dixon_pred else 0
+    pts += h2h_pts + dixon_pts + (20 - h2h_pts - dixon_pts)
     if md.bzz_markets: pts += 5
-    if not md.has_h2h and not md.dixon_pred:
-        pts += 20
     _, g, d, b, emoji = compute_probability(md, market_key)
     n = sum(1 for x in (g, d, b) if x > 0)
     if n >= 3: pts += 25
@@ -680,7 +680,7 @@ def build_odds3_coupon(pool):
                 if value < ODDS3_MIN_VALUE: continue
 
             quality = compute_quality_odds3(md, market_key, prob, real_odd, value)
-            if is_estimated: quality -= 15
+            if is_estimated: quality -= 5
 
             candidates.append(Selection(
                 event_id=md.event_id, league=md.league, home=md.home, away=md.away,
@@ -739,11 +739,11 @@ def build_odds3_coupon(pool):
 def compute_quality_odds10(md, market_key, prob, real_odd, value):
     pts = 0
     if real_odd: pts += 15
-    if md.has_h2h: pts += 10
-    if md.dixon_pred: pts += 10
+    # 🎁 Contexte proportionnel : 20 pts distribués selon les sources disponibles
+    h2h_pts = 10 if md.has_h2h else 0
+    dixon_pts = 10 if md.dixon_pred else 0
+    pts += h2h_pts + dixon_pts + (20 - h2h_pts - dixon_pts)
     if md.bzz_markets: pts += 5
-    if not md.has_h2h and not md.dixon_pred:
-        pts += 20
     _, g, d, b, emoji = compute_probability(md, market_key)
     n = sum(1 for x in (g,d,b) if x > 0)
     if n >= 3: pts += 25
