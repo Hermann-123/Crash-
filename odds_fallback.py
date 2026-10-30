@@ -1,8 +1,6 @@
 """
-Odds Fallback — InferSports (avec clé API)
-Tente de récupérer les cotes 1X2 + O/U via API asiatique quand The Odds API et Bzzoiro sont vides.
-
-⚠️ VERSION DEBUG : affiche la réponse brute pour identifier le bon format.
+Odds Fallback — InferSports (parser adapté au vrai format API)
+Format réel : {odds: [{market_type: '1x2', prices: {home, draw, away}}, ...]}
 """
 from __future__ import annotations
 
@@ -37,7 +35,6 @@ def _norm(s: str) -> str:
 
 
 def _safe_float(v) -> Optional[float]:
-    """Retourne float si > 1.01 (vraie cote), sinon None."""
     if v is None:
         return None
     try:
@@ -48,122 +45,60 @@ def _safe_float(v) -> Optional[float]:
 
 
 async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dict:
-    global _DEBUG_EVENTS_DONE
     try:
-        url = f"{INFER_BASE}{path}"
-        r = await client.get(url, headers=_headers(), params=params or {}, timeout=15.0)
-        
-        # Debug : afficher le statut pour la 1ère requête
-        if path == "/v1/events" and not _DEBUG_EVENTS_DONE:
-            print(f"🔎 InferSports {path} -> {r.status_code}")
-            if r.status_code == 200:
-                txt = r.text[:300]
-                print(f"🔎 InferSports sample response: {txt}")
-            _DEBUG_EVENTS_DONE = True
-        
+        r = await client.get(f"{INFER_BASE}{path}", headers=_headers(),
+                             params=params or {}, timeout=15.0)
         if r.status_code >= 400:
-            if r.status_code != 404:  # 404 = pas grave, on essaie autre chose
+            if r.status_code != 404:
                 print(f"⚠️ InferSports {path} -> {r.status_code}")
             return {}
-        data = r.json()
-        return data if isinstance(data, (dict, list)) else {}
+        return r.json() if r.text else {}
     except Exception as e:
         print(f"⚠️ InferSports {path} crash: {e}")
         return {}
 
 
-async def _find_event_id(client: httpx.AsyncClient, home: str, away: str, date: str) -> Optional[str]:
-    """Cherche l'event_id InferSports pour un match donné."""
-    # Essayer plusieurs endpoints (le bon dépend de leur API)
-    endpoints = [
-        ("/v1/events", {"date": date, "sport": "football"}),
-        ("/v1/football/events", {"date": date}),
-        ("/v1/fixtures", {"date": date, "sport": "football"}),
-        ("/events", {"date": date, "sport": "football"}),
-    ]
-    
-    events_list = []
-    for path, params in endpoints:
-        data = await _get(client, path, params)
-        if isinstance(data, list):
-            events_list = data
-        elif isinstance(data, dict):
-            events_list = data.get("events") or data.get("data") or data.get("results") or []
-        
-        if events_list:
-            break
-    
-    if not events_list:
-        return None
-    
+def _match_event(events_list: list, home: str, away: str) -> Optional[str]:
+    """Cherche un event_id correspondant dans une liste d'events."""
     target_home = _norm(home)
     target_away = _norm(away)
     if not target_home or not target_away:
         return None
     
-    best_id = None
-    best_score = 0.0
+    best_id, best_score = None, 0
     for ev in events_list:
         if not isinstance(ev, dict):
             continue
-        h_raw = (ev.get("home_team") or ev.get("home") or 
-                 ev.get("team_home") or ev.get("home_name") or "")
-        a_raw = (ev.get("away_team") or ev.get("away") or 
-                 ev.get("team_away") or ev.get("away_name") or "")
-        if not h_raw or not a_raw:
-            # Essayer avec "name": "Home vs Away"
-            name = ev.get("name") or ""
-            if " vs " in name:
-                parts = name.split(" vs ")
-                h_raw, a_raw = parts[0], parts[1]
+        ht = ev.get("home_team")
+        at = ev.get("away_team")
+        h_raw = ht.get("name", "") if isinstance(ht, dict) else ""
+        a_raw = at.get("name", "") if isinstance(at, dict) else ""
         
         h_norm = _norm(h_raw)
         a_norm = _norm(a_raw)
         
-        # Score de matching simple
         score = 0
-        if target_home in h_norm or h_norm in target_home:
+        if target_home and h_norm and (target_home == h_norm or target_home in h_norm or h_norm in target_home):
             score += 1
-        if target_away in a_norm or a_norm in target_away:
+        if target_away and a_norm and (target_away == a_norm or target_away in a_norm or a_norm in target_away):
             score += 1
         
         if score > best_score:
             best_score = score
-            best_id = ev.get("id") or ev.get("event_id")
+            best_id = ev.get("id")
             if score == 2:
-                break
+                return str(best_id) if best_id else None
     
-    if best_score == 2:
-        return str(best_id) if best_id else None
-    return None
+    return str(best_id) if best_score >= 2 and best_id else None
 
 
 async def _fetch_odds(client: httpx.AsyncClient, event_id: str) -> dict:
-    """Récupère et parse les cotes pour un event donné."""
+    """Parse les cotes au VRAI format InferSports."""
     global _DEBUG_ODDS_DONE
     
-    # Essayer plusieurs endpoints d'odds
-    endpoints = [
-        f"/v1/events/{event_id}/odds",
-        f"/v1/football/events/{event_id}/odds",
-        f"/events/{event_id}/odds",
-    ]
-    
-    data = {}
-    for path in endpoints:
-        d = await _get(client, path, {"format": "decimal"})
-        if d:
-            data = d
-            break
-    
+    data = await _get(client, f"/v1/events/{event_id}/odds", {"format": "decimal"})
     if not data:
         return {}
-    
-    # Debug : afficher la 1ère réponse d'odds
-    if not _DEBUG_ODDS_DONE:
-        print(f"🔎 InferSports ODDS SAMPLE (event {event_id}):")
-        print(f"   {str(data)[:500]}")
-        _DEBUG_ODDS_DONE = True
     
     result = {
         "home": None, "draw": None, "away": None,
@@ -171,76 +106,102 @@ async def _fetch_odds(client: httpx.AsyncClient, event_id: str) -> dict:
         "btts_yes": None, "btts_no": None,
     }
     
-    # Essayer plusieurs structures possibles
-    markets = data
-    if isinstance(data, dict):
-        markets = (data.get("markets") or data.get("odds") or 
-                   data.get("bookmakers") or data)
-    
-    if not isinstance(markets, dict):
+    # ✅ VRAI FORMAT : data['odds'] est une LISTE
+    odds_list = data.get("odds", [])
+    if not isinstance(odds_list, list):
         return result
     
-    # 1X2
-    for key in ("1x2", "1X2", "match_result", "moneyline", "h2h"):
-        m = markets.get(key)
-        if isinstance(m, dict):
-            result["home"] = (_safe_float(m.get("home")) or 
-                              _safe_float(m.get("HOME")) or 
-                              _safe_float(m.get("1")) or
-                              _safe_float(m.get("home_win")))
-            result["draw"] = (_safe_float(m.get("draw")) or 
-                              _safe_float(m.get("DRAW")) or 
-                              _safe_float(m.get("x")) or
-                              _safe_float(m.get("X")))
-            result["away"] = (_safe_float(m.get("away")) or 
-                              _safe_float(m.get("AWAY")) or 
-                              _safe_float(m.get("2")) or
-                              _safe_float(m.get("away_win")))
-            if result["home"] or result["draw"] or result["away"]:
-                break
+    market_types_found = set()
+    for item in odds_list:
+        if not isinstance(item, dict):
+            continue
+        mt = (item.get("market_type") or "").lower().strip()
+        market_types_found.add(mt)
+        prices = item.get("prices", {})
+        if not isinstance(prices, dict):
+            continue
+        
+        # 1X2
+        if mt == "1x2":
+            if result["home"] is None:
+                result["home"] = _safe_float(prices.get("home"))
+            if result["draw"] is None:
+                result["draw"] = _safe_float(prices.get("draw"))
+            if result["away"] is None:
+                result["away"] = _safe_float(prices.get("away"))
+        
+        # Totals (Over/Under 2.5) — vérifier la ligne
+        elif mt in ("totals", "total", "over_under", "ou"):
+            line = item.get("line")
+            try:
+                line_f = float(line) if line is not None else None
+            except (ValueError, TypeError):
+                line_f = None
+            if line_f == 2.5:
+                if result["over_2.5"] is None:
+                    result["over_2.5"] = _safe_float(prices.get("over"))
+                if result["under_2.5"] is None:
+                    result["under_2.5"] = _safe_float(prices.get("under"))
+        
+        # BTTS
+        elif mt in ("btts", "both_teams_to_score"):
+            if result["btts_yes"] is None:
+                result["btts_yes"] = _safe_float(prices.get("yes"))
+            if result["btts_no"] is None:
+                result["btts_no"] = _safe_float(prices.get("no"))
     
-    # Over/Under 2.5
-    for key in ("totals", "over_under", "ou", "ou_25", "over_under_25"):
-        m = markets.get(key)
-        if isinstance(m, dict):
-            result["over_2.5"] = (_safe_float(m.get("over_2.5")) or 
-                                  _safe_float(m.get("over")) or
-                                  _safe_float(m.get("OVER")))
-            result["under_2.5"] = (_safe_float(m.get("under_2.5")) or 
-                                   _safe_float(m.get("under")) or
-                                   _safe_float(m.get("UNDER")))
-            if result["over_2.5"] or result["under_2.5"]:
-                break
-    
-    # BTTS
-    for key in ("btts", "BTTS", "both_teams_to_score"):
-        m = markets.get(key)
-        if isinstance(m, dict):
-            result["btts_yes"] = (_safe_float(m.get("yes")) or 
-                                  _safe_float(m.get("YES")) or
-                                  _safe_float(m.get("btts_yes")))
-            result["btts_no"] = (_safe_float(m.get("no")) or 
-                                 _safe_float(m.get("NO")) or
-                                 _safe_float(m.get("btts_no")))
-            if result["btts_yes"] or result["btts_no"]:
-                break
+    # Debug 1ère fois
+    if not _DEBUG_ODDS_DONE:
+        print(f"🔎 InferSports PARSED (event {event_id}):")
+        print(f"   1X2 : {result['home']} / {result['draw']} / {result['away']}")
+        print(f"   O/U 2.5 : {result['over_2.5']} / {result['under_2.5']}")
+        print(f"   BTTS : {result['btts_yes']} / {result['btts_no']}")
+        print(f"   market_types disponibles : {market_types_found}")
+        _DEBUG_ODDS_DONE = True
     
     return result
 
 
 async def fetch_all_odds(matches: list[dict]) -> dict:
-    """
-    matches = [{"event_id": "bzz_123", "home": "X", "away": "Y", "kickoff": "2026-10-30"}]
-    Retourne {event_id: {home, draw, away, over_2.5, under_2.5, btts_yes, btts_no}}
-    """
+    """Récupère toutes les cotes. Charge les events UNE FOIS par date."""
+    global _DEBUG_EVENTS_DONE
+    
     if not INFER_API_KEY:
         print("⚠️ InferSports : pas de clé API")
         return {}
     
     results = {}
     async with httpx.AsyncClient(timeout=20.0) as client:
+        # === 1. Charger les events par date (1 appel par date, pas par match) ===
+        dates = set()
+        for m in matches:
+            date = (m.get("kickoff") or "")[:10]
+            if date:
+                dates.add(date)
+        
+        all_events = []
+        for date in sorted(dates):
+            data = await _get(client, "/v1/events",
+                              {"date": date, "sport": "football", "limit": 500})
+            events = data.get("data", []) if isinstance(data, dict) else []
+            all_events.extend(events)
+            await asyncio.sleep(0.15)
+        
+        print(f"🔎 InferSports : {len(all_events)} events chargés sur {len(dates)} date(s)")
+        
+        if not _DEBUG_EVENTS_DONE and all_events:
+            sample_names = []
+            for ev in all_events[:5]:
+                ht = ev.get("home_team", {}) if isinstance(ev.get("home_team"), dict) else {}
+                at = ev.get("away_team", {}) if isinstance(ev.get("away_team"), dict) else {}
+                lg = ev.get("league", {}) if isinstance(ev.get("league"), dict) else {}
+                sample_names.append(f"{ht.get('name','?')} vs {at.get('name','?')} ({lg.get('name','?')})")
+            print(f"🔎 InferSports exemples : {sample_names}")
+            _DEBUG_EVENTS_DONE = True
+        
+        # === 2. Matcher et récupérer les cotes ===
+        matched_count = 0
         for m in matches[:30]:
-            event_name = f"{m['home']} vs {m['away']}"
             date = (m.get("kickoff") or "")[:10]
             if not date:
                 continue
@@ -252,14 +213,12 @@ async def fetch_all_odds(matches: list[dict]) -> dict:
                     results[m["event_id"]] = cached
                 continue
             
-            # 1. Trouver l'event_id InferSports
-            infer_id = await _find_event_id(client, m["home"], m["away"], date)
+            infer_id = _match_event(all_events, m["home"], m["away"])
             if not infer_id:
                 CACHE[cache_key] = {}
-                await asyncio.sleep(0.2)
                 continue
             
-            # 2. Récupérer les cotes
+            matched_count += 1
             odds = await _fetch_odds(client, infer_id)
             if odds and any(v for v in odds.values()):
                 results[m["event_id"]] = odds
@@ -267,7 +226,9 @@ async def fetch_all_odds(matches: list[dict]) -> dict:
             else:
                 CACHE[cache_key] = {}
             
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.15)
+        
+        print(f"🔎 InferSports : {matched_count} events matchés sur {len(matches)}")
     
     print(f"📊 InferSports odds : {len(results)}/{len(matches)} matchs avec cotes")
     return results
