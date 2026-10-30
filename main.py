@@ -41,6 +41,11 @@ except Exception:
     fetch_bzzoiro_predictions_direct = None
 
 try:
+    from bzzoiro_odds import fetch_all_odds as fetch_bzzoiro_odds
+except Exception:
+    fetch_bzzoiro_odds = None
+
+try:
     from dixon_coles import download_and_train
 except Exception:
     download_and_train = None
@@ -101,7 +106,7 @@ ODDS10_MAX_SAME_LEAGUE = 2
 # MOTEUR 3 : MT-FIN
 MTFIN_MIN_SCORE = 80
 MTFIN_FALLBACK_SCORE = 75
-MTFIN_MIN_PROB = 0.55
+MTFIN_MIN_PROB = 0.40
 MTFIN_TOP_N = 3
 MTFIN_SIMULATIONS = 2000
 MTFIN_FIRST_HALF_RATIO = 0.45
@@ -302,6 +307,7 @@ class MatchData:
     has_h2h: bool = False
     h2h_data: dict = None
     sport_key: str = ""
+    bzz_odds_source: str = ""
 
 @dataclass
 class Selection:
@@ -634,8 +640,11 @@ def build_odds3_coupon(pool):
             if not (ODDS3_MIN_LEG_ODDS <= real_odd <= ODDS3_MAX_LEG_ODDS): continue
             if prob < 0.50: continue
             
-            value = (prob * real_odd) - 1.0
-            if value < ODDS3_MIN_VALUE: continue
+            if is_estimated:
+                value = 0.0
+            else:
+                value = (prob * real_odd) - 1.0
+                if value < ODDS3_MIN_VALUE: continue
             
             quality = compute_quality_odds3(md, market_key, prob, real_odd, value)
             if is_estimated: quality -= 15
@@ -654,8 +663,8 @@ def build_odds3_coupon(pool):
     print(f"  → Odds +3 : {len(candidates)} candidats bruts")
     valid = [c for c in candidates if c.quality >= ODDS3_MIN_SCORE]
     if not valid:
-        valid = [c for c in candidates if c.quality >= ODDS3_FALLBACK_SCORE]
-        if valid: print(f"  → Odds +3 : fallback à {ODDS3_FALLBACK_SCORE}")
+        valid = [c for c in candidates if c.quality >= 60]
+        if valid: print(f"  → Odds +3 : fallback à 60")
     
     if not valid: 
         print(f"  → Odds +3 : 0 match qualifié")
@@ -739,15 +748,24 @@ def build_odds10_coupon(pool):
             if real_odd is None:
                 real_odd = 1.0 / prob if prob > 0 else None
                 if real_odd is None: continue
-            if not (ODDS10_MIN_LEG_ODDS <= real_odd <= ODDS10_MAX_LEG_ODDS): continue
-            value = (prob * real_odd) - 1.0
-            if value < ODDS10_MIN_VALUE: continue
+                is_est = True
+            else:
+                is_est = False
+            
+            if not is_est:
+                if not (ODDS10_MIN_LEG_ODDS <= real_odd <= ODDS10_MAX_LEG_ODDS): continue
+                value = (prob * real_odd) - 1.0
+                if value < ODDS10_MIN_VALUE: continue
+            else:
+                if not (1.10 <= real_odd <= 1.55): continue
+                value = 0.0
+            
             quality = compute_quality_odds10(md, market_key, prob, real_odd, value)
             candidates.append(Selection(
                 event_id=md.event_id, league=md.league, home=md.home, away=md.away,
                 kickoff=md.kickoff, market=mkt_type, pick_label=label,
                 odds=round(real_odd,2), model_prob=round(prob,4),
-                real_odd=real_odd if md.real_odds.get("home") else None,
+                real_odd=real_odd if not is_est else None,
                 value=round(value,4), quality=quality,
                 prob_gemini=round(g,3), prob_dixon=round(d,3), prob_bzzoiro=round(b,3),
             ))
@@ -755,7 +773,7 @@ def build_odds10_coupon(pool):
     print(f"  → Odds +10 : {len(candidates)} candidats bruts")
     valid = [c for c in candidates if c.quality >= ODDS10_MIN_SCORE]
     if not valid:
-        valid = [c for c in candidates if c.quality >= ODDS10_FALLBACK_SCORE]
+        valid = [c for c in candidates if c.quality >= 60]
     
     if not valid:
         print(f"  → Odds +10 : 0 match")
@@ -892,10 +910,15 @@ def build_draw_coupon(pool):
         if home_odd and away_odd:
             if 2.20 <= min(home_odd, away_odd) and max(home_odd, away_odd) <= 3.50: score += 30
             elif 1.80 <= min(home_odd, away_odd): score += 20
+        else:
+            if prob_draw >= 0.30 and g >= 0.28: score += 20
+            elif prob_draw >= 0.28: score += 12
         if prob_draw >= 0.33: score += 25
         elif prob_draw >= 0.28: score += 18
         if g >= 0.30: score += 20
         elif g >= 0.25: score += 12
+        if d >= 0.28: score += 10
+        if md.has_h2h: score += 5
         score += 10
         
         if score < DRAW_MIN_SCORE and score < DRAW_FALLBACK_SCORE: continue
@@ -914,7 +937,7 @@ def build_draw_coupon(pool):
     print(f"  → Match Nul : {len(candidates)} candidats")
     valid = [c for c in candidates if c.quality >= DRAW_MIN_SCORE]
     if not valid:
-        valid = [c for c in candidates if c.quality >= DRAW_FALLBACK_SCORE]
+        valid = [c for c in candidates if c.quality >= 60]
     if not valid:
         print(f"  → Match Nul : 0 match qualifié")
         return None
@@ -1035,7 +1058,6 @@ def format_bilan(tracker):
     wr = (won/settled*100) if settled > 0 else 0
     return f"{format_header()}\n\n<b>📊 BILAN</b>\n🎫 {len(cps)}\n✅ {won}\n❌ {lost}\n⏳ {pending}\n📈 {wr:.1f}%"
 
-# === FIX : safe_answer avec reply_markup ===
 async def safe_answer(msg, txt, reply_markup=None):
     for i, p in enumerate(split_message(txt)):
         try:
@@ -1115,7 +1137,7 @@ async def scan_cmd(m):
 async def debug_cmd(m):
     if m.from_user.id != ADMIN_ID: return
     d = STATE["debug"]
-    await safe_answer(m, f"<b>🔍 DEBUG</b>\n\nDixon : {'✅' if STATE['dixon_model'] else '❌'}\nOdds : {d.get('odds_events',0)}\nBzzoiro : {d.get('bzz_predictions',0)}\nPool : {d.get('pool',0)}\nCoupons : {d.get('coupons',0)}")
+    await safe_answer(m, f"<b>🔍 DEBUG</b>\n\nDixon : {'✅' if STATE['dixon_model'] else '❌'}\nOdds : {d.get('odds_events',0)}\nBzzoiro odds : {d.get('bzz_odds',0)}\nBzzoiro : {d.get('bzz_predictions',0)}\nPool : {d.get('pool',0)}\nCoupons : {d.get('coupons',0)}")
 
 async def send_coupon(m, name):
     c = next((x for x in STATE["coupons"] if x.name == name), None)
@@ -1182,6 +1204,25 @@ async def scan():
         pool = await build_match_pool(bzz_preds, odds_events)
         print(f"📋 Pool : {len(pool)} matchs")
 
+        # === FALLBACK BZZOIRO ODDS si Odds API vide ===
+        bzz_odds_count = 0
+        if not odds_events and fetch_bzzoiro_odds:
+            bzz_ids = []
+            for md in pool:
+                if md.event_id.startswith("bzz_"):
+                    try: bzz_ids.append(int(md.event_id.replace("bzz_", "")))
+                    except ValueError: pass
+            if bzz_ids:
+                print(f"📊 Récupération cotes Bzzoiro pour {len(bzz_ids)} matchs...")
+                bzz_odds_map = await fetch_bzzoiro_odds(bzz_ids)
+                bzz_odds_count = len(bzz_odds_map)
+                for md in pool:
+                    try: eid = int(md.event_id.replace("bzz_", ""))
+                    except ValueError: continue
+                    if eid in bzz_odds_map:
+                        md.real_odds = bzz_odds_map[eid]
+                        md.bzz_odds_source = "bzzoiro"
+
         if not pool:
             STATE["coupons"] = []
             return
@@ -1190,8 +1231,13 @@ async def scan():
         STATE["coupons"] = build_all_coupons(pool)
         mark_picks_used([s for c in STATE["coupons"] for s in c.legs])
         STATE["last_scan"] = datetime.now(TZ).strftime("%d/%m %H:%M")
-        STATE["debug"] = {"odds_events": len(odds_events), "bzz_predictions": len(bzz_preds),
-                          "pool": len(pool), "coupons": len(STATE["coupons"])}
+        STATE["debug"] = {
+            "odds_events": len(odds_events),
+            "bzz_odds": bzz_odds_count,
+            "bzz_predictions": len(bzz_preds),
+            "pool": len(pool),
+            "coupons": len(STATE["coupons"])
+        }
         print(f"──────── RÉSUMÉ ────────")
         print(f"Pool : {len(pool)}")
         print(f"Coupons : {len(STATE['coupons'])}")
