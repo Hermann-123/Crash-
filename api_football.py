@@ -1,8 +1,5 @@
 """
-API-Football v3 — Source principale de fixtures + cotes réelles.
-Plan gratuit : 100 requêtes/jour, tous endpoints accessibles.
-Base URL : https://v3.football.api-sports.io
-Auth : header x-apisports-key
+API-Football v3 — Version respectueuse du rate limit (10 req/min gratuit).
 """
 from __future__ import annotations
 
@@ -15,6 +12,12 @@ import httpx
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
 _CACHE: dict = {}
+
+# ⚠️ Rate limit gratuit = 10 req/minute
+# On limite à 8 fixtures par scan = 1 (fixtures) + 8 (odds) = 9 requêtes
+# Avec sleep 7.5s entre chaque = 60s pour 8 odds
+MAX_FIXTURES_ODDS = 8
+SLEEP_BETWEEN_ODDS = 7.5
 
 
 def _headers() -> dict:
@@ -35,8 +38,11 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dic
     try:
         r = await client.get(f"{API_FOOTBALL_BASE}{path}", headers=_headers(),
                              params=params or {}, timeout=20.0)
+        if r.status_code == 429:
+            print(f"⚠️ API-Football {path} -> 429 (rate limit)")
+            return {"_rate_limited": True}
         if r.status_code >= 400:
-            print(f"⚠️ API-Football {path} -> {r.status_code} | {r.text[:150]}")
+            print(f"⚠️ API-Football {path} -> {r.status_code} | {r.text[:100]}")
             return {}
         return r.json() if r.text else {}
     except Exception as e:
@@ -45,7 +51,7 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dic
 
 
 async def fetch_fixtures_today(date_str: str) -> list:
-    """Retourne les fixtures du jour NON commencées (NS)."""
+    """Fixtures du jour NON commencées."""
     cache_key = f"fixtures_{date_str}"
     if cache_key in _CACHE:
         return _CACHE[cache_key]
@@ -59,7 +65,6 @@ async def fetch_fixtures_today(date_str: str) -> list:
     for f in response:
         fx = f.get("fixture", {})
         status = fx.get("status", {}).get("short", "")
-        # Garder UNIQUEMENT les matchs "Not Started"
         if status != "NS":
             continue
 
@@ -87,13 +92,16 @@ async def fetch_fixtures_today(date_str: str) -> list:
 
 
 async def fetch_fixture_odds(fixture_id: int) -> dict:
-    """Récupère les cotes pour un fixture. Prend le 1er bookmaker complet."""
+    """Récupère les cotes pour un fixture."""
     cache_key = f"odds_{fixture_id}"
     if cache_key in _CACHE:
         return _CACHE[cache_key]
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         data = await _get(client, "/odds", {"fixture": fixture_id})
+
+    if data.get("_rate_limited"):
+        return {}
 
     result = {
         "home": None, "draw": None, "away": None,
@@ -123,21 +131,13 @@ async def fetch_fixture_odds(fixture_id: int) -> dict:
                         elif val == "away" and result["away"] is None:
                             result["away"] = odd
 
-                elif "over/under" in bet_name and "2.5" in bet_name:
+                elif ("over/under" in bet_name or "goals over/under" in bet_name) and "2.5" in bet_name:
                     for v in values:
                         val = (v.get("value") or "").lower()
                         odd = _safe_float(v.get("odd"))
-                        if val == "over" and result["over_2.5"] is None:
+                        if ("over" in val) and result["over_2.5"] is None:
                             result["over_2.5"] = odd
-                        elif val == "under" and result["under_2.5"] is None:
-                            result["under_2.5"] = odd
-                    # Essayer aussi avec "Over 2.5" / "Under 2.5"
-                    for v in values:
-                        val = (v.get("value") or "").lower()
-                        odd = _safe_float(v.get("odd"))
-                        if "over 2.5" in val and result["over_2.5"] is None:
-                            result["over_2.5"] = odd
-                        elif "under 2.5" in val and result["under_2.5"] is None:
+                        elif ("under" in val) and result["under_2.5"] is None:
                             result["under_2.5"] = odd
 
                 elif "both teams" in bet_name:
@@ -158,20 +158,26 @@ async def fetch_fixture_odds(fixture_id: int) -> dict:
 
 
 async def fetch_all_odds(fixtures: list[dict]) -> dict:
-    """Récupère les cotes pour une liste de fixtures (limite 40 pour quota)."""
+    """Récupère les cotes pour un MAX de 8 fixtures (respecte rate limit)."""
     if not API_FOOTBALL_KEY:
         print("⚠️ API-Football : pas de clé API_FOOTBALL_KEY")
         return {}
 
     results = {}
-    for fx in fixtures[:40]:
+    limited = fixtures[:MAX_FIXTURES_ODDS]
+
+    print(f"📊 API-Football : {len(limited)} fixtures (limite rate-limit), ~{len(limited)*SLEEP_BETWEEN_ODDS:.0f}s")
+
+    for idx, fx in enumerate(limited):
         fid = fx.get("fixture_id")
         if not fid:
             continue
         odds = await fetch_fixture_odds(fid)
         if odds and any(v for v in odds.values()):
             results[fx["event_id"]] = odds
-        await asyncio.sleep(0.1)
+        # ⚠️ Sleep SAUF pour le dernier
+        if idx < len(limited) - 1:
+            await asyncio.sleep(SLEEP_BETWEEN_ODDS)
 
-    print(f"📊 API-Football odds : {len(results)}/{len(fixtures[:40])} matchs avec cotes")
+    print(f"📊 API-Football odds : {len(results)}/{len(limited)} matchs avec cotes")
     return results
