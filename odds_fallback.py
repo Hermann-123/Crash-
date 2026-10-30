@@ -47,10 +47,11 @@ def _safe_float(v) -> Optional[float]:
 async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dict:
     try:
         r = await client.get(f"{INFER_BASE}{path}", headers=_headers(),
-                             params=params or {}, timeout=15.0)
+                             params=params or {}, timeout=20.0)
         if r.status_code >= 400:
             if r.status_code != 404:
-                print(f"⚠️ InferSports {path} -> {r.status_code}")
+                # Log utile pour debug
+                print(f"⚠️ InferSports {path} ({params}) -> {r.status_code} | {r.text[:200]}")
             return {}
         return r.json() if r.text else {}
     except Exception as e:
@@ -71,8 +72,8 @@ def _match_event(events_list: list, home: str, away: str) -> Optional[str]:
             continue
         ht = ev.get("home_team")
         at = ev.get("away_team")
-        h_raw = ht.get("name", "") if isinstance(ht, dict) else ""
-        a_raw = at.get("name", "") if isinstance(at, dict) else ""
+        h_raw = ht.get("name", "") if isinstance(ht, dict) else (ht or "")
+        a_raw = at.get("name", "") if isinstance(at, dict) else (at or "")
         
         h_norm = _norm(h_raw)
         a_norm = _norm(a_raw)
@@ -130,7 +131,7 @@ async def _fetch_odds(client: httpx.AsyncClient, event_id: str) -> dict:
             if result["away"] is None:
                 result["away"] = _safe_float(prices.get("away"))
         
-        # Totals (Over/Under 2.5) — vérifier la ligne
+        # Totals (Over/Under 2.5)
         elif mt in ("totals", "total", "over_under", "ou"):
             line = item.get("line")
             try:
@@ -150,13 +151,12 @@ async def _fetch_odds(client: httpx.AsyncClient, event_id: str) -> dict:
             if result["btts_no"] is None:
                 result["btts_no"] = _safe_float(prices.get("no"))
     
-    # Debug 1ère fois
     if not _DEBUG_ODDS_DONE:
         print(f"🔎 InferSports PARSED (event {event_id}):")
         print(f"   1X2 : {result['home']} / {result['draw']} / {result['away']}")
         print(f"   O/U 2.5 : {result['over_2.5']} / {result['under_2.5']}")
         print(f"   BTTS : {result['btts_yes']} / {result['btts_no']}")
-        print(f"   market_types disponibles : {market_types_found}")
+        print(f"   market_types : {market_types_found}")
         _DEBUG_ODDS_DONE = True
     
     return result
@@ -171,8 +171,8 @@ async def fetch_all_odds(matches: list[dict]) -> dict:
         return {}
     
     results = {}
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        # === 1. Charger les events par date (1 appel par date, pas par match) ===
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        # === 1. Charger les events par date ===
         dates = set()
         for m in matches:
             date = (m.get("kickoff") or "")[:10]
@@ -181,27 +181,28 @@ async def fetch_all_odds(matches: list[dict]) -> dict:
         
         all_events = []
         for date in sorted(dates):
-            data = await _get(client, "/v1/events",
-                              {"date": date, "sport": "football", "limit": 500})
+            # ✅ SANS 'limit' — c'est ce qui causait le 400
+            data = await _get(client, "/v1/events", {"date": date, "sport": "football"})
             events = data.get("data", []) if isinstance(data, dict) else []
+            print(f"🔎 InferSports {date} : {len(events)} events")
             all_events.extend(events)
             await asyncio.sleep(0.15)
         
-        print(f"🔎 InferSports : {len(all_events)} events chargés sur {len(dates)} date(s)")
+        print(f"🔎 InferSports TOTAL : {len(all_events)} events sur {len(dates)} date(s)")
         
         if not _DEBUG_EVENTS_DONE and all_events:
-            sample_names = []
+            sample = []
             for ev in all_events[:5]:
                 ht = ev.get("home_team", {}) if isinstance(ev.get("home_team"), dict) else {}
                 at = ev.get("away_team", {}) if isinstance(ev.get("away_team"), dict) else {}
                 lg = ev.get("league", {}) if isinstance(ev.get("league"), dict) else {}
-                sample_names.append(f"{ht.get('name','?')} vs {at.get('name','?')} ({lg.get('name','?')})")
-            print(f"🔎 InferSports exemples : {sample_names}")
+                sample.append(f"{ht.get('name','?')} vs {at.get('name','?')} ({lg.get('name','?')})")
+            print(f"🔎 InferSports exemples : {sample}")
             _DEBUG_EVENTS_DONE = True
         
         # === 2. Matcher et récupérer les cotes ===
         matched_count = 0
-        for m in matches[:30]:
+        for m in matches[:40]:
             date = (m.get("kickoff") or "")[:10]
             if not date:
                 continue
