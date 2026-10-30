@@ -1,202 +1,177 @@
 """
-API-Football : fixtures, stats équipes, corners/cartons, H2H, blessés,
-stats BTTS+Over2.5 (compatible Free Plan).
+API-Football v3 — Source principale de fixtures + cotes réelles.
+Plan gratuit : 100 requêtes/jour, tous endpoints accessibles.
+Base URL : https://v3.football.api-sports.io
+Auth : header x-apisports-key
 """
 from __future__ import annotations
 
 import asyncio
 import os
-import re
-import unicodedata
-from datetime import datetime
 from typing import Optional
 
 import httpx
 
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
-API_BASE = "https://v3.football.api-sports.io"
-
-LEAGUE_MAP = {
-    "soccer_epl": 39, "soccer_spain_la_liga": 140, "soccer_italy_serie_a": 135,
-    "soccer_germany_bundesliga": 78, "soccer_france_ligue_one": 61,
-    "soccer_uefa_champs_league": 2, "soccer_uefa_europa_league": 3,
-    "soccer_efl_champ": 40, "soccer_netherlands_eredivisie": 88,
-    "soccer_portugal_primeira_liga": 94, "soccer_turkey_super_league": 203,
-    "soccer_belgium_first_div": 144, "soccer_scotland_premiership": 179,
-    "soccer_brazil_campeonato": 71, "soccer_argentina_primera_division": 128,
-}
-
-_TEAM_ID_CACHE: dict = {}
-_STATS_CACHE: dict = {}
-_H2H_CACHE: dict = {}
-_INJ_CACHE: dict = {}
-_BTTS_STATS_CACHE: dict = {}
-
-
-def _norm(s: str) -> str:
-    if not s:
-        return ""
-    s = str(s).lower().strip()
-    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    for sfx in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]:
-        s = s.replace(sfx, "")
-    s = re.sub(r"[^a-z0-9 ]", "", s)
-    return re.sub(r"\s+", " ", s).strip()
+API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
+_CACHE: dict = {}
 
 
 def _headers() -> dict:
     return {"x-apisports-key": API_FOOTBALL_KEY}
 
 
-async def _get(client: httpx.AsyncClient, path: str, params: dict) -> dict:
+def _safe_float(v) -> Optional[float]:
+    if v is None:
+        return None
     try:
-        r = await client.get(f"{API_BASE}{path}", headers=_headers(), params=params, timeout=15.0)
+        f = float(v)
+        return f if f > 1.01 else None
+    except (ValueError, TypeError):
+        return None
+
+
+async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dict:
+    try:
+        r = await client.get(f"{API_FOOTBALL_BASE}{path}", headers=_headers(),
+                             params=params or {}, timeout=20.0)
         if r.status_code >= 400:
-            print(f"  🚨 API-Football {path} -> {r.status_code} | {r.text[:120]}")
+            print(f"⚠️ API-Football {path} -> {r.status_code} | {r.text[:150]}")
             return {}
-        data = r.json()
-        errors = data.get("errors", {})
-        if errors and errors != []:
-            print(f"  🚨 API-Football {path} erreurs: {errors}")
-            return {}
-        return data
+        return r.json() if r.text else {}
     except Exception as e:
-        print(f"  🚨 API-Football {path} crash: {e}")
+        print(f"⚠️ API-Football {path} crash: {e}")
         return {}
 
 
-async def find_team_id(client: httpx.AsyncClient, name: str) -> Optional[int]:
-    """Trouve l'ID de l'équipe PREMIÈRE (exclut Women, U23, U21, B, etc.)"""
-    key = _norm(name)
-    if not key:
-        return None
-    if key in _TEAM_ID_CACHE:
-        return _TEAM_ID_CACHE[key]
-    
-    data = await _get(client, "/teams", {"search": name})
-    teams = data.get("response", [])
-    
-    if not teams:
-        _TEAM_ID_CACHE[key] = None
-        return None
+async def fetch_fixtures_today(date_str: str) -> list:
+    """Retourne les fixtures du jour NON commencées (NS)."""
+    cache_key = f"fixtures_{date_str}"
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
 
-    # Mots-clés à exclure (équipes féminines, jeunes, réserves)
-    EXCLUDE_KW = ["women", "w", "u23", "u21", "u20", "u19", "u18", "reserve", "reserves", "ii"]
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        data = await _get(client, "/fixtures", {"date": date_str, "timezone": "UTC"})
 
-    best_team_id = None
-    best_team_name = None
-
-    for t in teams:
-        team = t.get("team", {})
-        tid = team.get("id")
-        tname = team.get("name", "").strip()
-        tname_lower = tname.lower()
-
-        # Exclure
-        skip = False
-        for kw in EXCLUDE_KW:
-            if f" {kw}" in tname_lower or tname_lower.endswith(kw):
-                skip = True; break
-        if skip:
-            continue
-
-        # Match exact ou contenu
-        if tid and (_norm(tname) == key or key in _norm(tname) or _norm(tname) in key):
-            best_team_id = tid
-            best_team_name = tname
-            # Si match exact, on s'arrête tout de suite
-            if _norm(tname) == key:
-                break
-
-    if best_team_id:
-        print(f"    ✅ Matché '{name}' -> '{best_team_name}' (ID: {best_team_id})")
-        _TEAM_ID_CACHE[key] = best_team_id
-        return best_team_id
-
-    print(f"    ❌ Aucune équipe première trouvée pour '{name}' (filtré women/U23/etc)")
-    _TEAM_ID_CACHE[key] = None
-    return None
-
-
-async def get_team_btts_stats(team_id: int, last: int = 10) -> dict:
-    """Free plan : utilise 'season' au lieu de 'last'."""
-    if not API_FOOTBALL_KEY or not team_id:
-        return {}
-
-    cache_key = f"btts_{team_id}_{last}"
-    if cache_key in _BTTS_STATS_CACHE:
-        return _BTTS_STATS_CACHE[cache_key]
-
-    # On teste l'année en cours, puis l'année précédente
-    current_year = datetime.now().year
+    response = data.get("response", []) if isinstance(data, dict) else []
     fixtures = []
 
+    for f in response:
+        fx = f.get("fixture", {})
+        status = fx.get("status", {}).get("short", "")
+        # Garder UNIQUEMENT les matchs "Not Started"
+        if status != "NS":
+            continue
+
+        fixture_id = fx.get("id")
+        teams = f.get("teams", {})
+        league = f.get("league", {})
+        home = teams.get("home", {}).get("name", "")
+        away = teams.get("away", {}).get("name", "")
+        if not home or not away or not fixture_id:
+            continue
+
+        fixtures.append({
+            "event_id": f"af_{fixture_id}",
+            "fixture_id": fixture_id,
+            "home": home,
+            "away": away,
+            "league": league.get("name", ""),
+            "country": league.get("country", ""),
+            "kickoff": fx.get("date", ""),
+        })
+
+    _CACHE[cache_key] = fixtures
+    print(f"📊 API-Football : {len(fixtures)} fixtures NS le {date_str}")
+    return fixtures
+
+
+async def fetch_fixture_odds(fixture_id: int) -> dict:
+    """Récupère les cotes pour un fixture. Prend le 1er bookmaker complet."""
+    cache_key = f"odds_{fixture_id}"
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
+
     async with httpx.AsyncClient(timeout=20.0) as client:
-        for season in [current_year, current_year - 1]:
-            data = await _get(client, "/fixtures", {
-                "team": team_id,
-                "season": str(season),
-            })
-            fixtures = data.get("response", [])
-            if fixtures:
-                break
-
-    if not fixtures:
-        _BTTS_STATS_CACHE[cache_key] = {}
-        return {}
-
-    # Garder uniquement les matchs terminés
-    finished = [fx for fx in fixtures if fx.get("fixture", {}).get("status", {}).get("short") in ("FT", "AET", "PEN")]
-
-    # Trier par timestamp DESC et prendre les N derniers
-    finished.sort(key=lambda x: x.get("fixture", {}).get("timestamp", 0), reverse=True)
-    recent = finished[:last]
-
-    if not recent:
-        _BTTS_STATS_CACHE[cache_key] = {}
-        return {}
-
-    total = gf_sum = ga_sum = 0
-    scored = conceded = btts = over25 = btts_over25 = 0
-
-    for fx in recent:
-        goals = fx.get("goals", {})
-        hg, ag = goals.get("home"), goals.get("away")
-        if hg is None or ag is None: continue
-
-        home_id = fx.get("teams", {}).get("home", {}).get("id")
-        gf, ga = (hg, ag) if home_id == team_id else (ag, hg)
-
-        total += 1
-        gf_sum += gf; ga_sum += ga
-        if gf >= 1: scored += 1
-        if ga >= 1: conceded += 1
-        if gf >= 1 and ga >= 1: btts += 1
-        if (gf + ga) >= 3: over25 += 1
-        if gf >= 1 and ga >= 1 and (gf + ga) >= 3: btts_over25 += 1
-
-    if total == 0:
-        _BTTS_STATS_CACHE[cache_key] = {}
-        return {}
+        data = await _get(client, "/odds", {"fixture": fixture_id})
 
     result = {
-        "matches_played": total,
-        "goals_for_avg": round(gf_sum / total, 2),
-        "goals_against_avg": round(ga_sum / total, 2),
-        "scored_pct": round(scored / total, 3),
-        "conceded_pct": round(conceded / total, 3),
-        "btts_pct": round(btts / total, 3),
-        "over_25_pct": round(over25 / total, 3),
-        "btts_over_25_pct": round(btts_over25 / total, 3),
+        "home": None, "draw": None, "away": None,
+        "over_2.5": None, "under_2.5": None,
+        "btts_yes": None, "btts_no": None,
     }
-    print(f"    📊 Stats OK pour team_id={team_id} : BTTS+O2.5 = {result['btts_over_25_pct']*100:.0f}% (sur {total} matchs)")
-    _BTTS_STATS_CACHE[cache_key] = result
-    return result
+
+    response = data.get("response", []) if isinstance(data, dict) else []
+    if not response:
+        _CACHE[cache_key] = {}
+        return {}
+
+    for item in response:
+        for bk in item.get("bookmakers", []):
+            for bet in bk.get("bets", []):
+                bet_name = (bet.get("name") or "").lower()
+                values = bet.get("values", [])
+
+                if "match winner" in bet_name:
+                    for v in values:
+                        val = (v.get("value") or "").lower()
+                        odd = _safe_float(v.get("odd"))
+                        if val == "home" and result["home"] is None:
+                            result["home"] = odd
+                        elif val == "draw" and result["draw"] is None:
+                            result["draw"] = odd
+                        elif val == "away" and result["away"] is None:
+                            result["away"] = odd
+
+                elif "over/under" in bet_name and "2.5" in bet_name:
+                    for v in values:
+                        val = (v.get("value") or "").lower()
+                        odd = _safe_float(v.get("odd"))
+                        if val == "over" and result["over_2.5"] is None:
+                            result["over_2.5"] = odd
+                        elif val == "under" and result["under_2.5"] is None:
+                            result["under_2.5"] = odd
+                    # Essayer aussi avec "Over 2.5" / "Under 2.5"
+                    for v in values:
+                        val = (v.get("value") or "").lower()
+                        odd = _safe_float(v.get("odd"))
+                        if "over 2.5" in val and result["over_2.5"] is None:
+                            result["over_2.5"] = odd
+                        elif "under 2.5" in val and result["under_2.5"] is None:
+                            result["under_2.5"] = odd
+
+                elif "both teams" in bet_name:
+                    for v in values:
+                        val = (v.get("value") or "").lower()
+                        odd = _safe_float(v.get("odd"))
+                        if val == "yes" and result["btts_yes"] is None:
+                            result["btts_yes"] = odd
+                        elif val == "no" and result["btts_no"] is None:
+                            result["btts_no"] = odd
+
+            if result["home"] and result["draw"] and result["away"]:
+                _CACHE[cache_key] = result
+                return result
+
+    _CACHE[cache_key] = result
+    return result if any(result.values()) else {}
 
 
-# --- Fonctions conservées telles quelles (pas critiques pour BBTS+2.5) ---
-async def fetch_all_today_fixtures() -> list[dict]:
-    return []
+async def fetch_all_odds(fixtures: list[dict]) -> dict:
+    """Récupère les cotes pour une liste de fixtures (limite 40 pour quota)."""
+    if not API_FOOTBALL_KEY:
+        print("⚠️ API-Football : pas de clé API_FOOTBALL_KEY")
+        return {}
 
-async def get_h2h_by_names(home: str, away: str) -> dict:
-    return {"available": False}
+    results = {}
+    for fx in fixtures[:40]:
+        fid = fx.get("fixture_id")
+        if not fid:
+            continue
+        odds = await fetch_fixture_odds(fid)
+        if odds and any(v for v in odds.values()):
+            results[fx["event_id"]] = odds
+        await asyncio.sleep(0.1)
+
+    print(f"📊 API-Football odds : {len(results)}/{len(fixtures[:40])} matchs avec cotes")
+    return results
