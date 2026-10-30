@@ -43,6 +43,7 @@ except Exception as e:
     fetch_bzzoiro_predictions_direct = None
     print(f"❌ bzzoiro_predictions_direct: {e}")
 
+# ⭐ L'IMPORT QUI CORRESPOND AU NOUVEAU api_football.py
 try:
     from api_football import fetch_odds_for_date as af_fetch_odds_date
     print("✅ api_football chargé")
@@ -80,7 +81,7 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • 4 Moteurs")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "35")) # Un peu plus pour analyser tous les matchs API
+GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "30"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
 # MOTEUR 1 : ODDS +3
@@ -89,6 +90,7 @@ ODDS3_MIN_ODDS = 3.0
 ODDS3_MAX_ODDS = 4.5
 ODDS3_MIN_LEG_ODDS = 1.55
 ODDS3_MAX_LEG_ODDS = 2.20
+ODDS3_MIN_LEG_ODDS_ABS = 1.25
 ODDS3_MIN_VALUE = 0.05
 ODDS3_MIN_LEGS = 2
 ODDS3_MAX_LEGS = 3
@@ -96,10 +98,10 @@ ODDS3_MAX_LEGS = 3
 # MOTEUR 2 : ODDS +10
 ODDS10_MIN_SCORE = 80
 ODDS10_MIN_ODDS = 10.0
-ODDS10_MIN_LEG_ODDS = 1.30 # Élargi de 1.35 à 1.30 pour faciliter
-ODDS10_MAX_LEG_ODDS = 1.70 # Élargi de 1.65 à 1.70
-ODDS10_MIN_PROB = 0.65 # Abaissé de 0.68 à 0.65
-ODDS10_MIN_VALUE = 0.02 # Abaissé de 0.03 à 0.02
+ODDS10_MIN_LEG_ODDS = 1.35
+ODDS10_MAX_LEG_ODDS = 1.65
+ODDS10_MIN_PROB = 0.68
+ODDS10_MIN_VALUE = 0.03
 ODDS10_MIN_LEGS = 6
 ODDS10_MAX_LEGS = 8
 ODDS10_MAX_SAME_MARKET = 2
@@ -129,7 +131,6 @@ TZ = ZoneInfo(NOTIFY_TZ)
 if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
     raise RuntimeError("Variables d'environnement manquantes")
 
-# --- FONCTIONS UTILITAIRES ---
 def today_pretty():
     d = datetime.now(TZ)
     months = {1:"janvier",2:"février",3:"mars",4:"avril",5:"mai",6:"juin",7:"juillet",8:"août",9:"septembre",10:"octobre",11:"novembre",12:"décembre"}
@@ -407,14 +408,10 @@ def compute_probability(md, market_key):
         elif delta >= 0.15: emoji = "⚠️"
     return final, gem, dix, bzz, emoji
 
-# --- MOTEURS ---
-
 def build_odds3_coupon(pool):
     candidates = []
     for md in pool:
-        # Sécurité anti-fantôme
         if not md.home or not md.away: continue
-        
         for market_key, (label, mkt_type) in {"btts_yes": ("BTTS Oui", "BTTS"), "btts_no": ("BTTS Non", "BTTS"), "over_2.5": ("Over 2.5", "O/U"), "under_2.5": ("Under 2.5", "O/U")}.items():
             prob, g, d, b, emoji = compute_probability(md, market_key)
             if prob <= 0 or emoji == "⚠️": continue
@@ -464,7 +461,6 @@ def build_odds10_coupon(pool):
     candidates = []
     for md in pool:
         if not md.home or not md.away: continue
-        
         for market_key, (label, mkt_type) in {"btts_yes": ("BTTS Oui", "BTTS"), "over_2.5": ("Over 2.5", "O/U"), "under_2.5": ("Under 2.5", "O/U")}.items():
             prob, g, d, b, emoji = compute_probability(md, market_key)
             if prob < ODDS10_MIN_PROB or emoji == "⚠️": continue
@@ -479,7 +475,7 @@ def build_odds10_coupon(pool):
             n = sum(1 for x in (g, d, b) if x > 0)
             pts += 25 if n >= 3 else 15
             if prob >= 0.75: pts += 20
-            elif prob >= 0.65: pts += 10
+            elif prob >= 0.68: pts += 10
             if value >= 0.05: pts += 10
             
             if pts < ODDS10_MIN_SCORE: continue
@@ -581,25 +577,17 @@ def build_all_coupons(pool):
     used_ids = set()
     def fresh(): return [md for md in pool if md.event_id not in used_ids]
 
-    # 1. Odds +10 (le plus gourmand)
     if c := build_odds10_coupon(fresh()):
         coupons.append(c); used_ids.update(s.event_id for s in c.legs)
-    
-    # 2. Odds +3
     if c := build_odds3_coupon(fresh()):
         coupons.append(c); used_ids.update(s.event_id for s in c.legs)
-    
-    # 3. Match Nul
     if c := build_draw_coupon(fresh()):
         coupons.append(c); used_ids.update(s.event_id for s in c.legs)
-    
-    # 4. MT-Fin
     if c := build_mtft_coupon(fresh()):
         coupons.append(c); used_ids.update(s.event_id for s in c.legs)
 
     return coupons
 
-# --- FORMATAGE TELEGRAM ---
 def format_header():
     return f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n     <b>⚡ {BRAND_NAME.upper()} ⚡</b>\n<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n<i>{BRAND_TAGLINE}</i>\n<i>📅 {today_pretty()} • 🇨🇮 Côte d’Ivoire</i>"
 
@@ -668,7 +656,6 @@ async def broadcast_after_scan():
                 await asyncio.sleep(0.3)
         except: pass
 
-# --- HANDLERS ---
 @dp.message(Command("start"))
 async def start_cmd(m):
     kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
@@ -720,6 +707,8 @@ async def scan():
             except: pass
 
         today_iso = datetime.now(TZ).strftime("%Y-%m-%d")
+        
+        # ⭐ APPEL AU NOUVEAU api_football.py (qui ne rejette aucune ligue)
         af_matches = {}
         if af_fetch_odds_date and API_FOOTBALL_KEY:
             af_matches = await af_fetch_odds_date(today_iso)
@@ -734,9 +723,7 @@ async def scan():
         
         # Ajout API-Football
         for eid, data in af_matches.items():
-            if not data.get("home") or not data.get("away"):
-                continue # Sécurité ultime
-                
+            if not data.get("home") or not data.get("away"): continue
             bzz_match = next((b for b in bzz_preds if normalize_name(b["home"]) == normalize_name(data["home"]) and normalize_name(b["away"]) == normalize_name(data["away"])), None)
             md = MatchData(
                 event_id=eid, league=data["league"], home=data["home"], away=data["away"], kickoff=data["kickoff"],
