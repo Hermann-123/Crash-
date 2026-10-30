@@ -46,6 +46,11 @@ except Exception:
     fetch_bzzoiro_odds = None
 
 try:
+    from odds_fallback import fetch_all_odds as fetch_infer_odds
+except Exception:
+    fetch_infer_odds = None
+
+try:
     from dixon_coles import download_and_train
 except Exception:
     download_and_train = None
@@ -54,6 +59,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
+INFERSPORTS_API_KEY = os.getenv("INFERSPORTS_API_KEY", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 
@@ -619,7 +625,6 @@ def compute_probability(md, market_key):
 def compute_quality_odds3(md, market_key, prob, real_odd, value):
     pts = 0
     if real_odd: pts += 15
-    # 🎁 Contexte proportionnel : 20 pts distribués selon les sources disponibles
     h2h_pts = 10 if md.has_h2h else 0
     dixon_pts = 10 if md.dixon_pred else 0
     pts += h2h_pts + dixon_pts + (20 - h2h_pts - dixon_pts)
@@ -739,7 +744,6 @@ def build_odds3_coupon(pool):
 def compute_quality_odds10(md, market_key, prob, real_odd, value):
     pts = 0
     if real_odd: pts += 15
-    # 🎁 Contexte proportionnel : 20 pts distribués selon les sources disponibles
     h2h_pts = 10 if md.has_h2h else 0
     dixon_pts = 10 if md.dixon_pred else 0
     pts += h2h_pts + dixon_pts + (20 - h2h_pts - dixon_pts)
@@ -1260,6 +1264,21 @@ async def scan():
                     if eid in bzz_odds_map:
                         md.real_odds = bzz_odds_map[eid]
                         md.bzz_odds_source = "bzzoiro"
+
+        # === FALLBACK INFERSPORTS si Bzzoiro n'a rien donné ===
+        if not odds_events and bzz_odds_count == 0 and fetch_infer_odds:
+            print("🔄 Fallback InferSports...")
+            matches_for_infer = [
+                {"event_id": md.event_id, "home": md.home, "away": md.away, "kickoff": md.kickoff}
+                for md in pool if not any((md.real_odds or {}).values())
+            ]
+            if matches_for_infer:
+                infer_map = await fetch_infer_odds(matches_for_infer)
+                for md in pool:
+                    if md.event_id in infer_map:
+                        md.real_odds = infer_map[md.event_id]
+                        md.bzz_odds_source = "infersports"
+                bzz_odds_count += len(infer_map)
 
         if not pool:
             STATE["coupons"] = []
