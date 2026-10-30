@@ -43,7 +43,6 @@ except Exception as e:
     fetch_bzzoiro_predictions_direct = None
     print(f"❌ bzzoiro_predictions_direct: {e}")
 
-# ⭐ NOUVEL IMPORT OPTIMISÉ API-FOOTBALL
 try:
     from api_football import fetch_odds_for_date as af_fetch_odds_date
     print("✅ api_football chargé")
@@ -81,8 +80,7 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • 4 Moteurs")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-# On monte à 30 appels Gemini pour couvrir les besoins des 4 tickets (16 matchs requis)
-GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "30"))
+GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "35")) # Un peu plus pour analyser tous les matchs API
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
 # MOTEUR 1 : ODDS +3
@@ -98,10 +96,10 @@ ODDS3_MAX_LEGS = 3
 # MOTEUR 2 : ODDS +10
 ODDS10_MIN_SCORE = 80
 ODDS10_MIN_ODDS = 10.0
-ODDS10_MIN_LEG_ODDS = 1.35
-ODDS10_MAX_LEG_ODDS = 1.65
-ODDS10_MIN_PROB = 0.68
-ODDS10_MIN_VALUE = 0.03
+ODDS10_MIN_LEG_ODDS = 1.30 # Élargi de 1.35 à 1.30 pour faciliter
+ODDS10_MAX_LEG_ODDS = 1.70 # Élargi de 1.65 à 1.70
+ODDS10_MIN_PROB = 0.65 # Abaissé de 0.68 à 0.65
+ODDS10_MIN_VALUE = 0.02 # Abaissé de 0.03 à 0.02
 ODDS10_MIN_LEGS = 6
 ODDS10_MAX_LEGS = 8
 ODDS10_MAX_SAME_MARKET = 2
@@ -414,6 +412,9 @@ def compute_probability(md, market_key):
 def build_odds3_coupon(pool):
     candidates = []
     for md in pool:
+        # Sécurité anti-fantôme
+        if not md.home or not md.away: continue
+        
         for market_key, (label, mkt_type) in {"btts_yes": ("BTTS Oui", "BTTS"), "btts_no": ("BTTS Non", "BTTS"), "over_2.5": ("Over 2.5", "O/U"), "under_2.5": ("Under 2.5", "O/U")}.items():
             prob, g, d, b, emoji = compute_probability(md, market_key)
             if prob <= 0 or emoji == "⚠️": continue
@@ -462,6 +463,8 @@ def build_odds3_coupon(pool):
 def build_odds10_coupon(pool):
     candidates = []
     for md in pool:
+        if not md.home or not md.away: continue
+        
         for market_key, (label, mkt_type) in {"btts_yes": ("BTTS Oui", "BTTS"), "over_2.5": ("Over 2.5", "O/U"), "under_2.5": ("Under 2.5", "O/U")}.items():
             prob, g, d, b, emoji = compute_probability(md, market_key)
             if prob < ODDS10_MIN_PROB or emoji == "⚠️": continue
@@ -476,7 +479,7 @@ def build_odds10_coupon(pool):
             n = sum(1 for x in (g, d, b) if x > 0)
             pts += 25 if n >= 3 else 15
             if prob >= 0.75: pts += 20
-            elif prob >= 0.68: pts += 10
+            elif prob >= 0.65: pts += 10
             if value >= 0.05: pts += 10
             
             if pts < ODDS10_MIN_SCORE: continue
@@ -512,6 +515,7 @@ def build_mtft_coupon(pool):
     if not STATE.get("dixon_model"): return None
     picks = []
     for md in pool:
+        if not md.home or not md.away: continue
         if not md.dixon_pred: continue
         if (md.real_odds.get("home") and md.real_odds["home"] < 1.35) or (md.real_odds.get("away") and md.real_odds["away"] < 1.35): continue
         
@@ -546,6 +550,8 @@ def build_mtft_coupon(pool):
 def build_draw_coupon(pool):
     candidates = []
     for md in pool:
+        if not md.home or not md.away: continue
+        
         prob_draw, g, d, b, emoji = compute_probability(md, "match_nul")
         if prob_draw < DRAW_MIN_PROB or (g > 0 and g < DRAW_GEMINI_MIN_PROB) or emoji == "⚠️": continue
         
@@ -575,19 +581,19 @@ def build_all_coupons(pool):
     used_ids = set()
     def fresh(): return [md for md in pool if md.event_id not in used_ids]
 
-    # ON COMMENCE PAR ODDS +10 (car il demande 6-8 matchs, c'est le plus dur)
+    # 1. Odds +10 (le plus gourmand)
     if c := build_odds10_coupon(fresh()):
         coupons.append(c); used_ids.update(s.event_id for s in c.legs)
     
-    # PUIS ODDS +3
+    # 2. Odds +3
     if c := build_odds3_coupon(fresh()):
         coupons.append(c); used_ids.update(s.event_id for s in c.legs)
     
-    # PUIS MATCH NUL
+    # 3. Match Nul
     if c := build_draw_coupon(fresh()):
         coupons.append(c); used_ids.update(s.event_id for s in c.legs)
     
-    # ENFIN MT-FIN
+    # 4. MT-Fin
     if c := build_mtft_coupon(fresh()):
         coupons.append(c); used_ids.update(s.event_id for s in c.legs)
 
@@ -705,16 +711,14 @@ async def b_act(m): await m.answer("🔑 /activate VOTRE_CLE")
 @dp.message(F.text == "⚙️ Debug")
 async def b_debug(m): await debug_cmd(m)
 
-# --- SCAN PRINCIPAL (Logique des Paniers) ---
+# --- SCAN PRINCIPAL ---
 async def scan():
     async with STATE["scan_lock"]:
-        # 1. Prédictions Bzzoiro
         bzz_preds = []
         if fetch_bzzoiro_predictions_direct and BZZOIRO_API_KEY:
             try: bzz_preds = await fetch_bzzoiro_predictions_direct(min_confidence=BZZ_NATIVE_CONFIDENCE)
             except: pass
 
-        # 2. Cotes massives API-Football
         today_iso = datetime.now(TZ).strftime("%Y-%m-%d")
         af_matches = {}
         if af_fetch_odds_date and API_FOOTBALL_KEY:
@@ -725,12 +729,14 @@ async def scan():
             STATE["coupons"] = []
             return
 
-        # 3. Fusion des Paniers
         pool = []
         used_ids = set()
         
-        # Ajout des matchs API-Football (avec cotes)
+        # Ajout API-Football
         for eid, data in af_matches.items():
+            if not data.get("home") or not data.get("away"):
+                continue # Sécurité ultime
+                
             bzz_match = next((b for b in bzz_preds if normalize_name(b["home"]) == normalize_name(data["home"]) and normalize_name(b["away"]) == normalize_name(data["away"])), None)
             md = MatchData(
                 event_id=eid, league=data["league"], home=data["home"], away=data["away"], kickoff=data["kickoff"],
@@ -740,7 +746,7 @@ async def scan():
             pool.append(md)
             used_ids.add(eid)
 
-        # Ajout des matchs Dixon (s'ils ne sont pas déjà dans API-Football)
+        # Ajout Dixon
         if STATE.get("dixon_model"):
             for bz in bzz_preds:
                 if bz["event_id"] in used_ids: continue
@@ -751,16 +757,13 @@ async def scan():
                     pool.append(md)
                     used_ids.add(md.event_id)
 
-        print(f"📋 Pool total : {len(pool)} matchs (Cotes: {len(af_matches)}, Dixon-only: {len(pool)-len(af_matches)})")
+        print(f"📋 Pool total : {len(pool)} matchs valides (Cotes: {len(af_matches)}, Dixon: {len(pool)-len(af_matches)})")
         
-        # 4. Trier pour garder les meilleurs candidats pour Gemini
         pool.sort(key=prescore_match, reverse=True)
         top_pool = pool[:GEMINI_MAX_CALLS_PER_SCAN]
 
-        # 5. Analyse Gemini
         await enrich_and_analyze(top_pool)
 
-        # 6. Création des 4 tickets
         STATE["coupons"] = build_all_coupons(top_pool)
         
         STATE["debug"] = {
