@@ -14,8 +14,7 @@ from typing import Optional
 import httpx
 
 LEAGUES = {
-    # ===== SAISON 2025-2026 =====
-    "England Premier League 25/26":    "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
+    "England Premier League 25/26":     "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
     "England Championship 25/26":       "https://www.football-data.co.uk/mmz4281/2526/E1.csv",
     "England League One 25/26":         "https://www.football-data.co.uk/mmz4281/2526/E2.csv",
     "England League Two 25/26":         "https://www.football-data.co.uk/mmz4281/2526/E3.csv",
@@ -34,8 +33,7 @@ LEAGUES = {
     "Greece Super League 25/26":        "https://www.football-data.co.uk/mmz4281/2526/G1.csv",
     "Scotland Premiership 25/26":       "https://www.football-data.co.uk/mmz4281/2526/SC0.csv",
 
-    # ===== SAISON 2026-2027 =====
-    "England Premier League 26/27":    "https://www.football-data.co.uk/mmz4281/2627/E0.csv",
+    "England Premier League 26/27":     "https://www.football-data.co.uk/mmz4281/2627/E0.csv",
     "England Championship 26/27":       "https://www.football-data.co.uk/mmz4281/2627/E1.csv",
     "Spain La Liga 26/27":              "https://www.football-data.co.uk/mmz4281/2627/SP1.csv",
     "Italy Serie A 26/27":              "https://www.football-data.co.uk/mmz4281/2627/I1.csv",
@@ -114,10 +112,9 @@ class DixonColesModel:
         self._trained = False
         self._normalized_index = {}
 
-    def train(self, results: list[dict]) -> bool:
+    def train(self, results):
         if len(results) < 100:
             return False
-
         now = datetime.datetime.now()
         def get_weight(date_str):
             if not date_str: return 1.0
@@ -130,13 +127,11 @@ class DixonColesModel:
                 return math.exp(-0.005 * max(0, days))
             except:
                 return 1.0
-
         total_weight = 0.0
         total_goals = 0.0
         total_home_goals = 0.0
         total_away_goals = 0.0
         team_stats = {}
-
         for r in results:
             w = get_weight(r.get("date", ""))
             hg, ag = r["home_goals"], r["away_goals"]
@@ -144,7 +139,6 @@ class DixonColesModel:
             total_goals += (hg + ag) * w
             total_home_goals += hg * w
             total_away_goals += ag * w
-
             h, a = r["home"], r["away"]
             lg = r["league"]
             for t in (h, a):
@@ -152,38 +146,32 @@ class DixonColesModel:
                     team_stats[t] = {"gf": 0, "ga": 0, "n": 0, "league": lg}
             team_stats[h]["gf"] += hg * w; team_stats[h]["ga"] += ag * w; team_stats[h]["n"] += w
             team_stats[a]["gf"] += ag * w; team_stats[a]["ga"] += hg * w; team_stats[a]["n"] += w
-
         self.avg_goals = max(0.5, total_goals / (2 * total_weight)) if total_weight > 0 else 1.35
         self.home_advantage = max(1.0, min(1.40, total_home_goals / max(1.0, total_away_goals)))
-
         for t, s in team_stats.items():
             if s["n"] < 3: continue
             att = (s["gf"] / s["n"]) / self.avg_goals
             dfn = (s["ga"] / s["n"]) / self.avg_goals
             self.teams[t] = {"att": max(0.4, min(2.5, att)), "def": max(0.4, min(2.5, dfn)), "league": s["league"]}
-
         self._trained = len(self.teams) >= 20
         self._build_indexes()
         return self._trained
 
     def _build_indexes(self):
-        self._normalized_index = {_normalize_team_name(csv_name): csv_name for csv_name in self.teams if _normalize_team_name(csv_name)}
+        self._normalized_index = {_normalize_team_name(c): c for c in self.teams if _normalize_team_name(c)}
 
-    def _poisson(self, lam: float, k: int) -> float:
+    def _poisson(self, lam, k):
         return (lam ** k) * math.exp(-lam) / math.factorial(k)
 
-    def predict_all(self, home: str, away: str, max_goals: int = 8) -> Optional[dict]:
+    def predict_all(self, home, away, max_goals=8):
         h_key, a_key = self._find_team(home), self._find_team(away)
         if not h_key or not a_key: return None
-
         h_data, a_data = self.teams[h_key], self.teams[a_key]
         lambda_home = h_data["att"] * a_data["def"] * self.avg_goals * self.home_advantage
         lambda_away = a_data["att"] * h_data["def"] * self.avg_goals
-
         p_home = p_draw = p_away = 0.0
         p_over_15 = p_over_25 = p_over_35 = p_btts_yes = total = 0.0
         p_btts_over_25 = 0.0
-
         for i in range(max_goals + 1):
             for j in range(max_goals + 1):
                 p = self._poisson(lambda_home, i) * self._poisson(lambda_away, j)
@@ -198,28 +186,19 @@ class DixonColesModel:
                     p_btts_yes += p
                     if (i + j) >= 3:
                         p_btts_over_25 += p
-
         if total <= 0: return None
-
-        # === RETURN COMPLET avec lambda_home et lambda_away ===
         return {
-            "p_home": round(p_home / total, 4),
-            "p_draw": round(p_draw / total, 4),
-            "p_away": round(p_away / total, 4),
-            "over_1.5": round(p_over_15 / total, 4),
-            "under_1.5": round((total - p_over_15) / total, 4),
-            "over_2.5": round(p_over_25 / total, 4),
-            "under_2.5": round((total - p_over_25) / total, 4),
-            "over_3.5": round(p_over_35 / total, 4),
-            "under_3.5": round((total - p_over_35) / total, 4),
-            "btts_yes": round(p_btts_yes / total, 4),
-            "btts_no": round((total - p_btts_yes) / total, 4),
+            "p_home": round(p_home / total, 4), "p_draw": round(p_draw / total, 4), "p_away": round(p_away / total, 4),
+            "over_1.5": round(p_over_15 / total, 4), "under_1.5": round((total - p_over_15) / total, 4),
+            "over_2.5": round(p_over_25 / total, 4), "under_2.5": round((total - p_over_25) / total, 4),
+            "over_3.5": round(p_over_35 / total, 4), "under_3.5": round((total - p_over_35) / total, 4),
+            "btts_yes": round(p_btts_yes / total, 4), "btts_no": round((total - p_btts_yes) / total, 4),
             "btts_over_25": round(p_btts_over_25 / total, 4),
             "lambda_home": round(lambda_home, 2),
             "lambda_away": round(lambda_away, 2),
         }
 
-    def _find_team(self, name: str) -> Optional[str]:
+    def _find_team(self, name):
         if not name or not self.teams: return None
         raw = str(name).lower().strip()
         alias = TEAM_ALIASES.get(raw)
@@ -227,11 +206,9 @@ class DixonColesModel:
             target_norm = _normalize_team_name(alias)
             for csv_name in self.teams:
                 if _normalize_team_name(csv_name) == target_norm: return csv_name
-
         n_norm = _normalize_team_name(name)
         if n_norm and n_norm in self._normalized_index:
             return self._normalized_index[n_norm]
-
         best_team, best_score = None, 0.0
         for csv_name in self.teams:
             score = _similarity_score(name, csv_name)
@@ -242,7 +219,7 @@ class DixonColesModel:
             return best_team
         return None
 
-async def download_and_train() -> Optional[DixonColesModel]:
+async def download_and_train():
     results = []
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
         for league, url in LEAGUES.items():
@@ -255,12 +232,9 @@ async def download_and_train() -> Optional[DixonColesModel]:
                     except (ValueError, TypeError): continue
                     h, a = row.get("HomeTeam", "").strip(), row.get("AwayTeam", "").strip()
                     if not h or not a: continue
-                    results.append({
-                        "home": h, "away": a, "home_goals": hg, "away_goals": ag, "league": league,
-                        "date": row.get("Date", "")
-                    })
+                    results.append({"home": h, "away": a, "home_goals": hg, "away_goals": ag,
+                                    "league": league, "date": row.get("Date", "")})
             except Exception: pass
-
     if not results: return None
     model = DixonColesModel()
     return model if model.train(results) else None
