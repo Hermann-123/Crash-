@@ -24,7 +24,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
 
-# --- IMPORTS ---
 try:
     from gemini_predictor import predict_match_probas
 except Exception as e:
@@ -56,7 +55,6 @@ except Exception as e:
     download_and_train = None
     print(f"❌ dixon_coles: {e}")
 
-# --- VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
@@ -80,36 +78,37 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • 4 Moteurs")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "35"))
+# On augmente le nombre d'analyses pour avoir plus de choix
+GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "50"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
 # MOTEUR 1 : ODDS +3
-ODDS3_MIN_SCORE = 80
+ODDS3_MIN_SCORE = 75 # Abaissé de 80 à 75
 ODDS3_MIN_ODDS = 3.0
 ODDS3_MAX_ODDS = 4.5
-ODDS3_MIN_LEG_ODDS = 1.55
-ODDS3_MAX_LEG_ODDS = 2.20
+ODDS3_MIN_LEG_ODDS = 1.50 # Élargi
+ODDS3_MAX_LEG_ODDS = 2.30 # Élargi
 ODDS3_MIN_LEGS = 2
 ODDS3_MAX_LEGS = 3
 
 # MOTEUR 2 : ODDS +10
-ODDS10_MIN_SCORE = 75
+ODDS10_MIN_SCORE = 70 # Abaissé de 75 à 70
 ODDS10_MIN_ODDS = 10.0
-ODDS10_MIN_LEG_ODDS = 1.35
-ODDS10_MAX_LEG_ODDS = 1.65
+ODDS10_MIN_LEG_ODDS = 1.30 # Élargi
+ODDS10_MAX_LEG_ODDS = 1.70 # Élargi
 ODDS10_MIN_LEGS = 6
 ODDS10_MAX_LEGS = 8
 
 # MOTEUR 3 : MT-FIN
-MTFIN_MIN_SCORE = 75
-MTFIN_MIN_PROB = 0.38
+MTFIN_MIN_SCORE = 70
+MTFIN_MIN_PROB = 0.35
 MTFIN_TOP_N = 3
 MTFIN_SIMULATIONS = 2000
 MTFIN_FIRST_HALF_RATIO = 0.45
 
 # MOTEUR 4 : MATCH NUL
 DRAW_MIN_SCORE = 75
-DRAW_MIN_PROB = 0.26
+DRAW_MIN_PROB = 0.25
 DRAW_GEMINI_MIN_PROB = 0.20
 DRAW_MIN_ODD = 3.10
 DRAW_TOP_N = 3
@@ -120,7 +119,6 @@ TZ = ZoneInfo(NOTIFY_TZ)
 if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
     raise RuntimeError("Variables d'environnement manquantes")
 
-# --- UTILITAIRES ---
 def today_pretty():
     d = datetime.now(TZ)
     months = {1:"janvier",2:"février",3:"mars",4:"avril",5:"mai",6:"juin",7:"juillet",8:"août",9:"septembre",10:"octobre",11:"novembre",12:"décembre"}
@@ -227,17 +225,17 @@ class Selection:
     market: str
     pick_label: str
     odds: float
-    model_prob: float # ATTENTION ICI
+    model_prob: float
     real_odd: Optional[float] = None
     value: float = -1.0
     quality: int = 0
-    prob_gemini: float = 0.0 # ATTENTION ICI
+    prob_gemini: float = 0.0
     prob_dixon: float = 0.0
     prob_bzzoiro: float = 0.0
     analysis: str = ""
     advices: list = None
     htft_pick: str = ""
-    prob_sources_agreement: str = "" # ATTENTION ICI
+    prob_sources_agreement: str = ""
 
 @dataclass
 class Coupon:
@@ -370,7 +368,7 @@ async def enrich_and_analyze(pool):
                     try: md.dixon_pred = STATE["dixon_model"].predict_all(md.home, md.away)
                     except: pass
                 
-                await asyncio.sleep(2.0) # Pause un peu plus longue
+                await asyncio.sleep(2.0)
             except Exception as e:
                 print(f"  ⚠️ {e}")
 
@@ -393,9 +391,9 @@ def compute_probability(md, market_key):
     emoji = ""
     if len(sources) >= 2:
         delta = max(sources) - min(sources)
-        if len(sources) == 3 and delta <= 0.10: emoji = "🤝🤝"
-        elif delta <= 0.10: emoji = "🤝"
-        elif delta >= 0.15: emoji = "⚠️"
+        if len(sources) == 3 and delta <= 0.12: emoji = "🤝🤝" # Élargi à 12%
+        elif delta <= 0.15: emoji = "🤝" # Élargi à 15%
+        elif delta >= 0.20: emoji = "⚠️"
     return final, gem, dix, bzz, emoji
 
 def compute_quality_odds3(md, market_key, prob, real_odd, value, emoji):
@@ -408,6 +406,7 @@ def compute_quality_odds3(md, market_key, prob, real_odd, value, emoji):
     
     if emoji == "🤝🤝": pts += 30
     elif emoji == "🤝": pts += 20
+    elif emoji == "": pts += 10 # Si une seule source, on donne quand même 10 pts
     
     if value >= 0.10: pts += 20
     elif value >= 0.07: pts += 15
@@ -431,7 +430,9 @@ def build_odds3_coupon(pool):
             "double_chance_1X": ("DC 1X", "DC"), "double_chance_X2": ("DC X2", "DC"), "double_chance_12": ("DC 12 (Pas de Nul)", "DC"),
         }.items():
             prob, g, d, b, emoji = compute_probability(md, market_key)
-            if prob < 0.58 or emoji not in ["🤝", "🤝🤝"]: continue
+            
+            # On accepte si prob >= 55% ET pas de conflit majeur (⚠️)
+            if prob < 0.55 or emoji == "⚠️": continue
             
             real_odd = md.real_odds.get(market_key)
             is_estimated = False
@@ -445,7 +446,6 @@ def build_odds3_coupon(pool):
             pts = compute_quality_odds3(md, market_key, prob, real_odd, value, emoji)
             if pts < ODDS3_MIN_SCORE: continue
             
-            # ⚠️ CORRECTION DU BUG ICI
             if not best_market or prob > best_market.model_prob or (prob == best_market.model_prob and pts > best_market.quality):
                 best_market = Selection(
                     event_id=md.event_id, league=md.league, home=md.home, away=md.away, kickoff=md.kickoff,
@@ -487,7 +487,9 @@ def build_odds10_coupon(pool):
             "over_1.5": ("Over 1.5", "O/U"), "double_chance_1X": ("DC 1X", "DC"), "double_chance_X2": ("DC X2", "DC"), "double_chance_12": ("DC 12 (Pas de Nul)", "DC"),
         }.items():
             prob, g, d, b, emoji = compute_probability(md, market_key)
-            if prob < 0.65 or emoji not in ["🤝", "🤝🤝"]: continue
+            
+            # On accepte si prob >= 60% ET pas de conflit
+            if prob < 0.60 or emoji == "⚠️": continue
             
             real_odd = md.real_odds.get(market_key)
             is_est = False
@@ -501,14 +503,13 @@ def build_odds10_coupon(pool):
             value = 0.0 if is_est else (prob * real_odd) - 1.0
             
             pts = 15 + (10 if md.has_h2h else 0) + (10 if md.dixon_pred else 0) + 5
-            pts += (30 if emoji == "🤝🤝" else 20)
+            pts += (30 if emoji == "🤝🤝" else (20 if emoji == "🤝" else 10))
             if prob >= 0.75: pts += 20
             elif prob >= 0.65: pts += 10
             pts = max(0, min(100, pts))
             
             if pts < ODDS10_MIN_SCORE: continue
             
-            # ⚠️ CORRECTION DU BUG ICI AUSSI
             if not best_market or prob > best_market.model_prob:
                 best_market = Selection(
                     event_id=md.event_id, league=md.league, home=md.home, away=md.away, kickoff=md.kickoff,
@@ -616,7 +617,6 @@ def build_all_coupons(pool):
 
     return coupons
 
-# --- FORMATAGE ---
 def format_header():
     return f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n     <b>⚡ {BRAND_NAME.upper()} ⚡</b>\n<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n<i>{BRAND_TAGLINE}</i>\n<i>📅 {today_pretty()} • 🇨🇮 Côte d’Ivoire</i>"
 
@@ -690,7 +690,6 @@ async def broadcast_after_scan():
                 await asyncio.sleep(0.3)
         except: pass
 
-# --- HANDLERS ---
 @dp.message(Command("start"))
 async def start_cmd(m):
     kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
@@ -733,7 +732,6 @@ async def b_act(m): await m.answer("🔑 /activate VOTRE_CLE")
 @dp.message(F.text == "⚙️ Debug")
 async def b_debug(m): await debug_cmd(m)
 
-# --- SCAN PRINCIPAL ---
 async def scan():
     async with STATE["scan_lock"]:
         bzz_preds = []
@@ -787,7 +785,6 @@ async def daily_broadcast():
     record_coupons(STATE["coupons"], datetime.now(TZ).strftime("%Y-%m-%d"))
     await broadcast_after_scan()
 
-# --- LIFESPAN (CORRECTION DU SCAN À 00H) ---
 @asynccontextmanager
 async def lifespan(app):
     try: await bot.delete_webhook(drop_pending_updates=True)
@@ -812,7 +809,6 @@ async def lifespan(app):
             
             await asyncio.sleep(5)
             
-            # On ne lance plus le scan au démarrage !
             if NOTIFY_ON_STARTUP:
                 for cid in TARGETS: 
                     await safe_send(cid, f"{format_header()}\n\n⏳ Bot démarré. En attente du scan automatique de {NOTIFY_HOUR:02d}h00...")
