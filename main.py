@@ -227,17 +227,17 @@ class Selection:
     market: str
     pick_label: str
     odds: float
-    model_prob: float
+    model_prob: float # ATTENTION ICI
     real_odd: Optional[float] = None
     value: float = -1.0
     quality: int = 0
-    prob_gemini: float = 0.0
+    prob_gemini: float = 0.0 # ATTENTION ICI
     prob_dixon: float = 0.0
     prob_bzzoiro: float = 0.0
     analysis: str = ""
     advices: list = None
     htft_pick: str = ""
-    prob_sources_agreement: str = ""
+    prob_sources_agreement: str = "" # ATTENTION ICI
 
 @dataclass
 class Coupon:
@@ -342,7 +342,7 @@ def prescore_match(md) -> int:
     return score
 
 async def enrich_and_analyze(pool):
-    async with httpx.AsyncClient(timeout=40.0) as client:
+    async with httpx.AsyncClient(timeout=70.0) as client:
         for idx, md in enumerate(pool[:GEMINI_MAX_CALLS_PER_SCAN]):
             try:
                 print(f"  [{idx+1}/{min(len(pool), GEMINI_MAX_CALLS_PER_SCAN)}] {md.home} vs {md.away}")
@@ -370,7 +370,7 @@ async def enrich_and_analyze(pool):
                     try: md.dixon_pred = STATE["dixon_model"].predict_all(md.home, md.away)
                     except: pass
                 
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2.0) # Pause un peu plus longue
             except Exception as e:
                 print(f"  ⚠️ {e}")
 
@@ -445,15 +445,17 @@ def build_odds3_coupon(pool):
             pts = compute_quality_odds3(md, market_key, prob, real_odd, value, emoji)
             if pts < ODDS3_MIN_SCORE: continue
             
-            if not best_market or prob > best_market["prob"] or (prob == best_market["prob"] and pts > best_market["pts"]):
-                best_market = {
-                    "event_id": md.event_id, "league": md.league, "home": md.home, "away": md.away, "kickoff": md.kickoff,
-                    "market": mkt_type, "pick_label": label, "odds": real_odd, "prob": prob, "real_odd": real_odd if not is_estimated else None,
-                    "value": value, "quality": pts, "g": g, "d": d, "b": b, "analysis": md.analysis, "advices": md.advices, "emoji": emoji
-                }
+            # ⚠️ CORRECTION DU BUG ICI
+            if not best_market or prob > best_market.model_prob or (prob == best_market.model_prob and pts > best_market.quality):
+                best_market = Selection(
+                    event_id=md.event_id, league=md.league, home=md.home, away=md.away, kickoff=md.kickoff,
+                    market=mkt_type, pick_label=label, odds=real_odd, model_prob=prob, 
+                    real_odd=real_odd if not is_estimated else None, value=value, quality=pts, 
+                    prob_gemini=g, prob_dixon=d, prob_bzzoiro=b, analysis=md.analysis, advices=md.advices, prob_sources_agreement=emoji
+                )
 
         if best_market:
-            candidates.append(Selection(**best_market))
+            candidates.append(best_market)
 
     candidates.sort(key=lambda x: (x.quality, x.value), reverse=True)
     legs, used_ev, used_mk, used_lg = [], set(), set(), set()
@@ -506,15 +508,17 @@ def build_odds10_coupon(pool):
             
             if pts < ODDS10_MIN_SCORE: continue
             
-            if not best_market or prob > best_market["prob"]:
-                best_market = {
-                    "event_id": md.event_id, "league": md.league, "home": md.home, "away": md.away, "kickoff": md.kickoff,
-                    "market": mkt_type, "pick_label": label, "odds": real_odd, "prob": prob, "real_odd": real_odd if not is_est else None,
-                    "value": value, "quality": pts, "g": g, "d": d, "b": b
-                }
+            # ⚠️ CORRECTION DU BUG ICI AUSSI
+            if not best_market or prob > best_market.model_prob:
+                best_market = Selection(
+                    event_id=md.event_id, league=md.league, home=md.home, away=md.away, kickoff=md.kickoff,
+                    market=mkt_type, pick_label=label, odds=real_odd, model_prob=prob, 
+                    real_odd=real_odd if not is_est else None, value=value, quality=pts, 
+                    prob_gemini=g, prob_dixon=d, prob_bzzoiro=b
+                )
 
         if best_market:
-            candidates.append(Selection(**best_market))
+            candidates.append(best_market)
 
     candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
     legs, used_ev, mkt_c, lg_c = [], set(), {}, {}
@@ -696,7 +700,7 @@ async def start_cmd(m):
 @dp.message(Command("scan"))
 async def scan_cmd(m):
     if m.from_user.id != ADMIN_ID: return
-    await safe_answer(m, "⏳ Analyse des matchs en cours...")
+    await safe_answer(m, "⏳ Analyse des matchs en cours (Patientez 3-5 min)...")
     await scan()
     await broadcast_after_scan()
 
@@ -808,12 +812,10 @@ async def lifespan(app):
             
             await asyncio.sleep(5)
             
-            # ⚠️ CORRECTION ICI : On envoie juste un message de démarrage, on NE LANCE PAS de scan.
+            # On ne lance plus le scan au démarrage !
             if NOTIFY_ON_STARTUP:
                 for cid in TARGETS: 
                     await safe_send(cid, f"{format_header()}\n\n⏳ Bot démarré. En attente du scan automatique de {NOTIFY_HOUR:02d}h00...")
-            
-            # L'ancienne ligne `await daily_broadcast()` a été supprimée ici.
             
         except Exception as e: print(f"⚠️ {e}")
 
