@@ -80,7 +80,6 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • 4 Moteurs")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-# On analyse jusqu'à 50 matchs pour avoir plus de chances
 GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "50"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
@@ -108,12 +107,12 @@ MTFIN_TOP_N = 3
 MTFIN_SIMULATIONS = 2000
 MTFIN_FIRST_HALF_RATIO = 0.45
 
-# MOTEUR 4 : MATCH NUL (Règles d'équilibre strictes)
-DRAW_MIN_SCORE = 75
-DRAW_MIN_PROB = 0.30 # Proba de nul minimum
-DRAW_GEMINI_MIN_PROB = 0.25
-DRAW_MIN_ODD = 3.20
-DRAW_MAX_ECART = 0.15 # Écart max de 15% entre la proba de victoire des 2 équipes
+# MOTEUR 4 : MATCH NUL (Règles ajustées pour trouver des matchs)
+DRAW_MIN_SCORE = 70
+DRAW_MIN_PROB = 0.28 # Redescendu à 28%
+DRAW_GEMINI_MIN_PROB = 0.20
+DRAW_MIN_ODD = 3.00
+DRAW_MAX_ECART = 0.20 # Écart max de 20% entre les 2 équipes
 DRAW_TOP_N = 3
 
 TELEGRAM_MAX_LEN = 3800
@@ -582,7 +581,7 @@ def build_draw_coupon(pool):
         prob_home, _, _, _, _ = compute_probability(md, "victoire_home")
         prob_away, _, _, _, _ = compute_probability(md, "victoire_away")
         
-        # 2. RÈGLE D'OR : Le match doit être équilibré (écart max 15%)
+        # 2. RÈGLE D'OR : Le match doit être équilibré (écart max 20%)
         if abs(prob_home - prob_away) > DRAW_MAX_ECART: continue
         
         # 3. Analyse du match nul
