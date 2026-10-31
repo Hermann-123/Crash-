@@ -1,6 +1,5 @@
 """
-Prédicteur Gemini enrichi.
-RETRY ROBUSTE + FALLBACK MULTI-MODÈLES + SCORE EXACT.
+Prédicteur Gemini enrichi avec recherche contextuelle (Web).
 """
 from __future__ import annotations
 
@@ -13,14 +12,8 @@ from typing import Optional
 import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-
-GEMINI_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-]
-
+GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-
 
 def format_context(context):
     if not context or not context.get("available"):
@@ -36,15 +29,17 @@ def format_context(context):
             parts.append(f"\nH2H ({total} matchs) : {hw}V dom / {d}N / {aw}V ext")
     return "\n".join(parts)
 
-
 def build_prompt(home, away, league, ctx_block):
-    return f"""Tu es un analyste football expert. Analyse ce match.
-
-Match : {home} vs {away}
-Compétition : {league}
+    return f"""Tu es un pronostiqueur sportif professionnel et un expert en analyse de données football.
+Analyse ce match en profondeur : {home} vs {away} ({league}).
 {ctx_block}
 
-Retourne UNIQUEMENT ce JSON :
+INSTRUCTIONS CRUCIALES :
+1. Utilise tes connaissances récentes (blessures, forme, enjeux, météo, fatigue, motivation).
+2. Sois impitoyable : si le match est déséquilibré ou sans intérêt, dis-le.
+3. Cherche la "Value" (l'erreur du bookmaker).
+
+Retourne UNIQUEMENT ce JSON valide (aucun texte avant ou après) :
 
 {{
   "markets": {{
@@ -53,100 +48,77 @@ Retourne UNIQUEMENT ce JSON :
     "victoire_away": 0,
     "double_chance_1X": 0,
     "double_chance_X2": 0,
+    "double_chance_12": 0,
     "over_2.5": 0,
     "under_2.5": 0,
+    "over_1.5": 0,
+    "under_1.5": 0,
+    "over_3.5": 0,
+    "under_3.5": 0,
     "btts_yes": 0,
     "btts_no": 0
   }},
-  "score_exact": {{ "home": 0, "away": 0, "prob": 0 }},
-  "analysis": "2 phrases max.",
+  "analysis": "Une analyse d'expert en 3 phrases. Mentionne le contexte (blessures, enjeu, forme). Sois précis et tranchant.",
   "advices": [
-    {{"text": "1er conseil", "confidence": 0}},
-    {{"text": "2ème conseil (optionnel)", "confidence": 0}}
+    {{"text": "Conseil de pro 1 (ex: 'Le bookmaker sous-estime l'attaque de X')", "confidence": 0}}
   ]
 }}
 
 RÈGLES :
-- Probas entre 15 et 85
+- Probas entre 1 et 99
 - victoire_home + match_nul + victoire_away = 100
 - over_2.5 + under_2.5 = 100
 - Rien avant/après le JSON"""
-
 
 async def call_gemini(client, model, payload):
     url = f"{GEMINI_BASE_URL}/{model}:generateContent?key={GEMINI_API_KEY}"
     for attempt in range(3):
         try:
-            r = await client.post(url, json=payload, timeout=30.0)
+            # Timeout augmenté à 60s car l'analyse est plus profonde
+            r = await client.post(url, json=payload, timeout=60.0) 
             if r.status_code in (503, 429):
                 wait = min(2 ** attempt, 10)
-                print(f"  ⏳ Gemini {model} {r.status_code}, retry {attempt+1}/3 (wait {wait}s)")
+                print(f"  ⏳ Gemini {model} {r.status_code}, retry {attempt+1}/3...")
                 await asyncio.sleep(wait)
                 continue
-            if r.status_code == 404:
-                print(f"  ⚠️ Gemini {model} 404")
-                return None
             if r.status_code >= 400:
-                print(f"  ⚠️ Gemini {model} {r.status_code}: {r.text[:100]}")
                 return None
+                
             data = r.json()
             try:
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
             except (KeyError, IndexError, TypeError):
                 return None
+                
             m = re.search(r"\{[\s\S]*\}", text)
             if not m:
                 return None
             try:
                 parsed = json.loads(m.group())
             except json.JSONDecodeError:
-                raw = m.group().replace("\n", " ").replace("  ", " ")
-                try:
-                    parsed = json.loads(raw)
-                except:
-                    return None
-            if "advices" not in parsed and "advice" in parsed:
-                parsed["advices"] = [{"text": parsed.get("advice", ""), "confidence": parsed.get("advice_confidence", 0)}]
+                return None
+                
             return parsed
         except Exception as e:
-            print(f"  ⚠️ Gemini {model} crash: {e}")
+            print(f"  ⚠️ Gemini {model} crash: {repr(e)}") # Affiche la vraie erreur
             await asyncio.sleep(2)
-    print(f"  ❌ Gemini {model} échec après 3 tentatives")
     return None
-
-
-def _normalize_score_exact(raw):
-    if not isinstance(raw, dict): return {}
-    try:
-        h = int(raw.get("home", -1))
-        a = int(raw.get("away", -1))
-        p = float(raw.get("prob", 0))
-    except: return {}
-    if not (0 <= h <= 8 and 0 <= a <= 8): return {}
-    if p < 0: return {}
-    if p > 1.0: p = p / 100.0
-    if p > 0.6: p = 0.0
-    return {"home": h, "away": a, "prob": round(p, 4)}
-
 
 async def predict_match_probas(client, home, away, league, kickoff, context=None):
     if not GEMINI_API_KEY:
         return None
     ctx_block = format_context(context)
     prompt = build_prompt(home, away, league, ctx_block)
+    
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1600},
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1500},
     }
+    
     for i, model in enumerate(GEMINI_MODELS):
-        print(f"  🧠 Analyse de {home} vs {away} avec {model}")
         result = await call_gemini(client, model, payload)
         if result is not None:
-            if i > 0:
-                print(f"  ✅ Fallback réussi via {model}")
-            result["score_exact"] = _normalize_score_exact(result.get("score_exact"))
             return result
         if i < len(GEMINI_MODELS) - 1:
             print(f"  🔄 Bascule vers {GEMINI_MODELS[i+1]}")
-    print(f"❌ Tous les modèles Gemini ont échoué pour {home} vs {away}")
     return None
