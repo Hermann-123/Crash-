@@ -24,6 +24,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
 
+# --- IMPORTS ---
 try:
     from gemini_predictor import predict_match_probas
 except Exception as e:
@@ -55,6 +56,7 @@ except Exception as e:
     download_and_train = None
     print(f"❌ dixon_coles: {e}")
 
+# --- VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
@@ -78,24 +80,24 @@ BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • 4 Moteurs")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-# On augmente le nombre d'analyses pour avoir plus de choix
+# On analyse jusqu'à 50 matchs pour avoir plus de chances
 GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "50"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
 # MOTEUR 1 : ODDS +3
-ODDS3_MIN_SCORE = 75 # Abaissé de 80 à 75
+ODDS3_MIN_SCORE = 75
 ODDS3_MIN_ODDS = 3.0
 ODDS3_MAX_ODDS = 4.5
-ODDS3_MIN_LEG_ODDS = 1.50 # Élargi
-ODDS3_MAX_LEG_ODDS = 2.30 # Élargi
+ODDS3_MIN_LEG_ODDS = 1.50
+ODDS3_MAX_LEG_ODDS = 2.30
 ODDS3_MIN_LEGS = 2
 ODDS3_MAX_LEGS = 3
 
 # MOTEUR 2 : ODDS +10
-ODDS10_MIN_SCORE = 70 # Abaissé de 75 à 70
+ODDS10_MIN_SCORE = 70
 ODDS10_MIN_ODDS = 10.0
-ODDS10_MIN_LEG_ODDS = 1.30 # Élargi
-ODDS10_MAX_LEG_ODDS = 1.70 # Élargi
+ODDS10_MIN_LEG_ODDS = 1.30
+ODDS10_MAX_LEG_ODDS = 1.70
 ODDS10_MIN_LEGS = 6
 ODDS10_MAX_LEGS = 8
 
@@ -106,11 +108,12 @@ MTFIN_TOP_N = 3
 MTFIN_SIMULATIONS = 2000
 MTFIN_FIRST_HALF_RATIO = 0.45
 
-# MOTEUR 4 : MATCH NUL
+# MOTEUR 4 : MATCH NUL (Règles d'équilibre strictes)
 DRAW_MIN_SCORE = 75
-DRAW_MIN_PROB = 0.25
-DRAW_GEMINI_MIN_PROB = 0.20
-DRAW_MIN_ODD = 3.10
+DRAW_MIN_PROB = 0.30 # Proba de nul minimum
+DRAW_GEMINI_MIN_PROB = 0.25
+DRAW_MIN_ODD = 3.20
+DRAW_MAX_ECART = 0.15 # Écart max de 15% entre la proba de victoire des 2 équipes
 DRAW_TOP_N = 3
 
 TELEGRAM_MAX_LEN = 3800
@@ -119,6 +122,7 @@ TZ = ZoneInfo(NOTIFY_TZ)
 if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
     raise RuntimeError("Variables d'environnement manquantes")
 
+# --- UTILITAIRES ---
 def today_pretty():
     d = datetime.now(TZ)
     months = {1:"janvier",2:"février",3:"mars",4:"avril",5:"mai",6:"juin",7:"juillet",8:"août",9:"septembre",10:"octobre",11:"novembre",12:"décembre"}
@@ -391,8 +395,8 @@ def compute_probability(md, market_key):
     emoji = ""
     if len(sources) >= 2:
         delta = max(sources) - min(sources)
-        if len(sources) == 3 and delta <= 0.12: emoji = "🤝🤝" # Élargi à 12%
-        elif delta <= 0.15: emoji = "🤝" # Élargi à 15%
+        if len(sources) == 3 and delta <= 0.12: emoji = "🤝🤝" 
+        elif delta <= 0.15: emoji = "🤝" 
         elif delta >= 0.20: emoji = "⚠️"
     return final, gem, dix, bzz, emoji
 
@@ -406,7 +410,7 @@ def compute_quality_odds3(md, market_key, prob, real_odd, value, emoji):
     
     if emoji == "🤝🤝": pts += 30
     elif emoji == "🤝": pts += 20
-    elif emoji == "": pts += 10 # Si une seule source, on donne quand même 10 pts
+    elif emoji == "": pts += 10
     
     if value >= 0.10: pts += 20
     elif value >= 0.07: pts += 15
@@ -430,8 +434,6 @@ def build_odds3_coupon(pool):
             "double_chance_1X": ("DC 1X", "DC"), "double_chance_X2": ("DC X2", "DC"), "double_chance_12": ("DC 12 (Pas de Nul)", "DC"),
         }.items():
             prob, g, d, b, emoji = compute_probability(md, market_key)
-            
-            # On accepte si prob >= 55% ET pas de conflit majeur (⚠️)
             if prob < 0.55 or emoji == "⚠️": continue
             
             real_odd = md.real_odds.get(market_key)
@@ -487,8 +489,6 @@ def build_odds10_coupon(pool):
             "over_1.5": ("Over 1.5", "O/U"), "double_chance_1X": ("DC 1X", "DC"), "double_chance_X2": ("DC X2", "DC"), "double_chance_12": ("DC 12 (Pas de Nul)", "DC"),
         }.items():
             prob, g, d, b, emoji = compute_probability(md, market_key)
-            
-            # On accepte si prob >= 60% ET pas de conflit
             if prob < 0.60 or emoji == "⚠️": continue
             
             real_odd = md.real_odds.get(market_key)
@@ -578,27 +578,63 @@ def build_draw_coupon(pool):
     for md in pool:
         if not md.home or not md.away: continue
         
+        # 1. On récupère les probas de victoire pour vérifier l'équilibre
+        prob_home, _, _, _, _ = compute_probability(md, "victoire_home")
+        prob_away, _, _, _, _ = compute_probability(md, "victoire_away")
+        
+        # 2. RÈGLE D'OR : Le match doit être équilibré (écart max 15%)
+        if abs(prob_home - prob_away) > DRAW_MAX_ECART: continue
+        
+        # 3. Analyse du match nul
         prob_draw, g, d, b, emoji = compute_probability(md, "match_nul")
         if prob_draw < DRAW_MIN_PROB or (g > 0 and g < DRAW_GEMINI_MIN_PROB) or emoji == "⚠️": continue
         
-        home_odd, away_odd = md.real_odds.get("home"), md.real_odds.get("away")
+        # 4. On récupère la cote (réelle ou estimée)
         draw_odd = md.real_odds.get("draw")
-        if not draw_odd: draw_odd = round(1.0 / prob_draw, 2) if prob_draw > 0 else 3.20
-        if draw_odd < DRAW_MIN_ODD: continue
-        if (home_odd and home_odd < 1.80) or (away_odd and away_odd < 1.80): continue
+        is_estimated = False
+        if not draw_odd:
+            draw_odd = round(1.0 / prob_draw, 2)
+            is_estimated = True
         
-        pts = 30 + (25 if prob_draw >= 0.33 else 18) + (20 if g >= 0.30 else 12) + 10 + (5 if md.has_h2h else 0) + 10
+        if draw_odd < DRAW_MIN_ODD: continue
+        
+        # 5. Vérification de l'équilibre des cotes 1X2
+        home_odd, away_odd = md.real_odds.get("home"), md.real_odds.get("away")
+        if home_odd and away_odd:
+            if min(home_odd, away_odd) < 1.80: continue
+        
+        # 6. Calcul du score (Bonus si Dixon voit un match serré)
+        pts = 30
+        pts += (25 if prob_draw >= 0.33 else 18)
+        pts += (20 if g >= 0.30 else 12)
+        pts += 10
+        if md.has_h2h: pts += 5
+        
+        if md.dixon_pred:
+            lam_h = md.dixon_pred.get("lambda_home", 0)
+            lam_a = md.dixon_pred.get("lambda_away", 0)
+            if abs(lam_h - lam_a) < 0.3: pts += 10 # Équilibre mathématique parfait
+
         pts = max(0, min(100, pts))
         if pts < DRAW_MIN_SCORE: continue
         
-        candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, "Match Nul", "Nul", draw_odd, prob_draw, draw_odd if md.real_odds.get("draw") else None, (prob_draw*draw_odd)-1, pts))
+        candidates.append(Selection(
+            event_id=md.event_id, league=md.league, home=md.home, away=md.away, kickoff=md.kickoff, 
+            market="Match Nul", pick_label="Nul", odds=draw_odd, model_prob=prob_draw, 
+            real_odd=draw_odd if not is_estimated else None, 
+            value=0.0 if is_estimated else (prob_draw * draw_odd) - 1.0, 
+            quality=pts
+        ))
         
     candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
     top = candidates[:DRAW_TOP_N]
-    if len(top) < DRAW_TOP_N: return None
+    if len(top) < DRAW_TOP_N: 
+        print(f"  → Match Nul : besoin de 3, seulement {len(top)}")
+        return None
     
     co, cp = 1.0, 1.0
     for s in top: co *= s.odds; cp *= s.model_prob
+    print(f"  → Match Nul OK : {len(top)} nuls, cote {co:.2f}")
     return Coupon("Match Nul", "3 nuls combinés", "🤝", top, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
 
 def build_all_coupons(pool):
@@ -617,6 +653,7 @@ def build_all_coupons(pool):
 
     return coupons
 
+# --- FORMATAGE ---
 def format_header():
     return f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n     <b>⚡ {BRAND_NAME.upper()} ⚡</b>\n<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n<i>{BRAND_TAGLINE}</i>\n<i>📅 {today_pretty()} • 🇨🇮 Côte d’Ivoire</i>"
 
@@ -690,6 +727,7 @@ async def broadcast_after_scan():
                 await asyncio.sleep(0.3)
         except: pass
 
+# --- HANDLERS ---
 @dp.message(Command("start"))
 async def start_cmd(m):
     kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
@@ -732,6 +770,7 @@ async def b_act(m): await m.answer("🔑 /activate VOTRE_CLE")
 @dp.message(F.text == "⚙️ Debug")
 async def b_debug(m): await debug_cmd(m)
 
+# --- SCAN PRINCIPAL ---
 async def scan():
     async with STATE["scan_lock"]:
         bzz_preds = []
