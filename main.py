@@ -106,7 +106,7 @@ DRAW_TOP_N = 3
 # MOTEUR ODDS +3
 ODDS3_MIN_COTE_LEG = 1.15
 ODDS3_MIN_COTE_TOTAL = 3.0
-ODDS3_MAX_COTE_TOTAL = 5.0  # Modifié à 5.0
+ODDS3_MAX_COTE_TOTAL = 5.0
 
 TELEGRAM_MAX_LEN = 3800
 TZ = ZoneInfo(NOTIFY_TZ)
@@ -127,6 +127,7 @@ class WS_MatchData:
     home_odds: float
     draw_odds: float
     away_odds: float
+    commence_time: str = ""  # ⭐ NOUVEAU : heure exacte UTC
 
 @dataclass
 class WS_SimulationResult:
@@ -177,7 +178,7 @@ class DixonColesEngine:
 dixon_ws = DixonColesEngine()
 
 # =====================================================================
-# 🎫 ARCHITECTURE VOLATILITY INDEX
+# 🎫 ARCHITECTURE
 # =====================================================================
 
 @dataclass
@@ -284,10 +285,16 @@ def parse_dt_safe(s) -> Optional[datetime]:
     except: return None
 
 def format_kickoff(kickoff_str) -> str:
-    if not kickoff_str: return "?"
+    """⭐ NOUVEAU : Affiche correctement l'heure ou 'Heure non confirmée'."""
+    if not kickoff_str: 
+        return "Heure non confirmée"
     dt = parse_dt_safe(kickoff_str)
-    if dt: return dt.strftime("%d/%m %H:%M")
-    return "?"
+    if dt:
+        # Si l'heure est exactement minuit, c'est probablement une date sans heure
+        if dt.hour == 0 and dt.minute == 0:
+            return dt.strftime("%d/%m") + " (heure non confirmée)"
+        return dt.strftime("%d/%m %H:%M")
+    return "Heure non confirmée"
 
 def prob_bar(p: float) -> str:
     if p >= 0.80: return "🟢🟢🟢"
@@ -344,7 +351,64 @@ def prescore_match(md) -> int:
     return score
 
 # =====================================================================
-# 🎯 MOTEUR 1 : MT-FIN (Top 1-2 pour Odds +3)
+# ⏰ RÉCUPÉRATION DES HEURES EXACTES (via The Odds API)
+# =====================================================================
+async def fetch_real_odds_matches() -> list:
+    """Récupère tous les matchs The Odds API avec leur commence_time exact."""
+    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={API_KEY_ODDS}&regions=eu&markets=h2h"
+    matches = []
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=20.0)
+            if response.status_code == 200:
+                data = response.json()
+                for m in data:
+                    commence_time = m.get('commence_time', '')
+                    if not commence_time.startswith(today_str): continue
+                    if 'bookmakers' in m and len(m['bookmakers']) > 0:
+                        cotes = {c['name']: c['price'] for c in m['bookmakers'][0]['markets'][0]['outcomes']}
+                        home, away = m['home_team'], m['away_team']
+                        
+                        if home in cotes and away in cotes and 'Draw' in cotes:
+                            matches.append(WS_MatchData(
+                                match_id=m['id'], league=m['sport_title'],
+                                home_team=home, away_team=away,
+                                home_odds=cotes[home], draw_odds=cotes['Draw'], away_odds=cotes[away],
+                                commence_time=commence_time  # ⭐ Heure exacte UTC
+                            ))
+                            if len(matches) >= 100: break
+    except Exception as e:
+        print(f"⚠️ Erreur API Odds: {e}")
+    return matches
+
+def inject_exact_times(pool: list, ws_matches: list):
+    """
+    ⭐ NOUVEAU : Injecte les heures exactes de The Odds API dans le pool Bzzoiro.
+    Fait un matching sur les noms d'équipes.
+    """
+    if not ws_matches: return
+    
+    matched = 0
+    for md in pool:
+        hn = normalize_name(md.home)
+        an = normalize_name(md.away)
+        
+        for ws in ws_matches:
+            whn = normalize_name(ws.home_team)
+            wan = normalize_name(ws.away_team)
+            
+            # Matching flexible (l'un contient l'autre)
+            if (hn in whn or whn in hn) and (an in wan or wan in an):
+                md.kickoff = ws.commence_time  # ⭐ On remplace par l'heure exacte
+                matched += 1
+                break
+    
+    print(f"⏰ Heures exactes injectées : {matched}/{len(pool)} matchs")
+
+# =====================================================================
+# 🎯 MOTEUR 1 : MT-FIN (Top 3)
 # =====================================================================
 def _poisson_sample(lam: float) -> int:
     if lam <= 0: return 0
@@ -398,7 +462,7 @@ def build_mtft_coupon_and_bonus(pool):
             "md": md, "pick": best_pick, "prob": best_prob, "score": pts, "odd": est_odd
         })
 
-    # On trie et on garde les 3 meilleurs pour le ticket MT-Fin
+    # Ticket MT-Fin classique (Top 3)
     coupon = None
     if len(picks) >= MTFIN_TOP_N:
         picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
@@ -408,8 +472,9 @@ def build_mtft_coupon_and_bonus(pool):
         for s in legs: co *= s.odds; cp *= s.model_prob
         coupon = Coupon("MT-Fin", "3 matchs Bookmaker Blind", "⏱", legs, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
 
-    # ⭐ BONUS ODDS +3 : On prend les 2 MEILLEURS (Top 1-2)
-    top_bonus = picks[:2]
+    # Bonus Odds +3 : Top 3
+    picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
+    top_bonus = picks[:3]
     for p in top_bonus:
         md = p["md"]
         if p["pick"] == "V1/V1":
@@ -428,19 +493,17 @@ def build_mtft_coupon_and_bonus(pool):
             is_est = True
 
         bonus_pool.append({
-            "match": md,
-            "type": fav_market,
-            "odds": real_odd,
-            "proba": fav_ft_prob * 100,
-            "ai": md.analysis,
+            "match": md, "type": fav_market, "odds": real_odd,
+            "proba": fav_ft_prob * 100, "ai": md.analysis,
             "real_odd": real_odd if not is_est else None,
             "source": "MT-FIN",
+            "kickoff": md.kickoff,  # ⭐ Garder l'heure
         })
 
     return coupon, bonus_pool
 
 # =====================================================================
-# 🤝 MOTEUR 2 : MATCH NUL (Bottom 1-2 pour Odds +3)
+# 🤝 MOTEUR 2 : MATCH NUL (Bottom 3)
 # =====================================================================
 def compute_probability(md, market_key):
     gem = dix = bzz = 0.0
@@ -489,7 +552,7 @@ def build_draw_coupon_and_bonus(pool):
         
         candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, "Match Nul", "Match Nul (X)", draw_odd, prob_draw, draw_odd if md.real_odds.get("draw") else None, (prob_draw*draw_odd)-1, pts))
 
-    # Ticket Match Nul : les 3 meilleurs
+    # Ticket Match Nul (Top 3)
     coupon = None
     if len(candidates) >= DRAW_TOP_N:
         candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
@@ -498,10 +561,9 @@ def build_draw_coupon_and_bonus(pool):
         for s in top3: co *= s.odds; cp *= s.model_prob
         coupon = Coupon("Match Nul", "3 nuls combinés", "🤝", top3, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
 
-    # ⭐ BONUS ODDS +3 : On prend les 2 MOINS PROBABLES (Bottom 1-2)
-    # On trie par prob_draw croissant
-    candidates.sort(key=lambda x: x.model_prob, reverse=False)  # Ordre croissant
-    bottom_candidates = candidates[:2]
+    # Bonus Odds +3 : Bottom 3
+    candidates.sort(key=lambda x: x.model_prob, reverse=False) 
+    bottom_candidates = candidates[:3]
     
     for c in bottom_candidates:
         md = next((m for m in pool if m.event_id == c.event_id), None)
@@ -514,52 +576,19 @@ def build_draw_coupon_and_bonus(pool):
         dc12_odd = round(1.0 / prob_dc_12, 2) if prob_dc_12 > 0 else 1.30
 
         bonus_pool.append({
-            "match": md,
-            "type": "Double Chance 12 (Pas de Nul)",
-            "odds": dc12_odd,
-            "proba": prob_dc_12 * 100,
-            "ai": md.analysis,
-            "real_odd": None,
+            "match": md, "type": "Double Chance 12 (Pas de Nul)",
+            "odds": dc12_odd, "proba": prob_dc_12 * 100,
+            "ai": md.analysis, "real_odd": None,
             "source": "MATCH-NUL",
+            "kickoff": md.kickoff,  # ⭐ Garder l'heure
         })
 
     return coupon, bonus_pool
 
 # =====================================================================
-# 🎯 MOTEUR 3 : ODDS +3 (Assemblage Top MT-Fin + Bottom Match Nul + Top WS)
+# 🎯 MOTEUR 3 : ODDS +3 (Mixité stricte MT-Fin + Match Nul + WS)
 # =====================================================================
-async def fetch_real_odds_matches() -> list:
-    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={API_KEY_ODDS}&regions=eu&markets=h2h"
-    matches = []
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=20.0)
-            if response.status_code == 200:
-                data = response.json()
-                for m in data:
-                    commence_time = m.get('commence_time', '')
-                    if not commence_time.startswith(today_str): continue
-                    if 'bookmakers' in m and len(m['bookmakers']) > 0:
-                        cotes = {c['name']: c['price'] for c in m['bookmakers'][0]['markets'][0]['outcomes']}
-                        home, away = m['home_team'], m['away_team']
-                        
-                        if home in cotes and away in cotes and 'Draw' in cotes:
-                            matches.append(WS_MatchData(
-                                match_id=m['id'], league=m['sport_title'],
-                                home_team=home, away_team=away,
-                                home_odds=cotes[home], draw_odds=cotes['Draw'], away_odds=cotes[away]
-                            ))
-                            if len(matches) >= 100: break
-    except Exception as e:
-        print(f"⚠️ Erreur API Odds: {e}")
-    return matches
-
-def build_ws_best(ws_matches) -> list:
-    """
-    Retourne le TOP 1 match de WallStreet (The Odds API).
-    """
+def build_ws_top3(ws_matches) -> list:
     pool = []
     for match in ws_matches:
         sim = dixon_ws.simulate(match)
@@ -569,35 +598,31 @@ def build_ws_best(ws_matches) -> list:
         p_home, p_draw, p_away = sim.proba_home, sim.proba_draw, sim.proba_away
         
         if p_home >= 55.0 and match.home_odds >= 1.15:
-            pool.append({"match": match, "type": f"Victoire {match.home_team} (1)", "odds": match.home_odds, "proba": p_home, "ai": "Analyse mathématique solide.", "real_odd": match.home_odds, "source": "WALLSTREET"})
+            pool.append({"match": match, "type": f"Victoire {match.home_team} (1)", "odds": match.home_odds, "proba": p_home, "ai": "Analyse mathématique solide.", "real_odd": match.home_odds, "source": "WALLSTREET", "kickoff": match.commence_time})
         if p_away >= 55.0 and match.away_odds >= 1.15:
-            pool.append({"match": match, "type": f"Victoire {match.away_team} (2)", "odds": match.away_odds, "proba": p_away, "ai": "Analyse mathématique solide.", "real_odd": match.away_odds, "source": "WALLSTREET"})
+            pool.append({"match": match, "type": f"Victoire {match.away_team} (2)", "odds": match.away_odds, "proba": p_away, "ai": "Analyse mathématique solide.", "real_odd": match.away_odds, "source": "WALLSTREET", "kickoff": match.commence_time})
     
-    # On trie et on garde le TOP 1
     pool.sort(key=lambda x: x['proba'], reverse=True)
-    return pool[:1]
+    return pool[:3]
 
-def build_odds3_coupon(bonus_mtft, bonus_draw, ws_best) -> Optional[Coupon]:
-    """
-    Assemble le ticket Odds +3 avec :
-    - Top 1-2 MT-Fin
-    - Bottom 1-2 Match Nul
-    - Top 1 WallStreet
-    Cote totale entre 3.0 et 5.0.
-    """
-    # On combine tous les éléments
-    combined = bonus_mtft + bonus_draw + ws_best
-    
-    if len(combined) < 2:
-        print(f"  → Odds +3 : pas assez de matchs ({len(combined)})")
+def build_odds3_coupon(bonus_mtft, bonus_draw, ws_pool) -> Optional[Coupon]:
+    if not bonus_mtft or not bonus_draw or not ws_pool:
+        print(f"  → Odds +3 impossible : manque une catégorie")
+        print(f"     - MT-Fin: {len(bonus_mtft)} | Match Nul: {len(bonus_draw)} | WS: {len(ws_pool)}")
         return None
     
-    # On cherche une combinaison qui donne une cote entre 3.0 et 5.0
-    for r in range(2, min(len(combined), 5) + 1):
+    combined = bonus_mtft + bonus_draw + ws_pool
+    
+    for r in range(3, min(len(combined), 6) + 1):
         for combo in itertools.combinations(combined, r):
-            # Anti-doublon intra-ticket
             match_ids = [c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id for c in combo]
             if len(set(match_ids)) != len(match_ids): continue
+            
+            has_mtft = any(c.get('source') == 'MT-FIN' for c in combo)
+            has_draw = any(c.get('source') == 'MATCH-NUL' for c in combo)
+            has_ws = any(c.get('source') == 'WALLSTREET' for c in combo)
+            
+            if not (has_mtft and has_draw and has_ws): continue
             
             total_odds = 1.0
             for x in combo: total_odds *= x['odds']
@@ -612,7 +637,8 @@ def build_odds3_coupon(bonus_mtft, bonus_draw, ws_best) -> Optional[Coupon]:
                         league=c['match'].league, 
                         home=c['match'].home if hasattr(c['match'], 'home') else c['match'].home_team, 
                         away=c['match'].away if hasattr(c['match'], 'away') else c['match'].away_team, 
-                        kickoff="", market=c['type'], pick_label=c['type'], odds=c['odds'], 
+                        kickoff=c.get('kickoff', ''),  # ⭐ Utiliser l'heure stockée
+                        market=c['type'], pick_label=c['type'], odds=c['odds'], 
                         model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
                     ))
                 
@@ -622,7 +648,7 @@ def build_odds3_coupon(bonus_mtft, bonus_draw, ws_best) -> Optional[Coupon]:
                 print(f"  → Odds +3 OK : {len(legs)} legs ({n_mtft} MT-Fin + {n_nul} Nul + {n_ws} WS), cote {total_odds:.2f}")
                 return Coupon("Odds +3", "Moteur WallStreet Fusionné", "🎯", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
     
-    print(f"  → Odds +3 : 0 combinaison possible")
+    print(f"  → Odds +3 : 0 combinaison possible (cote cible 3.0-5.0)")
     return None
 
 # =====================================================================
@@ -657,7 +683,12 @@ async def enrich_and_analyze(pool):
 
 async def scan():
     async with STATE["scan_lock"]:
-        # ÉTAPE 1 : Données Bzzoiro + InferSports
+        # ⭐ ÉTAPE 0 : Récupérer The Odds API EN PREMIER pour avoir les heures exactes
+        print("⏰ Récupération des heures exactes via The Odds API...")
+        ws_matches = await fetch_real_odds_matches()
+        print(f"   → {len(ws_matches)} matchs The Odds API")
+
+        # ÉTAPE 1 : Bzzoiro + InferSports
         bzz_preds = []
         if fetch_bzzoiro_predictions_direct and BZZOIRO_API_KEY:
             try: bzz_preds = await fetch_bzzoiro_predictions_direct(min_confidence=BZZ_NATIVE_CONFIDENCE)
@@ -678,12 +709,15 @@ async def scan():
                     except: pass
                 pool.append(md)
 
+            # ⭐ INJECTION DES HEURES EXACTES
+            inject_exact_times(pool, ws_matches)
+
             pool.sort(key=prescore_match, reverse=True)
             top_pool = pool[:GEMINI_MAX_CALLS_PER_SCAN]
 
             await enrich_and_analyze(top_pool)
 
-        # ÉTAPE 2 : MT-Fin et Match Nul (tickets + bonus Top/Bottom)
+        # ÉTAPE 2 : MT-Fin et Match Nul
         coupon_mtft, bonus_mtft = build_mtft_coupon_and_bonus(top_pool) if pool else (None, [])
         coupon_draw, bonus_draw = build_draw_coupon_and_bonus(top_pool) if pool else (None, [])
 
@@ -691,16 +725,14 @@ async def scan():
         if coupon_mtft: coupons.append(coupon_mtft)
         if coupon_draw: coupons.append(coupon_draw)
 
-        # ÉTAPE 3 : Odds +3 (Top MT-Fin + Bottom Match Nul + Top WS)
-        print("🎯 Construction Odds +3 (Top MT-Fin + Bottom Nul + Top WS)...")
-        print(f"  → Bonus MT-Fin : {len(bonus_mtft)} matchs")
-        print(f"  → Bonus Match-Nul : {len(bonus_draw)} matchs")
+        # ÉTAPE 3 : Odds +3 (Mixité stricte)
+        print("🎯 Construction Odds +3 (Mixité MT-Fin + Match Nul + WS)...")
+        print(f"  → Bonus MT-Fin : {len(bonus_mtft)} | Match-Nul : {len(bonus_draw)}")
         
-        ws_matches = await fetch_real_odds_matches()
-        ws_best = build_ws_best(ws_matches) if ws_matches else []
-        print(f"  → WS Best : {len(ws_best)} matchs")
+        ws_top3 = build_ws_top3(ws_matches) if ws_matches else []
+        print(f"  → WS Top : {len(ws_top3)}")
         
-        coupon_odds3 = build_odds3_coupon(bonus_mtft, bonus_draw, ws_best)
+        coupon_odds3 = build_odds3_coupon(bonus_mtft, bonus_draw, ws_top3)
         if coupon_odds3:
             coupons.insert(0, coupon_odds3)
 
