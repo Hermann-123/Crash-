@@ -103,10 +103,10 @@ DRAW_MAX_ECART = 0.20
 DRAW_MIN_PROB = 0.28
 DRAW_TOP_N = 3
 
-# MOTEUR ODDS +3 (nouvelle règle 80/20)
-ODDS3_MIN_COTE_LEG = 1.20  # Cote minimum pour TOUS les legs (rejette 1.01, 1.02...)
+# MOTEUR ODDS +3
+ODDS3_MIN_COTE_LEG = 1.15
 ODDS3_MIN_COTE_TOTAL = 3.0
-ODDS3_MAX_COTE_TOTAL = 4.5
+ODDS3_MAX_COTE_TOTAL = 5.0  # Modifié à 5.0
 
 TELEGRAM_MAX_LEN = 3800
 TZ = ZoneInfo(NOTIFY_TZ)
@@ -344,7 +344,7 @@ def prescore_match(md) -> int:
     return score
 
 # =====================================================================
-# 🎯 MOTEUR 1 : MT-FIN (V1/V1 ou V2/V2) + Génère "Victoire Favori" pour Odds +3
+# 🎯 MOTEUR 1 : MT-FIN (Top 1-2 pour Odds +3)
 # =====================================================================
 def _poisson_sample(lam: float) -> int:
     if lam <= 0: return 0
@@ -398,15 +398,28 @@ def build_mtft_coupon_and_bonus(pool):
             "md": md, "pick": best_pick, "prob": best_prob, "score": pts, "odd": est_odd
         })
 
-        # BONUS pour Odds +3 : "Victoire Favori"
-        if best_pick == "V1/V1":
+    # On trie et on garde les 3 meilleurs pour le ticket MT-Fin
+    coupon = None
+    if len(picks) >= MTFIN_TOP_N:
+        picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
+        top3 = picks[:MTFIN_TOP_N]
+        legs = [Selection(p["md"].event_id, p["md"].league, p["md"].home, p["md"].away, p["md"].kickoff, "MT-Fin", f"MT/Fin : {p['pick']}", p["odd"], p["prob"], None, -1.0, p["score"], htft_pick=p["pick"]) for p in top3]
+        co, cp = 1.0, 1.0
+        for s in legs: co *= s.odds; cp *= s.model_prob
+        coupon = Coupon("MT-Fin", "3 matchs Bookmaker Blind", "⏱", legs, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
+
+    # ⭐ BONUS ODDS +3 : On prend les 2 MEILLEURS (Top 1-2)
+    top_bonus = picks[:2]
+    for p in top_bonus:
+        md = p["md"]
+        if p["pick"] == "V1/V1":
             fav_market = f"Victoire {md.home} (1)"
             real_odd = md.real_odds.get("home")
         else:
             fav_market = f"Victoire {md.away} (2)"
             real_odd = md.real_odds.get("away")
 
-        ft_res = best_pick.split("/")[1]
+        ft_res = p["pick"].split("/")[1]
         fav_ft_prob = sum(htft_probs.get(f"{ht}/{ft_res}", 0) for ht in ("V1", "V2", "X"))
 
         is_est = False
@@ -424,21 +437,10 @@ def build_mtft_coupon_and_bonus(pool):
             "source": "MT-FIN",
         })
 
-    coupon = None
-    if len(picks) >= MTFIN_TOP_N:
-        picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
-        top = picks[:MTFIN_TOP_N]
-        legs = [Selection(p["md"].event_id, p["md"].league, p["md"].home, p["md"].away, p["md"].kickoff, "MT-Fin", f"MT/Fin : {p['pick']}", p["odd"], p["prob"], None, -1.0, p["score"], htft_pick=p["pick"]) for p in top]
-        co, cp = 1.0, 1.0
-        for s in legs: co *= s.odds; cp *= s.model_prob
-        coupon = Coupon("MT-Fin", "3 matchs Bookmaker Blind", "⏱", legs, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
-    else:
-        print(f"  → MT-Fin : besoin de 3, seulement {len(picks)}")
-
     return coupon, bonus_pool
 
 # =====================================================================
-# 🤝 MOTEUR 2 : MATCH NUL + Génère "Double Chance 12" pour Odds +3
+# 🤝 MOTEUR 2 : MATCH NUL (Bottom 1-2 pour Odds +3)
 # =====================================================================
 def compute_probability(md, market_key):
     gem = dix = bzz = 0.0
@@ -487,7 +489,24 @@ def build_draw_coupon_and_bonus(pool):
         
         candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, "Match Nul", "Match Nul (X)", draw_odd, prob_draw, draw_odd if md.real_odds.get("draw") else None, (prob_draw*draw_odd)-1, pts))
 
-        # BONUS pour Odds +3 : "Double Chance 12"
+    # Ticket Match Nul : les 3 meilleurs
+    coupon = None
+    if len(candidates) >= DRAW_TOP_N:
+        candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
+        top3 = candidates[:DRAW_TOP_N]
+        co, cp = 1.0, 1.0
+        for s in top3: co *= s.odds; cp *= s.model_prob
+        coupon = Coupon("Match Nul", "3 nuls combinés", "🤝", top3, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
+
+    # ⭐ BONUS ODDS +3 : On prend les 2 MOINS PROBABLES (Bottom 1-2)
+    # On trie par prob_draw croissant
+    candidates.sort(key=lambda x: x.model_prob, reverse=False)  # Ordre croissant
+    bottom_candidates = candidates[:2]
+    
+    for c in bottom_candidates:
+        md = next((m for m in pool if m.event_id == c.event_id), None)
+        if not md: continue
+        
         prob_home, _, _, _, _ = compute_probability(md, "victoire_home")
         prob_away, _, _, _, _ = compute_probability(md, "victoire_away")
         prob_dc_12 = prob_home + prob_away
@@ -504,20 +523,10 @@ def build_draw_coupon_and_bonus(pool):
             "source": "MATCH-NUL",
         })
 
-    coupon = None
-    if len(candidates) >= DRAW_TOP_N:
-        candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
-        top = candidates[:DRAW_TOP_N]
-        co, cp = 1.0, 1.0
-        for s in top: co *= s.odds; cp *= s.model_prob
-        coupon = Coupon("Match Nul", "3 nuls combinés", "🤝", top, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
-    else:
-        print(f"  → Match Nul : besoin de 3, seulement {len(candidates)}")
-
     return coupon, bonus_pool
 
 # =====================================================================
-# 🎯 MOTEUR 3 : ODDS +3 (80% bonus MT-Fin/Nul + 20% WallStreet)
+# 🎯 MOTEUR 3 : ODDS +3 (Assemblage Top MT-Fin + Bottom Match Nul + Top WS)
 # =====================================================================
 async def fetch_real_odds_matches() -> list:
     url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={API_KEY_ODDS}&regions=eu&markets=h2h"
@@ -547,10 +556,9 @@ async def fetch_real_odds_matches() -> list:
         print(f"⚠️ Erreur API Odds: {e}")
     return matches
 
-def build_ws_pool(ws_matches) -> list:
+def build_ws_best(ws_matches) -> list:
     """
-    Construit le pool des pronostics WallStreet (The Odds API).
-    Filtre strict : cote minimum 1.20 (pas de 1.01, 1.02...).
+    Retourne le TOP 1 match de WallStreet (The Odds API).
     """
     pool = []
     for match in ws_matches:
@@ -560,117 +568,59 @@ def build_ws_pool(ws_matches) -> list:
         
         p_home, p_draw, p_away = sim.proba_home, sim.proba_draw, sim.proba_away
         
-        # Victoire Domicile (uniquement si cote >= 1.20)
-        if p_home >= 55.0 and match.home_odds >= ODDS3_MIN_COTE_LEG:
+        if p_home >= 55.0 and match.home_odds >= 1.15:
             pool.append({"match": match, "type": f"Victoire {match.home_team} (1)", "odds": match.home_odds, "proba": p_home, "ai": "Analyse mathématique solide.", "real_odd": match.home_odds, "source": "WALLSTREET"})
-        
-        # Victoire Extérieur
-        if p_away >= 55.0 and match.away_odds >= ODDS3_MIN_COTE_LEG:
+        if p_away >= 55.0 and match.away_odds >= 1.15:
             pool.append({"match": match, "type": f"Victoire {match.away_team} (2)", "odds": match.away_odds, "proba": p_away, "ai": "Analyse mathématique solide.", "real_odd": match.away_odds, "source": "WALLSTREET"})
-        
-        # Double Chance 1X (si cote >= 1.20 calculée)
-        if p_home + p_draw >= 82.0:
-            dc_odd = round(100.0 / (p_home + p_draw), 2)
-            if dc_odd >= ODDS3_MIN_COTE_LEG:
-                pool.append({"match": match, "type": "Double Chance (1X)", "odds": dc_odd, "proba": p_home+p_draw, "ai": "Stabilité défensive.", "real_odd": None, "source": "WALLSTREET"})
-        
-        if p_away + p_draw >= 82.0:
-            dc_odd = round(100.0 / (p_away + p_draw), 2)
-            if dc_odd >= ODDS3_MIN_COTE_LEG:
-                pool.append({"match": match, "type": "Double Chance (X2)", "odds": dc_odd, "proba": p_away+p_draw, "ai": "Stabilité défensive.", "real_odd": None, "source": "WALLSTREET"})
-        
-        # Over 1.5
-        if sim.proba_over_1_5 >= 78.0:
-            o_odd = round(100.0 / sim.proba_over_1_5, 2)
-            if o_odd >= ODDS3_MIN_COTE_LEG:
-                pool.append({"match": match, "type": "Plus de 1,5 buts", "odds": o_odd, "proba": sim.proba_over_1_5, "ai": "Match ouvert.", "real_odd": None, "source": "WALLSTREET"})
-        
-        # Over 2.5
-        if sim.proba_over_2_5 >= 60.0:
-            o_odd = round(100.0 / sim.proba_over_2_5, 2)
-            if o_odd >= ODDS3_MIN_COTE_LEG:
-                pool.append({"match": match, "type": "Plus de 2,5 buts", "odds": o_odd, "proba": sim.proba_over_2_5, "ai": "Match ouvert.", "real_odd": None, "source": "WALLSTREET"})
-        
-        # BTTS
-        if sim.proba_btts >= 62.0:
-            b_odd = round(100.0 / sim.proba_btts, 2)
-            if b_odd >= ODDS3_MIN_COTE_LEG:
-                pool.append({"match": match, "type": "Les 2 équipes marquent (BTTS)", "odds": b_odd, "proba": sim.proba_btts, "ai": "Attaques prolifiques.", "real_odd": None, "source": "WALLSTREET"})
     
-    return pool
+    # On trie et on garde le TOP 1
+    pool.sort(key=lambda x: x['proba'], reverse=True)
+    return pool[:1]
 
-def build_odds3_coupon(bonus_pool, ws_pool) -> Optional[Coupon]:
+def build_odds3_coupon(bonus_mtft, bonus_draw, ws_best) -> Optional[Coupon]:
     """
-    RÈGLE 80/20 : Le ticket doit être composé à ~80% de bonus MT-Fin/Nul
-    et à ~20% de pronostics WallStreet (The Odds API).
-    
-    Stratégies par ordre de priorité :
-    1. 4 bonus + 1 WS
-    2. 3 bonus + 1 WS  
-    3. 2 bonus + 1 WS
-    4. 4 bonus seuls
-    5. 3 bonus seuls
-    6. 2 bonus seuls
+    Assemble le ticket Odds +3 avec :
+    - Top 1-2 MT-Fin
+    - Bottom 1-2 Match Nul
+    - Top 1 WallStreet
+    Cote totale entre 3.0 et 5.0.
     """
-    # Filtre cote minimum sur tout
-    bonus_pool = [x for x in bonus_pool if x['odds'] >= ODDS3_MIN_COTE_LEG]
-    ws_pool = [x for x in ws_pool if x['odds'] >= ODDS3_MIN_COTE_LEG]
+    # On combine tous les éléments
+    combined = bonus_mtft + bonus_draw + ws_best
     
-    # Tri par proba
-    bonus_sorted = sorted(bonus_pool, key=lambda x: x['proba'], reverse=True)
-    ws_sorted = sorted(ws_pool, key=lambda x: x['proba'], reverse=True)
+    if len(combined) < 2:
+        print(f"  → Odds +3 : pas assez de matchs ({len(combined)})")
+        return None
     
-    print(f"  → Odds +3 : {len(bonus_sorted)} bonus (MT-Fin+Nul) + {len(ws_sorted)} WallStreet disponibles")
-    
-    # Stratégies 80/20 : on essaie d'abord les compositions avec plus de bonus
-    strategies = [
-        ("4 bonus + 1 WS", bonus_sorted[:4], ws_sorted[:1]),
-        ("3 bonus + 1 WS", bonus_sorted[:3], ws_sorted[:1]),
-        ("2 bonus + 1 WS", bonus_sorted[:2], ws_sorted[:1]),
-        ("4 bonus seuls", bonus_sorted[:4], []),
-        ("3 bonus seuls", bonus_sorted[:3], []),
-        ("2 bonus seuls", bonus_sorted[:2], []),
-        ("1 bonus + 1 WS", bonus_sorted[:1], ws_sorted[:1]),
-    ]
-    
-    for strat_name, bonus_set, ws_set in strategies:
-        combined = bonus_set + ws_set
-        if len(combined) < 2: continue
-        
-        # Essayer toutes les combinaisons de 2 à 5 legs
-        for r in range(2, min(len(combined), 5) + 1):
-            for combo in itertools.combinations(combined, r):
-                # Vérifier qu'il y a AU MOINS un bonus (règle 80/20)
-                has_bonus = any(c.get('source') in ('MT-FIN', 'MATCH-NUL') for c in combo)
-                if not has_bonus: continue
+    # On cherche une combinaison qui donne une cote entre 3.0 et 5.0
+    for r in range(2, min(len(combined), 5) + 1):
+        for combo in itertools.combinations(combined, r):
+            # Anti-doublon intra-ticket
+            match_ids = [c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id for c in combo]
+            if len(set(match_ids)) != len(match_ids): continue
+            
+            total_odds = 1.0
+            for x in combo: total_odds *= x['odds']
+            
+            if ODDS3_MIN_COTE_TOTAL <= total_odds <= ODDS3_MAX_COTE_TOTAL:
+                legs = []
+                total_prob = 1.0
+                for c in combo:
+                    total_prob *= (c['proba'] / 100.0)
+                    legs.append(Selection(
+                        event_id=c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id, 
+                        league=c['match'].league, 
+                        home=c['match'].home if hasattr(c['match'], 'home') else c['match'].home_team, 
+                        away=c['match'].away if hasattr(c['match'], 'away') else c['match'].away_team, 
+                        kickoff="", market=c['type'], pick_label=c['type'], odds=c['odds'], 
+                        model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
+                    ))
                 
-                # Vérifier pas de doublon de match
-                match_ids = [c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id for c in combo]
-                if len(set(match_ids)) != len(match_ids): continue
-                
-                # Vérifier cotes minimum
-                if any(c['odds'] < ODDS3_MIN_COTE_LEG for c in combo): continue
-                
-                total_odds = 1.0
-                for x in combo: total_odds *= x['odds']
-                
-                if ODDS3_MIN_COTE_TOTAL <= total_odds <= ODDS3_MAX_COTE_TOTAL:
-                    legs = []
-                    total_prob = 1.0
-                    for c in combo:
-                        total_prob *= (c['proba'] / 100.0)
-                        legs.append(Selection(
-                            event_id=c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id, 
-                            league=c['match'].league, 
-                            home=c['match'].home if hasattr(c['match'], 'home') else c['match'].home_team, 
-                            away=c['match'].away if hasattr(c['match'], 'away') else c['match'].away_team, 
-                            kickoff="", market=c['type'], pick_label=c['type'], odds=c['odds'], 
-                            model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
-                        ))
-                    
-                    n_bonus = sum(1 for c in combo if c.get('source') in ('MT-FIN', 'MATCH-NUL'))
-                    print(f"  → Odds +3 OK : {strat_name} → {len(legs)} legs ({n_bonus} bonus), cote {total_odds:.2f}")
-                    return Coupon("Odds +3", "Moteur WallStreet Fusionné", "🎯", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
+                n_mtft = sum(1 for c in combo if c.get('source') == 'MT-FIN')
+                n_nul = sum(1 for c in combo if c.get('source') == 'MATCH-NUL')
+                n_ws = sum(1 for c in combo if c.get('source') == 'WALLSTREET')
+                print(f"  → Odds +3 OK : {len(legs)} legs ({n_mtft} MT-Fin + {n_nul} Nul + {n_ws} WS), cote {total_odds:.2f}")
+                return Coupon("Odds +3", "Moteur WallStreet Fusionné", "🎯", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
     
     print(f"  → Odds +3 : 0 combinaison possible")
     return None
@@ -733,7 +683,7 @@ async def scan():
 
             await enrich_and_analyze(top_pool)
 
-        # ÉTAPE 2 : MT-Fin et Match Nul (tickets + bonus pour Odds +3)
+        # ÉTAPE 2 : MT-Fin et Match Nul (tickets + bonus Top/Bottom)
         coupon_mtft, bonus_mtft = build_mtft_coupon_and_bonus(top_pool) if pool else (None, [])
         coupon_draw, bonus_draw = build_draw_coupon_and_bonus(top_pool) if pool else (None, [])
 
@@ -741,20 +691,16 @@ async def scan():
         if coupon_mtft: coupons.append(coupon_mtft)
         if coupon_draw: coupons.append(coupon_draw)
 
-        # ÉTAPE 3 : Odds +3 (80% bonus + 20% WallStreet)
-        print("🎯 Construction Odds +3 (80% bonus + 20% WallStreet)...")
+        # ÉTAPE 3 : Odds +3 (Top MT-Fin + Bottom Match Nul + Top WS)
+        print("🎯 Construction Odds +3 (Top MT-Fin + Bottom Nul + Top WS)...")
+        print(f"  → Bonus MT-Fin : {len(bonus_mtft)} matchs")
+        print(f"  → Bonus Match-Nul : {len(bonus_draw)} matchs")
         
-        # 3a. Pool bonus MT-Fin + Match Nul (80%)
-        bonus_pool = bonus_mtft + bonus_draw
-        print(f"  → Bonus pool : {len(bonus_pool)} pronostics ({len(bonus_mtft)} MT-Fin + {len(bonus_draw)} Match-Nul)")
-        
-        # 3b. Pool WallStreet (20%)
         ws_matches = await fetch_real_odds_matches()
-        ws_pool = build_ws_pool(ws_matches) if ws_matches else []
-        print(f"  → WS pool : {len(ws_pool)} pronostics WallStreet")
+        ws_best = build_ws_best(ws_matches) if ws_matches else []
+        print(f"  → WS Best : {len(ws_best)} matchs")
         
-        # 3c. Construction du ticket Odds +3
-        coupon_odds3 = build_odds3_coupon(bonus_pool, ws_pool)
+        coupon_odds3 = build_odds3_coupon(bonus_mtft, bonus_draw, ws_best)
         if coupon_odds3:
             coupons.insert(0, coupon_odds3)
 
