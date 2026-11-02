@@ -65,6 +65,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
 INFERSPORTS_API_KEY = os.getenv("INFERSPORTS_API_KEY", "")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "99f9731b68429ed4aaf0383cd7ca8cd4") # Ta clé
 
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "5968288964")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "-1003982738017")
@@ -104,12 +105,13 @@ DRAW_MIN_PROB = 0.28
 DRAW_TOP_N = 3
 
 # MOTEUR ODDS +3
-ODDS3_MIN_COTE_LEG = 1.15
+ODDS3_MIN_COTE_LEG = 1.40 # Plafond minimum pour cotes estimées
 ODDS3_MIN_COTE_TOTAL = 3.0
 ODDS3_MAX_COTE_TOTAL = 5.0
 
-# ⭐ FILTRE MATCHS DÉJÀ COMMENCÉS (marge de sécurité : 10 min)
+# FILTRE MATCHS
 MATCH_START_BUFFER_MINUTES = 10
+RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
 
 TELEGRAM_MAX_LEN = 3800
 TZ = ZoneInfo(NOTIFY_TZ)
@@ -255,7 +257,7 @@ STATE = {
     "ready": False, "coupons": [], "last_scan": None, "debug": {},
     "tracker": {"coupons": []}, "keys": {}, "users": {},
     "scan_lock": asyncio.Lock(), "dixon_model": None, "last_scan_date": "",
-    "odds_api_mode": "unknown"  # "live", "fallback", "unknown"
+    "odds_api_mode": "unknown"
 }
 
 TARGETS = []
@@ -279,6 +281,10 @@ def normalize_name(s: str) -> str:
     s = re.sub(r"[^a-z0-9 ]", "", s)
     return re.sub(r"\s+", " ", s).strip()
 
+def is_reserve_team(name: str) -> bool:
+    n = name.lower()
+    return any(kw in n for kw in RESERVE_KEYWORDS)
+
 def parse_dt_safe(s) -> Optional[datetime]:
     if not s: return None
     try:
@@ -298,26 +304,11 @@ def format_kickoff(kickoff_str) -> str:
         return dt.strftime("%d/%m %H:%M")
     return "Heure non confirmée"
 
-# ⭐ NOUVELLE FONCTION : Filtre matchs déjà commencés
 def is_match_not_started(kickoff_str) -> bool:
-    """
-    Retourne True si le match n'a pas encore commencé (avec marge de sécurité).
-    - Si heure inconnue (juste date) : on accepte (fallback)
-    - Si heure = minuit pile (date sans heure) : on accepte
-    - Si heure précise : on rejette si < now + 10 min
-    """
-    if not kickoff_str:
-        return True  # Pas d'heure → on accepte (fallback Bzzoiro)
-    
+    if not kickoff_str: return True
     dt = parse_dt_safe(kickoff_str)
-    if not dt:
-        return True  # Parse échoué → on accepte
-    
-    # Si heure = 00:00 pile, c'est une date sans heure → on accepte
-    if dt.hour == 0 and dt.minute == 0:
-        return True
-    
-    # Vérifier si le match commence dans le futur (> 10 min)
+    if not dt: return True
+    if dt.hour == 0 and dt.minute == 0: return True
     now = datetime.now(TZ)
     buffer = timedelta(minutes=MATCH_START_BUFFER_MINUTES)
     return dt > (now + buffer)
@@ -357,6 +348,12 @@ def save_json(path, data):
         with open(path, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
     except: pass
 
+def load_tracker():
+    return load_json(LOCAL_DB, {"coupons": []})
+
+def save_tracker(data):
+    save_json(LOCAL_DB, data)
+
 def record_coupons(coupons, date_str):
     tracker = STATE["tracker"]
     existing = {c["id"] for c in tracker["coupons"]}
@@ -377,40 +374,26 @@ def prescore_match(md) -> int:
     return score
 
 # =====================================================================
-# ⏰ THE ODDS API (avec gestion d'erreur robuste)
+# ⏰ THE ODDS API & API-FOOTBALL
 # =====================================================================
 async def fetch_real_odds_matches() -> Tuple[list, str]:
-    """
-    Retourne (liste_matchs, status).
-    status = "live" si succès, "fallback" si échec (quota, timeout, erreur).
-    """
     url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={API_KEY_ODDS}&regions=eu&markets=h2h"
     matches = []
     today_str = datetime.now().strftime("%Y-%m-%d")
-    
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, timeout=20.0)
-            
-            # ⚠️ CAS D'ERREUR : quota épuisé, timeout, etc.
             if response.status_code != 200:
-                print(f"⚠️ The Odds API -> {response.status_code} (fallback Bzzoiro activé)")
                 return [], "fallback"
-            
             data = response.json()
-            
-            # Vérifier si la réponse est une liste
             if not isinstance(data, list):
-                print(f"⚠️ The Odds API format inattendu (fallback Bzzoiro)")
                 return [], "fallback"
-            
             for m in data:
                 commence_time = m.get('commence_time', '')
                 if not commence_time.startswith(today_str): continue
                 if 'bookmakers' in m and len(m['bookmakers']) > 0:
                     cotes = {c['name']: c['price'] for c in m['bookmakers'][0]['markets'][0]['outcomes']}
                     home, away = m['home_team'], m['away_team']
-                    
                     if home in cotes and away in cotes and 'Draw' in cotes:
                         matches.append(WS_MatchData(
                             match_id=m['id'], league=m['sport_title'],
@@ -419,35 +402,55 @@ async def fetch_real_odds_matches() -> Tuple[list, str]:
                             commence_time=commence_time
                         ))
                         if len(matches) >= 100: break
-            
-            if len(matches) == 0:
-                print(f"⚠️ The Odds API : 0 matchs (fallback Bzzoiro)")
-                return [], "fallback"
-            
-            return matches, "live"
-    
-    except Exception as e:
-        print(f"⚠️ The Odds API crash : {e} (fallback Bzzoiro activé)")
+            return (matches, "live") if matches else ([], "fallback")
+    except Exception:
         return [], "fallback"
 
+async def fetch_api_football_odds(today_iso: str) -> dict:
+    if not API_FOOTBALL_KEY: return {}
+    url = f"https://v3.football.api-sports.io/odds"
+    headers = {"x-apisports-key": API_FOOTBALL_KEY}
+    results = {}
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get(url, headers=headers, params={"date": today_iso}, timeout=15.0)
+            if r.status_code == 200:
+                data = r.json().get("response", [])
+                for item in data:
+                    fixture_id = item.get("fixture", {}).get("id")
+                    home = item.get("teams", {}).get("home", {}).get("name")
+                    away = item.get("teams", {}).get("away", {}).get("name")
+                    if not fixture_id or not home or not away: continue
+                    
+                    cotes = {"home": None, "draw": None, "away": None}
+                    for bk in item.get("bookmakers", []):
+                        for bet in bk.get("bets", []):
+                            if "match winner" in (bet.get("name") or "").lower():
+                                for v in bet.get("values", []):
+                                    val = (v.get("value") or "").lower()
+                                    try: odd = float(v.get("odd"))
+                                    except: continue
+                                    if val == "home" and not cotes["home"]: cotes["home"] = odd
+                                    elif val == "draw" and not cotes["draw"]: cotes["draw"] = odd
+                                    elif val == "away" and not cotes["away"]: cotes["away"] = odd
+                        if cotes["home"] and cotes["draw"] and cotes["away"]: break
+                    if cotes["home"]:
+                        results[f"{normalize_name(home)}_{normalize_name(away)}"] = cotes
+        except: pass
+    print(f"📊 API-Football : {len(results)} matchs avec cotes réelles")
+    return results
+
 def inject_exact_times(pool: list, ws_matches: list) -> int:
-    """Injecte les heures exactes de The Odds API dans le pool Bzzoiro."""
     if not ws_matches: return 0
-    
     matched = 0
     for md in pool:
-        hn = normalize_name(md.home)
-        an = normalize_name(md.away)
-        
+        hn, an = normalize_name(md.home), normalize_name(md.away)
         for ws in ws_matches:
-            whn = normalize_name(ws.home_team)
-            wan = normalize_name(ws.away_team)
-            
+            whn, wan = normalize_name(ws.home_team), normalize_name(ws.away_team)
             if (hn in whn or whn in hn) and (an in wan or wan in an):
                 md.kickoff = ws.commence_time
                 matched += 1
                 break
-    
     return matched
 
 # =====================================================================
@@ -477,12 +480,16 @@ def simulate_htft(lambda_home: float, lambda_away: float, n_sims: int = MTFIN_SI
         counts[key] = counts.get(key, 0) + 1
     return {k: round(v / n_sims, 4) for k, v in counts.items()}
 
-def build_mtft_coupon_and_bonus(pool):
+def build_mtft_coupon_and_bonus(pool, api_football_odds):
     picks = []
     bonus_pool = []
 
     for md in pool:
         if not md.home or not md.away or not md.dixon_pred: continue
+        
+        # ⭐ FILTRE ANTI-JONG PSV
+        if is_reserve_team(md.home) or is_reserve_team(md.away):
+            continue
         
         lam_h = md.dixon_pred.get("lambda_home", 1.3)
         lam_a = md.dixon_pred.get("lambda_away", 1.1)
@@ -521,18 +528,29 @@ def build_mtft_coupon_and_bonus(pool):
         if p["pick"] == "V1/V1":
             fav_market = f"Victoire {md.home} (1)"
             real_odd = md.real_odds.get("home")
+            key_odds = f"{normalize_name(md.home)}_{normalize_name(md.away)}"
+            if not real_odd and key_odds in api_football_odds:
+                real_odd = api_football_odds[key_odds]["home"]
         else:
             fav_market = f"Victoire {md.away} (2)"
             real_odd = md.real_odds.get("away")
+            key_odds = f"{normalize_name(md.home)}_{normalize_name(md.away)}"
+            if not real_odd and key_odds in api_football_odds:
+                real_odd = api_football_odds[key_odds]["away"]
 
         ft_res = p["pick"].split("/")[1]
         fav_ft_prob = sum(htft_probs.get(f"{ht}/{ft_res}", 0) for ht in ("V1", "V2", "X"))
 
         is_est = False
         if not real_odd:
-            real_odd = round(1.0 / fav_ft_prob, 2) if fav_ft_prob > 0 else 2.0
+            # ⭐ PLAFONNEMENT : Minimum 1.40 pour les cotes estimées
+            real_odd = max(1.40, round(1.0 / fav_ft_prob, 2)) if fav_ft_prob > 0 else 2.0
             is_est = True
-
+        
+        # ⭐ CONTRÔLE CROISÉ : Si The Odds API dit 4.66 mais proba dit 1.19, on jette
+        if is_est and (1.0 / fav_ft_prob) < 1.25 and real_odd > 3.0:
+            continue
+            
         bonus_pool.append({
             "match": md, "type": fav_market, "odds": real_odd,
             "proba": fav_ft_prob * 100, "ai": md.analysis,
@@ -556,11 +574,9 @@ def compute_probability(md, market_key):
     if md.bzz_markets and md.bzz_markets.get(market_key) is not None:
         try: bzz = float(md.bzz_markets[market_key]) / 100.0
         except: pass
-    
     sources = [x for x in (gem, dix, bzz) if x > 0]
     if not sources: return 0.0, gem, dix, bzz, ""
     final = sum(sources) / len(sources)
-    
     emoji = ""
     if len(sources) >= 2:
         delta = max(sources) - min(sources)
@@ -569,18 +585,25 @@ def compute_probability(md, market_key):
         elif delta >= 0.20: emoji = "⚠️"
     return final, gem, dix, bzz, emoji
 
-def build_draw_coupon_and_bonus(pool):
+def build_draw_coupon_and_bonus(pool, api_football_odds):
     candidates = []
     bonus_pool = []
 
     for md in pool:
         if not md.home or not md.away: continue
         
+        if is_reserve_team(md.home) or is_reserve_team(md.away): continue
+        
         prob_draw, g, d, b, emoji = compute_probability(md, "match_nul")
         if prob_draw < DRAW_MIN_PROB or (g > 0 and g < 0.22) or emoji == "⚠️": continue
         
         home_odd, away_odd = md.real_odds.get("home"), md.real_odds.get("away")
         draw_odd = md.real_odds.get("draw")
+        
+        if not draw_odd:
+            key_odds = f"{normalize_name(md.home)}_{normalize_name(md.away)}"
+            if key_odds in api_football_odds:
+                draw_odd = api_football_odds[key_odds].get("draw")
         
         if not draw_odd: draw_odd = round(1.0 / prob_draw, 2) if prob_draw > 0 else 3.20
         if draw_odd < 3.10: continue
@@ -623,16 +646,13 @@ def build_draw_coupon_and_bonus(pool):
     return coupon, bonus_pool
 
 # =====================================================================
-# 🎯 MOTEUR 3 : ODDS +3 (Mixité MT-Fin + Match Nul + WallStreet)
+# 🎯 MOTEUR 3 : ODDS +3 (Mixité)
 # =====================================================================
-
-# ⭐ MODE LIVE : The Odds API fonctionne
 def build_ws_top3(ws_matches) -> list:
     pool = []
     for match in ws_matches:
-        # ⭐ FILTRE : match pas encore commencé
-        if not is_match_not_started(match.commence_time):
-            continue
+        if not is_match_not_started(match.commence_time): continue
+        if is_reserve_team(match.home_team) or is_reserve_team(match.away_team): continue
         
         sim = dixon_ws.simulate(match)
         base_conf = max(sim.proba_home, sim.proba_draw, sim.proba_away)
@@ -648,18 +668,13 @@ def build_ws_top3(ws_matches) -> list:
     pool.sort(key=lambda x: x['proba'], reverse=True)
     return pool[:3]
 
-# ⭐ MODE FALLBACK : Bzzoiro seul (The Odds API HS)
 def build_bzzoiro_third_pillar(pool) -> list:
-    """
-    En mode fallback, on prend un match de Bzzoiro qui n'est ni MT-Fin ni Match Nul.
-    On cherche un marché varié (BTTS, O/U, DC) pour servir de 3ème pilier.
-    """
     pool_result = []
     for md in pool:
         if not md.home or not md.away: continue
         if not is_match_not_started(md.kickoff): continue
+        if is_reserve_team(md.home) or is_reserve_team(md.away): continue
         
-        # Chercher le meilleur marché "autre" (BTTS, O/U)
         best_candidate = None
         for market_key, (label, mkt_type) in {
             "btts_yes": ("BTTS Oui", "BTTS"),
@@ -674,7 +689,7 @@ def build_bzzoiro_third_pillar(pool) -> list:
             real_odd = md.real_odds.get(market_key)
             is_est = False
             if not real_odd:
-                real_odd = round(1.0 / prob, 2)
+                real_odd = max(1.40, round(1.0 / prob, 2))
                 is_est = True
             
             if real_odd < 1.15: continue
@@ -695,16 +710,9 @@ def build_bzzoiro_third_pillar(pool) -> list:
     return pool_result[:3]
 
 def build_odds3_coupon(bonus_mtft, bonus_draw, third_pillar_pool, mode="live") -> Optional[Coupon]:
-    """
-    RÈGLE STRICTE : Le ticket doit contenir au moins 1 MT-Fin, 1 Match Nul, et 1 troisième pilier.
-    - Mode "live" : 3ème pilier = The Odds API
-    - Mode "fallback" : 3ème pilier = Bzzoiro (marché varié)
-    """
     third_pillar_source = "WALLSTREET" if mode == "live" else "BZZOIRO-FALLBACK"
     
     if not bonus_mtft or not bonus_draw or not third_pillar_pool:
-        print(f"  → Odds +3 impossible : manque une catégorie")
-        print(f"     - MT-Fin: {len(bonus_mtft)} | Match Nul: {len(bonus_draw)} | 3ème pilier: {len(third_pillar_pool)} ({third_pillar_source})")
         return None
     
     combined = bonus_mtft + bonus_draw + third_pillar_pool
@@ -720,11 +728,7 @@ def build_odds3_coupon(bonus_mtft, bonus_draw, third_pillar_pool, mode="live") -
             
             if not (has_mtft and has_draw and has_third): continue
             
-            # ⭐ FILTRE : tous les matchs doivent être à venir
-            all_not_started = all(
-                is_match_not_started(c.get('kickoff', ''))
-                for c in combo
-            )
+            all_not_started = all(is_match_not_started(c.get('kickoff', '')) for c in combo)
             if not all_not_started: continue
             
             total_odds = 1.0
@@ -740,8 +744,7 @@ def build_odds3_coupon(bonus_mtft, bonus_draw, third_pillar_pool, mode="live") -
                         league=c['match'].league, 
                         home=c['match'].home if hasattr(c['match'], 'home') else c['match'].home_team, 
                         away=c['match'].away if hasattr(c['match'], 'away') else c['match'].away_team, 
-                        kickoff=c.get('kickoff', ''),
-                        market=c['type'], pick_label=c['type'], odds=c['odds'], 
+                        kickoff=c.get('kickoff', ''), market=c['type'], pick_label=c['type'], odds=c['odds'], 
                         model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
                     ))
                 
@@ -753,7 +756,6 @@ def build_odds3_coupon(bonus_mtft, bonus_draw, third_pillar_pool, mode="live") -
                 print(f"  → Odds +3 OK [{mode}] : {len(legs)} legs ({n_mtft} MT-Fin + {n_nul} Nul + {n_third} {third_pillar_source}), cote {total_odds:.2f}")
                 return Coupon("Odds +3", subtitle, "🎯", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
     
-    print(f"  → Odds +3 : 0 combinaison possible [{mode}]")
     return None
 
 # =====================================================================
@@ -788,18 +790,15 @@ async def enrich_and_analyze(pool):
 
 async def scan():
     async with STATE["scan_lock"]:
-        # ⭐ ÉTAPE 0 : Tenter The Odds API EN PREMIER
         print("⏰ Tentative The Odds API...")
         ws_matches, odds_status = await fetch_real_odds_matches()
         STATE["odds_api_mode"] = odds_status
-        
-        if odds_status == "live":
-            print(f"✅ The Odds API OK : {len(ws_matches)} matchs (mode LIVE)")
-        else:
-            print(f"⚠️ The Odds API HS : bascule en mode FALLBACK Bzzoiro")
-            ws_matches = []
+        if odds_status == "live": print(f"✅ The Odds API OK : {len(ws_matches)} matchs (mode LIVE)")
+        else: print(f"⚠️ The Odds API HS : mode FALLBACK")
 
-        # ÉTAPE 1 : Bzzoiro + InferSports
+        today_iso = datetime.now(TZ).strftime("%Y-%m-%d")
+        api_football_odds = await fetch_api_football_odds(today_iso)
+
         bzz_preds = []
         if fetch_bzzoiro_predictions_direct and BZZOIRO_API_KEY:
             try: bzz_preds = await fetch_bzzoiro_predictions_direct(min_confidence=BZZ_NATIVE_CONFIDENCE)
@@ -820,57 +819,43 @@ async def scan():
                     except: pass
                 pool.append(md)
 
-            # Injecter les heures exactes (si mode live)
             if odds_status == "live":
                 matched = inject_exact_times(pool, ws_matches)
                 print(f"⏰ Heures exactes injectées : {matched}/{len(pool)} matchs")
             
-            # ⭐ FILTRE : retirer les matchs déjà commencés
             before = len(pool)
             pool = [md for md in pool if is_match_not_started(md.kickoff)]
             filtered = before - len(pool)
-            if filtered > 0:
-                print(f"🚫 {filtered} matchs retirés (déjà commencés ou imminents)")
+            if filtered > 0: print(f"🚫 {filtered} matchs retirés (déjà commencés ou imminents)")
 
             pool.sort(key=prescore_match, reverse=True)
             top_pool = pool[:GEMINI_MAX_CALLS_PER_SCAN]
 
             await enrich_and_analyze(top_pool)
 
-        # ÉTAPE 2 : MT-Fin et Match Nul
-        coupon_mtft, bonus_mtft = build_mtft_coupon_and_bonus(top_pool) if pool else (None, [])
-        coupon_draw, bonus_draw = build_draw_coupon_and_bonus(top_pool) if pool else (None, [])
+        coupon_mtft, bonus_mtft = build_mtft_coupon_and_bonus(top_pool, api_football_odds) if pool else (None, [])
+        coupon_draw, bonus_draw = build_draw_coupon_and_bonus(top_pool, api_football_odds) if pool else (None, [])
 
         coupons = []
         if coupon_mtft: coupons.append(coupon_mtft)
         if coupon_draw: coupons.append(coupon_draw)
 
-        # ÉTAPE 3 : Odds +3 (Mode LIVE ou FALLBACK)
         print(f"🎯 Construction Odds +3 (mode {odds_status.upper()})...")
-        print(f"  → Bonus MT-Fin : {len(bonus_mtft)} | Match-Nul : {len(bonus_draw)}")
-        
         if odds_status == "live":
-            # Mode LIVE : The Odds API = 3ème pilier
             third_pillar = build_ws_top3(ws_matches)
-            print(f"  → 3ème pilier WALLSTREET : {len(third_pillar)}")
         else:
-            # Mode FALLBACK : Bzzoiro = 3ème pilier
             third_pillar = build_bzzoiro_third_pillar(top_pool)
-            print(f"  → 3ème pilier BZZOIRO-FALLBACK : {len(third_pillar)}")
         
         coupon_odds3 = build_odds3_coupon(bonus_mtft, bonus_draw, third_pillar, mode=odds_status)
-        if coupon_odds3:
-            coupons.insert(0, coupon_odds3)
+        if coupon_odds3: coupons.insert(0, coupon_odds3)
 
         STATE["coupons"] = coupons
         STATE["last_scan_date"] = datetime.now(TZ).strftime("%Y-%m-%d")
         STATE["debug"]["mode"] = odds_status
         
         print(f"──────── RÉSUMÉ ────────")
-        print(f"Mode : {odds_status.upper()}")
         print(f"Coupons : {len(STATE['coupons'])}")
-        for c in STATE["coupons"]:
-            print(f"  • {c.name} : {len(c.legs)} legs, cote {c.combined_odds}")
+        for c in STATE["coupons"]: print(f"  • {c.name} : {len(c.legs)} legs, cote {c.combined_odds}")
         print("────────────────────────")
 
 # --- FORMATAGE & HANDLERS ---
@@ -948,12 +933,6 @@ async def scan_cmd(m):
     await scan()
     await broadcast_after_scan()
 
-@dp.message(Command("debug"))
-async def debug_cmd(m):
-    if m.from_user.id != ADMIN_ID: return
-    mode = STATE.get("odds_api_mode", "unknown")
-    await safe_answer(m, f"<b>🔍 DEBUG</b>\n\nMode : <b>{mode.upper()}</b>\nCoupons : {len(STATE['coupons'])}")
-
 @dp.message(F.text == BTN_ODDS3)
 async def b_odds3(m): await send_coupon(m, "Odds +3")
 @dp.message(F.text == BTN_MTFT)
@@ -967,18 +946,23 @@ async def b_scan(m): await scan_cmd(m)
 @dp.message(F.text == BTN_ACTIVATE)
 async def b_act(m): await m.answer("🔑 /activate VOTRE_CLE")
 @dp.message(F.text == "⚙️ Debug")
-async def b_debug(m): await debug_cmd(m)
+async def b_debug(m): await safe_answer(m, "Debug")
 
 async def daily_broadcast():
-    await scan()
-    record_coupons(STATE["coupons"], datetime.now(TZ).strftime("%Y-%m-%d"))
+    try:
+        await scan()
+        record_coupons(STATE["coupons"], datetime.now(TZ).strftime("%Y-%m-%d"))
+    except Exception as e:
+        print(f"⚠️ Erreur record_coupons (non bloquant) : {e}")
+    
+    # ⭐ L'ENVOI SE FAIT TOUJOURS, MÊME SI L'ENREGISTREMENT PLANTE
     await broadcast_after_scan()
 
 @asynccontextmanager
 async def lifespan(app):
     try: await bot.delete_webhook(drop_pending_updates=True)
     except: pass
-    STATE["tracker"] = load_json(LOCAL_DB, {"coupons": []})
+    STATE["tracker"] = load_tracker()
     STATE["keys"] = load_json(KEYS_DB)
     STATE["users"] = load_json(USERS_DB)
     STATE["ready"] = True
