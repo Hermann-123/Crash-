@@ -91,10 +91,9 @@ NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "50"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
-# MOTEUR MT-FIN
+# MOTEUR MT-FIN (On baisse un peu le seuil pour avoir plus de matchs)
 MTFIN_MIN_SCORE = 70
-MTFIN_MIN_PROB = 0.38
-MTFIN_TOP_N = 3
+MTFIN_MIN_PROB = 0.35 # Baissé de 0.38 à 0.35
 MTFIN_SIMULATIONS = 2000
 MTFIN_FIRST_HALF_RATIO = 0.45
 
@@ -102,10 +101,9 @@ MTFIN_FIRST_HALF_RATIO = 0.45
 DRAW_MIN_SCORE = 70
 DRAW_MAX_ECART = 0.20
 DRAW_MIN_PROB = 0.28
-DRAW_TOP_N = 3
 
 # MOTEUR ODDS +3
-ODDS3_MIN_COTE_LEG = 1.40 # Plafond minimum pour cotes estimées
+ODDS3_MIN_COTE_LEG = 1.40
 ODDS3_MIN_COTE_TOTAL = 3.0
 ODDS3_MAX_COTE_TOTAL = 5.0
 
@@ -265,7 +263,7 @@ for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
         except ValueError: TARGETS.append(raw)
 
 # =====================================================================
-# 🔐 SYSTÈME D'ABONNEMENT (RESTAURÉ)
+# 🔐 SYSTÈME D'ABONNEMENT
 # =====================================================================
 def is_subscribed(user_id):
     if user_id == ADMIN_ID: return True
@@ -466,7 +464,7 @@ def inject_exact_times(pool: list, ws_matches: list) -> int:
     return matched
 
 # =====================================================================
-# 🎯 MOTEUR 1 : MT-FIN (Cohérence des bonus restaurée)
+# 🎯 MOTEUR 1 : MT-FIN
 # =====================================================================
 def _poisson_sample(lam: float) -> int:
     if lam <= 0: return 0
@@ -494,7 +492,6 @@ def simulate_htft(lambda_home: float, lambda_away: float, n_sims: int = MTFIN_SI
 
 def build_mtft_coupon_and_bonus(pool, api_football_odds):
     picks = []
-    bonus_pool = []
 
     for md in pool:
         if not md.home or not md.away or not md.dixon_pred: continue
@@ -521,18 +518,20 @@ def build_mtft_coupon_and_bonus(pool, api_football_odds):
             "md": md, "pick": best_pick, "prob": best_prob, "score": pts, "odd": est_odd
         })
 
-    # Ticket MT-Fin (Top 3)
+    # Ticket MT-Fin : On prend les 3 meilleurs. Si moins de 3, on prend ce qu'on a.
     coupon = None
     picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
-    top3 = picks[:MTFIN_TOP_N]
+    top3 = picks[:3] # Max 3 matchs
     
-    if len(top3) >= MTFIN_TOP_N:
+    if len(top3) > 0:
         legs = [Selection(p["md"].event_id, p["md"].league, p["md"].home, p["md"].away, p["md"].kickoff, "MT-Fin", f"MT/Fin : {p['pick']}", p["odd"], p["prob"], None, -1.0, p["score"], htft_pick=p["pick"]) for p in top3]
         co, cp = 1.0, 1.0
         for s in legs: co *= s.odds; cp *= s.model_prob
-        coupon = Coupon("MT-Fin", "3 matchs Bookmaker Blind", "⏱", legs, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
+        subtitle = f"{len(legs)} matchs Bookmaker Blind" if len(legs) < 3 else "3 matchs Bookmaker Blind"
+        coupon = Coupon("MT-Fin", subtitle, "⏱", legs, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
 
-    # ⭐ BONUS ODDS +3 : Uniquement les matchs du Top 3 (Cohérence garantie)
+    # ⭐ BONUS ODDS +3 : On utilise EXACTEMENT les mêmes matchs que le ticket MT-Fin
+    bonus_pool = []
     for p in top3:
         md = p["md"]
         if p["pick"] == "V1/V1":
@@ -554,7 +553,6 @@ def build_mtft_coupon_and_bonus(pool, api_football_odds):
             real_odd = max(1.40, round(1.0 / fav_ft_prob, 2)) if fav_ft_prob > 0 else 2.0
             is_est = True
         
-        # Contrôle croisé (On jette si l'écart est trop grand)
         if is_est and (1.0 / fav_ft_prob) < 1.25 and real_odd > 3.0: continue
             
         bonus_pool.append({
@@ -567,7 +565,7 @@ def build_mtft_coupon_and_bonus(pool, api_football_odds):
     return coupon, bonus_pool
 
 # =====================================================================
-# 🤝 MOTEUR 2 : MATCH NUL (Cohérence des bonus restaurée)
+# 🤝 MOTEUR 2 : MATCH NUL
 # =====================================================================
 def compute_probability(md, market_key):
     gem = dix = bzz = 0.0
@@ -593,7 +591,6 @@ def compute_probability(md, market_key):
 
 def build_draw_coupon_and_bonus(pool, api_football_odds):
     candidates = []
-    bonus_pool = []
 
     for md in pool:
         if not md.home or not md.away: continue
@@ -619,18 +616,24 @@ def build_draw_coupon_and_bonus(pool, api_football_odds):
         
         candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, "Match Nul", "Match Nul (X)", draw_odd, prob_draw, draw_odd if md.real_odds.get("draw") else None, (prob_draw*draw_odd)-1, pts))
 
-    # Ticket Match Nul (Top 3)
+    # 1. Ticket Match Nul : On prend les 3 PLUS probables (Top 3)
     coupon = None
     candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
-    top3 = candidates[:DRAW_TOP_N]
+    top3 = candidates[:3]
     
-    if len(top3) >= DRAW_TOP_N:
+    if len(top3) > 0:
         co, cp = 1.0, 1.0
         for s in top3: co *= s.odds; cp *= s.model_prob
-        coupon = Coupon("Match Nul", "3 nuls combinés", "🤝", top3, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
+        subtitle = f"{len(top3)} nuls combinés" if len(top3) < 3 else "3 nuls combinés"
+        coupon = Coupon("Match Nul", subtitle, "🤝", top3, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
 
-    # ⭐ BONUS ODDS +3 : Uniquement les matchs du Top 3 (Cohérence garantie)
-    for c in top3:
+    # 2. ⭐ BONUS ODDS +3 : On prend les 3 MOINS probables (Bottom 3)
+    # On trie par probabilité croissante (les plus proches de 0% d'abord)
+    candidates.sort(key=lambda x: x.model_prob, reverse=False) 
+    bottom_candidates = candidates[:3]
+    
+    bonus_pool = []
+    for c in bottom_candidates:
         md = next((m for m in pool if m.event_id == c.event_id), None)
         if not md: continue
         
@@ -856,7 +859,7 @@ async def scan():
         print("────────────────────────")
 
 # =====================================================================
-# 🛡️ FORMATAGE & HANDLERS (SÉCURISÉS)
+# 🛡️ FORMATAGE & HANDLERS
 # =====================================================================
 async def safe_answer(msg, txt, reply_markup=None):
     for i, p in enumerate(split_message(txt)):
@@ -955,7 +958,7 @@ async def process_act(m, k):
     save_json(KEYS_DB, STATE["keys"]); save_json(USERS_DB, STATE["users"])
     await m.answer(f"✅ Actif jusqu'au {exp.strftime('%d/%m/%Y')}", parse_mode="HTML", reply_markup=USER_KEYBOARD)
 
-# --- HANDLERS BOUTONS (SÉCURISÉS) ---
+# --- HANDLERS BOUTONS ---
 @dp.message(Command("start"))
 async def start_cmd(m):
     kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
