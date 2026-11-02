@@ -60,12 +60,12 @@ except Exception as e:
     download_and_train = None
     print(f"❌ dixon_coles: {e}")
 
-# --- VARIABLES ---
+# --- VARIABLES & ENV ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
 INFERSPORTS_API_KEY = os.getenv("INFERSPORTS_API_KEY", "")
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "99f9731b68429ed4aaf0383cd7ca8cd4") # Ta clé
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "99f9731b68429ed4aaf0383cd7ca8cd4")
 
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "5968288964")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "-1003982738017")
@@ -122,7 +122,6 @@ if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
 # =====================================================================
 # ⚙️ MOTEUR WALLSTREET
 # =====================================================================
-
 @dataclass
 class WS_MatchData:
     match_id: str
@@ -183,9 +182,8 @@ class DixonColesEngine:
 dixon_ws = DixonColesEngine()
 
 # =====================================================================
-# 🎫 ARCHITECTURE
+# 🎫 ARCHITECTURE & DATACLASSES
 # =====================================================================
-
 @dataclass
 class MatchData:
     event_id: str
@@ -266,7 +264,42 @@ for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
         try: TARGETS.append(int(raw))
         except ValueError: TARGETS.append(raw)
 
-# --- UTILITAIRES ---
+# =====================================================================
+# 🔐 SYSTÈME D'ABONNEMENT (RESTAURÉ)
+# =====================================================================
+def is_subscribed(user_id):
+    if user_id == ADMIN_ID: return True
+    uid = str(user_id)
+    if uid not in STATE["users"]: return False
+    exp = STATE["users"][uid].get("expires_at")
+    if not exp: return False
+    try: return datetime.now(TZ) < datetime.fromisoformat(exp)
+    except: return False
+
+def get_subscription_message(user_id):
+    if user_id == ADMIN_ID: return "✅ Admin"
+    if is_subscribed(user_id):
+        exp = STATE["users"][str(user_id)]["expires_at"]
+        return f"✅ Actif jusqu'au {datetime.fromisoformat(exp).strftime('%d/%m/%Y à %H:%M')}."
+    return "❌ Abonnement expiré ou inexistant.\nContactez @hermann1123 pour activer votre clé."
+
+def load_json(path, default=None):
+    if default is None: default = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f: return json.load(f)
+    except: return default
+
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
+    except: pass
+
+def load_tracker(): return load_json(LOCAL_DB, {"coupons": []})
+def save_tracker(data): save_json(LOCAL_DB, data)
+
+# =====================================================================
+# 🛠️ UTILITAIRES
+# =====================================================================
 def today_pretty():
     d = datetime.now(TZ)
     months = {1:"janvier",2:"février",3:"mars",4:"avril",5:"mai",6:"juin",7:"juillet",8:"août",9:"septembre",10:"octobre",11:"novembre",12:"décembre"}
@@ -295,12 +328,10 @@ def parse_dt_safe(s) -> Optional[datetime]:
     except: return None
 
 def format_kickoff(kickoff_str) -> str:
-    if not kickoff_str:
-        return "Heure non confirmée"
+    if not kickoff_str: return "Heure non confirmée"
     dt = parse_dt_safe(kickoff_str)
     if dt:
-        if dt.hour == 0 and dt.minute == 0:
-            return dt.strftime("%d/%m") + " (heure non confirmée)"
+        if dt.hour == 0 and dt.minute == 0: return dt.strftime("%d/%m") + " (heure non confirmée)"
         return dt.strftime("%d/%m %H:%M")
     return "Heure non confirmée"
 
@@ -337,23 +368,6 @@ def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
     if current.strip(): parts.append(current.rstrip())
     return parts
 
-def load_json(path, default=None):
-    if default is None: default = {}
-    try:
-        with open(path, "r", encoding="utf-8") as f: return json.load(f)
-    except: return default
-
-def save_json(path, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
-    except: pass
-
-def load_tracker():
-    return load_json(LOCAL_DB, {"coupons": []})
-
-def save_tracker(data):
-    save_json(LOCAL_DB, data)
-
 def record_coupons(coupons, date_str):
     tracker = STATE["tracker"]
     existing = {c["id"] for c in tracker["coupons"]}
@@ -374,7 +388,7 @@ def prescore_match(md) -> int:
     return score
 
 # =====================================================================
-# ⏰ THE ODDS API & API-FOOTBALL
+# ⏰ APIS DE COTES
 # =====================================================================
 async def fetch_real_odds_matches() -> Tuple[list, str]:
     url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={API_KEY_ODDS}&regions=eu&markets=h2h"
@@ -383,11 +397,9 @@ async def fetch_real_odds_matches() -> Tuple[list, str]:
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, timeout=20.0)
-            if response.status_code != 200:
-                return [], "fallback"
+            if response.status_code != 200: return [], "fallback"
             data = response.json()
-            if not isinstance(data, list):
-                return [], "fallback"
+            if not isinstance(data, list): return [], "fallback"
             for m in data:
                 commence_time = m.get('commence_time', '')
                 if not commence_time.startswith(today_str): continue
@@ -454,7 +466,7 @@ def inject_exact_times(pool: list, ws_matches: list) -> int:
     return matched
 
 # =====================================================================
-# 🎯 MOTEUR 1 : MT-FIN
+# 🎯 MOTEUR 1 : MT-FIN (Cohérence des bonus restaurée)
 # =====================================================================
 def _poisson_sample(lam: float) -> int:
     if lam <= 0: return 0
@@ -486,10 +498,7 @@ def build_mtft_coupon_and_bonus(pool, api_football_odds):
 
     for md in pool:
         if not md.home or not md.away or not md.dixon_pred: continue
-        
-        # ⭐ FILTRE ANTI-JONG PSV
-        if is_reserve_team(md.home) or is_reserve_team(md.away):
-            continue
+        if is_reserve_team(md.home) or is_reserve_team(md.away): continue
         
         lam_h = md.dixon_pred.get("lambda_home", 1.3)
         lam_a = md.dixon_pred.get("lambda_away", 1.1)
@@ -512,44 +521,41 @@ def build_mtft_coupon_and_bonus(pool, api_football_odds):
             "md": md, "pick": best_pick, "prob": best_prob, "score": pts, "odd": est_odd
         })
 
+    # Ticket MT-Fin (Top 3)
     coupon = None
-    if len(picks) >= MTFIN_TOP_N:
-        picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
-        top3 = picks[:MTFIN_TOP_N]
+    picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
+    top3 = picks[:MTFIN_TOP_N]
+    
+    if len(top3) >= MTFIN_TOP_N:
         legs = [Selection(p["md"].event_id, p["md"].league, p["md"].home, p["md"].away, p["md"].kickoff, "MT-Fin", f"MT/Fin : {p['pick']}", p["odd"], p["prob"], None, -1.0, p["score"], htft_pick=p["pick"]) for p in top3]
         co, cp = 1.0, 1.0
         for s in legs: co *= s.odds; cp *= s.model_prob
         coupon = Coupon("MT-Fin", "3 matchs Bookmaker Blind", "⏱", legs, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
 
-    picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
-    top_bonus = picks[:3]
-    for p in top_bonus:
+    # ⭐ BONUS ODDS +3 : Uniquement les matchs du Top 3 (Cohérence garantie)
+    for p in top3:
         md = p["md"]
         if p["pick"] == "V1/V1":
             fav_market = f"Victoire {md.home} (1)"
             real_odd = md.real_odds.get("home")
             key_odds = f"{normalize_name(md.home)}_{normalize_name(md.away)}"
-            if not real_odd and key_odds in api_football_odds:
-                real_odd = api_football_odds[key_odds]["home"]
+            if not real_odd and key_odds in api_football_odds: real_odd = api_football_odds[key_odds]["home"]
         else:
             fav_market = f"Victoire {md.away} (2)"
             real_odd = md.real_odds.get("away")
             key_odds = f"{normalize_name(md.home)}_{normalize_name(md.away)}"
-            if not real_odd and key_odds in api_football_odds:
-                real_odd = api_football_odds[key_odds]["away"]
+            if not real_odd and key_odds in api_football_odds: real_odd = api_football_odds[key_odds]["away"]
 
         ft_res = p["pick"].split("/")[1]
         fav_ft_prob = sum(htft_probs.get(f"{ht}/{ft_res}", 0) for ht in ("V1", "V2", "X"))
 
         is_est = False
         if not real_odd:
-            # ⭐ PLAFONNEMENT : Minimum 1.40 pour les cotes estimées
             real_odd = max(1.40, round(1.0 / fav_ft_prob, 2)) if fav_ft_prob > 0 else 2.0
             is_est = True
         
-        # ⭐ CONTRÔLE CROISÉ : Si The Odds API dit 4.66 mais proba dit 1.19, on jette
-        if is_est and (1.0 / fav_ft_prob) < 1.25 and real_odd > 3.0:
-            continue
+        # Contrôle croisé (On jette si l'écart est trop grand)
+        if is_est and (1.0 / fav_ft_prob) < 1.25 and real_odd > 3.0: continue
             
         bonus_pool.append({
             "match": md, "type": fav_market, "odds": real_odd,
@@ -561,7 +567,7 @@ def build_mtft_coupon_and_bonus(pool, api_football_odds):
     return coupon, bonus_pool
 
 # =====================================================================
-# 🤝 MOTEUR 2 : MATCH NUL
+# 🤝 MOTEUR 2 : MATCH NUL (Cohérence des bonus restaurée)
 # =====================================================================
 def compute_probability(md, market_key):
     gem = dix = bzz = 0.0
@@ -591,7 +597,6 @@ def build_draw_coupon_and_bonus(pool, api_football_odds):
 
     for md in pool:
         if not md.home or not md.away: continue
-        
         if is_reserve_team(md.home) or is_reserve_team(md.away): continue
         
         prob_draw, g, d, b, emoji = compute_probability(md, "match_nul")
@@ -602,8 +607,7 @@ def build_draw_coupon_and_bonus(pool, api_football_odds):
         
         if not draw_odd:
             key_odds = f"{normalize_name(md.home)}_{normalize_name(md.away)}"
-            if key_odds in api_football_odds:
-                draw_odd = api_football_odds[key_odds].get("draw")
+            if key_odds in api_football_odds: draw_odd = api_football_odds[key_odds].get("draw")
         
         if not draw_odd: draw_odd = round(1.0 / prob_draw, 2) if prob_draw > 0 else 3.20
         if draw_odd < 3.10: continue
@@ -615,18 +619,18 @@ def build_draw_coupon_and_bonus(pool, api_football_odds):
         
         candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, "Match Nul", "Match Nul (X)", draw_odd, prob_draw, draw_odd if md.real_odds.get("draw") else None, (prob_draw*draw_odd)-1, pts))
 
+    # Ticket Match Nul (Top 3)
     coupon = None
-    if len(candidates) >= DRAW_TOP_N:
-        candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
-        top3 = candidates[:DRAW_TOP_N]
+    candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
+    top3 = candidates[:DRAW_TOP_N]
+    
+    if len(top3) >= DRAW_TOP_N:
         co, cp = 1.0, 1.0
         for s in top3: co *= s.odds; cp *= s.model_prob
         coupon = Coupon("Match Nul", "3 nuls combinés", "🤝", top3, round(co, 2), round(cp, 4), is_list=True, show_analysis=False)
 
-    candidates.sort(key=lambda x: x.model_prob, reverse=False) 
-    bottom_candidates = candidates[:3]
-    
-    for c in bottom_candidates:
+    # ⭐ BONUS ODDS +3 : Uniquement les matchs du Top 3 (Cohérence garantie)
+    for c in top3:
         md = next((m for m in pool if m.event_id == c.event_id), None)
         if not md: continue
         
@@ -646,7 +650,7 @@ def build_draw_coupon_and_bonus(pool, api_football_odds):
     return coupon, bonus_pool
 
 # =====================================================================
-# 🎯 MOTEUR 3 : ODDS +3 (Mixité)
+# 🎯 MOTEUR 3 : ODDS +3
 # =====================================================================
 def build_ws_top3(ws_matches) -> list:
     pool = []
@@ -748,12 +752,7 @@ def build_odds3_coupon(bonus_mtft, bonus_draw, third_pillar_pool, mode="live") -
                         model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
                     ))
                 
-                n_mtft = sum(1 for c in combo if c.get('source') == 'MT-FIN')
-                n_nul = sum(1 for c in combo if c.get('source') == 'MATCH-NUL')
-                n_third = sum(1 for c in combo if c.get('source') == third_pillar_source)
-                
                 subtitle = "Moteur WallStreet Fusionné" if mode == "live" else "Moteur Bzzoiro (Fallback)"
-                print(f"  → Odds +3 OK [{mode}] : {len(legs)} legs ({n_mtft} MT-Fin + {n_nul} Nul + {n_third} {third_pillar_source}), cote {total_odds:.2f}")
                 return Coupon("Odds +3", subtitle, "🎯", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
     
     return None
@@ -820,13 +819,11 @@ async def scan():
                 pool.append(md)
 
             if odds_status == "live":
-                matched = inject_exact_times(pool, ws_matches)
-                print(f"⏰ Heures exactes injectées : {matched}/{len(pool)} matchs")
+                inject_exact_times(pool, ws_matches)
             
             before = len(pool)
             pool = [md for md in pool if is_match_not_started(md.kickoff)]
-            filtered = before - len(pool)
-            if filtered > 0: print(f"🚫 {filtered} matchs retirés (déjà commencés ou imminents)")
+            if before - len(pool) > 0: print(f"🚫 {before - len(pool)} matchs retirés (déjà commencés ou imminents)")
 
             pool.sort(key=prescore_match, reverse=True)
             top_pool = pool[:GEMINI_MAX_CALLS_PER_SCAN]
@@ -858,7 +855,9 @@ async def scan():
         for c in STATE["coupons"]: print(f"  • {c.name} : {len(c.legs)} legs, cote {c.combined_odds}")
         print("────────────────────────")
 
-# --- FORMATAGE & HANDLERS ---
+# =====================================================================
+# 🛡️ FORMATAGE & HANDLERS (SÉCURISÉS)
+# =====================================================================
 async def safe_answer(msg, txt, reply_markup=None):
     for i, p in enumerate(split_message(txt)):
         try:
@@ -920,33 +919,95 @@ async def send_coupon(m, name):
     if c: await safe_answer(m, format_coupon(c))
     else: await safe_answer(m, f"Aucun coupon {name} aujourd'hui.")
 
+# --- COMMANDES ADMIN ---
+@dp.message(Command("keygen"))
+async def keygen(m):
+    if m.from_user.id != ADMIN_ID: return
+    a = m.text.split()
+    if len(a) != 2: await m.answer("Usage: /keygen [1m|1s|60]"); return
+    d, days = a[1].lower(), 0
+    if d.endswith("m"): days = int(d[:-1])*30
+    elif d.endswith("s"): days = int(d[:-1])*7
+    else: days = int(d)
+    if days <= 0: await m.answer("❌"); return
+    k = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+    STATE["keys"][k] = {"days": days, "used": False, "created_at": datetime.now(TZ).isoformat()}
+    save_json(KEYS_DB, STATE["keys"])
+    await m.answer(f"🔑 <code>{k}</code> • {days}j", parse_mode="HTML")
+
+# --- COMMANDES ABONNÉS ---
+@dp.message(Command("activate", "vip", "cle", "key"))
+async def activate_cmd(m):
+    a = m.text.split()
+    if len(a) != 2: await m.answer("Usage: /activate <clé>"); return
+    await process_act(m, a[1].strip().upper())
+
+@dp.message(F.text.regexp(r"^[A-Z0-9]{8}$"))
+async def raw_key(m): await process_act(m, m.text.strip().upper())
+
+async def process_act(m, k):
+    if k not in STATE["keys"]: await m.answer("❌ Invalide."); return
+    kd = STATE["keys"][k]
+    if kd.get("used"): await m.answer("❌ Déjà utilisée."); return
+    d = kd["days"]; exp = datetime.now(TZ) + timedelta(days=d)
+    STATE["users"][str(m.from_user.id)] = {"expires_at": exp.isoformat(), "key_used": k}
+    kd["used"] = True; kd["used_by"] = str(m.from_user.id); kd["used_at"] = datetime.now(TZ).isoformat()
+    save_json(KEYS_DB, STATE["keys"]); save_json(USERS_DB, STATE["users"])
+    await m.answer(f"✅ Actif jusqu'au {exp.strftime('%d/%m/%Y')}", parse_mode="HTML", reply_markup=USER_KEYBOARD)
+
+# --- HANDLERS BOUTONS (SÉCURISÉS) ---
 @dp.message(Command("start"))
 async def start_cmd(m):
     kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
-    msg = f"{format_header()}\n\n<b>👋 Admin</b>\n/scan pour analyser." if m.from_user.id == ADMIN_ID else f"{format_header()}\n\nBienvenue."
+    msg = f"{format_header()}\n\n<b>👋 Admin</b>\n/scan pour analyser." if m.from_user.id == ADMIN_ID else f"{format_header()}\n\n{get_subscription_message(m.from_user.id)}"
     await safe_answer(m, msg, reply_markup=kb)
+
+@dp.message(F.text == BTN_ODDS3)
+async def b_odds3(m):
+    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
+        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
+    await send_coupon(m, "Odds +3")
+
+@dp.message(F.text == BTN_MTFT)
+async def b_mtft(m):
+    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
+        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
+    await send_coupon(m, "MT-Fin")
+
+@dp.message(F.text == BTN_DRAW)
+async def b_draw(m):
+    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
+        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
+    await send_coupon(m, "Match Nul")
+
+@dp.message(F.text == BTN_BILAN)
+async def b_bilan(m):
+    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
+        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
+    await safe_answer(m, "Bilan en construction.")
+
+@dp.message(F.text == BTN_SCAN)
+async def b_scan(m):
+    if m.from_user.id != ADMIN_ID: return
+    await safe_answer(m, "⏳ Analyse des matchs en cours...")
+    await scan()
+    await broadcast_after_scan()
+
+@dp.message(F.text == BTN_ACTIVATE)
+async def b_act(m): await m.answer("🔑 /activate VOTRE_CLE")
+
+@dp.message(F.text == "⚙️ Debug")
+async def b_debug(m):
+    if m.from_user.id != ADMIN_ID: return
+    mode = STATE.get("odds_api_mode", "unknown")
+    await safe_answer(m, f"<b>🔍 DEBUG</b>\n\nMode : <b>{mode.upper()}</b>\nCoupons : {len(STATE['coupons'])}")
 
 @dp.message(Command("scan"))
 async def scan_cmd(m):
     if m.from_user.id != ADMIN_ID: return
-    await safe_answer(m, "⏳ Analyse des matchs en cours (Patientez 3-5 min)...")
+    await safe_answer(m, "⏳ Analyse des matchs en cours...")
     await scan()
     await broadcast_after_scan()
-
-@dp.message(F.text == BTN_ODDS3)
-async def b_odds3(m): await send_coupon(m, "Odds +3")
-@dp.message(F.text == BTN_MTFT)
-async def b_mtft(m): await send_coupon(m, "MT-Fin")
-@dp.message(F.text == BTN_DRAW)
-async def b_draw(m): await send_coupon(m, "Match Nul")
-@dp.message(F.text == BTN_BILAN)
-async def b_bilan(m): await safe_answer(m, "Bilan en construction.")
-@dp.message(F.text == BTN_SCAN)
-async def b_scan(m): await scan_cmd(m)
-@dp.message(F.text == BTN_ACTIVATE)
-async def b_act(m): await m.answer("🔑 /activate VOTRE_CLE")
-@dp.message(F.text == "⚙️ Debug")
-async def b_debug(m): await safe_answer(m, "Debug")
 
 async def daily_broadcast():
     try:
@@ -955,7 +1016,6 @@ async def daily_broadcast():
     except Exception as e:
         print(f"⚠️ Erreur record_coupons (non bloquant) : {e}")
     
-    # ⭐ L'ENVOI SE FAIT TOUJOURS, MÊME SI L'ENREGISTREMENT PLANTE
     await broadcast_after_scan()
 
 @asynccontextmanager
