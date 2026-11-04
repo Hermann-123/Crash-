@@ -120,7 +120,7 @@ if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
     raise RuntimeError("Variables d'environnement manquantes")
 
 # =====================================================================
-# ⚙️ MOTEUR WALLSTREET & API-FOOTBALL
+# ⚙️ MOTEUR WALLSTREET
 # =====================================================================
 @dataclass
 class WS_MatchData:
@@ -699,32 +699,55 @@ def build_draw_coupon_and_bonus(pool, api_football_odds):
 # =====================================================================
 # 🎯 MOTEUR 3 : ODDS +3 (AUTHENTIQUE & HYBRIDE)
 # =====================================================================
-def build_ws_auth_pool(ws_matches) -> list:
-    pool = []
-    for match in ws_matches:
-        if not is_match_not_started(match.commence_time): continue
-        if is_reserve_team(match.home_team) or is_reserve_team(match.away_team): continue
+def build_auth_candidates(pool) -> list:
+    """
+    Construit la liste des pronostics AUTHENTIQUES (uniquement vraies cotes).
+    Utilise InferSports, API-Football, et The Odds API (déjà dans md.real_odds).
+    """
+    auth_pool = []
+    for md in pool:
+        if not md.home or not md.away: continue
+        if not is_match_not_started(md.kickoff): continue
+        if is_reserve_team(md.home) or is_reserve_team(md.away): continue
         
-        sim = dixon_ws.simulate(match)
-        if not sim: continue
+        # Vérifier qu'on a au moins une vraie cote (1X2, O/U ou BTTS)
+        if not md.real_odds: continue
         
-        p_home, p_draw, p_away = sim.proba_home, sim.proba_draw, sim.proba_away
+        # 1X2
+        if md.real_odds.get("home"):
+            prob, _, _, _, _ = compute_probability(md, "victoire_home")
+            if prob >= 0.55:
+                auth_pool.append({"match": md, "type": f"Victoire {md.home} (1)", "odds": md.real_odds["home"], "proba": prob * 100, "ai": md.analysis, "real_odd": md.real_odds["home"], "kickoff": md.kickoff})
         
-        if p_home >= 55.0 and match.home_odds and match.home_odds >= 1.15:
-            pool.append({"match": match, "type": f"Victoire {match.home_team} (1)", "odds": match.home_odds, "proba": p_home, "ai": "Analyse mathématique solide.", "real_odd": match.home_odds, "source": "WALLSTREET", "kickoff": match.commence_time})
-        if p_away >= 55.0 and match.away_odds and match.away_odds >= 1.15:
-            pool.append({"match": match, "type": f"Victoire {match.away_team} (2)", "odds": match.away_odds, "proba": p_away, "ai": "Analyse mathématique solide.", "real_odd": match.away_odds, "source": "WALLSTREET", "kickoff": match.commence_time})
-        if sim.proba_over_2_5 >= 60.0 and match.over_2_5 and match.over_2_5 >= 1.15:
-            pool.append({"match": match, "type": "Plus de 2.5 buts", "odds": match.over_2_5, "proba": sim.proba_over_2_5, "ai": "Match ouvert.", "real_odd": match.over_2_5, "source": "WALLSTREET", "kickoff": match.commence_time})
-        if sim.proba_over_2_5 < 35.0 and match.under_2_5 and match.under_2_5 >= 1.15:
-            pool.append({"match": match, "type": "Moins de 2.5 buts", "odds": match.under_2_5, "proba": 100 - sim.proba_over_2_5, "ai": "Match fermé.", "real_odd": match.under_2_5, "source": "WALLSTREET", "kickoff": match.commence_time})
-        if sim.proba_btts >= 62.0 and match.btts_yes and match.btts_yes >= 1.15:
-            pool.append({"match": match, "type": "BTTS Oui", "odds": match.btts_yes, "proba": sim.proba_btts, "ai": "Attaques prolifiques.", "real_odd": match.btts_yes, "source": "WALLSTREET", "kickoff": match.commence_time})
-        if sim.proba_btts < 40.0 and match.btts_no and match.btts_no >= 1.15:
-            pool.append({"match": match, "type": "BTTS Non", "odds": match.btts_no, "proba": 100 - sim.proba_btts, "ai": "Défenses solides.", "real_odd": match.btts_no, "source": "WALLSTREET", "kickoff": match.commence_time})
-    
-    pool.sort(key=lambda x: x['proba'], reverse=True)
-    return pool
+        if md.real_odds.get("away"):
+            prob, _, _, _, _ = compute_probability(md, "victoire_away")
+            if prob >= 0.55:
+                auth_pool.append({"match": md, "type": f"Victoire {md.away} (2)", "odds": md.real_odds["away"], "proba": prob * 100, "ai": md.analysis, "real_odd": md.real_odds["away"], "kickoff": md.kickoff})
+                
+        # Over/Under 2.5
+        if md.real_odds.get("over_2.5"):
+            prob, _, _, _, _ = compute_probability(md, "over_2.5")
+            if prob >= 0.60:
+                auth_pool.append({"match": md, "type": "Plus de 2.5 buts", "odds": md.real_odds["over_2.5"], "proba": prob * 100, "ai": md.analysis, "real_odd": md.real_odds["over_2.5"], "kickoff": md.kickoff})
+        
+        if md.real_odds.get("under_2.5"):
+            prob, _, _, _, _ = compute_probability(md, "under_2.5")
+            if prob >= 0.60:
+                auth_pool.append({"match": md, "type": "Moins de 2.5 buts", "odds": md.real_odds["under_2.5"], "proba": prob * 100, "ai": md.analysis, "real_odd": md.real_odds["under_2.5"], "kickoff": md.kickoff})
+
+        # BTTS
+        if md.real_odds.get("btts_yes"):
+            prob, _, _, _, _ = compute_probability(md, "btts_yes")
+            if prob >= 0.60:
+                auth_pool.append({"match": md, "type": "BTTS Oui", "odds": md.real_odds["btts_yes"], "proba": prob * 100, "ai": md.analysis, "real_odd": md.real_odds["btts_yes"], "kickoff": md.kickoff})
+        
+        if md.real_odds.get("btts_no"):
+            prob, _, _, _, _ = compute_probability(md, "btts_no")
+            if prob >= 0.60:
+                auth_pool.append({"match": md, "type": "BTTS Non", "odds": md.real_odds["btts_no"], "proba": prob * 100, "ai": md.analysis, "real_odd": md.real_odds["btts_no"], "kickoff": md.kickoff})
+
+    auth_pool.sort(key=lambda x: x['proba'], reverse=True)
+    return auth_pool
 
 def build_ws_hybrid_pool(ws_matches) -> list:
     pool = []
@@ -785,14 +808,14 @@ def build_bzzoiro_third_pillar(pool) -> list:
     pool_result.sort(key=lambda x: x['proba'], reverse=True)
     return pool_result[:3]
 
-def build_odds3_auth_coupon(ws_auth_pool) -> Optional[Coupon]:
-    if len(ws_auth_pool) < 2: return None
-    for combo in itertools.combinations(ws_auth_pool[:15], 2):
-        match_ids = [c['match'].match_id for c in combo]
+def build_odds3_auth_coupon(auth_pool) -> Optional[Coupon]:
+    if len(auth_pool) < 2: return None
+    for combo in itertools.combinations(auth_pool[:15], 2):
+        match_ids = [c['match'].event_id for c in combo]
         if len(set(match_ids)) != len(match_ids): continue
         total_odds = combo[0]['odds'] * combo[1]['odds']
         if ODDS3_AUTH_MIN_COTE_TOTAL <= total_odds <= ODDS3_AUTH_MAX_COTE_TOTAL:
-            legs = [Selection(c['match'].match_id, c['match'].league, c['match'].home_team, c['match'].away_team, "", c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], -1.0, 90, c['ai']) for c in combo]
+            legs = [Selection(c['match'].event_id, c['match'].league, c['match'].home, c['match'].away, c['kickoff'], c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], -1.0, 90, c['ai']) for c in combo]
             prob = (combo[0]['proba']/100.0) * (combo[1]['proba']/100.0)
             return Coupon("Odds +3 AUTH", "Mode Authentique (2.5 - 3.0)", "🎯", legs, round(total_odds, 2), round(prob, 4), show_analysis=True)
     return None
@@ -879,11 +902,7 @@ async def scan():
 
         today_iso = datetime.now(TZ).strftime("%Y-%m-%d")
         af_matches = await fetch_api_football_odds(today_iso)
-        
-        # Si The Odds API est HS, on utilise API-Football pour le pool AUTH
-        auth_source_matches = ws_matches if odds_status == "live" else af_matches
-        if odds_status != "live" and len(auth_source_matches) > 0:
-             print(f"✅ API-Football OK pour mode AUTH : {len(auth_source_matches)} matchs")
+        if len(af_matches) > 0: print(f"✅ API-Football OK : {len(af_matches)} matchs")
 
         bzz_preds = []
         if fetch_bzzoiro_predictions_direct and BZZOIRO_API_KEY:
@@ -917,7 +936,6 @@ async def scan():
 
             await enrich_and_analyze(top_pool)
 
-        # Génère MT-Fin et Match Nul
         coupon_mtft, bonus_mtft = build_mtft_coupon_and_bonus(top_pool, af_matches) if pool else (None, [])
         coupon_draw, bonus_draw = build_draw_coupon_and_bonus(top_pool, af_matches) if pool else (None, [])
 
@@ -925,13 +943,16 @@ async def scan():
         if coupon_mtft: coupons.append(coupon_mtft)
         if coupon_draw: coupons.append(coupon_draw)
 
-        # Génère Odds +3 (AUTH & HYBRID)
         print(f"🎯 Construction Odds +3 AUTH & HYBRID (mode {odds_status.upper()})...")
         
-        # 1. AUTHENTIQUE
-        ws_auth_pool = build_ws_auth_pool(auth_source_matches)
-        coupon_auth = build_odds3_auth_coupon(ws_auth_pool)
-        if coupon_auth: coupons.insert(0, coupon_auth)
+        # 1. AUTHENTIQUE (utilise toutes les vraies cotes, y compris InferSports)
+        auth_pool = build_auth_candidates(top_pool)
+        coupon_auth = build_odds3_auth_coupon(auth_pool)
+        if coupon_auth: 
+            coupons.insert(0, coupon_auth)
+            print(f"  → Odds +3 AUTH OK : {len(coupon_auth.legs)} legs, cote {coupon_auth.combined_odds}")
+        else:
+            print(f"  → Odds +3 AUTH : impossible (pas assez de vraies cotes)")
 
         # 2. HYBRIDE
         if odds_status == "live":
@@ -940,7 +961,8 @@ async def scan():
             third_pillar = build_bzzoiro_third_pillar(top_pool)
         
         coupon_hybrid = build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, mode=odds_status)
-        if coupon_hybrid: coupons.insert(1, coupon_hybrid)
+        if coupon_hybrid: 
+            coupons.insert(1, coupon_hybrid)
 
         STATE["coupons"] = coupons
         STATE["last_scan_date"] = datetime.now(TZ).strftime("%Y-%m-%d")
@@ -967,7 +989,10 @@ async def safe_send(cid, txt):
         try:
             await bot.send_message(chat_id=cid, text=p, parse_mode="HTML")
             await asyncio.sleep(0.3)
-        except Exception as e: print(f"⚠️ {e}")
+        except Exception as e: 
+            # Gestion du chat not found pour ne pas spammer les erreurs
+            if "chat not found" not in str(e).lower():
+                print(f"⚠️ {e}")
 
 async def broadcast_after_scan():
     mode = STATE.get("odds_api_mode", "unknown")
@@ -1063,14 +1088,12 @@ async def b_odds3(m):
     if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
         await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
     
-    # Envoi du coupon AUTH
     c_auth = next((x for x in STATE["coupons"] if x.name == "Odds +3 AUTH"), None)
     if c_auth: await safe_answer(m, format_coupon(c_auth))
     else: await safe_answer(m, "Aucun coupon AUTHENTIQUE aujourd'hui.")
     
-    await asyncio.sleep(1) # Petite pause pour ne pas spammer
+    await asyncio.sleep(1)
     
-    # Envoi du coupon HYBRIDE
     c_hyb = next((x for x in STATE["coupons"] if x.name == "Odds +3 HYBRIDE"), None)
     if c_hyb: await safe_answer(m, format_coupon(c_hyb))
     else: await safe_answer(m, "Aucun coupon HYBRIDE aujourd'hui.")
