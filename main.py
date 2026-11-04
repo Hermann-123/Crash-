@@ -55,6 +55,13 @@ except Exception as e:
     print(f"❌ odds_fallback: {e}")
 
 try:
+    from sportsgameodds_odds import fetch_sgo_odds
+    print("✅ sportsgameodds_odds chargé")
+except Exception as e:
+    fetch_sgo_odds = None
+    print(f"❌ sportsgameodds_odds: {e}")
+
+try:
     from dixon_coles import download_and_train
 except Exception as e:
     download_and_train = None
@@ -66,6 +73,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
 INFERSPORTS_API_KEY = os.getenv("INFERSPORTS_API_KEY", "")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "99f9731b68429ed4aaf0383cd7ca8cd4")
+SPORTSGAMEODDS_API_KEY = os.getenv("SPORTSGAMEODDS_API_KEY", "")
 
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "5968288964")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "-1003982738017")
@@ -498,8 +506,10 @@ async def fetch_api_football_odds(today_iso: str) -> list:
     print(f"📊 API-Football : {len(results)} matchs avec cotes réelles")
     return results
 
-def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
+def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list, sgo_odds: dict = None) -> int:
+    if sgo_odds is None: sgo_odds = {}
     matched = 0
+    
     for md in pool:
         hn, an = normalize_name(md.home), normalize_name(md.away)
         
@@ -531,11 +541,29 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
                 if af.btts_no and not md.real_odds.get("btts_no"): md.real_odds["btts_no"] = af.btts_no
                 if not md.kickoff and af.commence_time: md.kickoff = af.commence_time
                 break
+        
+        # 3. Chercher dans SportsGameOdds
+        if sgo_odds and not md.real_odds.get("home"):
+            for sgo_id, sgo_data in sgo_odds.items():
+                sgo_hn = normalize_name(sgo_data.get("home", ""))
+                sgo_an = normalize_name(sgo_data.get("away", ""))
+                if (hn in sgo_hn or sgo_hn in hn) and (an in sgo_an or sgo_an in an):
+                    odds = sgo_data.get("odds", {})
+                    if odds.get("home") and not md.real_odds.get("home"): md.real_odds["home"] = odds["home"]
+                    if odds.get("draw") and not md.real_odds.get("draw"): md.real_odds["draw"] = odds["draw"]
+                    if odds.get("away") and not md.real_odds.get("away"): md.real_odds["away"] = odds["away"]
+                    if odds.get("over_2.5") and not md.real_odds.get("over_2.5"): md.real_odds["over_2.5"] = odds["over_2.5"]
+                    if odds.get("under_2.5") and not md.real_odds.get("under_2.5"): md.real_odds["under_2.5"] = odds["under_2.5"]
+                    if odds.get("btts_yes") and not md.real_odds.get("btts_yes"): md.real_odds["btts_yes"] = odds["btts_yes"]
+                    if odds.get("btts_no") and not md.real_odds.get("btts_no"): md.real_odds["btts_no"] = odds["btts_no"]
+                    if not md.kickoff and sgo_data.get("kickoff"): md.kickoff = sgo_data["kickoff"]
+                    matched += 1
+                    break
     
     return matched
 
 # =====================================================================
-# 🎯 MOTEUR 1 : MT-FIN & MATCH NUL (Génère bonus pour HYBRIDE)
+# 🎯 MOTEUR 1 : MT-FIN & MATCH NUL
 # =====================================================================
 def _poisson_sample(lam: float) -> int:
     if lam <= 0: return 0
@@ -894,6 +922,13 @@ async def scan():
         af_matches = await fetch_api_football_odds(today_iso)
         if len(af_matches) > 0: print(f"✅ API-Football OK : {len(af_matches)} matchs")
 
+        # SportsGameOdds (nouvelle source gratuite)
+        sgo_odds = {}
+        if fetch_sgo_odds:
+            sgo_odds = await fetch_sgo_odds(today_iso)
+            if sgo_odds:
+                print(f"✅ SportsGameOdds OK : {len(sgo_odds)} matchs avec cotes")
+
         bzz_preds = []
         if fetch_bzzoiro_predictions_direct and BZZOIRO_API_KEY:
             try: bzz_preds = await fetch_bzzoiro_predictions_direct(min_confidence=BZZ_NATIVE_CONFIDENCE)
@@ -915,8 +950,8 @@ async def scan():
                 pool.append(md)
 
             # ⭐ ENRICHISSEMENT MULTI-SOURCES
-            matched = inject_all_real_odds(pool, ws_matches, af_matches)
-            print(f"⏰ Cotes injectées : {matched} matchs")
+            matched = inject_all_real_odds(pool, ws_matches, af_matches, sgo_odds)
+            print(f"⏰ Cotes injectées depuis toutes les sources : {matched} matchs")
             
             before = len(pool)
             pool = [md for md in pool if is_match_not_started(md.kickoff)]
@@ -936,7 +971,7 @@ async def scan():
 
         print(f"🎯 Construction Odds +3 AUTH & HYBRID (mode {odds_status.upper()})...")
         
-        # 1. AUTHENTIQUE (utilise le pool Bzzoiro enrichi avec TOUTES les sources de cotes)
+        # 1. AUTHENTIQUE
         auth_pool = build_auth_candidates(top_pool)
         coupon_auth = build_odds3_auth_coupon(auth_pool)
         if coupon_auth: 
