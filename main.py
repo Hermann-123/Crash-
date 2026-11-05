@@ -84,7 +84,7 @@ KEYS_DB = os.getenv("KEYS_DB", "/tmp/keys.json")
 USERS_DB = os.getenv("USERS_DB", "/tmp/users.json")
 
 BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
-BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • 3 Moteurs")
+BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • VIP")
 PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
@@ -241,13 +241,14 @@ BTN_SCAN = "🔄 Actualiser"
 BTN_BILAN = "📊 Bilan"
 BTN_ACTIVATE = "🔑 Activer mon abonnement"
 
+# ⭐ CLAVIER ABONNÉ : UNIQUEMENT LE BOUTON ODDS +3
 USER_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_ODDS3), KeyboardButton(text=BTN_MTFT)],
-        [KeyboardButton(text=BTN_DRAW)],
-        [KeyboardButton(text=BTN_BILAN), KeyboardButton(text=BTN_ACTIVATE)],
-    ], resize_keyboard=True, input_field_placeholder="Choisis un ticket…")
+        [KeyboardButton(text=BTN_ODDS3)],
+        [KeyboardButton(text=BTN_ACTIVATE)],
+    ], resize_keyboard=True, input_field_placeholder="🎯 Ton coupon du jour")
 
+# CLAVIER ADMIN : Tous les boutons
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ODDS3), KeyboardButton(text=BTN_MTFT)],
@@ -708,7 +709,7 @@ def build_draw_coupon_and_bonus(pool):
     return coupon, bonus_pool
 
 # =====================================================================
-# 🎯 MOTEUR 3 : ODDS +3 (AUTH & HYBRIDE)
+# 🎯 MOTEUR 3 : ODDS +3
 # =====================================================================
 def build_third_pillar(pool) -> list:
     pool_result = []
@@ -751,9 +752,6 @@ def build_third_pillar(pool) -> list:
     return pool_result[:3]
 
 def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) -> Optional[Coupon]:
-    """
-    Ticket AUTH : Priorité WallStreet, Fallback sur cotes estimées.
-    """
     # ÉTAPE 1 : WallStreet (The Odds API)
     if ws_matches:
         pool_ws = []
@@ -1149,34 +1147,60 @@ async def process_act(m, k):
 @dp.message(Command("start"))
 async def start_cmd(m):
     kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
-    msg = f"{format_header()}\n\n<b>👋 Admin</b>\n/scan pour analyser." if m.from_user.id == ADMIN_ID else f"{format_header()}\n\n{get_subscription_message(m.from_user.id)}"
+    
+    if m.from_user.id == ADMIN_ID:
+        msg = f"{format_header()}\n\n<b>👋 Admin</b>\n/scan pour analyser."
+    elif is_subscribed(m.from_user.id):
+        msg = (
+            f"{format_header()}\n\n"
+            f"<b>🎉 Bienvenue dans le VIP !</b>\n\n"
+            f"✅ Ton abonnement : {get_subscription_message(m.from_user.id)}\n\n"
+            f"<b>🎯 Ton coupon quotidien :</b>\n"
+            f"Clique sur <b>« 🎯 Odds +3 »</b> pour recevoir le coupon AUTHENTIQUE du jour.\n\n"
+            f"<i>💡 Coupon sélectionné par notre IA avec les vraies cotes des bookmakers.</i>"
+        )
+    else:
+        msg = (
+            f"{format_header()}\n\n"
+            f"<b>🔒 Accès VIP requis</b>\n\n"
+            f"{get_subscription_message(m.from_user.id)}\n\n"
+            f"Envoie ta clé ici (8 caractères) pour activer ton accès."
+        )
+    
     await safe_answer(m, msg, reply_markup=kb)
 
 @dp.message(F.text == BTN_ODDS3)
 async def b_odds3(m):
+    # Vérification abonnement (admin bypass)
     if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
         await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
     
+    # ✅ AUTH : accessible à TOUT LE MONDE
     c_auth = next((x for x in STATE["coupons"] if x.name == "Odds +3 AUTH"), None)
-    if c_auth: await safe_answer(m, format_coupon(c_auth))
-    else: await safe_answer(m, "Aucun coupon AUTHENTIQUE aujourd'hui.")
+    if c_auth: 
+        await safe_answer(m, format_coupon(c_auth))
+    else: 
+        await safe_answer(m, "📭 Aucun coupon AUTHENTIQUE disponible pour le moment.")
     
-    await asyncio.sleep(1)
-    
-    c_hyb = next((x for x in STATE["coupons"] if x.name == "Odds +3 HYBRIDE"), None)
-    if c_hyb: await safe_answer(m, format_coupon(c_hyb))
-    else: await safe_answer(m, "Aucun coupon HYBRIDE aujourd'hui.")
+    # 🔒 HYBRIDE : RÉSERVÉ À L'ADMIN UNIQUEMENT
+    if m.from_user.id == ADMIN_ID:
+        await asyncio.sleep(1)
+        c_hyb = next((x for x in STATE["coupons"] if x.name == "Odds +3 HYBRIDE"), None)
+        if c_hyb: 
+            await safe_answer(m, format_coupon(c_hyb))
+        else: 
+            await safe_answer(m, "Aucun coupon HYBRIDE aujourd'hui.")
 
 @dp.message(F.text == BTN_MTFT)
 async def b_mtft(m):
-    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
-        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
+    # 🔒 MT-Fin RÉSERVÉ À L'ADMIN
+    if m.from_user.id != ADMIN_ID: return
     await send_coupon(m, "MT-Fin")
 
 @dp.message(F.text == BTN_DRAW)
 async def b_draw(m):
-    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
-        await m.answer(f"❌ {get_subscription_message(m.from_user.id)}"); return
+    # 🔒 Match Nul RÉSERVÉ À L'ADMIN
+    if m.from_user.id != ADMIN_ID: return
     await send_coupon(m, "Match Nul")
 
 @dp.message(F.text == BTN_BILAN)
