@@ -92,22 +92,24 @@ GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "50"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
 # ═══════════════════════════════════════════════════════════════════
-# 🔁 SOLUTION B — PARAMÈTRES DU DOUBLE SCAN
+# 🎯 RÉFORMES QUALITÉ (1+2+3+4+5)
 # ═══════════════════════════════════════════════════════════════════
-# Nombre de matchs enrichis par passe (25 × 2 passes = 50 appels Gemini
-# au total, ce qui préserve le budget actuel de GEMINI_MAX_CALLS_PER_SCAN)
-DOUBLE_SCAN_POOL_SIZE = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "25"))
+# RÉFORME 1 — Pondération Dixon 30% / Gemini 35% / Bzzoiro 35%
+WEIGHT_DIXON   = float(os.getenv("WEIGHT_DIXON",   "0.30"))
+WEIGHT_GEMINI  = float(os.getenv("WEIGHT_GEMINI",  "0.35"))
+WEIGHT_BZZOIRO = float(os.getenv("WEIGHT_BZZOIRO", "0.35"))
 
-# Delta max (en %) entre les 2 passes pour considérer un marché comme stable.
-# Au-delà → marché "volatil" : on prend le MIN des 2 valeurs (conservateur)
+# RÉFORME 3 — Filtre Value (edge minimum sur cotes réelles uniquement)
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))  # 5% — baisser à 0.02 si trop strict
+
+# RÉFORME 4 — Plancher EV sur le coupon final
+MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.95"))
+
+# 🔁 Double scan (solution B — conservée)
+DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "25"))
 DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.15"))
-
-# Nombre minimum de matchs stables pour rester en mode STRICT.
-# En dessous → fallback : on garde tous les matchs enrichis (jamais 0 ticket)
-DOUBLE_SCAN_MIN_STABLE = int(os.getenv("DOUBLE_SCAN_MIN_STABLE", "5"))
-
-# Pause entre les 2 passes (secondes)
-DOUBLE_SCAN_PAUSE_SECONDS = int(os.getenv("DOUBLE_SCAN_PAUSE_SECONDS", "5"))
+DOUBLE_SCAN_MIN_STABLE      = int(os.getenv("DOUBLE_SCAN_MIN_STABLE", "5"))
+DOUBLE_SCAN_PAUSE_SECONDS   = int(os.getenv("DOUBLE_SCAN_PAUSE_SECONDS", "5"))
 
 # RÈGLES MT-FIN
 MTFIN_MIN_SCORE = 70
@@ -220,7 +222,7 @@ class MatchData:
     dixon_pred: dict = None
     analysis: str = ""
     has_h2h: bool = False
-    stability_flag: str = "unknown"  # "stable" | "unstable" | "single" | "no_gemini"
+    stability_flag: str = "unknown"
 
 @dataclass
 class Selection:
@@ -260,14 +262,12 @@ BTN_SCAN = "🔄 Actualiser"
 BTN_BILAN = "📊 Bilan"
 BTN_ACTIVATE = "🔑 Activer mon abonnement"
 
-# ⭐ CLAVIER ABONNÉ : UNIQUEMENT LE BOUTON ODDS +3
 USER_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ODDS3)],
         [KeyboardButton(text=BTN_ACTIVATE)],
     ], resize_keyboard=True, input_field_placeholder="🎯 Ton coupon du jour")
 
-# CLAVIER ADMIN : Tous les boutons
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ODDS3), KeyboardButton(text=BTN_MTFT)],
@@ -279,7 +279,8 @@ STATE = {
     "ready": False, "coupons": [], "last_scan": None, "debug": {},
     "tracker": {"coupons": []}, "keys": {}, "users": {},
     "scan_lock": asyncio.Lock(), "dixon_model": None, "last_scan_date": "",
-    "double_scan_status": "", "double_scan_stats": {}
+    "double_scan_status": "", "double_scan_stats": {},
+    "rejections": {"value": 0, "ev_coupon": 0, "mtft_quality": 0},
 }
 
 TARGETS = []
@@ -411,27 +412,128 @@ def prescore_match(md) -> int:
     if md.has_h2h: score += 10
     return score
 
+# ═══════════════════════════════════════════════════════════════════
+# 🎯 RÉFORME 1 — Pondération 30/35/35 (remplace la moyenne simple)
+# ═══════════════════════════════════════════════════════════════════
 def compute_probability(md, market_key):
     gem = dix = bzz = 0.0
+    gem_avail = dix_avail = bzz_avail = False
+
     if md.gemini_markets and md.gemini_markets.get(market_key) is not None:
-        try: gem = float(md.gemini_markets[market_key]) / 100.0
+        try:
+            gem = float(md.gemini_markets[market_key]) / 100.0
+            gem_avail = True
         except: pass
+
     if md.dixon_pred:
-        dk = {"victoire_home":"p_home","match_nul":"p_draw","victoire_away":"p_away","over_2.5":"over_2.5","under_2.5":"under_2.5","over_3.5":"over_3.5","over_1.5":"over_1.5","under_1.5":"under_1.5","btts_yes":"btts_yes","btts_no":"btts_no"}.get(market_key)
-        if dk: dix = md.dixon_pred.get(dk, 0)
+        dk = {"victoire_home":"p_home","match_nul":"p_draw","victoire_away":"p_away",
+              "over_2.5":"over_2.5","under_2.5":"under_2.5","over_3.5":"over_3.5",
+              "over_1.5":"over_1.5","under_1.5":"under_1.5",
+              "btts_yes":"btts_yes","btts_no":"btts_no"}.get(market_key)
+        if dk is not None and md.dixon_pred.get(dk) is not None:
+            try:
+                dix = float(md.dixon_pred.get(dk))
+                dix_avail = True
+            except: pass
+
     if md.bzz_markets and md.bzz_markets.get(market_key) is not None:
-        try: bzz = float(md.bzz_markets[market_key]) / 100.0
+        try:
+            bzz = float(md.bzz_markets[market_key]) / 100.0
+            bzz_avail = True
         except: pass
-    sources = [x for x in (gem, dix, bzz) if x > 0]
-    if not sources: return 0.0, gem, dix, bzz, ""
-    final = sum(sources) / len(sources)
+
+    # Pondération 30/35/35, redistribuée automatiquement sur les sources présentes
+    total_w = 0.0
+    weighted_sum = 0.0
+    if dix_avail:
+        total_w += WEIGHT_DIXON
+        weighted_sum += dix * WEIGHT_DIXON
+    if gem_avail:
+        total_w += WEIGHT_GEMINI
+        weighted_sum += gem * WEIGHT_GEMINI
+    if bzz_avail:
+        total_w += WEIGHT_BZZOIRO
+        weighted_sum += bzz * WEIGHT_BZZOIRO
+
+    if total_w <= 0:
+        return 0.0, gem, dix, bzz, ""
+
+    final = weighted_sum / total_w
+
+    # Emoji consensus (basé sur les sources brutes, pas la pondération)
+    sources = []
+    if gem_avail: sources.append(gem)
+    if dix_avail: sources.append(dix)
+    if bzz_avail: sources.append(bzz)
+
     emoji = ""
     if len(sources) >= 2:
         delta = max(sources) - min(sources)
         if len(sources) == 3 and delta <= 0.12: emoji = "🤝🤝"
         elif delta <= 0.15: emoji = "🤝"
         elif delta >= 0.20: emoji = "⚠️"
+
     return final, gem, dix, bzz, emoji
+
+# ═══════════════════════════════════════════════════════════════════
+# 🎯 RÉFORME 3 — Filtre Value 5% (cotes réelles uniquement)
+# ═══════════════════════════════════════════════════════════════════
+def passes_value_filter(proba_0_1: float, odd: float, is_real_odd: bool) -> bool:
+    """Retourne True si le pari a assez de value (edge ≥ MIN_EDGE).
+    Ne s'applique PAS aux cotes estimées (on ne peut pas calculer d'edge dessus)."""
+    if proba_0_1 <= 0 or odd <= 0: return False
+    if not is_real_odd: return True
+    ev = proba_0_1 * odd
+    return ev >= (1.0 + MIN_EDGE)
+
+# ═══════════════════════════════════════════════════════════════════
+# 🎯 RÉFORME 4 — Plancher EV sur le coupon final
+# ═══════════════════════════════════════════════════════════════════
+def coupon_passes_ev(combined_odds: float, combined_prob: float) -> bool:
+    """Rejette les coupons dont l'EV est trop basse (perdants à long terme)."""
+    if combined_odds <= 0 or combined_prob <= 0: return False
+    return (combined_odds * combined_prob) >= MIN_COUPON_EV
+
+# ═══════════════════════════════════════════════════════════════════
+# 🎯 RÉFORME 2 — Vrai quality score MT-Fin (0-100 discriminant)
+# ═══════════════════════════════════════════════════════════════════
+def compute_mtft_quality_score(md, best_prob: float, best_pick: str, htft_probs: dict) -> int:
+    """Score 0-100 basé sur des critères RÉELS (plus de 'tout passe')."""
+    score = 0
+
+    # 1. Proba HT/FT réelle (0-40 pts)
+    if best_prob >= 0.65: score += 40
+    elif best_prob >= 0.55: score += 32
+    elif best_prob >= 0.45: score += 24
+    elif best_prob >= 0.35: score += 15
+    else: score += 8
+
+    # 2. Consensus HT/FT (marge pick 1 vs pick 2) (0-20 pts)
+    others = [htft_probs.get(c, 0) for c in ("V1/V1", "V2/V2") if c != best_pick]
+    second_best = max(others) if others else 0
+    margin = best_prob - second_best
+    if margin >= 0.15: score += 20
+    elif margin >= 0.10: score += 14
+    elif margin >= 0.05: score += 8
+    else: score += 3
+
+    # 3. Cote estimée (plus haute = plus de value potentielle) (0-15 pts)
+    est_odd = (1.0 / best_prob) if best_prob > 0 else 99
+    if est_odd >= 2.5: score += 15
+    elif est_odd >= 2.0: score += 12
+    elif est_odd >= 1.7: score += 8
+    else: score += 4
+
+    # 4. H2H disponible (0-10 pts)
+    if md.has_h2h: score += 10
+
+    # 5. Cotes réelles disponibles (0-15 pts)
+    has_home = md.real_odds.get("home") is not None
+    has_away = md.real_odds.get("away") is not None
+    if has_home and has_away: score += 15
+    elif has_home or has_away: score += 8
+
+    return min(100, score)
 
 # =====================================================================
 # ⏰ APIS DE COTES
@@ -544,7 +646,6 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
     for md in pool:
         hn, an = normalize_name(md.home), normalize_name(md.away)
 
-        # 1. Chercher dans The Odds API
         for ws in ws_matches:
             whn, wan = normalize_name(ws.home_team), normalize_name(ws.away_team)
             if (hn in whn or whn in hn) and (an in wan or wan in an):
@@ -559,7 +660,6 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
                 matched += 1
                 break
 
-        # 2. Chercher dans API-Football
         for af in af_matches:
             afhn, afan = normalize_name(af.home_team), normalize_name(af.away_team)
             if (hn in afhn or afhn in hn) and (an in afan or afan in an):
@@ -576,13 +676,9 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
     return matched
 
 # =====================================================================
-# 🔁 SOLUTION B — ENRICHISSEMENT EN DOUBLE PASSE
+# 🔁 SOLUTION B — ENRICHISSEMENT EN DOUBLE PASSE (inchangé)
 # =====================================================================
 async def _enrich_single_pass(targets: list, pass_num: int) -> dict:
-    """
-    Exécute UNE passe d'enrichissement (Gemini + Bzzoiro context).
-    Retourne un dict {event_id: {"markets": {...}, "analysis": "..."}}.
-    """
     results = {}
     async with httpx.AsyncClient(timeout=70.0) as client:
         for idx, md in enumerate(targets):
@@ -609,12 +705,6 @@ async def _enrich_single_pass(targets: list, pass_num: int) -> dict:
 
 
 def _compare_two_passes(targets: list, results_1: dict, results_2: dict) -> tuple:
-    """
-    Compare les 2 passes et retourne:
-      - stable_list: matchs dont tous les marchés sont stables
-      - enriched_list: tous les matchs enrichis (stables + instables)
-      - stats: dict des compteurs
-    """
     stable_list = []
     enriched_list = []
     stats = {"stable": 0, "unstable": 0, "single": 0, "none": 0}
@@ -623,13 +713,11 @@ def _compare_two_passes(targets: list, results_1: dict, results_2: dict) -> tupl
         r1 = results_1.get(md.event_id)
         r2 = results_2.get(md.event_id)
 
-        # Aucune passe n'a retourné → skip
         if not r1 and not r2:
             stats["none"] += 1
             md.stability_flag = "no_gemini"
             continue
 
-        # Une seule passe → on utilise celle disponible (flag "single")
         if r1 and not r2:
             md.gemini_markets = r1["markets"]
             md.analysis = r1["analysis"]
@@ -646,7 +734,6 @@ def _compare_two_passes(targets: list, results_1: dict, results_2: dict) -> tupl
             enriched_list.append(md)
             continue
 
-        # Deux passes → comparaison marché par marché
         m1, m2 = r1["markets"], r2["markets"]
         is_stable = True
         merged = {}
@@ -655,10 +742,9 @@ def _compare_two_passes(targets: list, results_1: dict, results_2: dict) -> tupl
             v1 = m1.get(key)
             v2 = m2.get(key)
 
-            # Marché présent dans une seule passe → on garde celui dispo
             if v1 is None and v2 is not None:
                 merged[key] = v2
-                is_stable = False  # Donnée manquante dans une passe = instable
+                is_stable = False
                 continue
             if v2 is None and v1 is not None:
                 merged[key] = v1
@@ -675,16 +761,13 @@ def _compare_two_passes(targets: list, results_1: dict, results_2: dict) -> tupl
 
             delta = abs(f1 - f2) / 100.0
             if delta > DOUBLE_SCAN_STABILITY_DELTA:
-                # Marché volatil → valeur MIN (conservateur)
                 merged[key] = min(f1, f2)
                 is_stable = False
             else:
-                # Marché stable → moyenne
                 merged[key] = (f1 + f2) / 2.0
 
         md.gemini_markets = merged
 
-        # Prendre l'analyse la plus détaillée
         a1 = r1.get("analysis", "") or ""
         a2 = r2.get("analysis", "") or ""
         base_analysis = a1 if len(a1) >= len(a2) else a2
@@ -704,16 +787,6 @@ def _compare_two_passes(targets: list, results_1: dict, results_2: dict) -> tupl
 
 
 async def enrich_with_double_pass(pool: list) -> list:
-    """
-    SOLUTION B — Double scan.
-    Enrichit chaque match 2 fois via Gemini, puis :
-      - Si assez de matchs stables (>= DOUBLE_SCAN_MIN_STABLE) → mode STRICT,
-        on retourne UNIQUEMENT les matchs dont tous les marchés sont stables.
-      - Sinon → mode FALLBACK, on retourne TOUS les enrichis (jamais 0 ticket).
-
-    Le budget Gemini reste identique au mode simple :
-      DOUBLE_SCAN_POOL_SIZE (25) × 2 passes = 50 appels (== GEMINI_MAX_CALLS_PER_SCAN).
-    """
     if not pool:
         STATE["double_scan_status"] = "EMPTY"
         return pool
@@ -721,42 +794,35 @@ async def enrich_with_double_pass(pool: list) -> list:
     targets = pool[:DOUBLE_SCAN_POOL_SIZE]
     print(f"🔁 DOUBLE SCAN — Cible : {len(targets)} matchs × 2 passes")
 
-    # ---------- PASSE 1 ----------
     print(f"🔍 [Passe 1/2] Enrichissement en cours...")
     results_1 = await _enrich_single_pass(targets, pass_num=1)
     print(f"✅ Passe 1 terminée : {len(results_1)}/{len(targets)} enrichis")
 
     await asyncio.sleep(DOUBLE_SCAN_PAUSE_SECONDS)
 
-    # ---------- PASSE 2 ----------
     print(f"🔍 [Passe 2/2] Enrichissement en cours...")
     results_2 = await _enrich_single_pass(targets, pass_num=2)
     print(f"✅ Passe 2 terminée : {len(results_2)}/{len(targets)} enrichis")
 
-    # ---------- COMPARAISON ----------
     stable_list, enriched_list, stats = _compare_two_passes(targets, results_1, results_2)
 
     print(f"📊 BILAN DOUBLE SCAN : {stats['stable']} stables, {stats['unstable']} instables, "
           f"{stats['single']} passe-unique, {stats['none']} sans Gemini")
 
-    # Sauvegarde des stats pour /debug
     STATE["double_scan_stats"] = stats
 
-    # ---------- DÉCISION STRICT / FALLBACK ----------
     if len(stable_list) >= DOUBLE_SCAN_MIN_STABLE:
         STATE["double_scan_status"] = f"STRICT ({len(stable_list)} stables)"
         print(f"✅ MODE STRICT : {len(stable_list)} matchs stables retenus "
               f"(>= {DOUBLE_SCAN_MIN_STABLE})")
         return stable_list
 
-    # Fallback : pas assez de stables → on garde tous les enrichis
     if enriched_list:
         STATE["double_scan_status"] = f"FALLBACK ({len(stable_list)} stables / {len(enriched_list)} total)"
         print(f"⚠️ MODE FALLBACK : {len(stable_list)} stables < {DOUBLE_SCAN_MIN_STABLE} "
               f"→ on garde tous les {len(enriched_list)} enrichis pour éviter 0 ticket")
         return enriched_list
 
-    # Aucun match enrichi du tout → on renvoie la cible telle quelle (Gemini HS)
     print(f"⚠️ Aucun match enrichi (Gemini HS ?) → retour au pool original ({len(targets)} matchs)")
     for md in targets:
         md.stability_flag = "no_gemini"
@@ -765,7 +831,7 @@ async def enrich_with_double_pass(pool: list) -> list:
 
 
 # =====================================================================
-# 🎯 MOTEUR 1 : MT-FIN & MATCH NUL
+# 🎯 MOTEUR 1 : MT-FIN (réforme 2 + 3 appliquées)
 # =====================================================================
 def _poisson_sample(lam: float) -> int:
     if lam <= 0: return 0
@@ -794,6 +860,8 @@ def simulate_htft(lambda_home: float, lambda_away: float, n_sims: int = MTFIN_SI
 def build_mtft_coupon_and_bonus(pool):
     picks = []
     bonus_pool = []
+    rejected_value = 0
+    rejected_quality = 0
 
     for md in pool:
         if not md.home or not md.away or not md.dixon_pred: continue
@@ -812,12 +880,16 @@ def build_mtft_coupon_and_bonus(pool):
 
         if not best_pick or best_prob < MTFIN_MIN_PROB: continue
 
-        pts = 15 + (10 if md.has_h2h else 0) + 10 + (30 if best_prob >= 0.65 else 20) + 15 + 10
-        if pts < MTFIN_MIN_SCORE: continue
+        # 🎯 RÉFORME 2 — Quality score réel (0-100 discriminant)
+        pts = compute_mtft_quality_score(md, best_prob, best_pick, htft_probs)
+        if pts < MTFIN_MIN_SCORE:
+            rejected_quality += 1
+            continue
 
         est_odd = round(1.0 / best_prob, 2) if best_prob > 0 else 3.5
         picks.append({
-            "md": md, "pick": best_pick, "prob": best_prob, "score": pts, "odd": est_odd
+            "md": md, "pick": best_pick, "prob": best_prob, "score": pts,
+            "odd": est_odd, "htft_probs": htft_probs
         })
 
     coupon = None
@@ -825,7 +897,10 @@ def build_mtft_coupon_and_bonus(pool):
     top3 = picks[:3]
 
     if len(top3) > 0:
-        legs = [Selection(p["md"].event_id, p["md"].league, p["md"].home, p["md"].away, p["md"].kickoff, "MT-Fin", f"MT/Fin : {p['pick']}", p["odd"], p["prob"], None, -1.0, p["score"], htft_pick=p["pick"]) for p in top3]
+        legs = [Selection(p["md"].event_id, p["md"].league, p["md"].home, p["md"].away,
+                          p["md"].kickoff, "MT-Fin", f"MT/Fin : {p['pick']}",
+                          p["odd"], p["prob"], None, -1.0, p["score"],
+                          htft_pick=p["pick"]) for p in top3]
         co, cp = 1.0, 1.0
         for s in legs: co *= s.odds; cp *= s.model_prob
         subtitle = f"{len(legs)} matchs Bookmaker Blind" if len(legs) < 3 else "3 matchs Bookmaker Blind"
@@ -841,7 +916,7 @@ def build_mtft_coupon_and_bonus(pool):
             real_odd = md.real_odds.get("away")
 
         ft_res = p["pick"].split("/")[1]
-        fav_ft_prob = sum(htft_probs.get(f"{ht}/{ft_res}", 0) for ht in ("V1", "V2", "X"))
+        fav_ft_prob = sum(p["htft_probs"].get(f"{ht}/{ft_res}", 0) for ht in ("V1", "V2", "X"))
 
         is_est = False
         if not real_odd:
@@ -850,6 +925,11 @@ def build_mtft_coupon_and_bonus(pool):
 
         if real_odd < ODDS3_MIN_COTE_LEG: continue
 
+        # 🎯 RÉFORME 3 — Filtre Value sur les jambes bonus
+        if not passes_value_filter(fav_ft_prob, real_odd, is_real_odd=not is_est):
+            rejected_value += 1
+            continue
+
         bonus_pool.append({
             "match": md, "type": fav_market, "odds": real_odd,
             "proba": fav_ft_prob * 100, "ai": md.analysis,
@@ -857,10 +937,16 @@ def build_mtft_coupon_and_bonus(pool):
             "source": "MT-FIN", "kickoff": md.kickoff,
         })
 
+    STATE["rejections"]["value"] += rejected_value
+    STATE["rejections"]["mtft_quality"] += rejected_quality
     return coupon, bonus_pool
 
+# =====================================================================
+# 🎯 MOTEUR 2 : MATCH NUL (réforme 3 appliquée)
+# =====================================================================
 def build_draw_coupon_and_bonus(pool):
     candidates = []
+    rejected_value = 0
 
     for md in pool:
         if not md.home or not md.away: continue
@@ -871,16 +957,25 @@ def build_draw_coupon_and_bonus(pool):
 
         home_odd, away_odd = md.real_odds.get("home"), md.real_odds.get("away")
         draw_odd = md.real_odds.get("draw")
+        is_draw_real = draw_odd is not None
 
         if not draw_odd: draw_odd = round(1.0 / prob_draw, 2) if prob_draw > 0 else 3.20
         if draw_odd < 3.10: continue
         if (home_odd and home_odd < 1.80) or (away_odd and away_odd < 1.80): continue
 
+        # 🎯 RÉFORME 3 — Filtre Value sur le nul
+        if not passes_value_filter(prob_draw, draw_odd, is_real_odd=is_draw_real):
+            rejected_value += 1
+            continue
+
         pts = 30 + (25 if prob_draw >= 0.33 else 18) + (20 if g >= 0.30 else 12) + 10 + (5 if md.has_h2h else 0) + 10
         pts = max(0, min(100, pts))
         if pts < DRAW_MIN_SCORE: continue
 
-        candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, "Match Nul", "Match Nul (X)", draw_odd, prob_draw, draw_odd if md.real_odds.get("draw") else None, (prob_draw*draw_odd)-1, pts))
+        candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff,
+                                    "Match Nul", "Match Nul (X)", draw_odd, prob_draw,
+                                    draw_odd if is_draw_real else None,
+                                    (prob_draw*draw_odd)-1, pts))
 
     coupon = None
     candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
@@ -908,6 +1003,11 @@ def build_draw_coupon_and_bonus(pool):
 
         if dc12_odd < ODDS3_MIN_COTE_LEG: continue
 
+        # 🎯 RÉFORME 3 — Filtre Value sur DC12 (cote estimée → passe auto)
+        if not passes_value_filter(prob_dc_12, dc12_odd, is_real_odd=False):
+            rejected_value += 1
+            continue
+
         bonus_pool.append({
             "match": md, "type": "Double Chance 12 (Pas de Nul)",
             "odds": dc12_odd, "proba": prob_dc_12 * 100,
@@ -915,13 +1015,16 @@ def build_draw_coupon_and_bonus(pool):
             "source": "MATCH-NUL", "kickoff": md.kickoff,
         })
 
+    STATE["rejections"]["value"] += rejected_value
     return coupon, bonus_pool
 
 # =====================================================================
-# 🎯 MOTEUR 3 : ODDS +3
+# 🎯 MOTEUR 3 : ODDS +3 (réforme 3 + tri EV réforme 5)
 # =====================================================================
 def build_third_pillar(pool) -> list:
     pool_result = []
+    rejected_value = 0
+
     for md in pool:
         if not md.home or not md.away: continue
         if not is_match_not_started(md.kickoff): continue
@@ -946,6 +1049,11 @@ def build_third_pillar(pool) -> list:
 
             if real_odd < ODDS3_MIN_COTE_LEG: continue
 
+            # 🎯 RÉFORME 3 — Filtre Value
+            if not passes_value_filter(prob, real_odd, is_real_odd=not is_est):
+                rejected_value += 1
+                continue
+
             if not best_candidate or prob > best_candidate['proba']:
                 best_candidate = {
                     "match": md, "type": label, "odds": real_odd,
@@ -957,7 +1065,10 @@ def build_third_pillar(pool) -> list:
         if best_candidate:
             pool_result.append(best_candidate)
 
-    pool_result.sort(key=lambda x: x['proba'], reverse=True)
+    STATE["rejections"]["value"] += rejected_value
+
+    # 🎯 RÉFORME 5 — Tri par EV (au lieu de proba brute)
+    pool_result.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
     return pool_result[:3]
 
 def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) -> Optional[Coupon]:
@@ -988,7 +1099,8 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
                 pool_ws.append({"match": match, "type": "BTTS Oui", "odds": match.btts_yes, "proba": sim.proba_btts, "ai": "Attaques prolifiques.", "real_odd": match.btts_yes})
 
         if len(pool_ws) >= 2:
-            pool_ws.sort(key=lambda x: x['proba'], reverse=True)
+            # 🎯 RÉFORME 5 — Tri par EV
+            pool_ws.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
             print(f"  🔍 AUTH WallStreet : {len(pool_ws)} candidats (vraies cotes)")
 
             for combo in itertools.combinations(pool_ws[:15], 2):
@@ -996,6 +1108,13 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
                 if len(set(match_ids)) != len(match_ids): continue
                 total_odds = combo[0]['odds'] * combo[1]['odds']
                 if ODDS3_AUTH_MIN_COTE <= total_odds <= ODDS3_AUTH_MAX_COTE:
+                    prob = (combo[0]['proba']/100.0) * (combo[1]['proba']/100.0)
+
+                    # 🎯 RÉFORME 4 — Plancher EV coupon
+                    if not coupon_passes_ev(total_odds, prob):
+                        STATE["rejections"]["ev_coupon"] += 1
+                        continue
+
                     legs = [Selection(
                         event_id=c['match'].match_id, league=c['match'].league,
                         home=c['match'].home_team, away=c['match'].away_team,
@@ -1003,21 +1122,21 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
                         pick_label=c['type'], odds=c['odds'], model_prob=c['proba']/100.0,
                         real_odd=c['real_odd'], quality=95, analysis=c['ai']
                     ) for c in combo]
-                    prob = (combo[0]['proba']/100.0) * (combo[1]['proba']/100.0)
-                    print(f"  ✅ AUTH OK (WallStreet) : {len(legs)} legs, cote {round(total_odds, 2)}")
+                    print(f"  ✅ AUTH OK (WallStreet) : {len(legs)} legs, cote {round(total_odds, 2)}, EV {round(total_odds*prob, 2)}")
                     return Coupon("Odds +3 AUTH", "Moteur WallStreet (vraies cotes)", "🛡️", legs, round(total_odds, 2), round(prob, 4), show_analysis=True)
 
         print(f"  ⚠️ AUTH : WallStreet présent mais aucune combo dans [2.5-3.2] → fallback")
     else:
         print(f"  ⚠️ AUTH : The Odds API HS → fallback sur cotes estimées")
 
-    # ÉTAPE 2 : Fallback sur cotes estimées (Bzzoiro + Dixon)
+    # ÉTAPE 2 : Fallback
     combined = bonus_mtft + bonus_draw + third_pillar
     if not combined:
         print("  ❌ AUTH : pool fallback vide")
         return None
 
-    combined.sort(key=lambda x: x['proba'], reverse=True)
+    # 🎯 RÉFORME 5 — Tri par EV
+    combined.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
     print(f"  🔍 AUTH Fallback : {len(combined)} candidats (cotes estimées)")
 
     for combo in itertools.combinations(combined[:10], 2):
@@ -1025,6 +1144,13 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
         if len(set(match_ids)) != len(match_ids): continue
         total_odds = combo[0]['odds'] * combo[1]['odds']
         if ODDS3_AUTH_MIN_COTE <= total_odds <= ODDS3_AUTH_MAX_COTE:
+            prob = (combo[0]['proba']/100.0) * (combo[1]['proba']/100.0)
+
+            # 🎯 RÉFORME 4 — Plancher EV
+            if not coupon_passes_ev(total_odds, prob):
+                STATE["rejections"]["ev_coupon"] += 1
+                continue
+
             legs = [Selection(
                 event_id=c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id,
                 league=c['match'].league,
@@ -1033,8 +1159,7 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
                 kickoff=c.get('kickoff', ''), market=c['type'], pick_label=c['type'], odds=c['odds'],
                 model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
             ) for c in combo]
-            prob = (combo[0]['proba']/100.0) * (combo[1]['proba']/100.0)
-            print(f"  ✅ AUTH OK (Fallback 2 legs) : cote {round(total_odds, 2)}")
+            print(f"  ✅ AUTH OK (Fallback 2 legs) : cote {round(total_odds, 2)}, EV {round(total_odds*prob, 2)}")
             return Coupon("Odds +3 AUTH", "Fallback (cotes estimées Bzzoiro)", "🛡️", legs, round(total_odds, 2), round(prob, 4), show_analysis=True)
 
     for combo in itertools.combinations(combined[:8], 3):
@@ -1042,6 +1167,13 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
         if len(set(match_ids)) != len(match_ids): continue
         total_odds = combo[0]['odds'] * combo[1]['odds'] * combo[2]['odds']
         if ODDS3_AUTH_MIN_COTE <= total_odds <= ODDS3_AUTH_MAX_COTE:
+            prob = (combo[0]['proba']/100.0) * (combo[1]['proba']/100.0) * (combo[2]['proba']/100.0)
+
+            # 🎯 RÉFORME 4 — Plancher EV
+            if not coupon_passes_ev(total_odds, prob):
+                STATE["rejections"]["ev_coupon"] += 1
+                continue
+
             legs = [Selection(
                 event_id=c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id,
                 league=c['match'].league,
@@ -1050,11 +1182,10 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
                 kickoff=c.get('kickoff', ''), market=c['type'], pick_label=c['type'], odds=c['odds'],
                 model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
             ) for c in combo]
-            prob = (combo[0]['proba']/100.0) * (combo[1]['proba']/100.0) * (combo[2]['proba']/100.0)
-            print(f"  ✅ AUTH OK (Fallback 3 legs) : cote {round(total_odds, 2)}")
+            print(f"  ✅ AUTH OK (Fallback 3 legs) : cote {round(total_odds, 2)}, EV {round(total_odds*prob, 2)}")
             return Coupon("Odds +3 AUTH", "Fallback (cotes estimées Bzzoiro)", "🛡️", legs, round(total_odds, 2), round(prob, 4), show_analysis=True)
 
-    print(f"  ❌ AUTH : aucune combo dans [2.5-3.2] même en fallback")
+    print(f"  ❌ AUTH : aucune combo valide (EV ou range)")
     return None
 
 def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[Coupon]:
@@ -1094,10 +1225,17 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
                             kickoff=c.get('kickoff', ''), market=c['type'], pick_label=c['type'], odds=c['odds'],
                             model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
                         ))
-                    print(f"  ✅ HYBRIDE OK (mixité 3 sources) : {len(legs)} legs, cote {round(total_odds, 2)}")
+
+                    # 🎯 RÉFORME 4 — Plancher EV
+                    if not coupon_passes_ev(total_odds, total_prob):
+                        STATE["rejections"]["ev_coupon"] += 1
+                        continue
+
+                    print(f"  ✅ HYBRIDE OK (mixité 3 sources) : {len(legs)} legs, cote {round(total_odds, 2)}, EV {round(total_odds*total_prob, 2)}")
                     return Coupon("Odds +3 HYBRIDE", "Mélange MT-Fin + Nul + Bzzoiro", "🎯", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
 
-    combined.sort(key=lambda x: x['proba'], reverse=True)
+    # 🎯 RÉFORME 5 — Tri par EV
+    combined.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
     for r in range(3, min(len(combined), 5) + 1):
         for combo in itertools.combinations(combined[:15], r):
             match_ids = [c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id for c in combo]
@@ -1119,7 +1257,13 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
                         kickoff=c.get('kickoff', ''), market=c['type'], pick_label=c['type'], odds=c['odds'],
                         model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
                     ))
-                print(f"  ✅ HYBRIDE OK (sans mixité stricte) : {len(legs)} legs, cote {round(total_odds, 2)}")
+
+                # 🎯 RÉFORME 4 — Plancher EV
+                if not coupon_passes_ev(total_odds, total_prob):
+                    STATE["rejections"]["ev_coupon"] += 1
+                    continue
+
+                print(f"  ✅ HYBRIDE OK (sans mixité stricte) : {len(legs)} legs, cote {round(total_odds, 2)}, EV {round(total_odds*total_prob, 2)}")
                 return Coupon("Odds +3 HYBRIDE", "Mélange tout sources", "🎯", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
 
     if len(combined) >= 3:
@@ -1138,7 +1282,14 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
                 kickoff=c.get('kickoff', ''), market=c['type'], pick_label=c['type'], odds=c['odds'],
                 model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
             ))
-        print(f"  ⚠️ HYBRIDE : fallback sur top 3 (cote {round(total_odds, 2)})")
+
+        # 🎯 RÉFORME 4 — Plancher EV
+        if not coupon_passes_ev(total_odds, total_prob):
+            STATE["rejections"]["ev_coupon"] += 1
+            print(f"  ❌ HYBRIDE fallback rejeté par EV ({round(total_odds*total_prob, 2)})")
+            return None
+
+        print(f"  ⚠️ HYBRIDE : fallback sur top 3 (cote {round(total_odds, 2)}, EV {round(total_odds*total_prob, 2)})")
         return Coupon("Odds +3 HYBRIDE", f"Fallback (cote {round(total_odds,2)})", "🎯", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
 
     return None
@@ -1148,6 +1299,9 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
 # =====================================================================
 async def scan():
     async with STATE["scan_lock"]:
+        # Reset compteurs de rejets
+        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "mtft_quality": 0}
+
         print("⏰ Tentative The Odds API...")
         ws_matches, odds_status = await fetch_real_odds_matches()
         STATE["odds_api_mode"] = odds_status
@@ -1196,7 +1350,6 @@ async def scan():
             pool.sort(key=prescore_match, reverse=True)
             top_pool = pool[:GEMINI_MAX_CALLS_PER_SCAN]
 
-            # ✅ SOLUTION B : enrichissement en DOUBLE passe
             enriched_pool = await enrich_with_double_pass(top_pool)
 
         coupon_mtft, bonus_mtft = build_mtft_coupon_and_bonus(enriched_pool) if enriched_pool else (None, [])
@@ -1209,19 +1362,17 @@ async def scan():
 
         print(f"  📊 Sources disponibles : {len(bonus_mtft)} MT-Fin + {len(bonus_draw)} Nul + {len(third_pillar)} Bzzoiro")
 
-        # 1. AUTHENTIQUE (WallStreet en priorité, Fallback sur cotes estimées)
         coupon_auth = build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches)
         if coupon_auth:
             coupons.insert(0, coupon_auth)
-            print(f"  ✅ Odds +3 AUTH OK : {len(coupon_auth.legs)} legs, cote {coupon_auth.combined_odds}")
+            print(f"  ✅ Odds +3 AUTH OK : {len(coupon_auth.legs)} legs, cote {coupon_auth.combined_odds}, EV {round(coupon_auth.combined_odds*coupon_auth.combined_prob, 2)}")
         else:
             print(f"  ❌ Odds +3 AUTH : échec total")
 
-        # 2. HYBRIDE (Mélange des 3 sources)
         coupon_hybrid = build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar)
         if coupon_hybrid:
             coupons.insert(1, coupon_hybrid)
-            print(f"  ✅ Odds +3 HYBRIDE OK : {len(coupon_hybrid.legs)} legs, cote {coupon_hybrid.combined_odds}")
+            print(f"  ✅ Odds +3 HYBRIDE OK : {len(coupon_hybrid.legs)} legs, cote {coupon_hybrid.combined_odds}, EV {round(coupon_hybrid.combined_odds*coupon_hybrid.combined_prob, 2)}")
         else:
             print(f"  ❌ Odds +3 HYBRIDE : échec total")
 
@@ -1234,6 +1385,9 @@ async def scan():
         print(f"Coupons : {len(STATE['coupons'])}")
         for c in STATE["coupons"]: print(f"  • {c.name} : {len(c.legs)} legs, cote {c.combined_odds}")
         print(f"Double scan : {STATE.get('double_scan_status', 'N/A')}")
+        print(f"Rejets : Value={STATE['rejections']['value']}, "
+              f"EV={STATE['rejections']['ev_coupon']}, "
+              f"MT-Fin Quality={STATE['rejections']['mtft_quality']}")
         print("────────────────────────")
 
 # =====================================================================
@@ -1265,7 +1419,7 @@ async def broadcast_after_scan():
     elif "GEMINI_KO" in ds: ds_short = " • ⚠️ Gemini KO"
 
     if not STATE["coupons"]:
-        msg = f"<b>📭 Aucun coupon aujourd'hui</b>\n\n<i>Mode : {mode_label}{ds_short}</i>"
+        msg = f"<b>📭 Aucun coupon aujourd'hui</b>\n\n<i>Mode : {mode_label}{ds_short}</i>\n<i>🛡️ Filtres qualité actifs</i>"
     else:
         lignes = [f"{c.emoji} <b>{c.name}</b> • {len(c.legs)} paris • Cote <b>{c.combined_odds}</b>" for c in STATE["coupons"]]
         msg = f"<b>🔔 COUPONS DU JOUR !</b>\n<i>Mode : {mode_label}{ds_short}</i>\n\n" + "\n\n".join(lignes)
@@ -1304,7 +1458,11 @@ def format_coupon(c):
         lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", "", f"<b>🎯 {len(c.legs)} pronostics</b>", ""]
         for i, s in enumerate(c.legs, 1): lines.append(format_selection_block(s, i, getattr(c, "show_analysis", False)) + "\n")
     else:
-        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", "", f"<b>┏━━━━━━━━━━━━━━━┓</b>", f"<b>┃ 🎫 Cote : {c.combined_odds}</b>", f"<b>┃ 📈 Proba : {c.combined_prob*100:.1f}%</b>", f"<b>┗━━━━━━━━━━━━━━━┛</b>", ""]
+        # 🎯 RÉFORME 4 — Affichage EV sur coupons combinés
+        ev = c.combined_odds * c.combined_prob if (c.combined_odds > 0 and c.combined_prob > 0) else 0
+        ev_badge = f"<b>┃ 💎 EV : {ev:.2f}</b>" if ev > 0 else ""
+
+        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", "", f"<b>┏━━━━━━━━━━━━━━━┓</b>", f"<b>┃ 🎫 Cote : {c.combined_odds}</b>", f"<b>┃ 📈 Proba : {c.combined_prob*100:.1f}%</b>", ev_badge, f"<b>┗━━━━━━━━━━━━━━━┛</b>", ""]
         for i, s in enumerate(c.legs, 1): lines.append(format_selection_block(s, i, getattr(c, "show_analysis", False)) + "\n")
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
@@ -1385,7 +1543,7 @@ async def b_odds3(m):
     if c_auth:
         await safe_answer(m, format_coupon(c_auth))
     else:
-        await safe_answer(m, "📭 Aucun coupon AUTHENTIQUE disponible pour le moment.")
+        await safe_answer(m, "📭 Aucun coupon AUTHENTIQUE disponible pour le moment.\n\n<i>🛡️ Nos filtres qualité (Value 5% + EV) n'ont laissé passer aucun ticket. On préfère 0 ticket qu'un mauvais pari.</i>")
 
     if m.from_user.id == ADMIN_ID:
         await asyncio.sleep(1)
@@ -1414,7 +1572,7 @@ async def b_bilan(m):
 @dp.message(F.text == BTN_SCAN)
 async def b_scan(m):
     if m.from_user.id != ADMIN_ID: return
-    await safe_answer(m, "⏳ <b>Double scan en cours...</b>\n\n🔁 2 passes × 25 matchs\n⏱️ Compte environ 2-3 minutes.")
+    await safe_answer(m, "⏳ <b>Double scan + filtres qualité en cours...</b>\n\n🔁 2 passes × 25 matchs\n🛡️ Value 5% + EV 0.95\n⏱️ Compte environ 2-3 minutes.")
     await scan()
     await broadcast_after_scan()
 
@@ -1427,6 +1585,7 @@ async def b_debug(m):
     mode = STATE.get("odds_api_mode", "unknown")
     ds = STATE.get("double_scan_status", "N/A")
     stats = STATE.get("double_scan_stats", {})
+    rej = STATE.get("rejections", {})
 
     stats_lines = ""
     if stats:
@@ -1439,18 +1598,29 @@ async def b_debug(m):
             f"• Seuil strict : <b>{DOUBLE_SCAN_MIN_STABLE}</b>"
         )
 
+    filtres_lines = (
+        f"\n\n<b>🛡️ FILTRES QUALITÉ</b>\n"
+        f"• Pondération : <b>Dixon 30% / Gemini 35% / Bzzoiro 35%</b>\n"
+        f"• Edge min (value) : <b>{MIN_EDGE*100:.1f}%</b>\n"
+        f"• EV coupon min : <b>{MIN_COUPON_EV}</b>\n"
+        f"• Jambes rejetées value : <b>{rej.get('value', 0)}</b>\n"
+        f"• Coupons rejetés EV : <b>{rej.get('ev_coupon', 0)}</b>\n"
+        f"• MT-Fin rejetés (qualité) : <b>{rej.get('mtft_quality', 0)}</b>"
+    )
+
     await safe_answer(m,
         f"<b>🔍 DEBUG</b>\n\n"
         f"Mode : <b>{mode.upper()}</b>\n"
         f"Double scan : <b>{ds}</b>\n"
         f"Coupons : {len(STATE['coupons'])}"
         f"{stats_lines}"
+        f"{filtres_lines}"
     )
 
 @dp.message(Command("scan"))
 async def scan_cmd(m):
     if m.from_user.id != ADMIN_ID: return
-    await safe_answer(m, "⏳ <b>Double scan en cours...</b>\n\n🔁 2 passes × 25 matchs\n⏱️ Compte environ 2-3 minutes.")
+    await safe_answer(m, "⏳ <b>Double scan + filtres qualité en cours...</b>\n\n🔁 2 passes × 25 matchs\n🛡️ Value 5% + EV 0.95\n⏱️ Compte environ 2-3 minutes.")
     await scan()
     await broadcast_after_scan()
 
@@ -1472,8 +1642,8 @@ async def lifespan(app):
     STATE["users"] = load_json(USERS_DB)
     STATE["ready"] = True
     print("✅ Bot prêt.")
-    print(f"🔁 Double scan actif : {DOUBLE_SCAN_POOL_SIZE} matchs × 2 passes "
-          f"(seuil strict={DOUBLE_SCAN_MIN_STABLE}, delta={DOUBLE_SCAN_STABILITY_DELTA*100:.0f}%)")
+    print(f"🔁 Double scan : {DOUBLE_SCAN_POOL_SIZE} matchs × 2 passes (seuil strict={DOUBLE_SCAN_MIN_STABLE})")
+    print(f"🛡️ Filtres : pondération 30/35/35, value>={MIN_EDGE*100:.0f}%, EV>={MIN_COUPON_EV}")
 
     scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(
@@ -1526,6 +1696,7 @@ async def root():
         "mode": STATE.get("odds_api_mode"),
         "double_scan": STATE.get("double_scan_status"),
         "double_scan_stats": STATE.get("double_scan_stats", {}),
+        "rejections": STATE.get("rejections", {}),
         "coupons": [c.name for c in STATE["coupons"]]
     }
 
