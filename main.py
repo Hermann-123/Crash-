@@ -92,20 +92,21 @@ GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "50"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
 # ═══════════════════════════════════════════════════════════════════
-# 🎯 RÉFORMES QUALITÉ (1+2+3+4+5)
+# 🎯 RÉFORMES QUALITÉ (1+3+4+5) — réforme 2 retirée pour MT-Fin
 # ═══════════════════════════════════════════════════════════════════
-# RÉFORME 1 — Pondération Dixon 30% / Gemini 35% / Bzzoiro 35%
 WEIGHT_DIXON   = float(os.getenv("WEIGHT_DIXON",   "0.30"))
 WEIGHT_GEMINI  = float(os.getenv("WEIGHT_GEMINI",  "0.35"))
 WEIGHT_BZZOIRO = float(os.getenv("WEIGHT_BZZOIRO", "0.35"))
 
-# RÉFORME 3 — Filtre Value (edge minimum sur cotes réelles uniquement)
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))  # 5% — baisser à 0.02 si trop strict
-
-# RÉFORME 4 — Plancher EV sur le coupon final
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
 MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.95"))
 
-# 🔁 Double scan (solution B — conservée)
+# 🎯 NOUVEAU — Filtre proba AUTH (70-85% par défaut, configurable)
+AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "70.0"))
+AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "85.0"))
+AUTH_MAX_LEGS  = int(os.getenv("AUTH_MAX_LEGS", "5"))
+
+# 🔁 Double scan
 DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "25"))
 DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.15"))
 DOUBLE_SCAN_MIN_STABLE      = int(os.getenv("DOUBLE_SCAN_MIN_STABLE", "5"))
@@ -124,10 +125,10 @@ DRAW_MIN_PROB = 0.28
 
 # RÈGLES ODDS +3
 ODDS3_AUTH_MIN_COTE = 2.5
-ODDS3_AUTH_MAX_COTE = 3.2
+ODDS3_AUTH_MAX_COTE = 3.0   # 🎯 Modifié : 3.2 → 3.0 (comme demandé)
 ODDS3_HYB_MIN_COTE = 3.0
 ODDS3_HYB_MAX_COTE = 5.5
-ODDS3_MIN_COTE_LEG = 1.30  # Anti-Vague
+ODDS3_MIN_COTE_LEG = 1.30
 
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
@@ -280,7 +281,7 @@ STATE = {
     "tracker": {"coupons": []}, "keys": {}, "users": {},
     "scan_lock": asyncio.Lock(), "dixon_model": None, "last_scan_date": "",
     "double_scan_status": "", "double_scan_stats": {},
-    "rejections": {"value": 0, "ev_coupon": 0, "mtft_quality": 0},
+    "rejections": {"value": 0, "ev_coupon": 0, "mtft_quality": 0, "auth_proba": 0},
 }
 
 TARGETS = []
@@ -413,7 +414,7 @@ def prescore_match(md) -> int:
     return score
 
 # ═══════════════════════════════════════════════════════════════════
-# 🎯 RÉFORME 1 — Pondération 30/35/35 (remplace la moyenne simple)
+# 🎯 Pondération 30/35/35 (réforme 1 conservée)
 # ═══════════════════════════════════════════════════════════════════
 def compute_probability(md, market_key):
     gem = dix = bzz = 0.0
@@ -442,7 +443,6 @@ def compute_probability(md, market_key):
             bzz_avail = True
         except: pass
 
-    # Pondération 30/35/35, redistribuée automatiquement sur les sources présentes
     total_w = 0.0
     weighted_sum = 0.0
     if dix_avail:
@@ -460,7 +460,6 @@ def compute_probability(md, market_key):
 
     final = weighted_sum / total_w
 
-    # Emoji consensus (basé sur les sources brutes, pas la pondération)
     sources = []
     if gem_avail: sources.append(gem)
     if dix_avail: sources.append(dix)
@@ -476,64 +475,28 @@ def compute_probability(md, market_key):
     return final, gem, dix, bzz, emoji
 
 # ═══════════════════════════════════════════════════════════════════
-# 🎯 RÉFORME 3 — Filtre Value 5% (cotes réelles uniquement)
+# 🎯 Filtre Value 5% (réforme 3 conservée)
 # ═══════════════════════════════════════════════════════════════════
 def passes_value_filter(proba_0_1: float, odd: float, is_real_odd: bool) -> bool:
-    """Retourne True si le pari a assez de value (edge ≥ MIN_EDGE).
-    Ne s'applique PAS aux cotes estimées (on ne peut pas calculer d'edge dessus)."""
     if proba_0_1 <= 0 or odd <= 0: return False
     if not is_real_odd: return True
     ev = proba_0_1 * odd
     return ev >= (1.0 + MIN_EDGE)
 
 # ═══════════════════════════════════════════════════════════════════
-# 🎯 RÉFORME 4 — Plancher EV sur le coupon final
+# 🎯 Plancher EV coupon (réforme 4 conservée)
 # ═══════════════════════════════════════════════════════════════════
 def coupon_passes_ev(combined_odds: float, combined_prob: float) -> bool:
-    """Rejette les coupons dont l'EV est trop basse (perdants à long terme)."""
     if combined_odds <= 0 or combined_prob <= 0: return False
     return (combined_odds * combined_prob) >= MIN_COUPON_EV
 
 # ═══════════════════════════════════════════════════════════════════
-# 🎯 RÉFORME 2 — Vrai quality score MT-Fin (0-100 discriminant)
+# 🎯 NOUVEAU — Filtre proba AUTH [70%, 85%]
 # ═══════════════════════════════════════════════════════════════════
-def compute_mtft_quality_score(md, best_prob: float, best_pick: str, htft_probs: dict) -> int:
-    """Score 0-100 basé sur des critères RÉELS (plus de 'tout passe')."""
-    score = 0
-
-    # 1. Proba HT/FT réelle (0-40 pts)
-    if best_prob >= 0.65: score += 40
-    elif best_prob >= 0.55: score += 32
-    elif best_prob >= 0.45: score += 24
-    elif best_prob >= 0.35: score += 15
-    else: score += 8
-
-    # 2. Consensus HT/FT (marge pick 1 vs pick 2) (0-20 pts)
-    others = [htft_probs.get(c, 0) for c in ("V1/V1", "V2/V2") if c != best_pick]
-    second_best = max(others) if others else 0
-    margin = best_prob - second_best
-    if margin >= 0.15: score += 20
-    elif margin >= 0.10: score += 14
-    elif margin >= 0.05: score += 8
-    else: score += 3
-
-    # 3. Cote estimée (plus haute = plus de value potentielle) (0-15 pts)
-    est_odd = (1.0 / best_prob) if best_prob > 0 else 99
-    if est_odd >= 2.5: score += 15
-    elif est_odd >= 2.0: score += 12
-    elif est_odd >= 1.7: score += 8
-    else: score += 4
-
-    # 4. H2H disponible (0-10 pts)
-    if md.has_h2h: score += 10
-
-    # 5. Cotes réelles disponibles (0-15 pts)
-    has_home = md.real_odds.get("home") is not None
-    has_away = md.real_odds.get("away") is not None
-    if has_home and has_away: score += 15
-    elif has_home or has_away: score += 8
-
-    return min(100, score)
+def passes_auth_proba_filter(proba_0_100: float) -> bool:
+    """Filtre strict pour le ticket AUTH : proba entre AUTH_PROBA_MIN et AUTH_PROBA_MAX."""
+    if proba_0_100 <= 0: return False
+    return AUTH_PROBA_MIN <= proba_0_100 <= AUTH_PROBA_MAX
 
 # =====================================================================
 # ⏰ APIS DE COTES
@@ -831,7 +794,7 @@ async def enrich_with_double_pass(pool: list) -> list:
 
 
 # =====================================================================
-# 🎯 MOTEUR 1 : MT-FIN (réforme 2 + 3 appliquées)
+# 🎯 MOTEUR 1 : MT-FIN (⚙️ RÉTABLI À L'ANCIEN CALCUL)
 # =====================================================================
 def _poisson_sample(lam: float) -> int:
     if lam <= 0: return 0
@@ -861,7 +824,6 @@ def build_mtft_coupon_and_bonus(pool):
     picks = []
     bonus_pool = []
     rejected_value = 0
-    rejected_quality = 0
 
     for md in pool:
         if not md.home or not md.away or not md.dixon_pred: continue
@@ -880,11 +842,9 @@ def build_mtft_coupon_and_bonus(pool):
 
         if not best_pick or best_prob < MTFIN_MIN_PROB: continue
 
-        # 🎯 RÉFORME 2 — Quality score réel (0-100 discriminant)
-        pts = compute_mtft_quality_score(md, best_prob, best_pick, htft_probs)
-        if pts < MTFIN_MIN_SCORE:
-            rejected_quality += 1
-            continue
+        # ⚙️ RESTAURATION : ancien calcul de quality score
+        pts = 15 + (10 if md.has_h2h else 0) + 10 + (30 if best_prob >= 0.65 else 20) + 15 + 10
+        if pts < MTFIN_MIN_SCORE: continue
 
         est_odd = round(1.0 / best_prob, 2) if best_prob > 0 else 3.5
         picks.append({
@@ -925,7 +885,6 @@ def build_mtft_coupon_and_bonus(pool):
 
         if real_odd < ODDS3_MIN_COTE_LEG: continue
 
-        # 🎯 RÉFORME 3 — Filtre Value sur les jambes bonus
         if not passes_value_filter(fav_ft_prob, real_odd, is_real_odd=not is_est):
             rejected_value += 1
             continue
@@ -938,11 +897,10 @@ def build_mtft_coupon_and_bonus(pool):
         })
 
     STATE["rejections"]["value"] += rejected_value
-    STATE["rejections"]["mtft_quality"] += rejected_quality
     return coupon, bonus_pool
 
 # =====================================================================
-# 🎯 MOTEUR 2 : MATCH NUL (réforme 3 appliquée)
+# 🎯 MOTEUR 2 : MATCH NUL (inchangé)
 # =====================================================================
 def build_draw_coupon_and_bonus(pool):
     candidates = []
@@ -963,7 +921,6 @@ def build_draw_coupon_and_bonus(pool):
         if draw_odd < 3.10: continue
         if (home_odd and home_odd < 1.80) or (away_odd and away_odd < 1.80): continue
 
-        # 🎯 RÉFORME 3 — Filtre Value sur le nul
         if not passes_value_filter(prob_draw, draw_odd, is_real_odd=is_draw_real):
             rejected_value += 1
             continue
@@ -1003,7 +960,6 @@ def build_draw_coupon_and_bonus(pool):
 
         if dc12_odd < ODDS3_MIN_COTE_LEG: continue
 
-        # 🎯 RÉFORME 3 — Filtre Value sur DC12 (cote estimée → passe auto)
         if not passes_value_filter(prob_dc_12, dc12_odd, is_real_odd=False):
             rejected_value += 1
             continue
@@ -1019,7 +975,7 @@ def build_draw_coupon_and_bonus(pool):
     return coupon, bonus_pool
 
 # =====================================================================
-# 🎯 MOTEUR 3 : ODDS +3 (réforme 3 + tri EV réforme 5)
+# 🎯 MOTEUR 3 : ODDS +3 (inchangé pour third_pillar)
 # =====================================================================
 def build_third_pillar(pool) -> list:
     pool_result = []
@@ -1049,7 +1005,6 @@ def build_third_pillar(pool) -> list:
 
             if real_odd < ODDS3_MIN_COTE_LEG: continue
 
-            # 🎯 RÉFORME 3 — Filtre Value
             if not passes_value_filter(prob, real_odd, is_real_odd=not is_est):
                 rejected_value += 1
                 continue
@@ -1067,14 +1022,51 @@ def build_third_pillar(pool) -> list:
 
     STATE["rejections"]["value"] += rejected_value
 
-    # 🎯 RÉFORME 5 — Tri par EV (au lieu de proba brute)
     pool_result.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
     return pool_result[:3]
 
+# ═══════════════════════════════════════════════════════════════════
+# 🎯 NOUVEAU AUTH — Filtre proba [70-85%] + multi-jambes 2-5
+# ═══════════════════════════════════════════════════════════════════
+def _build_coupon_from_combo(combo, subtitle_prefix: str, quality: int, source_label: str):
+    """Helper : construit un Coupon AUTH à partir d'une liste de jambes validées."""
+    total_odds = 1.0
+    total_prob = 1.0
+    for c in combo:
+        total_odds *= c['odds']
+        total_prob *= (c['proba'] / 100.0)
+
+    if not coupon_passes_ev(total_odds, total_prob):
+        STATE["rejections"]["ev_coupon"] += 1
+        return None
+
+    legs = []
+    for c in combo:
+        m = c['match']
+        legs.append(Selection(
+            event_id=m.event_id if hasattr(m, 'event_id') else m.match_id,
+            league=m.league,
+            home=m.home if hasattr(m, 'home') else m.home_team,
+            away=m.away if hasattr(m, 'away') else m.away_team,
+            kickoff=c.get('kickoff', getattr(m, 'commence_time', '')),
+            market=c['type'],
+            pick_label=c['type'],
+            odds=c['odds'],
+            model_prob=c['proba']/100.0,
+            real_odd=c['real_odd'],
+            quality=quality,
+            analysis=c['ai']
+        ))
+    subtitle = f"{subtitle_prefix} • {len(combo)} jambes"
+    return Coupon("Odds +3 AUTH", subtitle, "🛡️", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
+
+
 def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) -> Optional[Coupon]:
-    # ÉTAPE 1 : WallStreet (The Odds API)
+    # ---------- ÉTAPE 1 : WallStreet (filtre proba [70-85%]) ----------
     if ws_matches:
         pool_ws = []
+        rejected_proba = 0
+
         for match in ws_matches:
             if not is_match_not_started(match.commence_time): continue
             if is_reserve_team(match.home_team) or is_reserve_team(match.away_team): continue
@@ -1084,108 +1076,90 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
             sim = dixon_ws.simulate(match)
             if not sim: continue
 
-            base_conf = max(sim.proba_home, sim.proba_draw, sim.proba_away)
-            if base_conf < 50.0: continue
+            candidates_this_match = [
+                (match.home_odds, sim.proba_home, f"Victoire {match.home_team} (1)", "Analyse mathématique (Dixon)."),
+                (match.away_odds, sim.proba_away, f"Victoire {match.away_team} (2)", "Analyse mathématique (Dixon)."),
+                (match.over_2_5, sim.proba_over_2_5, "Plus de 2.5 buts", "Match ouvert."),
+                (match.btts_yes, sim.proba_btts, "BTTS Oui", "Attaques prolifiques."),
+            ]
 
-            p_home, p_draw, p_away = sim.proba_home, sim.proba_draw, sim.proba_away
+            for odd, proba, label, ai in candidates_this_match:
+                if not odd: continue
+                if not passes_auth_proba_filter(proba):
+                    rejected_proba += 1
+                    continue
+                pool_ws.append({
+                    "match": match, "type": label, "odds": odd, "proba": proba,
+                    "ai": ai, "real_odd": odd, "kickoff": match.commence_time
+                })
 
-            if match.home_odds and p_home >= 55.0:
-                pool_ws.append({"match": match, "type": f"Victoire {match.home_team} (1)", "odds": match.home_odds, "proba": p_home, "ai": "Analyse mathématique (Dixon).", "real_odd": match.home_odds})
-            if match.away_odds and p_away >= 55.0:
-                pool_ws.append({"match": match, "type": f"Victoire {match.away_team} (2)", "odds": match.away_odds, "proba": p_away, "ai": "Analyse mathématique (Dixon).", "real_odd": match.away_odds})
-            if match.over_2_5 and sim.proba_over_2_5 >= 60.0:
-                pool_ws.append({"match": match, "type": "Plus de 2.5 buts", "odds": match.over_2_5, "proba": sim.proba_over_2_5, "ai": "Match ouvert.", "real_odd": match.over_2_5})
-            if match.btts_yes and sim.proba_btts >= 62.0:
-                pool_ws.append({"match": match, "type": "BTTS Oui", "odds": match.btts_yes, "proba": sim.proba_btts, "ai": "Attaques prolifiques.", "real_odd": match.btts_yes})
+        STATE["rejections"]["auth_proba"] += rejected_proba
 
         if len(pool_ws) >= 2:
-            # 🎯 RÉFORME 5 — Tri par EV
             pool_ws.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
-            print(f"  🔍 AUTH WallStreet : {len(pool_ws)} candidats (vraies cotes)")
+            print(f"  🔍 AUTH WallStreet : {len(pool_ws)} candidats (filtre proba [{AUTH_PROBA_MIN}-{AUTH_PROBA_MAX}%])")
 
-            for combo in itertools.combinations(pool_ws[:15], 2):
-                match_ids = [c['match'].match_id for c in combo]
-                if len(set(match_ids)) != len(match_ids): continue
-                total_odds = combo[0]['odds'] * combo[1]['odds']
-                if ODDS3_AUTH_MIN_COTE <= total_odds <= ODDS3_AUTH_MAX_COTE:
-                    prob = (combo[0]['proba']/100.0) * (combo[1]['proba']/100.0)
+            # Essayer 2, 3, 4, 5 jambes dans l'ordre
+            for num_legs in range(2, AUTH_MAX_LEGS + 1):
+                if len(pool_ws) < num_legs: break
+                for combo in itertools.combinations(pool_ws[:15], num_legs):
+                    match_ids = [c['match'].match_id for c in combo]
+                    if len(set(match_ids)) != len(match_ids): continue
+                    total_odds = 1.0
+                    for x in combo: total_odds *= x['odds']
+                    if not (ODDS3_AUTH_MIN_COTE <= total_odds <= ODDS3_AUTH_MAX_COTE): continue
 
-                    # 🎯 RÉFORME 4 — Plancher EV coupon
-                    if not coupon_passes_ev(total_odds, prob):
-                        STATE["rejections"]["ev_coupon"] += 1
-                        continue
+                    coupon = _build_coupon_from_combo(combo, "WallStreet (vraies cotes)", 95, "WS")
+                    if coupon:
+                        print(f"  ✅ AUTH OK (WallStreet {num_legs}j) : cote {round(total_odds, 2)}, "
+                              f"EV {round(total_odds*coupon.combined_prob, 2)}")
+                        return coupon
 
-                    legs = [Selection(
-                        event_id=c['match'].match_id, league=c['match'].league,
-                        home=c['match'].home_team, away=c['match'].away_team,
-                        kickoff=c['match'].commence_time, market=c['type'],
-                        pick_label=c['type'], odds=c['odds'], model_prob=c['proba']/100.0,
-                        real_odd=c['real_odd'], quality=95, analysis=c['ai']
-                    ) for c in combo]
-                    print(f"  ✅ AUTH OK (WallStreet) : {len(legs)} legs, cote {round(total_odds, 2)}, EV {round(total_odds*prob, 2)}")
-                    return Coupon("Odds +3 AUTH", "Moteur WallStreet (vraies cotes)", "🛡️", legs, round(total_odds, 2), round(prob, 4), show_analysis=True)
-
-        print(f"  ⚠️ AUTH : WallStreet présent mais aucune combo dans [2.5-3.2] → fallback")
+        print(f"  ⚠️ AUTH : WallStreet présent mais aucune combo valide → fallback")
     else:
         print(f"  ⚠️ AUTH : The Odds API HS → fallback sur cotes estimées")
 
-    # ÉTAPE 2 : Fallback
+    # ---------- ÉTAPE 2 : Fallback (bonus MT-Fin + Nul + Bzzoiro) ----------
     combined = bonus_mtft + bonus_draw + third_pillar
     if not combined:
         print("  ❌ AUTH : pool fallback vide")
         return None
 
-    # 🎯 RÉFORME 5 — Tri par EV
-    combined.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
-    print(f"  🔍 AUTH Fallback : {len(combined)} candidats (cotes estimées)")
+    # Filtre proba [70-85%] sur les bonus
+    filtered_combined = []
+    rejected_proba = 0
+    for c in combined:
+        proba = c.get('proba', 0)
+        if not passes_auth_proba_filter(proba):
+            rejected_proba += 1
+            continue
+        filtered_combined.append(c)
 
-    for combo in itertools.combinations(combined[:10], 2):
-        match_ids = [c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id for c in combo]
-        if len(set(match_ids)) != len(match_ids): continue
-        total_odds = combo[0]['odds'] * combo[1]['odds']
-        if ODDS3_AUTH_MIN_COTE <= total_odds <= ODDS3_AUTH_MAX_COTE:
-            prob = (combo[0]['proba']/100.0) * (combo[1]['proba']/100.0)
+    STATE["rejections"]["auth_proba"] += rejected_proba
 
-            # 🎯 RÉFORME 4 — Plancher EV
-            if not coupon_passes_ev(total_odds, prob):
-                STATE["rejections"]["ev_coupon"] += 1
-                continue
+    if not filtered_combined:
+        print(f"  ❌ AUTH : aucun bonus ne passe le filtre proba [{AUTH_PROBA_MIN}-{AUTH_PROBA_MAX}%]")
+        return None
 
-            legs = [Selection(
-                event_id=c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id,
-                league=c['match'].league,
-                home=c['match'].home if hasattr(c['match'], 'home') else c['match'].home_team,
-                away=c['match'].away if hasattr(c['match'], 'away') else c['match'].away_team,
-                kickoff=c.get('kickoff', ''), market=c['type'], pick_label=c['type'], odds=c['odds'],
-                model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
-            ) for c in combo]
-            print(f"  ✅ AUTH OK (Fallback 2 legs) : cote {round(total_odds, 2)}, EV {round(total_odds*prob, 2)}")
-            return Coupon("Odds +3 AUTH", "Fallback (cotes estimées Bzzoiro)", "🛡️", legs, round(total_odds, 2), round(prob, 4), show_analysis=True)
+    filtered_combined.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
+    print(f"  🔍 AUTH Fallback : {len(filtered_combined)} candidats après filtre proba")
 
-    for combo in itertools.combinations(combined[:8], 3):
-        match_ids = [c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id for c in combo]
-        if len(set(match_ids)) != len(match_ids): continue
-        total_odds = combo[0]['odds'] * combo[1]['odds'] * combo[2]['odds']
-        if ODDS3_AUTH_MIN_COTE <= total_odds <= ODDS3_AUTH_MAX_COTE:
-            prob = (combo[0]['proba']/100.0) * (combo[1]['proba']/100.0) * (combo[2]['proba']/100.0)
+    for num_legs in range(2, AUTH_MAX_LEGS + 1):
+        if len(filtered_combined) < num_legs: break
+        for combo in itertools.combinations(filtered_combined[:12], num_legs):
+            match_ids = [c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id for c in combo]
+            if len(set(match_ids)) != len(match_ids): continue
+            total_odds = 1.0
+            for x in combo: total_odds *= x['odds']
+            if not (ODDS3_AUTH_MIN_COTE <= total_odds <= ODDS3_AUTH_MAX_COTE): continue
 
-            # 🎯 RÉFORME 4 — Plancher EV
-            if not coupon_passes_ev(total_odds, prob):
-                STATE["rejections"]["ev_coupon"] += 1
-                continue
+            coupon = _build_coupon_from_combo(combo, "Fallback (cotes estimées)", 90, "FB")
+            if coupon:
+                print(f"  ✅ AUTH OK (Fallback {num_legs}j) : cote {round(total_odds, 2)}, "
+                      f"EV {round(total_odds*coupon.combined_prob, 2)}")
+                return coupon
 
-            legs = [Selection(
-                event_id=c['match'].event_id if hasattr(c['match'], 'event_id') else c['match'].match_id,
-                league=c['match'].league,
-                home=c['match'].home if hasattr(c['match'], 'home') else c['match'].home_team,
-                away=c['match'].away if hasattr(c['match'], 'away') else c['match'].away_team,
-                kickoff=c.get('kickoff', ''), market=c['type'], pick_label=c['type'], odds=c['odds'],
-                model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
-            ) for c in combo]
-            print(f"  ✅ AUTH OK (Fallback 3 legs) : cote {round(total_odds, 2)}, EV {round(total_odds*prob, 2)}")
-            return Coupon("Odds +3 AUTH", "Fallback (cotes estimées Bzzoiro)", "🛡️", legs, round(total_odds, 2), round(prob, 4), show_analysis=True)
-
-    print(f"  ❌ AUTH : aucune combo valide (EV ou range)")
+    print(f"  ❌ AUTH : aucune combo valide (filtre proba [{AUTH_PROBA_MIN}-{AUTH_PROBA_MAX}%] + cote [{ODDS3_AUTH_MIN_COTE}-{ODDS3_AUTH_MAX_COTE}])")
     return None
 
 def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[Coupon]:
@@ -1226,7 +1200,6 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
                             model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
                         ))
 
-                    # 🎯 RÉFORME 4 — Plancher EV
                     if not coupon_passes_ev(total_odds, total_prob):
                         STATE["rejections"]["ev_coupon"] += 1
                         continue
@@ -1234,7 +1207,6 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
                     print(f"  ✅ HYBRIDE OK (mixité 3 sources) : {len(legs)} legs, cote {round(total_odds, 2)}, EV {round(total_odds*total_prob, 2)}")
                     return Coupon("Odds +3 HYBRIDE", "Mélange MT-Fin + Nul + Bzzoiro", "🎯", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
 
-    # 🎯 RÉFORME 5 — Tri par EV
     combined.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
     for r in range(3, min(len(combined), 5) + 1):
         for combo in itertools.combinations(combined[:15], r):
@@ -1258,7 +1230,6 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
                         model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
                     ))
 
-                # 🎯 RÉFORME 4 — Plancher EV
                 if not coupon_passes_ev(total_odds, total_prob):
                     STATE["rejections"]["ev_coupon"] += 1
                     continue
@@ -1283,7 +1254,6 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
                 model_prob=c['proba']/100.0, real_odd=c['real_odd'], quality=90, analysis=c['ai']
             ))
 
-        # 🎯 RÉFORME 4 — Plancher EV
         if not coupon_passes_ev(total_odds, total_prob):
             STATE["rejections"]["ev_coupon"] += 1
             print(f"  ❌ HYBRIDE fallback rejeté par EV ({round(total_odds*total_prob, 2)})")
@@ -1299,8 +1269,7 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
 # =====================================================================
 async def scan():
     async with STATE["scan_lock"]:
-        # Reset compteurs de rejets
-        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "mtft_quality": 0}
+        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "mtft_quality": 0, "auth_proba": 0}
 
         print("⏰ Tentative The Odds API...")
         ws_matches, odds_status = await fetch_real_odds_matches()
@@ -1387,7 +1356,7 @@ async def scan():
         print(f"Double scan : {STATE.get('double_scan_status', 'N/A')}")
         print(f"Rejets : Value={STATE['rejections']['value']}, "
               f"EV={STATE['rejections']['ev_coupon']}, "
-              f"MT-Fin Quality={STATE['rejections']['mtft_quality']}")
+              f"AUTH proba={STATE['rejections']['auth_proba']}")
         print("────────────────────────")
 
 # =====================================================================
@@ -1458,7 +1427,6 @@ def format_coupon(c):
         lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", "", f"<b>🎯 {len(c.legs)} pronostics</b>", ""]
         for i, s in enumerate(c.legs, 1): lines.append(format_selection_block(s, i, getattr(c, "show_analysis", False)) + "\n")
     else:
-        # 🎯 RÉFORME 4 — Affichage EV sur coupons combinés
         ev = c.combined_odds * c.combined_prob if (c.combined_odds > 0 and c.combined_prob > 0) else 0
         ev_badge = f"<b>┃ 💎 EV : {ev:.2f}</b>" if ev > 0 else ""
 
@@ -1543,7 +1511,7 @@ async def b_odds3(m):
     if c_auth:
         await safe_answer(m, format_coupon(c_auth))
     else:
-        await safe_answer(m, "📭 Aucun coupon AUTHENTIQUE disponible pour le moment.\n\n<i>🛡️ Nos filtres qualité (Value 5% + EV) n'ont laissé passer aucun ticket. On préfère 0 ticket qu'un mauvais pari.</i>")
+        await safe_answer(m, "📭 Aucun coupon AUTHENTIQUE disponible pour le moment.\n\n<i>🛡️ Filtres actifs : proba 70-85% par jambe + cote 2.5-3.0 + EV ≥ 0.95. Aucun match ne réunit ces conditions aujourd'hui.</i>")
 
     if m.from_user.id == ADMIN_ID:
         await asyncio.sleep(1)
@@ -1572,7 +1540,7 @@ async def b_bilan(m):
 @dp.message(F.text == BTN_SCAN)
 async def b_scan(m):
     if m.from_user.id != ADMIN_ID: return
-    await safe_answer(m, "⏳ <b>Double scan + filtres qualité en cours...</b>\n\n🔁 2 passes × 25 matchs\n🛡️ Value 5% + EV 0.95\n⏱️ Compte environ 2-3 minutes.")
+    await safe_answer(m, "⏳ <b>Double scan + filtres qualité en cours...</b>\n\n🔁 2 passes × 25 matchs\n🛡️ AUTH : proba 70-85% + cote 2.5-3.0\n⏱️ Compte environ 2-3 minutes.")
     await scan()
     await broadcast_after_scan()
 
@@ -1601,11 +1569,14 @@ async def b_debug(m):
     filtres_lines = (
         f"\n\n<b>🛡️ FILTRES QUALITÉ</b>\n"
         f"• Pondération : <b>Dixon 30% / Gemini 35% / Bzzoiro 35%</b>\n"
+        f"• AUTH proba : <b>{AUTH_PROBA_MIN:.0f}-{AUTH_PROBA_MAX:.0f}%</b>\n"
+        f"• AUTH cote : <b>{ODDS3_AUTH_MIN_COTE}-{ODDS3_AUTH_MAX_COTE}</b>\n"
+        f"• AUTH max jambes : <b>{AUTH_MAX_LEGS}</b>\n"
         f"• Edge min (value) : <b>{MIN_EDGE*100:.1f}%</b>\n"
         f"• EV coupon min : <b>{MIN_COUPON_EV}</b>\n"
-        f"• Jambes rejetées value : <b>{rej.get('value', 0)}</b>\n"
-        f"• Coupons rejetés EV : <b>{rej.get('ev_coupon', 0)}</b>\n"
-        f"• MT-Fin rejetés (qualité) : <b>{rej.get('mtft_quality', 0)}</b>"
+        f"• Rejets value : <b>{rej.get('value', 0)}</b>\n"
+        f"• Rejets EV coupon : <b>{rej.get('ev_coupon', 0)}</b>\n"
+        f"• Rejets AUTH proba : <b>{rej.get('auth_proba', 0)}</b>"
     )
 
     await safe_answer(m,
@@ -1620,7 +1591,7 @@ async def b_debug(m):
 @dp.message(Command("scan"))
 async def scan_cmd(m):
     if m.from_user.id != ADMIN_ID: return
-    await safe_answer(m, "⏳ <b>Double scan + filtres qualité en cours...</b>\n\n🔁 2 passes × 25 matchs\n🛡️ Value 5% + EV 0.95\n⏱️ Compte environ 2-3 minutes.")
+    await safe_answer(m, "⏳ <b>Double scan + filtres qualité en cours...</b>\n\n🔁 2 passes × 25 matchs\n🛡️ AUTH : proba 70-85% + cote 2.5-3.0\n⏱️ Compte environ 2-3 minutes.")
     await scan()
     await broadcast_after_scan()
 
@@ -1643,7 +1614,8 @@ async def lifespan(app):
     STATE["ready"] = True
     print("✅ Bot prêt.")
     print(f"🔁 Double scan : {DOUBLE_SCAN_POOL_SIZE} matchs × 2 passes (seuil strict={DOUBLE_SCAN_MIN_STABLE})")
-    print(f"🛡️ Filtres : pondération 30/35/35, value>={MIN_EDGE*100:.0f}%, EV>={MIN_COUPON_EV}")
+    print(f"🛡️ AUTH : proba {AUTH_PROBA_MIN:.0f}-{AUTH_PROBA_MAX:.0f}%, "
+          f"cote {ODDS3_AUTH_MIN_COTE}-{ODDS3_AUTH_MAX_COTE}, max {AUTH_MAX_LEGS} jambes")
 
     scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(
@@ -1697,6 +1669,13 @@ async def root():
         "double_scan": STATE.get("double_scan_status"),
         "double_scan_stats": STATE.get("double_scan_stats", {}),
         "rejections": STATE.get("rejections", {}),
+        "auth_config": {
+            "proba_min": AUTH_PROBA_MIN,
+            "proba_max": AUTH_PROBA_MAX,
+            "cote_min": ODDS3_AUTH_MIN_COTE,
+            "cote_max": ODDS3_AUTH_MAX_COTE,
+            "max_legs": AUTH_MAX_LEGS
+        },
         "coupons": [c.name for c in STATE["coupons"]]
     }
 
