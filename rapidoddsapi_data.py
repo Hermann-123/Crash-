@@ -1,9 +1,8 @@
 """
 RapidOddsAPI Data — Cotes réelles de bookmakers
 Docs : https://rapidoddsapi.com
-Auth : query parameter `api_key` (clé commençant par `oa_`)
+Auth : query parameter `api_key`
 Base URL : https://api.rapidoddsapi.com
-Free tier : 250 crédits/mois, pas de carte requise[reference:2]
 """
 from __future__ import annotations
 
@@ -75,19 +74,11 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dic
 
 
 async def fetch_all_odds(matches: list[dict] = None) -> object:
-    """
-    Récupère les cotes 1X2 et Totals pour le soccer.
-    Retourne :
-      - sans matches -> list[dict] (tous les matchs avec cotes)
-      - avec matches -> {event_id: odds_dict} matché par noms
-    """
     if not RAPIDODDS_API_KEY:
         print("⚠️ RapidOddsAPI : RAPIDODDSAPI_API_KEY manquante")
         return [] if matches is None else {}
 
     async with httpx.AsyncClient(timeout=25.0) as client:
-        # 1. Récupérer les matchs de soccer avec les marchés 1X2 et Totals
-        # Le free tier permet 5 bookmakers par défaut. On demande les 5 les plus courants.
         data = await _get(client, "/sports/soccer/markets", {
             "market_types": "head_to_head_3_way,totals",
             "bookmakers": "bet365,pinnacle,draftkings,betmgm,fanduel",
@@ -97,7 +88,6 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
             print("⚠️ RapidOddsAPI : aucune donnée retournée")
             return [] if matches is None else {}
 
-        # Debug : afficher la structure globale une seule fois
         global _DEBUG_DONE
         if not _DEBUG_DONE:
             print(f"🔎 RapidOddsAPI — clés racine : {list(data.keys())}")
@@ -105,10 +95,6 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
                 sample_game = data["games"][0]
                 print(f"🔎 Exemple game : home={sample_game.get('game', {}).get('home_team')} "
                       f"away={sample_game.get('game', {}).get('away_team')}")
-                if sample_game.get("bookmakers"):
-                    sample_bk = sample_game["bookmakers"][0]
-                    print(f"🔎 Bookmaker exemple : {sample_bk.get('name')}, "
-                          f"marchés : {[m.get('market_type') for m in sample_bk.get('markets', [])]}")
             _DEBUG_DONE = True
 
         games = data.get("games", [])
@@ -118,7 +104,6 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
 
         print(f"🔎 RapidOddsAPI : {len(games)} matchs bruts reçus")
 
-        # 2. Construire les events avec cotes
         events_data = []
         for entry in games:
             game = entry.get("game", {})
@@ -193,7 +178,6 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
         if matches is None:
             return events_data
 
-        # 3. Matching par noms (pour l'injection dans le pool Bzzoiro)
         results = {}
         for m in matches:
             target_home = _norm(m.get("home", ""))
