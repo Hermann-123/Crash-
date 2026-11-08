@@ -1,8 +1,9 @@
 """
-Odds-API.io Data — Cotes réelles de bookmakers
-Docs : https://docs.odds-api.io
-Auth : apiKey en query parameter
-Free tier : 100 req/h, 500 req/jour
+RapidOddsAPI Data — Cotes réelles de bookmakers
+Docs : https://rapidoddsapi.com
+Auth : query parameter `api_key` (clé commençant par `oa_`)
+Base URL : https://api.rapidoddsapi.com
+Free tier : 250 crédits/mois, pas de carte requise[reference:2]
 """
 from __future__ import annotations
 
@@ -15,10 +16,9 @@ from typing import Optional
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
-ODDSAPI_BASE_URL = "https://api.odds-api.io/v3"
-ODDSAPI_KEY = os.getenv("ODDSAPI_KEY", "")
+RAPIDODDS_BASE_URL = "https://api.rapidoddsapi.com"
+RAPIDODDS_API_KEY = os.getenv("RAPIDODDSAPI_API_KEY", "")
 
-CACHE: dict = {}
 _DEBUG_DONE = False
 
 
@@ -58,173 +58,142 @@ def _is_in_future(date_str: str, buffer_min: int = 10) -> bool:
 
 async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dict:
     params = params or {}
-    params["apiKey"] = ODDSAPI_KEY
+    params["api_key"] = RAPIDODDS_API_KEY
 
     try:
-        r = await client.get(f"{ODDSAPI_BASE_URL}{path}", params=params, timeout=25.0)
+        r = await client.get(f"{RAPIDODDS_BASE_URL}{path}", params=params, timeout=25.0)
         if r.status_code == 429:
-            print("⚠️ Odds-API.io RATE LIMIT (429)")
+            print("⚠️ RapidOddsAPI RATE LIMIT (30 req/s)")
             return {}
         if r.status_code >= 400:
-            print(f"⚠️ Odds-API.io {path} -> {r.status_code} | {r.text[:150]}")
+            print(f"⚠️ RapidOddsAPI {path} -> {r.status_code} | {r.text[:150]}")
             return {}
         return r.json() if r.text else {}
     except Exception as e:
-        print(f"⚠️ Odds-API.io {path} crash: {e}")
+        print(f"⚠️ RapidOddsAPI {path} crash: {e}")
         return {}
-
-
-def _parse_odds_item(item: dict) -> dict:
-    """Parse une ligne de cote Odds-API.io (format : {home, draw, away} ou {over, under})"""
-    return {
-        "home": _safe_float(item.get("home")),
-        "draw": _safe_float(item.get("draw")),
-        "away": _safe_float(item.get("away")),
-        "over": _safe_float(item.get("over")),
-        "under": _safe_float(item.get("under")),
-        "yes": _safe_float(item.get("yes")),
-        "no": _safe_float(item.get("no")),
-    }
 
 
 async def fetch_all_odds(matches: list[dict] = None) -> object:
     """
-    API publique :
-      - sans matches  -> list[dict] (tous les matchs avec cotes)
-      - avec matches  -> {event_id: odds_dict} matché par noms
+    Récupère les cotes 1X2 et Totals pour le soccer.
+    Retourne :
+      - sans matches -> list[dict] (tous les matchs avec cotes)
+      - avec matches -> {event_id: odds_dict} matché par noms
     """
-    if not ODDSAPI_KEY:
-        print("⚠️ Odds-API.io : ODDSAPI_KEY manquante")
+    if not RAPIDODDS_API_KEY:
+        print("⚠️ RapidOddsAPI : RAPIDODDSAPI_API_KEY manquante")
         return [] if matches is None else {}
 
     async with httpx.AsyncClient(timeout=25.0) as client:
-        # 1. Récupérer les événements de football à venir
-        events_data = await _get(client, "/events", {
-            "sport": "football",
-            "status": "pending",
+        # 1. Récupérer les matchs de soccer avec les marchés 1X2 et Totals
+        # Le free tier permet 5 bookmakers par défaut. On demande les 5 les plus courants.
+        data = await _get(client, "/sports/soccer/markets", {
+            "market_types": "head_to_head_3_way,totals",
+            "bookmakers": "bet365,pinnacle,draftkings,betmgm,fanduel",
         })
 
-        if not isinstance(events_data, list):
-            print("⚠️ Odds-API.io : réponse /events invalide")
+        if not data:
+            print("⚠️ RapidOddsAPI : aucune donnée retournée")
             return [] if matches is None else {}
 
-        print(f"🔎 Odds-API.io : {len(events_data)} événements football trouvés")
-
-        # 2. Filtrer les événements futurs
-        upcoming = [
-            ev for ev in events_data
-            if _is_in_future(ev.get("date", ""), buffer_min=10)
-        ]
-        print(f"🔎 Odds-API.io : {len(upcoming)} événements futurs (après filtre)")
-
-        if not upcoming:
-            return [] if matches is None else {}
-
-        # 3. Récupérer les cotes par lots de 10 via /odds/multi (1 requête = 10 events)
-        events_data_list = []
-        batch_size = 10
-        for i in range(0, len(upcoming), batch_size):
-            batch = upcoming[i:i + batch_size]
-            ids = [str(ev.get("id")) for ev in batch if ev.get("id")]
-            if not ids:
-                continue
-
-            odds_resp = await _get(client, "/odds/multi", {
-                "eventIds": ",".join(ids),
-            })
-
-            if not isinstance(odds_resp, list):
-                continue
-
-            for ev_odds in odds_resp:
-                ev_id = ev_odds.get("id")
-                if not ev_id:
-                    continue
-
-                home_team = ev_odds.get("home", "")
-                away_team = ev_odds.get("away", "")
-                league = ev_odds.get("league", {}).get("name", "")
-                commence_time = ev_odds.get("date", "")
-
-                home_odds = draw_odds = away_odds = None
-                over_25 = under_25 = None
-                btts_yes = btts_no = None
-
-                bookmakers = ev_odds.get("bookmakers", {})
-                if isinstance(bookmakers, dict):
-                    for bk_name, bk_data in bookmakers.items():
-                        if not isinstance(bk_data, dict):
-                            continue
-                        markets = bk_data.get("markets", {})
-                        if not isinstance(markets, dict):
-                            continue
-
-                        # ML (Moneyline / 1X2)
-                        ml = markets.get("ML") or markets.get("ml")
-                        if isinstance(ml, list) and ml:
-                            for line in ml:
-                                parsed = _parse_odds_item(line)
-                                if home_odds is None and parsed["home"]: home_odds = parsed["home"]
-                                if draw_odds is None and parsed["draw"]: draw_odds = parsed["draw"]
-                                if away_odds is None and parsed["away"]: away_odds = parsed["away"]
-
-                        # Totals (Over/Under 2.5)
-                        totals = markets.get("Totals") or markets.get("totals")
-                        if isinstance(totals, list) and totals:
-                            for line in totals:
-                                hdp = line.get("hdp")
-                                try:
-                                    hdp_f = float(hdp) if hdp is not None else None
-                                except (ValueError, TypeError):
-                                    hdp_f = None
-                                if hdp_f == 2.5:
-                                    parsed = _parse_odds_item(line)
-                                    if over_25 is None and parsed["over"]: over_25 = parsed["over"]
-                                    if under_25 is None and parsed["under"]: under_25 = parsed["under"]
-
-                        # BTTS
-                        btts = markets.get("BTTS") or markets.get("btts") or markets.get("Both Teams to Score")
-                        if isinstance(btts, list) and btts:
-                            for line in btts:
-                                parsed = _parse_odds_item(line)
-                                if btts_yes is None and parsed["yes"]: btts_yes = parsed["yes"]
-                                if btts_no is None and parsed["no"]: btts_no = parsed["no"]
-
-                        if home_odds and draw_odds and away_odds:
-                            break
-
-                if home_odds and draw_odds and away_odds:
-                    events_data_list.append({
-                        "match_id": f"oa_{ev_id}",
-                        "league": league,
-                        "home_team": home_team,
-                        "away_team": away_team,
-                        "home_odds": home_odds,
-                        "draw_odds": draw_odds,
-                        "away_odds": away_odds,
-                        "over_2_5": over_25,
-                        "under_2_5": under_25,
-                        "btts_yes": btts_yes,
-                        "btts_no": btts_no,
-                        "commence_time": commence_time,
-                    })
-
-            await asyncio.sleep(1.0)  # respect rate limit
-
-        print(f"✅ Odds-API.io : {len(events_data_list)} matchs avec cotes 1X2 complètes")
-
-        # Debug 1 seule fois
+        # Debug : afficher la structure globale une seule fois
         global _DEBUG_DONE
-        if not _DEBUG_DONE and events_data_list:
-            sample = events_data_list[0]
-            print(f"🔎 Exemple : {sample['home_team']} vs {sample['away_team']} "
-                  f"({sample['home_odds']}/{sample['draw_odds']}/{sample['away_odds']})")
+        if not _DEBUG_DONE:
+            print(f"🔎 RapidOddsAPI — clés racine : {list(data.keys())}")
+            if "games" in data and data["games"]:
+                sample_game = data["games"][0]
+                print(f"🔎 Exemple game : home={sample_game.get('game', {}).get('home_team')} "
+                      f"away={sample_game.get('game', {}).get('away_team')}")
+                if sample_game.get("bookmakers"):
+                    sample_bk = sample_game["bookmakers"][0]
+                    print(f"🔎 Bookmaker exemple : {sample_bk.get('name')}, "
+                          f"marchés : {[m.get('market_type') for m in sample_bk.get('markets', [])]}")
             _DEBUG_DONE = True
 
-        if matches is None:
-            return events_data_list
+        games = data.get("games", [])
+        if not isinstance(games, list):
+            print("⚠️ RapidOddsAPI : 'games' n'est pas une liste")
+            return [] if matches is None else {}
 
-        # Matching par noms
+        print(f"🔎 RapidOddsAPI : {len(games)} matchs bruts reçus")
+
+        # 2. Construire les events avec cotes
+        events_data = []
+        for entry in games:
+            game = entry.get("game", {})
+            home_team = game.get("home_team", "")
+            away_team = game.get("away_team", "")
+            commence_time = game.get("start_time") or game.get("commence_time", "")
+            league = game.get("league", "Soccer")
+
+            if not home_team or not away_team:
+                continue
+            if not _is_in_future(commence_time, buffer_min=10):
+                continue
+
+            home_odds = draw_odds = away_odds = None
+            over_25 = under_25 = None
+
+            for book in entry.get("bookmakers", []):
+                for market in book.get("markets", []):
+                    mtype = (market.get("market_type") or "").lower()
+                    outcomes = market.get("outcomes", [])
+
+                    if mtype == "head_to_head_3_way":
+                        for out in outcomes:
+                            name = (out.get("name") or "").lower()
+                            price = _safe_float(out.get("price"))
+                            if not price:
+                                continue
+                            if name in ("home", "1") or _norm(home_team) in name:
+                                if home_odds is None: home_odds = price
+                            elif name in ("draw", "x", "tie"):
+                                if draw_odds is None: draw_odds = price
+                            elif name in ("away", "2") or _norm(away_team) in name:
+                                if away_odds is None: away_odds = price
+
+                    elif mtype == "totals":
+                        for out in outcomes:
+                            name = (out.get("name") or "").lower()
+                            price = _safe_float(out.get("price"))
+                            line = out.get("line") or out.get("handicap")
+                            try:
+                                line_f = float(line) if line is not None else None
+                            except (ValueError, TypeError):
+                                line_f = None
+                            if line_f != 2.5:
+                                continue
+                            if "over" in name and over_25 is None:
+                                over_25 = price
+                            elif "under" in name and under_25 is None:
+                                under_25 = price
+
+                if home_odds and draw_odds and away_odds:
+                    break
+
+            if home_odds and draw_odds and away_odds:
+                events_data.append({
+                    "match_id": f"rapid_{_norm(home_team)}__{_norm(away_team)}",
+                    "league": league,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_odds": home_odds,
+                    "draw_odds": draw_odds,
+                    "away_odds": away_odds,
+                    "over_2_5": over_25,
+                    "under_2_5": under_25,
+                    "btts_yes": None,
+                    "btts_no": None,
+                    "commence_time": commence_time,
+                })
+
+        print(f"✅ RapidOddsAPI : {len(events_data)} matchs avec cotes 1X2 complètes")
+
+        if matches is None:
+            return events_data
+
+        # 3. Matching par noms (pour l'injection dans le pool Bzzoiro)
         results = {}
         for m in matches:
             target_home = _norm(m.get("home", ""))
@@ -233,7 +202,7 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
                 continue
 
             best, best_score = None, 0
-            for ev in events_data_list:
+            for ev in events_data:
                 h = _norm(ev["home_team"])
                 a = _norm(ev["away_team"])
                 score = 0
@@ -253,5 +222,5 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
                     "btts_no": best["btts_no"],
                 }
 
-        print(f"📊 Odds-API.io matching : {len(results)}/{len(matches)} matchs avec cotes")
+        print(f"📊 RapidOddsAPI matching : {len(results)}/{len(matches)} matchs avec cotes")
         return results
