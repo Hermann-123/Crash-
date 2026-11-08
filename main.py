@@ -55,6 +55,13 @@ except Exception as e:
     print(f"❌ odds_fallback: {e}")
 
 try:
+    from sharpapi_data import fetch_all_odds as fetch_sharpapi_odds_data
+    print("✅ sharpapi_data chargé")
+except Exception as e:
+    fetch_sharpapi_odds_data = None
+    print(f"❌ sharpapi_data: {e}")
+
+try:
     from dixon_coles import download_and_train
 except Exception as e:
     download_and_train = None
@@ -70,9 +77,8 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "99f9731b68429ed4aaf0383cd7ca8c
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "5968288964")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "-1003982738017")
 
-# 🔑 SharpAPI (remplace The Odds API)
+# SharpAPI
 SHARPAPI_KEY = os.getenv("SHARPAPI_KEY", "")
-SHARPAPI_BASE_URL = "https://api.sharpapi.io/api/v1"
 
 try: ADMIN_ID = int(TELEGRAM_ADMIN_ID)
 except ValueError: ADMIN_ID = 0
@@ -483,151 +489,52 @@ def passes_auth_proba_filter(proba_0_100: float) -> bool:
     return AUTH_PROBA_MIN <= proba_0_100 <= AUTH_PROBA_MAX
 
 # =====================================================================
-# 🔑 SHARPAPI — RÉCUPÉRATION DES COTES RÉELLES
+# 🔑 SHARPAPI — WRAPPER VERS sharpapi_data.py
 # =====================================================================
 async def fetch_sharpapi_odds() -> Tuple[list, str]:
-    """
-    Récupère les cotes réelles depuis SharpAPI.
-    Free tier : DraftKings + FanDuel, 12 req/min, délai 60s.
-    Sport = 'soccer' (football européen).
-    """
+    """Appelle sharpapi_data.fetch_all_odds() et convertit en list[WS_MatchData]."""
     if not SHARPAPI_KEY:
-        print("⚠️ SharpAPI : clé manquante (SHARPAPI_KEY)")
+        print("⚠️ SharpAPI : SHARPAPI_KEY manquante")
         return [], "fallback"
 
-    headers = {"X-API-Key": SHARPAPI_KEY}
-    all_odds = []
-    offset = 0
-    limit = 100
-    max_pages = 5  # sécurité pour ne pas exploser le quota
-
-    async with httpx.AsyncClient(timeout=25.0) as client:
-        for page in range(max_pages):
-            try:
-                params = {
-                    "sport": "soccer",
-                    "is_live": "false",
-                    "limit": limit,
-                    "offset": offset,
-                }
-                r = await client.get(f"{SHARPAPI_BASE_URL}/odds", headers=headers, params=params)
-                if r.status_code == 429:
-                    print("  ⚠️ SharpAPI : rate limit atteint (12 req/min)")
-                    break
-                if r.status_code != 200:
-                    print(f"  ⚠️ SharpAPI HTTP {r.status_code} : {r.text[:200]}")
-                    break
-
-                payload = r.json()
-                data = payload.get("data", [])
-                meta = payload.get("meta", {})
-                pagination = meta.get("pagination", {})
-
-                all_odds.extend(data)
-                print(f"  📊 SharpAPI page {page+1} : {len(data)} cotes "
-                      f"(total {meta.get('total', '?')})")
-
-                if not pagination.get("has_more", False):
-                    break
-                offset = pagination.get("next_offset", offset + limit)
-
-                # Pause pour respecter les 12 req/min
-                await asyncio.sleep(5.5)
-
-            except Exception as e:
-                print(f"  ⚠️ SharpAPI erreur : {e}")
-                break
-
-    if not all_odds:
+    if not fetch_sharpapi_odds_data:
+        print("⚠️ SharpAPI : module sharpapi_data non chargé")
         return [], "fallback"
 
-    # --- Construire les matchs à partir des cotes ---
-    # SharpAPI renvoie une ligne par (match, bookmaker, marché, sélection).
-    # On regroupe par match_id (dérivé de home_team + away_team + commence_time).
-    matches_map = defaultdict(lambda: {
-        "home_team": None, "away_team": None, "league": "",
-        "commence_time": "", "home_odds": None, "draw_odds": None,
-        "away_odds": None, "over_2_5": None, "under_2_5": None,
-        "btts_yes": None, "btts_no": None,
-    })
+    try:
+        events = await fetch_sharpapi_odds_data()  # sans matches -> list[dict]
+        if not events:
+            print("⚠️ SharpAPI : aucune donnée retournée")
+            return [], "fallback"
 
-    for row in all_odds:
-        home = row.get("home_team", "")
-        away = row.get("away_team", "")
-        if not home or not away:
-            continue
-
-        # ID de match stable
-        match_key = f"{normalize_name(home)}__{normalize_name(away)}"
-        m = matches_map[match_key]
-        m["home_team"] = home
-        m["away_team"] = away
-        m["league"] = row.get("league", "") or row.get("sport", "Soccer")
-        m["commence_time"] = row.get("commence_time", "") or row.get("start_time", "")
-
-        market = (row.get("market_type") or "").lower()
-        selection = (row.get("selection") or "").lower()
-        odd = row.get("odds_decimal")
-
-        if not odd:
-            continue
-        try:
-            odd = float(odd)
-        except (TypeError, ValueError):
-            continue
-
-        # --- Mapper les marchés ---
-        if "moneyline" in market or "match_winner" in market or "1x2" in market:
-            # 1X2 : home / draw / away
-            if selection in ("home", normalize_name(home), home.lower()):
-                if not m["home_odds"]: m["home_odds"] = odd
-            elif selection in ("draw", "tie", "x"):
-                if not m["draw_odds"]: m["draw_odds"] = odd
-            elif selection in ("away", normalize_name(away), away.lower()):
-                if not m["away_odds"]: m["away_odds"] = odd
-
-        elif "total" in market:
-            # Over/Under 2.5 buts
-            if "2.5" in selection or "2.5" in str(row.get("line", "")):
-                if "over" in selection:
-                    if not m["over_2_5"]: m["over_2_5"] = odd
-                elif "under" in selection:
-                    if not m["under_2_5"]: m["under_2_5"] = odd
-
-        elif "both_teams" in market or "btts" in market:
-            if selection in ("yes", "oui", "o"):
-                if not m["btts_yes"]: m["btts_yes"] = odd
-            elif selection in ("no", "non", "n"):
-                if not m["btts_no"]: m["btts_no"] = odd
-
-    # --- Convertir en WS_MatchData ---
-    result = []
-    for match_key, m in matches_map.items():
-        # On garde uniquement les matchs avec au moins le 1X2 complet
-        if m["home_odds"] and m["away_odds"] and m["draw_odds"]:
-            result.append(WS_MatchData(
-                match_id=match_key,
-                league=m["league"],
-                home_team=m["home_team"],
-                away_team=m["away_team"],
-                home_odds=m["home_odds"],
-                draw_odds=m["draw_odds"],
-                away_odds=m["away_odds"],
-                over_2_5=m["over_2_5"],
-                under_2_5=m["under_2_5"],
-                btts_yes=m["btts_yes"],
-                btts_no=m["btts_no"],
-                commence_time=m["commence_time"],
+        ws_matches = []
+        for e in events:
+            ws_matches.append(WS_MatchData(
+                match_id=e["match_id"],
+                league=e.get("league", ""),
+                home_team=e["home_team"],
+                away_team=e["away_team"],
+                home_odds=e.get("home_odds"),
+                draw_odds=e.get("draw_odds"),
+                away_odds=e.get("away_odds"),
+                over_2_5=e.get("over_2_5"),
+                under_2_5=e.get("under_2_5"),
+                btts_yes=e.get("btts_yes"),
+                btts_no=e.get("btts_no"),
+                commence_time=e.get("commence_time", ""),
             ))
 
-    print(f"✅ SharpAPI : {len(result)} matchs exploitables (sur {len(all_odds)} lignes brutes)")
-    return (result, "live") if result else ([], "fallback")
+        print(f"✅ SharpAPI : {len(ws_matches)} matchs convertis en WS_MatchData")
+        return ws_matches, "live"
+
+    except Exception as e:
+        print(f"⚠️ SharpAPI crash: {e}")
+        return [], "fallback"
 
 # =====================================================================
-# ⏰ APIS DE COTES (SharpAPI remplace The Odds API)
+# ⏰ APIS DE COTES (fallback API-Football)
 # =====================================================================
 async def fetch_api_football_odds(today_iso: str) -> list:
-    """API-Football en fallback secondaire (obsolète mais conservé)."""
     if not API_FOOTBALL_KEY: return []
     url = f"https://v3.football.api-sports.io/odds"
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
@@ -1173,7 +1080,7 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
 
         if len(pool_ws) >= 2:
             pool_ws.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
-            print(f"  🔍 AUTH WallStreet : {len(pool_ws)} candidats (filtre proba [{AUTH_PROBA_MIN}-{AUTH_PROBA_MAX}%])")
+            print(f"  🔍 AUTH SharpAPI : {len(pool_ws)} candidats (filtre proba [{AUTH_PROBA_MIN}-{AUTH_PROBA_MAX}%])")
 
             for num_legs in range(2, AUTH_MAX_LEGS + 1):
                 if len(pool_ws) < num_legs: break
