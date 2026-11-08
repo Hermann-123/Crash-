@@ -70,7 +70,9 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "99f9731b68429ed4aaf0383cd7ca8c
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "5968288964")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "-1003982738017")
 
-API_KEY_ODDS = os.getenv("ODDS_API_KEY", "af11eb9ae715ca3585f4abdb00227bd6")
+# 🔑 SharpAPI (remplace The Odds API)
+SHARPAPI_KEY = os.getenv("SHARPAPI_KEY", "")
+SHARPAPI_BASE_URL = "https://api.sharpapi.io/api/v1"
 
 try: ADMIN_ID = int(TELEGRAM_ADMIN_ID)
 except ValueError: ADMIN_ID = 0
@@ -92,7 +94,7 @@ GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "50"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
 # ═══════════════════════════════════════════════════════════════════
-# 🎯 RÉFORMES QUALITÉ (1+3+4+5) — réforme 2 retirée pour MT-Fin
+# 🎯 RÉFORMES QUALITÉ
 # ═══════════════════════════════════════════════════════════════════
 WEIGHT_DIXON   = float(os.getenv("WEIGHT_DIXON",   "0.30"))
 WEIGHT_GEMINI  = float(os.getenv("WEIGHT_GEMINI",  "0.35"))
@@ -101,31 +103,26 @@ WEIGHT_BZZOIRO = float(os.getenv("WEIGHT_BZZOIRO", "0.35"))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
 MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.95"))
 
-# 🎯 NOUVEAU — Filtre proba AUTH (70-85% par défaut, configurable)
 AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "70.0"))
 AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "85.0"))
 AUTH_MAX_LEGS  = int(os.getenv("AUTH_MAX_LEGS", "5"))
 
-# 🔁 Double scan
 DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "25"))
 DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.15"))
 DOUBLE_SCAN_MIN_STABLE      = int(os.getenv("DOUBLE_SCAN_MIN_STABLE", "5"))
 DOUBLE_SCAN_PAUSE_SECONDS   = int(os.getenv("DOUBLE_SCAN_PAUSE_SECONDS", "5"))
 
-# RÈGLES MT-FIN
 MTFIN_MIN_SCORE = 70
 MTFIN_MIN_PROB = 0.35
 MTFIN_SIMULATIONS = 2000
 MTFIN_FIRST_HALF_RATIO = 0.45
 
-# RÈGLES MATCH NUL
 DRAW_MIN_SCORE = 70
 DRAW_MAX_ECART = 0.20
 DRAW_MIN_PROB = 0.28
 
-# RÈGLES ODDS +3
 ODDS3_AUTH_MIN_COTE = 2.5
-ODDS3_AUTH_MAX_COTE = 3.0   # 🎯 Modifié : 3.2 → 3.0 (comme demandé)
+ODDS3_AUTH_MAX_COTE = 3.0
 ODDS3_HYB_MIN_COTE = 3.0
 ODDS3_HYB_MAX_COTE = 5.5
 ODDS3_MIN_COTE_LEG = 1.30
@@ -281,7 +278,7 @@ STATE = {
     "tracker": {"coupons": []}, "keys": {}, "users": {},
     "scan_lock": asyncio.Lock(), "dixon_model": None, "last_scan_date": "",
     "double_scan_status": "", "double_scan_stats": {},
-    "rejections": {"value": 0, "ev_coupon": 0, "mtft_quality": 0, "auth_proba": 0},
+    "rejections": {"value": 0, "ev_coupon": 0, "auth_proba": 0},
 }
 
 TARGETS = []
@@ -413,9 +410,6 @@ def prescore_match(md) -> int:
     if md.has_h2h: score += 10
     return score
 
-# ═══════════════════════════════════════════════════════════════════
-# 🎯 Pondération 30/35/35 (réforme 1 conservée)
-# ═══════════════════════════════════════════════════════════════════
 def compute_probability(md, market_key):
     gem = dix = bzz = 0.0
     gem_avail = dix_avail = bzz_avail = False
@@ -474,81 +468,166 @@ def compute_probability(md, market_key):
 
     return final, gem, dix, bzz, emoji
 
-# ═══════════════════════════════════════════════════════════════════
-# 🎯 Filtre Value 5% (réforme 3 conservée)
-# ═══════════════════════════════════════════════════════════════════
 def passes_value_filter(proba_0_1: float, odd: float, is_real_odd: bool) -> bool:
     if proba_0_1 <= 0 or odd <= 0: return False
     if not is_real_odd: return True
     ev = proba_0_1 * odd
     return ev >= (1.0 + MIN_EDGE)
 
-# ═══════════════════════════════════════════════════════════════════
-# 🎯 Plancher EV coupon (réforme 4 conservée)
-# ═══════════════════════════════════════════════════════════════════
 def coupon_passes_ev(combined_odds: float, combined_prob: float) -> bool:
     if combined_odds <= 0 or combined_prob <= 0: return False
     return (combined_odds * combined_prob) >= MIN_COUPON_EV
 
-# ═══════════════════════════════════════════════════════════════════
-# 🎯 NOUVEAU — Filtre proba AUTH [70%, 85%]
-# ═══════════════════════════════════════════════════════════════════
 def passes_auth_proba_filter(proba_0_100: float) -> bool:
-    """Filtre strict pour le ticket AUTH : proba entre AUTH_PROBA_MIN et AUTH_PROBA_MAX."""
     if proba_0_100 <= 0: return False
     return AUTH_PROBA_MIN <= proba_0_100 <= AUTH_PROBA_MAX
 
 # =====================================================================
-# ⏰ APIS DE COTES
+# 🔑 SHARPAPI — RÉCUPÉRATION DES COTES RÉELLES
 # =====================================================================
-async def fetch_real_odds_matches() -> Tuple[list, str]:
-    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={API_KEY_ODDS}&regions=eu&markets=h2h,totals,btts"
-    matches = []
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=20.0)
-            if response.status_code != 200: return [], "fallback"
-            data = response.json()
-            if not isinstance(data, list): return [], "fallback"
-            for m in data:
-                commence_time = m.get('commence_time', '')
-                if not commence_time.startswith(today_str): continue
-
-                match_data = WS_MatchData(
-                    match_id=m['id'], league=m['sport_title'],
-                    home_team=m['home_team'], away_team=m['away_team'],
-                    home_odds=None, draw_odds=None, away_odds=None,
-                    commence_time=commence_time
-                )
-
-                for bk in m.get('bookmakers', []):
-                    for mkt in bk.get('markets', []):
-                        k = mkt.get('key')
-                        for outcome in mkt.get('outcomes', []):
-                            price = outcome.get('price')
-                            name = outcome.get('name')
-
-                            if k == 'h2h':
-                                if name == m['home_team'] and not match_data.home_odds: match_data.home_odds = price
-                                elif name == m['away_team'] and not match_data.away_odds: match_data.away_odds = price
-                                elif name == 'Draw' and not match_data.draw_odds: match_data.draw_odds = price
-                            elif k == 'totals' and outcome.get('point') == 2.5:
-                                if name == 'Over' and not match_data.over_2_5: match_data.over_2_5 = price
-                                elif name == 'Under' and not match_data.under_2_5: match_data.under_2_5 = price
-                            elif k == 'btts':
-                                if name == 'Yes' and not match_data.btts_yes: match_data.btts_yes = price
-                                elif name == 'No' and not match_data.btts_no: match_data.btts_no = price
-
-                if match_data.home_odds and match_data.away_odds and match_data.draw_odds:
-                    matches.append(match_data)
-                    if len(matches) >= 100: break
-
-            return (matches, "live") if matches else ([], "fallback")
-    except Exception:
+async def fetch_sharpapi_odds() -> Tuple[list, str]:
+    """
+    Récupère les cotes réelles depuis SharpAPI.
+    Free tier : DraftKings + FanDuel, 12 req/min, délai 60s.
+    Sport = 'soccer' (football européen).
+    """
+    if not SHARPAPI_KEY:
+        print("⚠️ SharpAPI : clé manquante (SHARPAPI_KEY)")
         return [], "fallback"
 
+    headers = {"X-API-Key": SHARPAPI_KEY}
+    all_odds = []
+    offset = 0
+    limit = 100
+    max_pages = 5  # sécurité pour ne pas exploser le quota
+
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        for page in range(max_pages):
+            try:
+                params = {
+                    "sport": "soccer",
+                    "is_live": "false",
+                    "limit": limit,
+                    "offset": offset,
+                }
+                r = await client.get(f"{SHARPAPI_BASE_URL}/odds", headers=headers, params=params)
+                if r.status_code == 429:
+                    print("  ⚠️ SharpAPI : rate limit atteint (12 req/min)")
+                    break
+                if r.status_code != 200:
+                    print(f"  ⚠️ SharpAPI HTTP {r.status_code} : {r.text[:200]}")
+                    break
+
+                payload = r.json()
+                data = payload.get("data", [])
+                meta = payload.get("meta", {})
+                pagination = meta.get("pagination", {})
+
+                all_odds.extend(data)
+                print(f"  📊 SharpAPI page {page+1} : {len(data)} cotes "
+                      f"(total {meta.get('total', '?')})")
+
+                if not pagination.get("has_more", False):
+                    break
+                offset = pagination.get("next_offset", offset + limit)
+
+                # Pause pour respecter les 12 req/min
+                await asyncio.sleep(5.5)
+
+            except Exception as e:
+                print(f"  ⚠️ SharpAPI erreur : {e}")
+                break
+
+    if not all_odds:
+        return [], "fallback"
+
+    # --- Construire les matchs à partir des cotes ---
+    # SharpAPI renvoie une ligne par (match, bookmaker, marché, sélection).
+    # On regroupe par match_id (dérivé de home_team + away_team + commence_time).
+    matches_map = defaultdict(lambda: {
+        "home_team": None, "away_team": None, "league": "",
+        "commence_time": "", "home_odds": None, "draw_odds": None,
+        "away_odds": None, "over_2_5": None, "under_2_5": None,
+        "btts_yes": None, "btts_no": None,
+    })
+
+    for row in all_odds:
+        home = row.get("home_team", "")
+        away = row.get("away_team", "")
+        if not home or not away:
+            continue
+
+        # ID de match stable
+        match_key = f"{normalize_name(home)}__{normalize_name(away)}"
+        m = matches_map[match_key]
+        m["home_team"] = home
+        m["away_team"] = away
+        m["league"] = row.get("league", "") or row.get("sport", "Soccer")
+        m["commence_time"] = row.get("commence_time", "") or row.get("start_time", "")
+
+        market = (row.get("market_type") or "").lower()
+        selection = (row.get("selection") or "").lower()
+        odd = row.get("odds_decimal")
+
+        if not odd:
+            continue
+        try:
+            odd = float(odd)
+        except (TypeError, ValueError):
+            continue
+
+        # --- Mapper les marchés ---
+        if "moneyline" in market or "match_winner" in market or "1x2" in market:
+            # 1X2 : home / draw / away
+            if selection in ("home", normalize_name(home), home.lower()):
+                if not m["home_odds"]: m["home_odds"] = odd
+            elif selection in ("draw", "tie", "x"):
+                if not m["draw_odds"]: m["draw_odds"] = odd
+            elif selection in ("away", normalize_name(away), away.lower()):
+                if not m["away_odds"]: m["away_odds"] = odd
+
+        elif "total" in market:
+            # Over/Under 2.5 buts
+            if "2.5" in selection or "2.5" in str(row.get("line", "")):
+                if "over" in selection:
+                    if not m["over_2_5"]: m["over_2_5"] = odd
+                elif "under" in selection:
+                    if not m["under_2_5"]: m["under_2_5"] = odd
+
+        elif "both_teams" in market or "btts" in market:
+            if selection in ("yes", "oui", "o"):
+                if not m["btts_yes"]: m["btts_yes"] = odd
+            elif selection in ("no", "non", "n"):
+                if not m["btts_no"]: m["btts_no"] = odd
+
+    # --- Convertir en WS_MatchData ---
+    result = []
+    for match_key, m in matches_map.items():
+        # On garde uniquement les matchs avec au moins le 1X2 complet
+        if m["home_odds"] and m["away_odds"] and m["draw_odds"]:
+            result.append(WS_MatchData(
+                match_id=match_key,
+                league=m["league"],
+                home_team=m["home_team"],
+                away_team=m["away_team"],
+                home_odds=m["home_odds"],
+                draw_odds=m["draw_odds"],
+                away_odds=m["away_odds"],
+                over_2_5=m["over_2_5"],
+                under_2_5=m["under_2_5"],
+                btts_yes=m["btts_yes"],
+                btts_no=m["btts_no"],
+                commence_time=m["commence_time"],
+            ))
+
+    print(f"✅ SharpAPI : {len(result)} matchs exploitables (sur {len(all_odds)} lignes brutes)")
+    return (result, "live") if result else ([], "fallback")
+
+# =====================================================================
+# ⏰ APIS DE COTES (SharpAPI remplace The Odds API)
+# =====================================================================
 async def fetch_api_football_odds(today_iso: str) -> list:
+    """API-Football en fallback secondaire (obsolète mais conservé)."""
     if not API_FOOTBALL_KEY: return []
     url = f"https://v3.football.api-sports.io/odds"
     headers = {"x-apisports-key": API_FOOTBALL_KEY}
@@ -609,6 +688,7 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
     for md in pool:
         hn, an = normalize_name(md.home), normalize_name(md.away)
 
+        # 1. SharpAPI (priorité)
         for ws in ws_matches:
             whn, wan = normalize_name(ws.home_team), normalize_name(ws.away_team)
             if (hn in whn or whn in hn) and (an in wan or wan in an):
@@ -623,6 +703,7 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
                 matched += 1
                 break
 
+        # 2. API-Football (fallback)
         for af in af_matches:
             afhn, afan = normalize_name(af.home_team), normalize_name(af.away_team)
             if (hn in afhn or afhn in hn) and (an in afan or afan in an):
@@ -639,7 +720,7 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
     return matched
 
 # =====================================================================
-# 🔁 SOLUTION B — ENRICHISSEMENT EN DOUBLE PASSE (inchangé)
+# 🔁 SOLUTION B — ENRICHISSEMENT EN DOUBLE PASSE
 # =====================================================================
 async def _enrich_single_pass(targets: list, pass_num: int) -> dict:
     results = {}
@@ -794,7 +875,7 @@ async def enrich_with_double_pass(pool: list) -> list:
 
 
 # =====================================================================
-# 🎯 MOTEUR 1 : MT-FIN (⚙️ RÉTABLI À L'ANCIEN CALCUL)
+# 🎯 MOTEUR 1 : MT-FIN (ancien calcul restauré)
 # =====================================================================
 def _poisson_sample(lam: float) -> int:
     if lam <= 0: return 0
@@ -842,7 +923,7 @@ def build_mtft_coupon_and_bonus(pool):
 
         if not best_pick or best_prob < MTFIN_MIN_PROB: continue
 
-        # ⚙️ RESTAURATION : ancien calcul de quality score
+        # Ancien calcul restauré
         pts = 15 + (10 if md.has_h2h else 0) + 10 + (30 if best_prob >= 0.65 else 20) + 15 + 10
         if pts < MTFIN_MIN_SCORE: continue
 
@@ -900,7 +981,7 @@ def build_mtft_coupon_and_bonus(pool):
     return coupon, bonus_pool
 
 # =====================================================================
-# 🎯 MOTEUR 2 : MATCH NUL (inchangé)
+# 🎯 MOTEUR 2 : MATCH NUL
 # =====================================================================
 def build_draw_coupon_and_bonus(pool):
     candidates = []
@@ -975,7 +1056,7 @@ def build_draw_coupon_and_bonus(pool):
     return coupon, bonus_pool
 
 # =====================================================================
-# 🎯 MOTEUR 3 : ODDS +3 (inchangé pour third_pillar)
+# 🎯 MOTEUR 3 : ODDS +3
 # =====================================================================
 def build_third_pillar(pool) -> list:
     pool_result = []
@@ -1025,11 +1106,7 @@ def build_third_pillar(pool) -> list:
     pool_result.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
     return pool_result[:3]
 
-# ═══════════════════════════════════════════════════════════════════
-# 🎯 NOUVEAU AUTH — Filtre proba [70-85%] + multi-jambes 2-5
-# ═══════════════════════════════════════════════════════════════════
 def _build_coupon_from_combo(combo, subtitle_prefix: str, quality: int, source_label: str):
-    """Helper : construit un Coupon AUTH à partir d'une liste de jambes validées."""
     total_odds = 1.0
     total_prob = 1.0
     for c in combo:
@@ -1062,7 +1139,6 @@ def _build_coupon_from_combo(combo, subtitle_prefix: str, quality: int, source_l
 
 
 def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) -> Optional[Coupon]:
-    # ---------- ÉTAPE 1 : WallStreet (filtre proba [70-85%]) ----------
     if ws_matches:
         pool_ws = []
         rejected_proba = 0
@@ -1099,7 +1175,6 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
             pool_ws.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
             print(f"  🔍 AUTH WallStreet : {len(pool_ws)} candidats (filtre proba [{AUTH_PROBA_MIN}-{AUTH_PROBA_MAX}%])")
 
-            # Essayer 2, 3, 4, 5 jambes dans l'ordre
             for num_legs in range(2, AUTH_MAX_LEGS + 1):
                 if len(pool_ws) < num_legs: break
                 for combo in itertools.combinations(pool_ws[:15], num_legs):
@@ -1109,23 +1184,21 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
                     for x in combo: total_odds *= x['odds']
                     if not (ODDS3_AUTH_MIN_COTE <= total_odds <= ODDS3_AUTH_MAX_COTE): continue
 
-                    coupon = _build_coupon_from_combo(combo, "WallStreet (vraies cotes)", 95, "WS")
+                    coupon = _build_coupon_from_combo(combo, "SharpAPI (cotes réelles)", 95, "WS")
                     if coupon:
-                        print(f"  ✅ AUTH OK (WallStreet {num_legs}j) : cote {round(total_odds, 2)}, "
+                        print(f"  ✅ AUTH OK (SharpAPI {num_legs}j) : cote {round(total_odds, 2)}, "
                               f"EV {round(total_odds*coupon.combined_prob, 2)}")
                         return coupon
 
-        print(f"  ⚠️ AUTH : WallStreet présent mais aucune combo valide → fallback")
+        print(f"  ⚠️ AUTH : SharpAPI présent mais aucune combo valide → fallback")
     else:
-        print(f"  ⚠️ AUTH : The Odds API HS → fallback sur cotes estimées")
+        print(f"  ⚠️ AUTH : SharpAPI HS → fallback sur cotes estimées")
 
-    # ---------- ÉTAPE 2 : Fallback (bonus MT-Fin + Nul + Bzzoiro) ----------
     combined = bonus_mtft + bonus_draw + third_pillar
     if not combined:
         print("  ❌ AUTH : pool fallback vide")
         return None
 
-    # Filtre proba [70-85%] sur les bonus
     filtered_combined = []
     rejected_proba = 0
     for c in combined:
@@ -1269,13 +1342,15 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
 # =====================================================================
 async def scan():
     async with STATE["scan_lock"]:
-        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "mtft_quality": 0, "auth_proba": 0}
+        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "auth_proba": 0}
 
-        print("⏰ Tentative The Odds API...")
-        ws_matches, odds_status = await fetch_real_odds_matches()
+        print("⏰ Récupération des cotes réelles via SharpAPI...")
+        ws_matches, odds_status = await fetch_sharpapi_odds()
         STATE["odds_api_mode"] = odds_status
-        if odds_status == "live": print(f"✅ The Odds API OK : {len(ws_matches)} matchs (mode LIVE)")
-        else: print(f"⚠️ The Odds API HS : mode FALLBACK")
+        if odds_status == "live":
+            print(f"✅ SharpAPI OK : {len(ws_matches)} matchs (mode LIVE)")
+        else:
+            print(f"⚠️ SharpAPI HS : mode FALLBACK")
 
         today_iso = datetime.now(TZ).strftime("%Y-%m-%d")
         af_matches = await fetch_api_football_odds(today_iso)
@@ -1310,7 +1385,7 @@ async def scan():
                 pool.append(md)
 
             matched = inject_all_real_odds(pool, ws_matches, af_matches)
-            print(f"⏰ Cotes injectées depuis The Odds API + API-Football : {matched} matchs")
+            print(f"⏰ Cotes injectées depuis SharpAPI + API-Football : {matched} matchs")
 
             before = len(pool)
             pool = [md for md in pool if is_match_not_started(md.kickoff)]
@@ -1511,7 +1586,7 @@ async def b_odds3(m):
     if c_auth:
         await safe_answer(m, format_coupon(c_auth))
     else:
-        await safe_answer(m, "📭 Aucun coupon AUTHENTIQUE disponible pour le moment.\n\n<i>🛡️ Filtres actifs : proba 70-85% par jambe + cote 2.5-3.0 + EV ≥ 0.95. Aucun match ne réunit ces conditions aujourd'hui.</i>")
+        await safe_answer(m, "📭 Aucun coupon AUTHENTIQUE disponible pour le moment.\n\n<i>🛡️ Filtres actifs : proba 70-85% + cote 2.5-3.0 + EV ≥ 0.95. Aucun match ne réunit ces conditions aujourd'hui.</i>")
 
     if m.from_user.id == ADMIN_ID:
         await asyncio.sleep(1)
@@ -1568,6 +1643,7 @@ async def b_debug(m):
 
     filtres_lines = (
         f"\n\n<b>🛡️ FILTRES QUALITÉ</b>\n"
+        f"• Source cotes : <b>SharpAPI</b>\n"
         f"• Pondération : <b>Dixon 30% / Gemini 35% / Bzzoiro 35%</b>\n"
         f"• AUTH proba : <b>{AUTH_PROBA_MIN:.0f}-{AUTH_PROBA_MAX:.0f}%</b>\n"
         f"• AUTH cote : <b>{ODDS3_AUTH_MIN_COTE}-{ODDS3_AUTH_MAX_COTE}</b>\n"
@@ -1613,6 +1689,7 @@ async def lifespan(app):
     STATE["users"] = load_json(USERS_DB)
     STATE["ready"] = True
     print("✅ Bot prêt.")
+    print(f"🔑 SharpAPI : {'configurée' if SHARPAPI_KEY else 'MANQUANTE'}")
     print(f"🔁 Double scan : {DOUBLE_SCAN_POOL_SIZE} matchs × 2 passes (seuil strict={DOUBLE_SCAN_MIN_STABLE})")
     print(f"🛡️ AUTH : proba {AUTH_PROBA_MIN:.0f}-{AUTH_PROBA_MAX:.0f}%, "
           f"cote {ODDS3_AUTH_MIN_COTE}-{ODDS3_AUTH_MAX_COTE}, max {AUTH_MAX_LEGS} jambes")
@@ -1665,6 +1742,7 @@ app = FastAPI(title="Value Bot", lifespan=lifespan)
 async def root():
     return {
         "status": "ok",
+        "odds_source": "SharpAPI",
         "mode": STATE.get("odds_api_mode"),
         "double_scan": STATE.get("double_scan_status"),
         "double_scan_stats": STATE.get("double_scan_stats", {}),
