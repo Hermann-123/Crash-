@@ -55,11 +55,11 @@ except Exception as e:
     print(f"❌ odds_fallback: {e}")
 
 try:
-    from sharpapi_data import fetch_all_odds as fetch_sharpapi_odds_data
-    print("✅ sharpapi_data chargé")
+    from oddsapiio_data import fetch_all_odds as fetch_oddsapi_odds_data
+    print("✅ oddsapiio_data chargé")
 except Exception as e:
-    fetch_sharpapi_odds_data = None
-    print(f"❌ sharpapi_data: {e}")
+    fetch_oddsapi_odds_data = None
+    print(f"❌ oddsapiio_data: {e}")
 
 try:
     from dixon_coles import download_and_train
@@ -77,8 +77,8 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "99f9731b68429ed4aaf0383cd7ca8c
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "5968288964")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "-1003982738017")
 
-# SharpAPI
-SHARPAPI_KEY = os.getenv("SHARPAPI_KEY", "")
+# Odds-API.io (remplace SharpAPI)
+ODDSAPI_KEY = os.getenv("ODDSAPI_KEY", "")
 
 try: ADMIN_ID = int(TELEGRAM_ADMIN_ID)
 except ValueError: ADMIN_ID = 0
@@ -489,22 +489,22 @@ def passes_auth_proba_filter(proba_0_100: float) -> bool:
     return AUTH_PROBA_MIN <= proba_0_100 <= AUTH_PROBA_MAX
 
 # =====================================================================
-# 🔑 SHARPAPI — WRAPPER VERS sharpapi_data.py
+# 🔑 ODDS-API.IO — WRAPPER VERS oddsapiio_data.py
 # =====================================================================
-async def fetch_sharpapi_odds() -> Tuple[list, str]:
-    """Appelle sharpapi_data.fetch_all_odds() et convertit en list[WS_MatchData]."""
-    if not SHARPAPI_KEY:
-        print("⚠️ SharpAPI : SHARPAPI_KEY manquante")
+async def fetch_oddsapi_odds() -> Tuple[list, str]:
+    """Appelle oddsapiio_data.fetch_all_odds() et convertit en list[WS_MatchData]."""
+    if not ODDSAPI_KEY:
+        print("⚠️ Odds-API.io : ODDSAPI_KEY manquante")
         return [], "fallback"
 
-    if not fetch_sharpapi_odds_data:
-        print("⚠️ SharpAPI : module sharpapi_data non chargé")
+    if not fetch_oddsapi_odds_data:
+        print("⚠️ Odds-API.io : module oddsapiio_data non chargé")
         return [], "fallback"
 
     try:
-        events = await fetch_sharpapi_odds_data()  # sans matches -> list[dict]
+        events = await fetch_oddsapi_odds_data()  # sans matches -> list[dict]
         if not events:
-            print("⚠️ SharpAPI : aucune donnée retournée")
+            print("⚠️ Odds-API.io : aucune donnée retournée")
             return [], "fallback"
 
         ws_matches = []
@@ -524,11 +524,11 @@ async def fetch_sharpapi_odds() -> Tuple[list, str]:
                 commence_time=e.get("commence_time", ""),
             ))
 
-        print(f"✅ SharpAPI : {len(ws_matches)} matchs convertis en WS_MatchData")
+        print(f"✅ Odds-API.io : {len(ws_matches)} matchs convertis en WS_MatchData")
         return ws_matches, "live"
 
     except Exception as e:
-        print(f"⚠️ SharpAPI crash: {e}")
+        print(f"⚠️ Odds-API.io crash: {e}")
         return [], "fallback"
 
 # =====================================================================
@@ -595,7 +595,7 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
     for md in pool:
         hn, an = normalize_name(md.home), normalize_name(md.away)
 
-        # 1. SharpAPI (priorité)
+        # 1. Odds-API.io (priorité)
         for ws in ws_matches:
             whn, wan = normalize_name(ws.home_team), normalize_name(ws.away_team)
             if (hn in whn or whn in hn) and (an in wan or wan in an):
@@ -1080,7 +1080,7 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
 
         if len(pool_ws) >= 2:
             pool_ws.sort(key=lambda x: (x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
-            print(f"  🔍 AUTH SharpAPI : {len(pool_ws)} candidats (filtre proba [{AUTH_PROBA_MIN}-{AUTH_PROBA_MAX}%])")
+            print(f"  🔍 AUTH Odds-API.io : {len(pool_ws)} candidats (filtre proba [{AUTH_PROBA_MIN}-{AUTH_PROBA_MAX}%])")
 
             for num_legs in range(2, AUTH_MAX_LEGS + 1):
                 if len(pool_ws) < num_legs: break
@@ -1091,15 +1091,15 @@ def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) ->
                     for x in combo: total_odds *= x['odds']
                     if not (ODDS3_AUTH_MIN_COTE <= total_odds <= ODDS3_AUTH_MAX_COTE): continue
 
-                    coupon = _build_coupon_from_combo(combo, "SharpAPI (cotes réelles)", 95, "WS")
+                    coupon = _build_coupon_from_combo(combo, "Odds-API.io (cotes réelles)", 95, "WS")
                     if coupon:
-                        print(f"  ✅ AUTH OK (SharpAPI {num_legs}j) : cote {round(total_odds, 2)}, "
+                        print(f"  ✅ AUTH OK (Odds-API.io {num_legs}j) : cote {round(total_odds, 2)}, "
                               f"EV {round(total_odds*coupon.combined_prob, 2)}")
                         return coupon
 
-        print(f"  ⚠️ AUTH : SharpAPI présent mais aucune combo valide → fallback")
+        print(f"  ⚠️ AUTH : Odds-API.io présent mais aucune combo valide → fallback")
     else:
-        print(f"  ⚠️ AUTH : SharpAPI HS → fallback sur cotes estimées")
+        print(f"  ⚠️ AUTH : Odds-API.io HS → fallback sur cotes estimées")
 
     combined = bonus_mtft + bonus_draw + third_pillar
     if not combined:
@@ -1251,13 +1251,13 @@ async def scan():
     async with STATE["scan_lock"]:
         STATE["rejections"] = {"value": 0, "ev_coupon": 0, "auth_proba": 0}
 
-        print("⏰ Récupération des cotes réelles via SharpAPI...")
-        ws_matches, odds_status = await fetch_sharpapi_odds()
+        print("⏰ Récupération des cotes réelles via Odds-API.io...")
+        ws_matches, odds_status = await fetch_oddsapi_odds()
         STATE["odds_api_mode"] = odds_status
         if odds_status == "live":
-            print(f"✅ SharpAPI OK : {len(ws_matches)} matchs (mode LIVE)")
+            print(f"✅ Odds-API.io OK : {len(ws_matches)} matchs (mode LIVE)")
         else:
-            print(f"⚠️ SharpAPI HS : mode FALLBACK")
+            print(f"⚠️ Odds-API.io HS : mode FALLBACK")
 
         today_iso = datetime.now(TZ).strftime("%Y-%m-%d")
         af_matches = await fetch_api_football_odds(today_iso)
@@ -1292,7 +1292,7 @@ async def scan():
                 pool.append(md)
 
             matched = inject_all_real_odds(pool, ws_matches, af_matches)
-            print(f"⏰ Cotes injectées depuis SharpAPI + API-Football : {matched} matchs")
+            print(f"⏰ Cotes injectées depuis Odds-API.io + API-Football : {matched} matchs")
 
             before = len(pool)
             pool = [md for md in pool if is_match_not_started(md.kickoff)]
@@ -1493,7 +1493,7 @@ async def b_odds3(m):
     if c_auth:
         await safe_answer(m, format_coupon(c_auth))
     else:
-        await safe_answer(m, "📭 Aucun coupon AUTHENTIQUE disponible pour le moment.\n\n<i>🛡️ Filtres actifs : proba 70-85% + cote 2.5-3.0 + EV ≥ 0.95. Aucun match ne réunit ces conditions aujourd'hui.</i>")
+        await safe_answer(m, "📭 Aucun coupon AUTHENTIQUE disponible pour le moment.\n\n<i>🛡️ Filtres actifs : proba 70-85% + cote 2.5-3.0 + EV ≥ 0.95.</i>")
 
     if m.from_user.id == ADMIN_ID:
         await asyncio.sleep(1)
@@ -1550,7 +1550,7 @@ async def b_debug(m):
 
     filtres_lines = (
         f"\n\n<b>🛡️ FILTRES QUALITÉ</b>\n"
-        f"• Source cotes : <b>SharpAPI</b>\n"
+        f"• Source cotes : <b>Odds-API.io</b>\n"
         f"• Pondération : <b>Dixon 30% / Gemini 35% / Bzzoiro 35%</b>\n"
         f"• AUTH proba : <b>{AUTH_PROBA_MIN:.0f}-{AUTH_PROBA_MAX:.0f}%</b>\n"
         f"• AUTH cote : <b>{ODDS3_AUTH_MIN_COTE}-{ODDS3_AUTH_MAX_COTE}</b>\n"
@@ -1596,7 +1596,7 @@ async def lifespan(app):
     STATE["users"] = load_json(USERS_DB)
     STATE["ready"] = True
     print("✅ Bot prêt.")
-    print(f"🔑 SharpAPI : {'configurée' if SHARPAPI_KEY else 'MANQUANTE'}")
+    print(f"🔑 Odds-API.io : {'configurée' if ODDSAPI_KEY else 'MANQUANTE'}")
     print(f"🔁 Double scan : {DOUBLE_SCAN_POOL_SIZE} matchs × 2 passes (seuil strict={DOUBLE_SCAN_MIN_STABLE})")
     print(f"🛡️ AUTH : proba {AUTH_PROBA_MIN:.0f}-{AUTH_PROBA_MAX:.0f}%, "
           f"cote {ODDS3_AUTH_MIN_COTE}-{ODDS3_AUTH_MAX_COTE}, max {AUTH_MAX_LEGS} jambes")
@@ -1649,7 +1649,7 @@ app = FastAPI(title="Value Bot", lifespan=lifespan)
 async def root():
     return {
         "status": "ok",
-        "odds_source": "SharpAPI",
+        "odds_source": "Odds-API.io",
         "mode": STATE.get("odds_api_mode"),
         "double_scan": STATE.get("double_scan_status"),
         "double_scan_stats": STATE.get("double_scan_stats", {}),
