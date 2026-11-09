@@ -1,5 +1,5 @@
 """
-RapidOddsAPI Data — Cotes réelles de bookmakers
+RapidOddsAPI Data — Cotes réelles de bookmakers (Soccer)
 Docs : https://rapidoddsapi.com
 Auth : query parameter `api_key`
 Base URL : https://api.rapidoddsapi.com
@@ -18,7 +18,15 @@ from datetime import datetime, timezone, timedelta
 RAPIDODDS_BASE_URL = "https://api.rapidoddsapi.com"
 RAPIDODDS_API_KEY = os.getenv("RAPIDODDSAPI_API_KEY", "")
 
-_DEBUG_DONE = False
+# IDs des ligues de soccer acceptées par RapidOddsAPI
+# On se concentre sur les 5 grands championnats + MLS pour le free tier
+SOCCER_LEAGUES = [
+    "EPL", "LA_LIGA", "SERIE_A", "BUNDESLIGA", "LIGUE_1", "MLS"
+]
+
+# Bookmakers disponibles (noms de feeds, pas de marques)
+# Le free tier permet 5 bookmakers par requête
+DEFAULT_BOOKMAKERS = ["Bet365", "Pinnacle", "DraftKings", "BetMGM", "FanDuel"]
 
 
 def _norm(s: str) -> str:
@@ -62,10 +70,10 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dic
     try:
         r = await client.get(f"{RAPIDODDS_BASE_URL}{path}", params=params, timeout=25.0)
         if r.status_code == 429:
-            print("⚠️ RapidOddsAPI RATE LIMIT")
+            print("⚠️ RapidOddsAPI RATE LIMIT (30 req/s)")
             return {}
         if r.status_code >= 400:
-            print(f"⚠️ RapidOddsAPI {path} -> {r.status_code} | {r.text[:250]}")
+            print(f"⚠️ RapidOddsAPI {path} -> {r.status_code} | {r.text[:200]}")
             return {}
         return r.json() if r.text else {}
     except Exception as e:
@@ -73,18 +81,18 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dic
         return {}
 
 
-async def _fetch_market_type(client: httpx.AsyncClient, market_type: str) -> list[dict]:
-    """Récupère les cotes pour un type de marché spécifique (1X2 ou Totals)."""
-    data = await _get(client, "/sports/soccer/markets", {
-        "market_type": market_type,   # Singulier (exigé par l'API)
-        "bookmaker": "bet365",        # Singulier (exigé par l'API)
+async def _fetch_league_markets(client: httpx.AsyncClient, league: str, market_type: str) -> list[dict]:
+    """Récupère les cotes pour une ligue et un type de marché spécifique."""
+    data = await _get(client, f"/sports/{league}/markets", {
+        "market_type": market_type,
+        "bookmakers": ",".join(DEFAULT_BOOKMAKERS),
     })
     return data.get("games", []) if isinstance(data, dict) else []
 
 
 async def fetch_all_odds(matches: list[dict] = None) -> object:
     """
-    Récupère les cotes 1X2 et Totals 2.5 via RapidOddsAPI.
+    Récupère les cotes 1X2 et Totals 2.5 via RapidOddsAPI pour plusieurs ligues.
     Retourne :
       - sans matches -> list[dict] (tous les matchs avec cotes)
       - avec matches -> {event_id: odds_dict} matché par noms
@@ -93,34 +101,30 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
         print("⚠️ RapidOddsAPI : RAPIDODDSAPI_API_KEY manquante")
         return [] if matches is None else {}
 
+    all_games_1x2 = []
+    all_games_totals = []
+
     async with httpx.AsyncClient(timeout=25.0) as client:
-        # 1. Récupération des cotes 1X2 (head_to_head_3_way)
-        print("🔎 RapidOddsAPI : récupération 1X2...")
-        games_1x2 = await _fetch_market_type(client, "head_to_head_3_way")
-        await asyncio.sleep(1.0) # Pause anti rate-limit
+        for league in SOCCER_LEAGUES:
+            print(f"🔎 RapidOddsAPI : récupération {league} (1X2)...")
+            games_1x2 = await _fetch_league_markets(client, league, "head_to_head_3_way")
+            all_games_1x2.extend(games_1x2)
+            await asyncio.sleep(1.5)  # Pause anti rate-limit
 
-        # 2. Récupération des cotes Over/Under 2.5 (totals)
-        print("🔎 RapidOddsAPI : récupération Totals...")
-        games_totals = await _fetch_market_type(client, "totals")
+            print(f"🔎 RapidOddsAPI : récupération {league} (Totals)...")
+            games_totals = await _fetch_league_markets(client, league, "totals")
+            all_games_totals.extend(games_totals)
+            await asyncio.sleep(1.5)
 
-        if not games_1x2 and not games_totals:
-            print("⚠️ RapidOddsAPI : aucune donnée retournée")
+        if not all_games_1x2 and not all_games_totals:
+            print("⚠️ RapidOddsAPI : aucune donnée retournée pour aucune ligue")
             return [] if matches is None else {}
 
-        # Debug (une seule fois)
-        global _DEBUG_DONE
-        if not _DEBUG_DONE:
-            if games_1x2:
-                sample = games_1x2[0]
-                print(f"🔎 Exemple 1X2 : home={sample.get('game', {}).get('home_team')} "
-                      f"away={sample.get('game', {}).get('away_team')}")
-            _DEBUG_DONE = True
-
-        # 3. Fusion des données par match (basé sur les noms d'équipes)
+        # Fusion des données par match (basé sur les noms d'équipes)
         merged_matches = {}
 
         # Traitement du 1X2
-        for entry in games_1x2:
+        for entry in all_games_1x2:
             game = entry.get("game", {})
             home = game.get("home_team", "")
             away = game.get("away_team", "")
@@ -145,7 +149,7 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
                             name = (out.get("name") or "").lower()
                             price = _safe_float(out.get("price"))
                             if not price: continue
-                            
+
                             if name in ("home", "1") or _norm(home) in name:
                                 if merged_matches[key]["home_odds"] is None: merged_matches[key]["home_odds"] = price
                             elif name in ("draw", "x", "tie"):
@@ -154,7 +158,7 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
                                 if merged_matches[key]["away_odds"] is None: merged_matches[key]["away_odds"] = price
 
         # Traitement des Totals
-        for entry in games_totals:
+        for entry in all_games_totals:
             game = entry.get("game", {})
             home = game.get("home_team", "")
             away = game.get("away_team", "")
@@ -163,7 +167,7 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
 
             key = f"{_norm(home)}__{_norm(away)}"
             if key not in merged_matches:
-                continue # On ne garde que les matchs qui ont déjà le 1X2
+                continue  # On ne garde que les matchs qui ont déjà le 1X2
 
             for book in entry.get("bookmakers", []):
                 for market in book.get("markets", []):
@@ -172,7 +176,7 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
                             name = (out.get("name") or "").lower()
                             price = _safe_float(out.get("price"))
                             line = out.get("line") or out.get("handicap")
-                            
+
                             try: line_f = float(line) if line is not None else None
                             except (ValueError, TypeError): line_f = None
 
@@ -182,7 +186,7 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
                                 elif "under" in name and merged_matches[key]["under_2_5"] is None:
                                     merged_matches[key]["under_2_5"] = price
 
-        # 4. Construction de la liste finale
+        # Construction de la liste finale
         events_data = []
         for key, data in merged_matches.items():
             # On ne garde que les matchs avec les 3 cotes 1X2 complètes et dans le futur
@@ -210,7 +214,7 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
         if matches is None:
             return events_data
 
-        # 5. Matching avec les matchs Bzzoiro (si mode dict demandé)
+        # Matching avec les matchs Bzzoiro (si mode dict demandé)
         results = {}
         for m in matches:
             target_home = _norm(m.get("home", ""))
