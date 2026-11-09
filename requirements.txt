@@ -7,3 +7,4 @@ uvicorn[standard]==0.32.1
 betbetter==1.1.0
 scipy
 numpy
+rapidoddsapi
