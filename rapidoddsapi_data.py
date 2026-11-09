@@ -1,30 +1,32 @@
 """
-RapidOddsAPI Data — Cotes réelles de bookmakers (Soccer)
-Docs : https://rapidoddsapi.com
-Auth : query parameter `api_key`
-Base URL : https://api.rapidoddsapi.com
+RapidOddsAPI Data — Cotes réelles (SDK officiel)
+pip install rapidoddsapi
 """
 from __future__ import annotations
 
-import asyncio
 import os
-import re
 import unicodedata
-import httpx
+import re
 from typing import Optional
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
-RAPIDODDS_BASE_URL = "https://api.rapidoddsapi.com"
+# SDK officiel
+try:
+    from rapidoddsapi import RapidOddsAPI
+except ImportError:
+    RapidOddsAPI = None
+    print("❌ rapidoddsapi non installé. Exécute : pip install rapidoddsapi")
+
 RAPIDODDS_API_KEY = os.getenv("RAPIDODDSAPI_API_KEY", "")
 
-# Ligues de soccer acceptées par l'API (identifiants exacts)
+# Ligues supportées (identifiants exacts de l’API)
 SOCCER_LEAGUES = [
     "EPL", "LA_LIGA", "SERIE_A", "BUNDESLIGA", "LIGUE_1", "MLS"
 ]
 
-# L'API exige UN SEUL bookmaker (singulier) et en minuscules
-DEFAULT_BOOKMAKER = "bet365"
+# Feed bookmaker (nom exact, sensible à la casse)
+BOOKMAKER_FEED = "Pinnacle"  # ou "Bet365", "DraftKings", etc.
 
 
 def _norm(s: str) -> str:
@@ -61,195 +63,138 @@ def _is_in_future(date_str: str, buffer_min: int = 10) -> bool:
         return True
 
 
-async def _get(client: httpx.AsyncClient, path: str, params: dict = None) -> dict:
-    params = params or {}
-    params["api_key"] = RAPIDODDS_API_KEY
-
-    try:
-        r = await client.get(f"{RAPIDODDS_BASE_URL}{path}", params=params, timeout=25.0)
-        if r.status_code == 429:
-            print("⚠️ RapidOddsAPI RATE LIMIT (30 req/s)")
-            return {}
-        if r.status_code >= 400:
-            print(f"⚠️ RapidOddsAPI {path} -> {r.status_code} | {r.text[:200]}")
-            return {}
-        return r.json() if r.text else {}
-    except Exception as e:
-        print(f"⚠️ RapidOddsAPI {path} crash: {e}")
-        return {}
-
-
-async def _fetch_league_markets(client: httpx.AsyncClient, league: str, market_type: str) -> list[dict]:
-    """Récupère les cotes pour une ligue et un type de marché spécifique."""
-    data = await _get(client, f"/sports/{league}/markets", {
-        "market_type": market_type,
-        "bookmaker": DEFAULT_BOOKMAKER,   # ✅ Singulier, une seule valeur
-    })
-    
-    # L'API retourne les données dans une liste sous la clé "games" ou directement une liste
-    if isinstance(data, dict) and "games" in data:
-        return data.get("games", [])
-    elif isinstance(data, list):
-        return data
-    return []
-
-
-async def fetch_all_odds(matches: list[dict] = None) -> object:
-    """
-    Récupère les cotes 1X2 et Totals 2.5 via RapidOddsAPI pour plusieurs ligues.
-    Retourne :
-      - sans matches -> list[dict] (tous les matchs avec cotes)
-      - avec matches -> {event_id: odds_dict} matché par noms
-    """
+def fetch_all_odds(matches: list[dict] = None):
     if not RAPIDODDS_API_KEY:
         print("⚠️ RapidOddsAPI : RAPIDODDSAPI_API_KEY manquante")
         return [] if matches is None else {}
+    if not RapidOddsAPI:
+        print("⚠️ SDK rapidoddsapi non disponible")
+        return [] if matches is None else {}
 
-    all_games_1x2 = []
-    all_games_totals = []
+    client = RapidOddsAPI(api_key=RAPIDODDS_API_KEY)
 
-    async with httpx.AsyncClient(timeout=25.0) as client:
-        for league in SOCCER_LEAGUES:
-            print(f"🔎 RapidOddsAPI : récupération {league} (1X2)...")
-            games_1x2 = await _fetch_league_markets(client, league, "head_to_head_3_way")
-            if games_1x2:
-                all_games_1x2.extend(games_1x2)
-            await asyncio.sleep(1.0)  # Pause anti rate-limit
+    all_events = []
 
-            print(f"🔎 RapidOddsAPI : récupération {league} (Totals)...")
-            games_totals = await _fetch_league_markets(client, league, "totals")
+    for league in SOCCER_LEAGUES:
+        # --- 1X2 (head_to_head) ---
+        try:
+            print(f"🔎 RapidOddsAPI : {league} (head_to_head)...")
+            odds_resp = client.get_odds(league, ["head_to_head"], [BOOKMAKER_FEED])
+            games = odds_resp.get("games", [])
+            if games:
+                print(f"✅ {league} : {len(games)} matchs 1X2 récupérés")
+                for entry in games:
+                    game = entry.get("game", {})
+                    home = game.get("home_team", "")
+                    away = game.get("away_team", "")
+                    commence_time = game.get("start_time") or game.get("commence_time", "")
+                    if not home or not away or not _is_in_future(commence_time):
+                        continue
+
+                    home_odds = draw_odds = away_odds = None
+                    for book in entry.get("bookmakers", []):
+                        for market in book.get("markets", []):
+                            for out in market.get("outcomes", []):
+                                name = (out.get("name") or "").lower()
+                                price = _safe_float(out.get("price"))
+                                if not price: continue
+                                if name in ("home", "1"): home_odds = price
+                                elif name in ("away", "2"): away_odds = price
+                    # head_to_head ne renvoie pas le nul → on laisse None
+                    if home_odds and away_odds:
+                        all_events.append({
+                            "match_id": f"rapid_{_norm(home)}__{_norm(away)}",
+                            "league": league,
+                            "home_team": home,
+                            "away_team": away,
+                            "home_odds": home_odds,
+                            "draw_odds": None,   # calculé par Dixon
+                            "away_odds": away_odds,
+                            "over_2_5": None,
+                            "under_2_5": None,
+                            "btts_yes": None,
+                            "btts_no": None,
+                            "commence_time": commence_time,
+                        })
+            else:
+                print(f"⚠️ {league} : aucun match 1X2 pour {BOOKMAKER_FEED}")
+        except Exception as e:
+            print(f"⚠️ {league} (1X2) erreur : {e}")
+
+        # --- Totals (Over/Under 2.5) ---
+        try:
+            print(f"🔎 RapidOddsAPI : {league} (totals)...")
+            totals_resp = client.get_odds(league, ["totals"], [BOOKMAKER_FEED])
+            games_totals = totals_resp.get("games", [])
             if games_totals:
-                all_games_totals.extend(games_totals)
-            await asyncio.sleep(1.0)
+                print(f"✅ {league} : {len(games_totals)} matchs Totals récupérés")
+                for entry in games_totals:
+                    game = entry.get("game", {})
+                    home = game.get("home_team", "")
+                    away = game.get("away_team", "")
+                    commence_time = game.get("start_time") or game.get("commence_time", "")
+                    if not home or not away or not _is_in_future(commence_time):
+                        continue
 
-        if not all_games_1x2 and not all_games_totals:
-            print("⚠️ RapidOddsAPI : aucune donnée retournée pour aucune ligue")
-            return [] if matches is None else {}
+                    over_25 = under_25 = None
+                    for book in entry.get("bookmakers", []):
+                        for market in book.get("markets", []):
+                            for out in market.get("outcomes", []):
+                                name = (out.get("name") or "").lower()
+                                price = _safe_float(out.get("price"))
+                                line = out.get("line") or out.get("handicap")
+                                try: line_f = float(line) if line is not None else None
+                                except: line_f = None
+                                if line_f == 2.5:
+                                    if "over" in name: over_25 = price
+                                    elif "under" in name: under_25 = price
 
-        print(f"🔎 RapidOddsAPI : {len(all_games_1x2)} matchs 1X2 bruts, {len(all_games_totals)} matchs Totals bruts")
+                    if over_25 and under_25:
+                        # Fusionner avec l'événement existant
+                        key = f"{_norm(home)}__{_norm(away)}"
+                        for ev in all_events:
+                            if ev["match_id"] == f"rapid_{key}":
+                                ev["over_2_5"] = over_25
+                                ev["under_2_5"] = under_25
+                                break
+            else:
+                print(f"⚠️ {league} : aucun Totals pour {BOOKMAKER_FEED}")
+        except Exception as e:
+            print(f"⚠️ {league} (Totals) erreur : {e}")
 
-        # Fusion des données par match (basé sur les noms d'équipes)
-        merged_matches = {}
+    print(f"✅ RapidOddsAPI : {len(all_events)} matchs au total avec cotes réelles")
 
-        # Traitement du 1X2
-        for entry in all_games_1x2:
-            game = entry.get("game", {})
-            home = game.get("home_team", "")
-            away = game.get("away_team", "")
-            if not home or not away:
-                continue
+    if matches is None:
+        return all_events
 
-            key = f"{_norm(home)}__{_norm(away)}"
-            if key not in merged_matches:
-                merged_matches[key] = {
-                    "home_team": home,
-                    "away_team": away,
-                    "commence_time": game.get("start_time") or game.get("commence_time", ""),
-                    "league": game.get("league", "Soccer"),
-                    "home_odds": None, "draw_odds": None, "away_odds": None,
-                    "over_2_5": None, "under_2_5": None,
-                }
+    # Matching avec les matchs Bzzoiro
+    results = {}
+    for m in matches:
+        target_home = _norm(m.get("home", ""))
+        target_away = _norm(m.get("away", ""))
+        if not target_home or not target_away:
+            continue
 
-            for book in entry.get("bookmakers", []):
-                for market in book.get("markets", []):
-                    if (market.get("market_type") or "").lower() == "head_to_head_3_way":
-                        for out in market.get("outcomes", []):
-                            name = (out.get("name") or "").lower()
-                            price = _safe_float(out.get("price"))
-                            if not price: continue
+        best, best_score = None, 0
+        for ev in all_events:
+            h = _norm(ev["home_team"])
+            a = _norm(ev["away_team"])
+            score = 0
+            if target_home in h or h in target_home: score += 1
+            if target_away in a or a in target_away: score += 1
+            if score > best_score:
+                best_score, best = score, ev
 
-                            if name in ("home", "1") or _norm(home) in name:
-                                if merged_matches[key]["home_odds"] is None: merged_matches[key]["home_odds"] = price
-                            elif name in ("draw", "x", "tie"):
-                                if merged_matches[key]["draw_odds"] is None: merged_matches[key]["draw_odds"] = price
-                            elif name in ("away", "2") or _norm(away) in name:
-                                if merged_matches[key]["away_odds"] is None: merged_matches[key]["away_odds"] = price
+        if best and best_score >= 2:
+            results[m["event_id"]] = {
+                "home": best["home_odds"],
+                "draw": best["draw_odds"],
+                "away": best["away_odds"],
+                "over_2.5": best["over_2_5"],
+                "under_2.5": best["under_2_5"],
+                "btts_yes": best["btts_yes"],
+                "btts_no": best["btts_no"],
+            }
 
-        # Traitement des Totals
-        for entry in all_games_totals:
-            game = entry.get("game", {})
-            home = game.get("home_team", "")
-            away = game.get("away_team", "")
-            if not home or not away:
-                continue
-
-            key = f"{_norm(home)}__{_norm(away)}"
-            if key not in merged_matches:
-                continue  # On ne garde que les matchs qui ont déjà le 1X2
-
-            for book in entry.get("bookmakers", []):
-                for market in book.get("markets", []):
-                    if (market.get("market_type") or "").lower() == "totals":
-                        for out in market.get("outcomes", []):
-                            name = (out.get("name") or "").lower()
-                            price = _safe_float(out.get("price"))
-                            line = out.get("line") or out.get("handicap")
-
-                            try: line_f = float(line) if line is not None else None
-                            except (ValueError, TypeError): line_f = None
-
-                            if line_f == 2.5:
-                                if "over" in name and merged_matches[key]["over_2_5"] is None:
-                                    merged_matches[key]["over_2_5"] = price
-                                elif "under" in name and merged_matches[key]["under_2_5"] is None:
-                                    merged_matches[key]["under_2_5"] = price
-
-        # Construction de la liste finale
-        events_data = []
-        for key, data in merged_matches.items():
-            # On ne garde que les matchs avec les 3 cotes 1X2 complètes et dans le futur
-            if data["home_odds"] and data["draw_odds"] and data["away_odds"]:
-                if not _is_in_future(data["commence_time"], buffer_min=10):
-                    continue
-
-                events_data.append({
-                    "match_id": f"rapid_{key}",
-                    "league": data["league"],
-                    "home_team": data["home_team"],
-                    "away_team": data["away_team"],
-                    "home_odds": data["home_odds"],
-                    "draw_odds": data["draw_odds"],
-                    "away_odds": data["away_odds"],
-                    "over_2_5": data["over_2_5"],
-                    "under_2_5": data["under_2_5"],
-                    "btts_yes": None,
-                    "btts_no": None,
-                    "commence_time": data["commence_time"],
-                })
-
-        print(f"✅ RapidOddsAPI : {len(events_data)} matchs avec cotes 1X2 complètes et futures")
-
-        if matches is None:
-            return events_data
-
-        # Matching avec les matchs Bzzoiro (si mode dict demandé)
-        results = {}
-        for m in matches:
-            target_home = _norm(m.get("home", ""))
-            target_away = _norm(m.get("away", ""))
-            if not target_home or not target_away:
-                continue
-
-            best, best_score = None, 0
-            for ev in events_data:
-                h = _norm(ev["home_team"])
-                a = _norm(ev["away_team"])
-                score = 0
-                if target_home in h or h in target_home: score += 1
-                if target_away in a or a in target_away: score += 1
-                if score > best_score:
-                    best_score, best = score, ev
-
-            if best and best_score >= 2:
-                results[m["event_id"]] = {
-                    "home": best["home_odds"],
-                    "draw": best["draw_odds"],
-                    "away": best["away_odds"],
-                    "over_2.5": best["over_2_5"],
-                    "under_2.5": best["under_2_5"],
-                    "btts_yes": best["btts_yes"],
-                    "btts_no": best["btts_no"],
-                }
-
-        print(f"📊 RapidOddsAPI matching : {len(results)}/{len(matches)} matchs avec cotes")
-        return results
+    print(f"📊 RapidOddsAPI matching : {len(results)}/{len(matches)} matchs avec cotes")
+    return results
