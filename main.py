@@ -77,7 +77,6 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "99f9731b68429ed4aaf0383cd7ca8c
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "5968288964")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "-1003982738017")
 
-# RapidOddsAPI
 RAPIDODDSAPI_API_KEY = os.getenv("RAPIDODDSAPI_API_KEY", "")
 
 try: ADMIN_ID = int(TELEGRAM_ADMIN_ID)
@@ -99,9 +98,6 @@ NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "50"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
-# ═══════════════════════════════════════════════════════════════════
-# 🎯 RÉFORMES QUALITÉ
-# ═══════════════════════════════════════════════════════════════════
 WEIGHT_DIXON   = float(os.getenv("WEIGHT_DIXON",   "0.30"))
 WEIGHT_GEMINI  = float(os.getenv("WEIGHT_GEMINI",  "0.35"))
 WEIGHT_BZZOIRO = float(os.getenv("WEIGHT_BZZOIRO", "0.35"))
@@ -142,9 +138,6 @@ TZ = ZoneInfo(NOTIFY_TZ)
 if not BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_ID:
     raise RuntimeError("Variables d'environnement manquantes")
 
-# =====================================================================
-# ⚙️ MOTEUR WALLSTREET
-# =====================================================================
 @dataclass
 class WS_MatchData:
     match_id: str
@@ -209,9 +202,6 @@ class DixonColesEngine:
 
 dixon_ws = DixonColesEngine()
 
-# =====================================================================
-# 🎫 ARCHITECTURE
-# =====================================================================
 @dataclass
 class MatchData:
     event_id: str
@@ -293,9 +283,6 @@ for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
         try: TARGETS.append(int(raw))
         except ValueError: TARGETS.append(raw)
 
-# =====================================================================
-# 🔐 SYSTÈME D'ABONNEMENT
-# =====================================================================
 def is_subscribed(user_id):
     if user_id == ADMIN_ID: return True
     uid = str(user_id)
@@ -326,9 +313,6 @@ def save_json(path, data):
 def load_tracker(): return load_json(LOCAL_DB, {"coupons": []})
 def save_tracker(data): save_json(LOCAL_DB, data)
 
-# =====================================================================
-# 🛠️ UTILITAIRES
-# =====================================================================
 def today_pretty():
     d = datetime.now(TZ)
     months = {1:"janvier",2:"février",3:"mars",4:"avril",5:"mai",6:"juin",7:"juillet",8:"août",9:"septembre",10:"octobre",11:"novembre",12:"décembre"}
@@ -488,11 +472,7 @@ def passes_auth_proba_filter(proba_0_100: float) -> bool:
     if proba_0_100 <= 0: return False
     return AUTH_PROBA_MIN <= proba_0_100 <= AUTH_PROBA_MAX
 
-# =====================================================================
-# 🔑 RAPIDODDSAPI — WRAPPER VERS rapidoddsapi_data.py
-# =====================================================================
 async def fetch_rapidodds_odds() -> Tuple[list, str]:
-    """Appelle rapidoddsapi_data.fetch_all_odds() et convertit en list[WS_MatchData]."""
     if not RAPIDODDSAPI_API_KEY:
         print("⚠️ RapidOddsAPI : RAPIDODDSAPI_API_KEY manquante")
         return [], "fallback"
@@ -502,9 +482,8 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
         return [], "fallback"
 
     try:
-        events = await fetch_rapidodds_odds_data()  # sans matches -> list[dict]
+        events = await fetch_rapidodds_odds_data()
         if not events:
-            print("⚠️ RapidOddsAPI : aucune donnée retournée")
             return [], "fallback"
 
         ws_matches = []
@@ -531,9 +510,6 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
         print(f"⚠️ RapidOddsAPI crash: {e}")
         return [], "fallback"
 
-# =====================================================================
-# ⏰ APIS DE COTES (fallback API-Football)
-# =====================================================================
 async def fetch_api_football_odds(today_iso: str) -> list:
     if not API_FOOTBALL_KEY: return []
     url = f"https://v3.football.api-sports.io/odds"
@@ -595,7 +571,6 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
     for md in pool:
         hn, an = normalize_name(md.home), normalize_name(md.away)
 
-        # 1. RapidOddsAPI (priorité)
         for ws in ws_matches:
             whn, wan = normalize_name(ws.home_team), normalize_name(ws.away_team)
             if (hn in whn or whn in hn) and (an in wan or wan in an):
@@ -610,7 +585,6 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
                 matched += 1
                 break
 
-        # 2. API-Football (fallback)
         for af in af_matches:
             afhn, afan = normalize_name(af.home_team), normalize_name(af.away_team)
             if (hn in afhn or afhn in hn) and (an in afan or afan in an):
@@ -626,9 +600,6 @@ def inject_all_real_odds(pool: list, ws_matches: list, af_matches: list) -> int:
 
     return matched
 
-# =====================================================================
-# 🔁 SOLUTION B — ENRICHISSEMENT EN DOUBLE PASSE
-# =====================================================================
 async def _enrich_single_pass(targets: list, pass_num: int) -> dict:
     results = {}
     async with httpx.AsyncClient(timeout=70.0) as client:
@@ -653,7 +624,6 @@ async def _enrich_single_pass(targets: list, pass_num: int) -> dict:
             except Exception as e:
                 print(f"  ⚠️ [Passe {pass_num}] {md.event_id}: {e}")
     return results
-
 
 def _compare_two_passes(targets: list, results_1: dict, results_2: dict) -> tuple:
     stable_list = []
@@ -736,7 +706,6 @@ def _compare_two_passes(targets: list, results_1: dict, results_2: dict) -> tupl
 
     return stable_list, enriched_list, stats
 
-
 async def enrich_with_double_pass(pool: list) -> list:
     if not pool:
         STATE["double_scan_status"] = "EMPTY"
@@ -780,10 +749,6 @@ async def enrich_with_double_pass(pool: list) -> list:
     STATE["double_scan_status"] = "GEMINI_KO"
     return targets
 
-
-# =====================================================================
-# 🎯 MOTEUR 1 : MT-FIN (ancien calcul restauré)
-# =====================================================================
 def _poisson_sample(lam: float) -> int:
     if lam <= 0: return 0
     L = math.exp(-lam)
@@ -830,7 +795,6 @@ def build_mtft_coupon_and_bonus(pool):
 
         if not best_pick or best_prob < MTFIN_MIN_PROB: continue
 
-        # Ancien calcul restauré
         pts = 15 + (10 if md.has_h2h else 0) + 10 + (30 if best_prob >= 0.65 else 20) + 15 + 10
         if pts < MTFIN_MIN_SCORE: continue
 
@@ -887,9 +851,6 @@ def build_mtft_coupon_and_bonus(pool):
     STATE["rejections"]["value"] += rejected_value
     return coupon, bonus_pool
 
-# =====================================================================
-# 🎯 MOTEUR 2 : MATCH NUL
-# =====================================================================
 def build_draw_coupon_and_bonus(pool):
     candidates = []
     rejected_value = 0
@@ -962,9 +923,6 @@ def build_draw_coupon_and_bonus(pool):
     STATE["rejections"]["value"] += rejected_value
     return coupon, bonus_pool
 
-# =====================================================================
-# 🎯 MOTEUR 3 : ODDS +3
-# =====================================================================
 def build_third_pillar(pool) -> list:
     pool_result = []
     rejected_value = 0
@@ -1043,7 +1001,6 @@ def _build_coupon_from_combo(combo, subtitle_prefix: str, quality: int, source_l
         ))
     subtitle = f"{subtitle_prefix} • {len(combo)} jambes"
     return Coupon("Odds +3 AUTH", subtitle, "🛡️", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
-
 
 def build_odds3_auth_coupon(bonus_mtft, bonus_draw, third_pillar, ws_matches) -> Optional[Coupon]:
     if ws_matches:
@@ -1244,9 +1201,6 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar) -> Optional[
 
     return None
 
-# =====================================================================
-# 🔧 ASSEMBLAGE FINAL
-# =====================================================================
 async def scan():
     async with STATE["scan_lock"]:
         STATE["rejections"] = {"value": 0, "ev_coupon": 0, "auth_proba": 0}
@@ -1341,9 +1295,6 @@ async def scan():
               f"AUTH proba={STATE['rejections']['auth_proba']}")
         print("────────────────────────")
 
-# =====================================================================
-# 🛡️ FORMATAGE & HANDLERS
-# =====================================================================
 async def safe_answer(msg, txt, reply_markup=None):
     for i, p in enumerate(split_message(txt)):
         try:
@@ -1422,7 +1373,6 @@ async def send_coupon(m, name):
     if c: await safe_answer(m, format_coupon(c))
     else: await safe_answer(m, f"Aucun coupon {name} aujourd'hui.")
 
-# --- COMMANDES ADMIN ---
 @dp.message(Command("keygen"))
 async def keygen(m):
     if m.from_user.id != ADMIN_ID: return
@@ -1438,7 +1388,6 @@ async def keygen(m):
     save_json(KEYS_DB, STATE["keys"])
     await m.answer(f"🔑 <code>{k}</code> • {days}j", parse_mode="HTML")
 
-# --- COMMANDES ABONNÉS ---
 @dp.message(Command("activate", "vip", "cle", "key"))
 async def activate_cmd(m):
     a = m.text.split()
@@ -1458,7 +1407,6 @@ async def process_act(m, k):
     save_json(KEYS_DB, STATE["keys"]); save_json(USERS_DB, STATE["users"])
     await m.answer(f"✅ Actif jusqu'au {exp.strftime('%d/%m/%Y')}", parse_mode="HTML", reply_markup=USER_KEYBOARD)
 
-# --- HANDLERS BOUTONS ---
 @dp.message(Command("start"))
 async def start_cmd(m):
     kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
