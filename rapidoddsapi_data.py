@@ -18,15 +18,13 @@ from datetime import datetime, timezone, timedelta
 RAPIDODDS_BASE_URL = "https://api.rapidoddsapi.com"
 RAPIDODDS_API_KEY = os.getenv("RAPIDODDSAPI_API_KEY", "")
 
-# IDs des ligues de soccer acceptées par RapidOddsAPI
-# On se concentre sur les 5 grands championnats + MLS pour le free tier
+# Ligues de soccer acceptées par l'API (identifiants exacts)
 SOCCER_LEAGUES = [
     "EPL", "LA_LIGA", "SERIE_A", "BUNDESLIGA", "LIGUE_1", "MLS"
 ]
 
-# Bookmakers disponibles (noms de feeds, pas de marques)
-# Le free tier permet 5 bookmakers par requête
-DEFAULT_BOOKMAKERS = ["Bet365", "Pinnacle", "DraftKings", "BetMGM", "FanDuel"]
+# L'API exige UN SEUL bookmaker (singulier) et en minuscules
+DEFAULT_BOOKMAKER = "bet365"
 
 
 def _norm(s: str) -> str:
@@ -85,9 +83,15 @@ async def _fetch_league_markets(client: httpx.AsyncClient, league: str, market_t
     """Récupère les cotes pour une ligue et un type de marché spécifique."""
     data = await _get(client, f"/sports/{league}/markets", {
         "market_type": market_type,
-        "bookmakers": ",".join(DEFAULT_BOOKMAKERS),
+        "bookmaker": DEFAULT_BOOKMAKER,   # ✅ Singulier, une seule valeur
     })
-    return data.get("games", []) if isinstance(data, dict) else []
+    
+    # L'API retourne les données dans une liste sous la clé "games" ou directement une liste
+    if isinstance(data, dict) and "games" in data:
+        return data.get("games", [])
+    elif isinstance(data, list):
+        return data
+    return []
 
 
 async def fetch_all_odds(matches: list[dict] = None) -> object:
@@ -108,17 +112,21 @@ async def fetch_all_odds(matches: list[dict] = None) -> object:
         for league in SOCCER_LEAGUES:
             print(f"🔎 RapidOddsAPI : récupération {league} (1X2)...")
             games_1x2 = await _fetch_league_markets(client, league, "head_to_head_3_way")
-            all_games_1x2.extend(games_1x2)
-            await asyncio.sleep(1.5)  # Pause anti rate-limit
+            if games_1x2:
+                all_games_1x2.extend(games_1x2)
+            await asyncio.sleep(1.0)  # Pause anti rate-limit
 
             print(f"🔎 RapidOddsAPI : récupération {league} (Totals)...")
             games_totals = await _fetch_league_markets(client, league, "totals")
-            all_games_totals.extend(games_totals)
-            await asyncio.sleep(1.5)
+            if games_totals:
+                all_games_totals.extend(games_totals)
+            await asyncio.sleep(1.0)
 
         if not all_games_1x2 and not all_games_totals:
             print("⚠️ RapidOddsAPI : aucune donnée retournée pour aucune ligue")
             return [] if matches is None else {}
+
+        print(f"🔎 RapidOddsAPI : {len(all_games_1x2)} matchs 1X2 bruts, {len(all_games_totals)} matchs Totals bruts")
 
         # Fusion des données par match (basé sur les noms d'équipes)
         merged_matches = {}
