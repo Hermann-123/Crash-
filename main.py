@@ -6,6 +6,8 @@ import math
 import os
 import random
 import re
+import secrets
+import string
 import unicodedata
 import itertools
 from contextlib import asynccontextmanager
@@ -114,7 +116,6 @@ ODDS3_MIN_COTE_LEG = 1.24
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
 
-# Signaux d'alerte détectés dans l'analyse contextuelle (approche pro anti-piège)
 PRO_TRAP_PHRASES = [
     "gestion d'effectif",
     "rotation",
@@ -189,10 +190,18 @@ class Coupon:
 
 bot = Bot(BOT_TOKEN); dp = Dispatcher()
 BTN_ODDS3 = "🎯 Odds +3"; BTN_MTFT = "⏱ MT-Fin"; BTN_DRAW = "🤝 Match Nul"
-BTN_SCAN = "🔄 Actualiser"; BTN_BILAN = "📊 Bilan"; BTN_ACTIVATE = "🔑 Activer mon abonnement"
+BTN_SCAN = "🔄 Actualiser"; BTN_BILAN = "📊 Bilan"
 
-USER_KEYBOARD = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_ODDS3)], [KeyboardButton(text=BTN_ACTIVATE)]], resize_keyboard=True)
-ADMIN_KEYBOARD = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_ODDS3), KeyboardButton(text=BTN_MTFT)], [KeyboardButton(text=BTN_DRAW)], [KeyboardButton(text=BTN_SCAN), KeyboardButton(text=BTN_BILAN), KeyboardButton(text="⚙️ Debug")]], resize_keyboard=True)
+# ✅ Clavier abonné : UNIQUEMENT le bouton Odds +3
+USER_KEYBOARD = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_ODDS3)]], resize_keyboard=True)
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_ODDS3), KeyboardButton(text=BTN_MTFT)],
+        [KeyboardButton(text=BTN_DRAW)],
+        [KeyboardButton(text=BTN_SCAN), KeyboardButton(text=BTN_BILAN), KeyboardButton(text="⚙️ Debug")],
+    ],
+    resize_keyboard=True,
+)
 
 STATE = {
     "ready": False, "coupons": [], "last_scan": None, "debug": {},
@@ -209,8 +218,73 @@ for raw in (TELEGRAM_ADMIN_ID, TELEGRAM_CHANNEL):
         except ValueError: TARGETS.append(raw)
 
 # =====================================================================
-# UTILITAIRES & CACHE JOURNALIER
+# GESTION DES CLÉS VIP & ABONNÉS
 # =====================================================================
+def generate_vip_key_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    p1 = "".join(secrets.choice(alphabet) for _ in range(4))
+    p2 = "".join(secrets.choice(alphabet) for _ in range(4))
+    return f"VIP-{p1}-{p2}"
+
+def create_access_keys(days: int = 30, count: int = 1) -> list[str]:
+    created = []
+    now_iso = datetime.now(TZ).isoformat()
+    for _ in range(count):
+        code = generate_vip_key_code()
+        while code in STATE["keys"]:
+            code = generate_vip_key_code()
+        STATE["keys"][code] = {
+            "days": days,
+            "created_at": now_iso,
+            "used": False,
+            "used_by": None,
+            "used_at": None,
+        }
+        created.append(code)
+    save_json(KEYS_DB, STATE["keys"])
+    return created
+
+def redeem_access_key(user, raw_code: str) -> Tuple[bool, str]:
+    code = raw_code.strip().upper()
+    key_info = STATE["keys"].get(code)
+    if not key_info:
+        return False, "❌ Clé invalide ou introuvable."
+    if key_info.get("used"):
+        return False, "❌ Cette clé a déjà été utilisée."
+
+    uid = str(user.id)
+    now = datetime.now(TZ)
+    days = int(key_info.get("days", 30))
+
+    # Prolonge si l'abonnement est déjà actif, sinon démarre maintenant
+    base_dt = now
+    if uid in STATE["users"]:
+        try:
+            old_exp = datetime.fromisoformat(STATE["users"][uid].get("expires_at", ""))
+            if old_exp > now:
+                base_dt = old_exp
+        except Exception:
+            pass
+
+    new_exp = base_dt + timedelta(days=days)
+    STATE["users"][uid] = {
+        "user_id": user.id,
+        "username": user.username or "",
+        "full_name": user.full_name or "",
+        "expires_at": new_exp.isoformat(),
+        "last_key": code,
+        "updated_at": now.isoformat(),
+    }
+    key_info["used"] = True
+    key_info["used_by"] = user.id
+    key_info["used_at"] = now.isoformat()
+
+    save_json(USERS_DB, STATE["users"])
+    save_json(KEYS_DB, STATE["keys"])
+
+    exp_str = new_exp.strftime("%d/%m/%Y à %H:%M")
+    return True, f"✅ <b>Accès VIP activé ({days} jours) !</b>\n📅 Valide jusqu'au <b>{exp_str}</b>.\n\nAppuie sur <b>{BTN_ODDS3}</b> pour voir le ticket du jour."
+
 def is_subscribed(user_id):
     if user_id == ADMIN_ID: return True
     uid = str(user_id)
@@ -222,9 +296,13 @@ def is_subscribed(user_id):
 
 def get_subscription_message(user_id):
     if user_id == ADMIN_ID: return "✅ Admin"
-    if is_subscribed(user_id): return f"✅ Actif jusqu'au {datetime.fromisoformat(STATE['users'][str(user_id)]['expires_at']).strftime('%d/%m/%Y à %H:%M')}."
-    return "❌ Abonnement expiré.\nContactez @hermann1123."
+    if is_subscribed(user_id):
+        return f"✅ Actif jusqu'au {datetime.fromisoformat(STATE['users'][str(user_id)]['expires_at']).strftime('%d/%m/%Y à %H:%M')}."
+    return "❌ Abonnement expiré ou inactif.\n🔑 <i>Colle directement ta clé d'accès dans ce chat pour activer ton VIP, ou contacte @hermann1123.</i>"
 
+# =====================================================================
+# UTILITAIRES & CACHE JOURNALIER
+# =====================================================================
 def load_json(path, default=None):
     if default is None: default = {}
     try:
@@ -306,7 +384,6 @@ def normalize_name(s: str) -> str:
 def is_reserve_team(name: str) -> bool: return any(kw in name.lower() for kw in RESERVE_KEYWORDS)
 
 def has_pro_red_flags(analysis_text: str) -> Tuple[bool, str]:
-    """Détecte les facteurs de risque humains/tactiques mentionnés dans l'analyse."""
     if not analysis_text:
         return False, ""
     low = analysis_text.lower()
@@ -316,7 +393,6 @@ def has_pro_red_flags(analysis_text: str) -> Tuple[bool, str]:
     return False, ""
 
 def clean_analysis_text(text: str, max_len: int = 320) -> str:
-    """Coupe proprement à la fin d'une phrase pour une lecture professionnelle."""
     if not text:
         return ""
     text = re.sub(r"\s+", " ", text).strip()
@@ -525,7 +601,7 @@ def inject_all_real_odds(pool, ws_matches, af_matches):
     return matched
 
 # =====================================================================
-# DOUBLE SCAN (AVEC CONTEXTE ANALYSE PRO)
+# DOUBLE SCAN
 # =====================================================================
 async def _enrich_single_pass(targets, pass_num):
     results = {}
@@ -606,8 +682,9 @@ async def enrich_with_double_pass(pool):
 # MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (STRATÉGIE PRO COTE 2.30 - 3.05)
 # =====================================================================
 def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
-    total_odds = math.prod(c["odds"] for c in combo)
-    total_prob = math.prod(c["proba"] / 100.0 for c in combo)
+    sorted_combo = sorted(combo, key=lambda c: parse_dt_safe(c.get("kickoff")) or datetime.max.replace(tzinfo=TZ))
+    total_odds = math.prod(c["odds"] for c in sorted_combo)
+    total_prob = math.prod(c["proba"] / 100.0 for c in sorted_combo)
     legs = [
         Selection(
             event_id=c["event_id"],
@@ -623,31 +700,24 @@ def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
             quality=quality,
             analysis=clean_analysis_text(c["ai"], 320),
         )
-        for c in combo
+        for c in sorted_combo
     ]
-    return Coupon("Odds +3 AUTH", f"{subtitle} • {len(combo)} sélections", "🛡️", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
+    return Coupon("Odds +3 AUTH", f"{subtitle} • {len(legs)} sélections", "🛡️", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
 
 def _valid_pro_combo(combo, require_anchor: bool = False) -> bool:
     if len({c["norm_key"] for c in combo}) != len(combo):
         return False
-    # Anti-répétition : max 1 pari buts et max 1 pari BTTS par coupon VIP
     if sum(1 for c in combo if c["family"] == "goals") > 1:
         return False
     if sum(1 for c in combo if c["family"] == "btts") > 1:
         return False
-    # Pour un combiné de 3 matchs, exige au moins 1 match "Banquier/Ancrage" (>= 72%)
+    if sum(1 for c in combo if c.get("mk") == "victoire_away") > 1:
+        return False
     if require_anchor and not any(c["proba"] >= 72.0 for c in combo):
         return False
     return True
 
 def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: List[WS_MatchData]) -> Tuple[Optional[Coupon], set]:
-    """
-    Stratégie Pronostiqueur Pro (Objectif Cote 2.30 - 3.05 rentable) :
-    - Priorité 1 : Duo Value (2 matchs forts entre 62% et 72% -> cote 2.30 - 3.05)
-    - Priorité 2 : Pyramide Sécurisée (3 matchs : 1 Ancrage >= 72% + 2 Value -> cote 2.30 - 3.05)
-    - Priorité 3 : Repli sécurisé (2.05 - 2.30) si aucune combinaison sûre n'atteint 2.30
-    - Rejet systématique des matchs pièges et diversification des marchés
-    """
     vip_candidates = []
 
     markets_map = [
@@ -666,12 +736,9 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             continue
         if is_reserve_team(md.home) or is_reserve_team(md.away):
             continue
-
-        # 1. Filtre ligue calibrée (Dixon-Coles ou cotes bookmakers réelles)
         if not md.dixon_pred and not md.real_odds:
             continue
 
-        # 2. Filtre lecture humaine : rejet si turnover, rotation ou match piège détecté
         is_trap, trap_reason = has_pro_red_flags(md.analysis)
         if is_trap:
             STATE["rejections"]["pro_trap"] += 1
@@ -686,7 +753,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             if emoji == "⚠️" or not passes_auth_proba_filter(proba_pct):
                 continue
 
-            # Victoire à l'extérieur sèche : exige accord des modèles ou vraie cote
             if mk == "victoire_away" and emoji not in ("🤝", "🤝🤝") and not md.real_odds.get("away"):
                 continue
 
@@ -703,7 +769,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             if not passes_value_filter(prob, odd, is_real, emoji):
                 continue
 
-            # Classement Pro : cotes réelles > triple consensus > victoires/DC > stabilité
             family_bonus = 2 if family in ("result", "dc") else 1
             consensus_bonus = 2 if emoji == "🤝🤝" else (1 if emoji == "🤝" else 0)
             stability_bonus = 1 if md.stability_flag == "stable" else 0
@@ -717,6 +782,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                     "home": md.home,
                     "away": md.away,
                     "kickoff": md.kickoff,
+                    "mk": mk,
                     "type": label_fn(md),
                     "family": family,
                     "odds": odd,
@@ -730,7 +796,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             best_for_match.pop("_rank", None)
             vip_candidates.append(best_for_match)
 
-    # Complément via RapidOddsAPI si disponible
     seen_keys = {c["norm_key"] for c in vip_candidates}
     for match in ws_matches:
         if not is_match_not_started(match.commence_time) or is_reserve_team(match.home_team) or is_reserve_team(match.away_team):
@@ -741,10 +806,10 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
         sim = dixon_ws.simulate(match)
         if not sim:
             continue
-        for odd, proba, family, label, ai in [
-            (match.home_odds, sim.proba_home, "result", f"Victoire {match.home_team} (1)", "Supériorité domicile validée par les cotes réelles et le modèle Poisson."),
-            (match.away_odds, sim.proba_away, "result", f"Victoire {match.away_team} (2)", "Supériorité extérieure validée par les cotes réelles et le modèle Poisson."),
-            (match.over_2_5, sim.proba_over_2_5, "goals", "Plus de 2.5 buts", "Potentiel offensif confirmé par les cotes du marché."),
+        for mk, odd, proba, family, label, ai in [
+            ("victoire_home", match.home_odds, sim.proba_home, "result", f"Victoire {match.home_team} (1)", "Supériorité domicile validée par les cotes réelles et le modèle Poisson."),
+            ("victoire_away", match.away_odds, sim.proba_away, "result", f"Victoire {match.away_team} (2)", "Supériorité extérieure validée par les cotes réelles et le modèle Poisson."),
+            ("over_2.5", match.over_2_5, sim.proba_over_2_5, "goals", "Plus de 2.5 buts", "Potentiel offensif confirmé par les cotes du marché."),
         ]:
             if not odd or odd < ODDS3_MIN_COTE_LEG or not passes_auth_proba_filter(proba):
                 continue
@@ -757,6 +822,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 "home": match.home_team,
                 "away": match.away_team,
                 "kickoff": match.commence_time,
+                "mk": mk,
                 "type": label,
                 "family": family,
                 "odds": odd,
@@ -771,7 +837,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
     vip_candidates.sort(key=lambda x: (1 if x["real_odd"] else 0, 1 if x["family"] in ("result", "dc") else 0, x["proba"]), reverse=True)
     top_pool = vip_candidates[:14]
 
-    # 1. PRIORITÉ 1 : Duo Value Pro (2 matchs -> cote 2.30 à 3.05)
+    # 1. Duo Value Pro (2 matchs -> cote 2.30 à 3.05)
     if len(top_pool) >= 2:
         for combo in itertools.combinations(top_pool, 2):
             if not _valid_pro_combo(combo, require_anchor=False):
@@ -784,7 +850,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 locked_keys = {c["norm_key"] for c in combo}
                 return _build_auth_coupon(combo, "Sélection Pro VIP • Duo Value", 96), locked_keys
 
-    # 2. PRIORITÉ 2 : Pyramide Sécurisée (3 matchs : 1 Ancrage >= 72% + 2 Value -> cote 2.30 à 3.05)
+    # 2. Pyramide Sécurisée (3 matchs : 1 Ancrage >= 72% + 2 Value -> cote 2.30 à 3.05)
     if len(top_pool) >= 3:
         for combo in itertools.combinations(top_pool, 3):
             if not _valid_pro_combo(combo, require_anchor=True):
@@ -797,7 +863,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 locked_keys = {c["norm_key"] for c in combo}
                 return _build_auth_coupon(combo, "Sélection Pro VIP • Pyramide Sécurisée", 94), locked_keys
 
-    # 3. PRIORITÉ 3 : Repli Sécurisé (2.05 - 2.30) si aucune combinaison sûre n'atteint 2.30
+    # 3. Repli Sécurisé (2.05 - 2.30)
     for r in (2, 3):
         if len(top_pool) < r:
             continue
@@ -1115,38 +1181,145 @@ def format_coupon(c):
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
 
+# --- COMMANDES UTILISATEUR & ADMIN CLÉS VIP ---
 @dp.message(Command("start"))
-async def start_cmd(m):
+async def start_cmd(m: Message):
     kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
-    if m.from_user.id == ADMIN_ID: msg = f"{format_header()}\n\n<b>👋 Admin</b>\n/scan (cache) • /rescan (forcer)."
-    elif is_subscribed(m.from_user.id): msg = f"{format_header()}\n\n<b>🎉 Bienvenue VIP !</b>\n\n{get_subscription_message(m.from_user.id)}"
-    else: msg = f"{format_header()}\n\n<b>🔒 Accès VIP requis</b>\n\n{get_subscription_message(m.from_user.id)}"
+    if m.from_user.id == ADMIN_ID:
+        msg = (
+            f"{format_header()}\n\n<b>👋 Mode Admin</b>\n"
+            f"• /genkey <code>[jours] [nb]</code> — Créer clé(s) VIP\n"
+            f"• /vip — Liste des abonnés & clés\n"
+            f"• /delvip <code>ID</code> — Révoquer un abonné\n"
+            f"• /scan • /rescan"
+        )
+    elif is_subscribed(m.from_user.id):
+        msg = f"{format_header()}\n\n<b>🎉 Bienvenue VIP !</b>\n\n{get_subscription_message(m.from_user.id)}\n\nAppuie sur <b>{BTN_ODDS3}</b> ci-dessous."
+    else:
+        msg = f"{format_header()}\n\n<b>🔒 Accès VIP requis</b>\n\n{get_subscription_message(m.from_user.id)}"
     await safe_answer(m, msg, reply_markup=kb)
 
+@dp.message(Command("genkey", "gen", "newkey"))
+async def genkey_cmd(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    parts = (m.text or "").split()
+    days = 30
+    count = 1
+    try:
+        if len(parts) >= 2:
+            days = max(1, min(3650, int(parts[1])))
+        if len(parts) >= 3:
+            count = max(1, min(50, int(parts[2])))
+    except ValueError:
+        await safe_answer(m, "⚠️ Format : <code>/genkey 30</code> ou <code>/genkey 30 5</code>")
+        return
+
+    keys = create_access_keys(days=days, count=count)
+    keys_fmt = "\n".join(f"• <code>{k}</code>" for k in keys)
+    await safe_answer(
+        m,
+        f"🔑 <b>{count} clé(s) VIP générée(s) ({days} jours) :</b>\n\n{keys_fmt}\n\n"
+        f"<i>L'abonné n'a qu'à coller la clé dans le bot pour activer son accès.</i>",
+    )
+
+@dp.message(Command("vip", "users", "keys"))
+async def vip_list_cmd(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    now = datetime.now(TZ)
+    active_lines = []
+    for uid, info in STATE["users"].items():
+        try:
+            exp = datetime.fromisoformat(info.get("expires_at", ""))
+            if exp > now:
+                uname = f"@{info['username']}" if info.get("username") else info.get("full_name", "Sans nom")
+                active_lines.append(f"• <b>{uname}</b> (<code>{uid}</code>) → {exp.strftime('%d/%m/%Y %H:%M')}")
+        except Exception:
+            pass
+
+    unused_keys = [
+        f"• <code>{k}</code> ({v.get('days', 30)}j)"
+        for k, v in STATE["keys"].items()
+        if not v.get("used")
+    ]
+
+    txt = f"<b>👥 ABONNÉS VIP ACTIFS ({len(active_lines)}) :</b>\n"
+    txt += ("\n".join(active_lines) if active_lines else "<i>Aucun abonné actif.</i>")
+    txt += f"\n\n<b>🔑 CLÉS DISPONIBLES ({len(unused_keys)}) :</b>\n"
+    txt += ("\n".join(unused_keys[:25]) if unused_keys else "<i>Aucune clé libre (/genkey pour en créer).</i>")
+    await safe_answer(m, txt)
+
+@dp.message(Command("delvip", "revoke"))
+async def delvip_cmd(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    parts = (m.text or "").split()
+    if len(parts) < 2:
+        await safe_answer(m, "⚠️ Format : <code>/delvip ID_TELEGRAM</code>")
+        return
+    uid = parts[1].strip()
+    if uid in STATE["users"]:
+        del STATE["users"][uid]
+        save_json(USERS_DB, STATE["users"])
+        await safe_answer(m, f"🗑️ Abonnement révoqué pour <code>{uid}</code>.")
+    else:
+        await safe_answer(m, f"❌ Utilisateur <code>{uid}</code> introuvable.")
+
 @dp.message(F.text == BTN_ODDS3)
-async def b_odds3(m):
-    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id): await m.answer("❌ VIP requis."); return
+async def b_odds3(m: Message):
+    if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
+        await safe_answer(
+            m,
+            f"<b>🔒 Accès VIP requis</b>\n\n{get_subscription_message(m.from_user.id)}",
+            reply_markup=USER_KEYBOARD,
+        )
+        return
     c = next((x for x in STATE["coupons"] if x.name == "Odds +3 AUTH"), None)
-    if c: await safe_answer(m, format_coupon(c))
-    else: await safe_answer(m, "📭 Aucun ticket VIP aujourd'hui : aucun match ne passe tous nos filtres de sécurité pro (protection de bankroll).")
+    if c:
+        await safe_answer(m, format_coupon(c))
+    else:
+        await safe_answer(m, "📭 Aucun ticket VIP aujourd'hui : aucun match ne passe tous nos filtres de sécurité pro (protection de bankroll).")
     if m.from_user.id == ADMIN_ID:
         c_hyb = next((x for x in STATE["coupons"] if x.name == "Odds +3 HYBRIDE"), None)
-        if c_hyb: await safe_answer(m, format_coupon(c_hyb))
+        if c_hyb:
+            await safe_answer(m, format_coupon(c_hyb))
 
 @dp.message(F.text == BTN_MTFT)
-async def b_mtft(m):
+async def b_mtft(m: Message):
     if m.from_user.id == ADMIN_ID:
         c = next((x for x in STATE["coupons"] if x.name == "MT-Fin"), None)
         if c: await safe_answer(m, format_coupon(c))
+        else: await safe_answer(m, "📭 Aucun coupon MT-Fin disponible.")
 
 @dp.message(F.text == BTN_DRAW)
-async def b_draw(m):
+async def b_draw(m: Message):
     if m.from_user.id == ADMIN_ID:
         c = next((x for x in STATE["coupons"] if x.name == "Match Nul"), None)
         if c: await safe_answer(m, format_coupon(c))
+        else: await safe_answer(m, "📭 Aucun coupon Match Nul disponible.")
+
+@dp.message(F.text == BTN_BILAN)
+async def b_bilan(m: Message):
+    if m.from_user.id == ADMIN_ID:
+        total = len(STATE["tracker"].get("coupons", []))
+        await safe_answer(m, f"📊 <b>Bilan Tracker</b>\n• Coupons enregistrés : <b>{total}</b>\n• Dernier scan : <code>{STATE.get('last_scan') or 'N/A'}</code>")
+
+@dp.message(F.text == "⚙️ Debug")
+async def b_debug(m: Message):
+    if m.from_user.id == ADMIN_ID:
+        await safe_answer(
+            m,
+            f"⚙️ <b>Debug</b>\n"
+            f"• Mode cotes : <code>{STATE.get('odds_api_mode', '?')}</code>\n"
+            f"• Double Scan : <code>{STATE.get('double_scan_status', '?')}</code>\n"
+            f"• Stats : <code>{STATE.get('double_scan_stats', {})}</code>\n"
+            f"• Rejets : <code>{STATE.get('rejections', {})}</code>\n"
+            f"• Clés libres : <b>{sum(1 for v in STATE['keys'].values() if not v.get('used'))}</b>",
+        )
 
 @dp.message(F.text == BTN_SCAN)
-async def b_scan(m):
+async def b_scan(m: Message):
     if m.from_user.id == ADMIN_ID:
         await safe_answer(m, "⏳ Vérification des coupons...")
         ran_fresh = await scan(force=False)
@@ -1157,7 +1330,7 @@ async def b_scan(m):
             await safe_answer(m, f"📦 <b>Cache journalier actif</b> ({len(STATE['coupons'])} coupon(s) figé(s) pour aujourd'hui).\n<i>Utilise /rescan pour forcer une nouvelle double analyse.</i>")
 
 @dp.message(Command("scan"))
-async def scan_cmd(m):
+async def scan_cmd(m: Message):
     if m.from_user.id == ADMIN_ID:
         await safe_answer(m, "⏳ Vérification des coupons...")
         ran_fresh = await scan(force=False)
@@ -1168,12 +1341,36 @@ async def scan_cmd(m):
             await safe_answer(m, f"📦 <b>Cache journalier actif</b> ({len(STATE['coupons'])} coupon(s) figé(s) pour aujourd'hui).\n<i>Utilise /rescan pour forcer une nouvelle double analyse.</i>")
 
 @dp.message(Command("rescan"))
-async def rescan_cmd(m):
+async def rescan_cmd(m: Message):
     if m.from_user.id == ADMIN_ID:
         await safe_answer(m, "🔄 <b>Rescan forcé en cours</b> (Analyse Pro + mise à jour du cache)...")
         await scan(force=True)
         record_coupons(STATE["coupons"], datetime.now(TZ).strftime("%Y-%m-%d"))
         await broadcast_after_scan()
+
+# --- ACTIVATION AUTOMATIQUE QUAND UN ABONNÉ COLLE SA CLÉ ---
+@dp.message(F.text)
+async def handle_key_redeem(m: Message):
+    raw = (m.text or "").strip()
+    if not raw or raw.startswith("/"):
+        return
+    candidate = raw.upper()
+    if candidate in STATE["keys"] or candidate.startswith("VIP-"):
+        ok, reply = redeem_access_key(m.from_user, candidate)
+        kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
+        await safe_answer(m, reply, reply_markup=kb)
+        if ok and ADMIN_ID and m.from_user.id != ADMIN_ID:
+            uname = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
+            await safe_send(
+                ADMIN_ID,
+                f"🔔 <b>Nouvelle activation VIP !</b>\n👤 {uname} (<code>{m.from_user.id}</code>)\n🔑 Clé : <code>{candidate}</code>",
+            )
+    elif m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id):
+        await safe_answer(
+            m,
+            f"<b>🔒 Accès VIP requis</b>\n\n{get_subscription_message(m.from_user.id)}",
+            reply_markup=USER_KEYBOARD,
+        )
 
 async def daily_broadcast():
     try:
@@ -1187,7 +1384,10 @@ async def daily_broadcast():
 async def lifespan(app):
     try: await bot.delete_webhook(drop_pending_updates=True)
     except: pass
-    STATE["tracker"] = load_json(LOCAL_DB, {"coupons": []}); STATE["keys"] = load_json(KEYS_DB); STATE["users"] = load_json(USERS_DB); STATE["ready"] = True
+    STATE["tracker"] = load_json(LOCAL_DB, {"coupons": []})
+    STATE["keys"] = load_json(KEYS_DB, {})
+    STATE["users"] = load_json(USERS_DB, {})
+    STATE["ready"] = True
     today_str = datetime.now(TZ).strftime("%Y-%m-%d")
     if load_daily_cache(today_str):
         print(f"📦 Cache du jour restauré au démarrage ({len(STATE['coupons'])} coupons)")
