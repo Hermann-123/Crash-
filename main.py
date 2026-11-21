@@ -76,10 +76,10 @@ COUPONS_CACHE_DB = os.getenv("COUPONS_CACHE_DB", "/tmp/coupons_today.json")
 
 BRAND_NAME = os.getenv("BRAND_NAME", "Volatility Index")
 BRAND_TAGLINE = os.getenv("BRAND_TAGLINE", "Analyse IA • VIP")
-PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Joue responsable.")
+PUBLIC_FOOTER = os.getenv("PUBLIC_FOOTER", "⚠️ Analyse statistique. Gestion de bankroll recommandée (1-3% par ticket).")
 NOTIFY_ON_STARTUP = os.getenv("NOTIFY_ON_STARTUP", "true").lower() == "true"
 
-GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "30"))
+GEMINI_MAX_CALLS_PER_SCAN = int(os.getenv("GEMINI_MAX_CALLS_PER_SCAN", "20"))
 BZZ_NATIVE_CONFIDENCE = float(os.getenv("BZZ_NATIVE_CONFIDENCE", "65.0"))
 
 WEIGHT_ALGO    = float(os.getenv("WEIGHT_ALGO",   "0.35"))
@@ -87,17 +87,18 @@ WEIGHT_GEMINI  = float(os.getenv("WEIGHT_GEMINI", "0.35"))
 WEIGHT_BZZOIRO = float(os.getenv("WEIGHT_BZZOIRO","0.30"))
 
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
-MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.98"))
+MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.94"))
 
-# ✅ ZONE RENTABLE AUTH (62% à 77% = cotes naturelles 1.32 à 1.85)
-AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "62.0"))
-AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "77.0"))
-AUTH_MAX_LEGS  = 3
+# ✅ CALIBRAGE PRONOSTIQUEUR PRO (VIP AUTH : 2 matchs max, haute probabilité de gain)
+AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "72.0"))
+AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "88.0"))
+AUTH_MAX_LEGS  = 2
+AUTH_MIN_COMBINED_PROB = 0.54
 
-DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "15"))
+DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "10"))
 DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.15"))
-DOUBLE_SCAN_MIN_STABLE      = int(os.getenv("DOUBLE_SCAN_MIN_STABLE", "4"))
-DOUBLE_SCAN_PAUSE_SECONDS   = int(os.getenv("DOUBLE_SCAN_PAUSE_SECONDS", "4"))
+DOUBLE_SCAN_MIN_STABLE      = int(os.getenv("DOUBLE_SCAN_MIN_STABLE", "3"))
+DOUBLE_SCAN_PAUSE_SECONDS   = int(os.getenv("DOUBLE_SCAN_PAUSE_SECONDS", "3"))
 
 MTFIN_MIN_SCORE = 70
 MTFIN_MIN_PROB = 0.38
@@ -108,14 +109,31 @@ DRAW_MIN_SCORE = 70
 DRAW_MAX_ECART = 0.20
 DRAW_MIN_PROB = 0.28
 
-ODDS3_AUTH_MIN_COTE = 2.40
-ODDS3_AUTH_MAX_COTE = 3.25
+ODDS3_AUTH_MIN_COTE = 1.45
+ODDS3_AUTH_MAX_COTE = 2.30
 ODDS3_HYB_MIN_COTE = 3.00
 ODDS3_HYB_MAX_COTE = 5.50
-ODDS3_MIN_COTE_LEG = 1.30
+ODDS3_MIN_COTE_LEG = 1.22
 
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
+
+# Signaux d'alerte détectés dans l'analyse contextuelle (approche pro anti-piège)
+PRO_TRAP_PHRASES = [
+    "gestion d'effectif",
+    "rotation",
+    "effectif remanié",
+    "nombreux absents",
+    "blessures majeures",
+    "déplacement piège",
+    "match piège",
+    "irrégularité chronique",
+    "très imprévisible",
+    "aucun enjeu",
+    "sans enjeu",
+    "en pleine crise",
+]
+
 TELEGRAM_MAX_LEN = 3800
 TZ = ZoneInfo(NOTIFY_TZ)
 
@@ -150,8 +168,9 @@ class DixonColesEngine:
         p_h = float(np.sum(np.tril(matrix, -1))) * 100; p_d = float(np.sum(np.diag(matrix))) * 100; p_a = float(np.sum(np.triu(matrix, 1))) * 100
         best_idx = np.argmax(matrix); sx, sy = np.unravel_index(best_idx, matrix.shape)
         p_btts = float(np.sum(matrix[1:, 1:])) * 100
+        p_o15 = float(np.sum([matrix[i, j] for i in range(self.max_goals) for j in range(self.max_goals) if i + j > 1])) * 100
         p_o25 = float(np.sum([matrix[i, j] for i in range(self.max_goals) for j in range(self.max_goals) if i + j > 2])) * 100
-        return WS_SimulationResult(match.match_id, p_h, p_d, p_a, f"{sx}-{sy}", p_btts, 0, p_o25, 0)
+        return WS_SimulationResult(match.match_id, p_h, p_d, p_a, f"{sx}-{sy}", p_btts, p_o15, p_o25, 0)
 
 dixon_ws = DixonColesEngine()
 
@@ -184,7 +203,7 @@ STATE = {
     "tracker": {"coupons": []}, "keys": {}, "users": {},
     "scan_lock": asyncio.Lock(), "dixon_model": None, "last_scan_date": "",
     "double_scan_status": "", "double_scan_stats": {},
-    "rejections": {"value": 0, "ev_coupon": 0, "auth_proba": 0},
+    "rejections": {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0},
 }
 
 TARGETS = []
@@ -290,6 +309,30 @@ def normalize_name(s: str) -> str:
 
 def is_reserve_team(name: str) -> bool: return any(kw in name.lower() for kw in RESERVE_KEYWORDS)
 
+def has_pro_red_flags(analysis_text: str) -> Tuple[bool, str]:
+    """Détecte les facteurs de risque humains/tactiques mentionnés dans l'analyse."""
+    if not analysis_text:
+        return False, ""
+    low = analysis_text.lower()
+    for phrase in PRO_TRAP_PHRASES:
+        if phrase in low:
+            return True, phrase
+    return False, ""
+
+def clean_analysis_text(text: str, max_len: int = 320) -> str:
+    """Coupe proprement à la fin d'une phrase pour une lecture professionnelle."""
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len]
+    for sep in (". ", "! ", "? "):
+        idx = cut.rfind(sep)
+        if idx > 80:
+            return cut[:idx + 1]
+    return cut.rsplit(" ", 1)[0] + "..."
+
 def parse_dt_safe(s) -> Optional[datetime]:
     if not s: return None
     try:
@@ -313,8 +356,8 @@ def is_match_not_started(kickoff_str) -> bool:
 
 def prob_bar(p: float) -> str:
     if p >= 0.80: return "🟢🟢🟢"
-    if p >= 0.72: return "🟢🟢⚪"
-    if p >= 0.65: return "🟢⚪⚪"
+    if p >= 0.74: return "🟢🟢⚪"
+    if p >= 0.68: return "🟢⚪⚪"
     return "⚪⚪⚪"
 
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
@@ -339,7 +382,7 @@ def prescore_match(md: MatchData) -> int:
     conf_score = int(md.bzz_confidence or 0)
     real_bonus = 40 if (md.real_odds.get("home") or md.real_odds.get("away")) else (20 if md.real_odds else 0)
     bzz_bonus = 15 if md.bzz_markets else 0
-    dixon_bonus = 20 if md.dixon_pred else 0
+    dixon_bonus = 25 if md.dixon_pred else 0
     h2h_bonus = 10 if md.has_h2h else 0
     return conf_score + real_bonus + bzz_bonus + dixon_bonus + h2h_bonus
 
@@ -348,7 +391,7 @@ def _get_match_id(item: dict) -> str:
     return str(m.event_id if hasattr(m, "event_id") else m.match_id)
 
 # =====================================================================
-# CALCUL PROBABILITÉ (Dixon + ML + Gemini + Bzzoiro)
+# CALCUL PROBABILITÉ (Dixon + ML + Gemini + Bzzoiro + Double Chance)
 # =====================================================================
 def compute_probability(md, market_key):
     dixon_pred = md.dixon_pred if md.dixon_pred else {}
@@ -356,13 +399,30 @@ def compute_probability(md, market_key):
     fused = fuse_probas(dixon_pred, ml_probas) if fuse_probas and ml_probas else dixon_pred
     gem = dix = bzz = 0.0; gem_avail = dix_avail = bzz_avail = False
 
-    if md.gemini_markets and md.gemini_markets.get(market_key) is not None:
-        try: gem = float(md.gemini_markets[market_key]) / 100.0; gem_avail = True
-        except: pass
-    dk = {"victoire_home":"p_home","match_nul":"p_draw","victoire_away":"p_away","over_2.5":"over_2.5","under_2.5":"under_2.5","over_3.5":"over_3.5","over_1.5":"over_1.5","under_1.5":"under_1.5","btts_yes":"btts_yes","btts_no":"btts_no"}.get(market_key)
-    if dk and fused and fused.get(dk) is not None:
-        try: dix = float(fused.get(dk)); dix_avail = True
-        except: pass
+    if md.gemini_markets:
+        if md.gemini_markets.get(market_key) is not None:
+            try: gem = float(md.gemini_markets[market_key]) / 100.0; gem_avail = True
+            except: pass
+        elif market_key == "double_chance_1X" and md.gemini_markets.get("victoire_home") is not None and md.gemini_markets.get("match_nul") is not None:
+            try: gem = (float(md.gemini_markets["victoire_home"]) + float(md.gemini_markets["match_nul"])) / 100.0; gem_avail = True
+            except: pass
+        elif market_key == "double_chance_X2" and md.gemini_markets.get("victoire_away") is not None and md.gemini_markets.get("match_nul") is not None:
+            try: gem = (float(md.gemini_markets["victoire_away"]) + float(md.gemini_markets["match_nul"])) / 100.0; gem_avail = True
+            except: pass
+
+    if fused:
+        if market_key == "double_chance_1X" and fused.get("p_home") is not None and fused.get("p_draw") is not None:
+            try: dix = float(fused["p_home"]) + float(fused["p_draw"]); dix_avail = True
+            except: pass
+        elif market_key == "double_chance_X2" and fused.get("p_away") is not None and fused.get("p_draw") is not None:
+            try: dix = float(fused["p_away"]) + float(fused["p_draw"]); dix_avail = True
+            except: pass
+        else:
+            dk = {"victoire_home":"p_home","match_nul":"p_draw","victoire_away":"p_away","over_2.5":"over_2.5","under_2.5":"under_2.5","over_3.5":"over_3.5","over_1.5":"over_1.5","under_1.5":"under_1.5","btts_yes":"btts_yes","btts_no":"btts_no"}.get(market_key)
+            if dk and fused.get(dk) is not None:
+                try: dix = float(fused.get(dk)); dix_avail = True
+                except: pass
+
     if md.bzz_markets and md.bzz_markets.get(market_key) is not None:
         try: bzz = float(md.bzz_markets[market_key]) / 100.0; bzz_avail = True
         except: pass
@@ -372,7 +432,7 @@ def compute_probability(md, market_key):
     if gem_avail: total_w += WEIGHT_GEMINI; weighted_sum += gem * WEIGHT_GEMINI
     if bzz_avail: total_w += WEIGHT_BZZOIRO; weighted_sum += bzz * WEIGHT_BZZOIRO
     if total_w <= 0: return 0.0, gem, dix, bzz, ""
-    final = weighted_sum / total_w
+    final = min(0.95, weighted_sum / total_w)
     sources = [x for x in (gem, dix, bzz) if x > 0]
     emoji = ""
     if len(sources) >= 2:
@@ -469,7 +529,7 @@ def inject_all_real_odds(pool, ws_matches, af_matches):
     return matched
 
 # =====================================================================
-# DOUBLE SCAN
+# DOUBLE SCAN (AVEC CONTEXTE ANALYSE PRO)
 # =====================================================================
 async def _enrich_single_pass(targets, pass_num):
     results = {}
@@ -477,11 +537,20 @@ async def _enrich_single_pass(targets, pass_num):
     async with httpx.AsyncClient(timeout=70.0) as client:
         for md in targets:
             try:
-                ctx = None
+                ctx = {}
                 if enrich_match_with_bzzoiro:
                     date_iso = parse_dt_safe(md.kickoff).strftime("%Y-%m-%d") if parse_dt_safe(md.kickoff) else datetime.now(TZ).strftime("%Y-%m-%d")
-                    ctx = await enrich_match_with_bzzoiro(md.home, md.away, date_iso)
-                    if ctx and ctx.get("available"): md.has_h2h = True
+                    bzz_ctx = await enrich_match_with_bzzoiro(md.home, md.away, date_iso)
+                    if isinstance(bzz_ctx, dict):
+                        ctx.update(bzz_ctx)
+                        if bzz_ctx.get("available"): md.has_h2h = True
+                if md.dixon_pred:
+                    ctx["dixon_coles"] = md.dixon_pred
+                ctx["pro_tipster_instructions"] = (
+                    "Analyse ce match comme un pronostiqueur professionnel avec 20 ans d'expérience : "
+                    "évalue la dynamique récente, le rapport de force domicile/extérieur, l'enjeu sportif, "
+                    "la fatigue/rotation éventuelle et le style tactique. Signale clairement tout risque de rotation ou piège."
+                )
                 if predict_match_probas:
                     pred = await predict_match_probas(client, md.home, md.away, md.league, md.kickoff, context=ctx)
                     if pred and "markets" in pred:
@@ -489,11 +558,11 @@ async def _enrich_single_pass(targets, pass_num):
                         errors = 0
                     else:
                         errors += 1
-                await asyncio.sleep(2.2)
+                await asyncio.sleep(2.0)
             except Exception as e:
                 errors += 1
                 print(f"⚠️ Gemini Pass {pass_num} ({md.home} vs {md.away}) : {e}")
-                if errors >= 4:
+                if errors >= 3:
                     print(f"🛑 Gemini Pass {pass_num} : arrêt anticipé (erreurs consécutives).")
                     break
     print(f"🤖 Gemini Pass {pass_num} : {len(results)}/{len(targets)} matchs analysés")
@@ -543,7 +612,7 @@ async def enrich_with_double_pass(pool):
     return targets
 
 # =====================================================================
-# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (EXÉCUTÉ EN PREMIER & VERROUILLÉ)
+# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (MÉTHODOLOGIE PRONOSTIQUEUR PRO)
 # =====================================================================
 def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
     total_odds = math.prod(c["odds"] for c in combo)
@@ -561,27 +630,32 @@ def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
             model_prob=c["proba"] / 100.0,
             real_odd=c["real_odd"],
             quality=quality,
-            analysis=c["ai"],
+            analysis=clean_analysis_text(c["ai"], 320),
         )
         for c in combo
     ]
-    return Coupon("Odds +3 AUTH", f"{subtitle} • {len(combo)} matchs", "🛡️", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
+    return Coupon("Odds +3 AUTH", f"{subtitle} • {len(combo)} sélections", "🛡️", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
 
 def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: List[WS_MatchData]) -> Tuple[Optional[Coupon], set]:
     """
-    Construit le ticket exclusif des abonnés VIP en premier et retourne
-    (Coupon, set_des_matchs_verrouillés) pour qu'aucune autre catégorie ne les réutilise.
+    Sélection VIP construite selon une méthodologie de pronostiqueur pro :
+    - 2 matchs max pour maximiser le taux de réussite (> 54% combiné)
+    - Rejet automatique des matchs avec signaux de rotation/piège dans l'analyse
+    - Exigence de ligue calibrée (Dixon-Coles) ou cotes bookmakers réelles
+    - Choix du marché le plus adapté (1, 2, 1X, X2, Over 1.5) sans doubler les paris buts
+    - Verrouillage exclusif pour les abonnés VIP
     """
     vip_candidates = []
 
-    # 1. Candidats issus de l'analyse multi-IA (Dixon + Gemini + Bzzoiro + cotes réelles)
+    # Marchés hiérarchisés par sécurité professionnelle (résultat/double chance prioritaire sur les buts)
     markets_map = [
-        ("victoire_home", "home", lambda m: f"Victoire {m.home} (1)"),
-        ("victoire_away", "away", lambda m: f"Victoire {m.away} (2)"),
-        ("over_2.5", "over_2.5", lambda m: "Plus de 2.5 buts"),
-        ("under_2.5", "under_2.5", lambda m: "Moins de 2.5 buts"),
-        ("btts_yes", "btts_yes", lambda m: "BTTS Oui"),
-        ("btts_no", "btts_no", lambda m: "BTTS Non"),
+        ("victoire_home", "home", "result", lambda m: f"Victoire {m.home} (1)"),
+        ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
+        ("victoire_away", "away", "result", lambda m: f"Victoire {m.away} (2)"),
+        ("double_chance_X2", "dc_x2", "dc", lambda m: f"Double Chance Nul ou {m.away} (X2)"),
+        ("over_1.5", "over_1.5", "goals", lambda m: "Plus de 1.5 buts"),
+        ("over_2.5", "over_2.5", "goals", lambda m: "Plus de 2.5 buts"),
+        ("under_2.5", "under_2.5", "goals", lambda m: "Moins de 2.5 buts"),
     ]
 
     for md in enriched_pool:
@@ -590,15 +664,28 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
         if is_reserve_team(md.home) or is_reserve_team(md.away):
             continue
 
+        # 1. Filtre ligue calibrée : pas de coupe/division obscure sans modèle Dixon ni cotes réelles
+        if not md.dixon_pred and not md.real_odds:
+            continue
+
+        # 2. Filtre lecture humaine : rejet si turnover, rotation ou match piège détecté
+        is_trap, trap_reason = has_pro_red_flags(md.analysis)
+        if is_trap:
+            STATE["rejections"]["pro_trap"] += 1
+            print(f"  🚩 Pro-Filter rejet ({md.home} vs {md.away}) : signal '{trap_reason}'")
+            continue
+
         best_for_match = None
-        for mk, odd_key, label_fn in markets_map:
+        for mk, odd_key, family, label_fn in markets_map:
             prob, g, d, b, emoji = compute_probability(md, mk)
             proba_pct = prob * 100.0
-            # Rejet strict si désaccord entre les sources
+
+            # Exige consensus clair et probabilité dans la bande pro (72% - 88%)
             if emoji == "⚠️" or not passes_auth_proba_filter(proba_pct):
                 continue
-            # Sur victoire sèche, exige soit le modèle Dixon de la ligue, soit une vraie cote bookmaker
-            if mk in ("victoire_home", "victoire_away") and not md.dixon_pred and not md.real_odds.get(odd_key):
+
+            # Victoire à l'extérieur sèche : exige triple consensus ou vraie cote
+            if mk == "victoire_away" and emoji not in ("🤝", "🤝🤝") and not md.real_odds.get("away"):
                 continue
 
             real_odd = md.real_odds.get(odd_key)
@@ -606,7 +693,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 odd = real_odd
                 is_real = True
             else:
-                # Vraie cote implicite SANS gonflage artificiel à 1.30
                 odd = round(1.0 / prob, 2) if prob > 0 else 0.0
                 is_real = False
 
@@ -615,8 +701,12 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             if not passes_value_filter(prob, odd, is_real, emoji):
                 continue
 
-            ev = prob * odd
-            rank_score = (1 if is_real else 0, 1 if emoji in ("🤝🤝", "🤝") else 0, ev, proba_pct)
+            # Bonus pro : priorité aux cotes réelles, au triple consensus (🤝🤝), et aux marchés résultat/DC
+            family_bonus = 2 if family in ("result", "dc") else 1
+            consensus_bonus = 2 if emoji == "🤝🤝" else (1 if emoji == "🤝" else 0)
+            stability_bonus = 1 if md.stability_flag == "stable" else 0
+            rank_score = (1 if is_real else 0, consensus_bonus, family_bonus, stability_bonus, proba_pct)
+
             if not best_for_match or rank_score > best_for_match["_rank"]:
                 best_for_match = {
                     "event_id": md.event_id,
@@ -626,17 +716,19 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                     "away": md.away,
                     "kickoff": md.kickoff,
                     "type": label_fn(md),
+                    "family": family,
                     "odds": odd,
                     "proba": proba_pct,
                     "real_odd": real_odd,
-                    "ai": md.analysis or f"Consensus IA ({proba_pct:.1f}%).",
+                    "consensus": emoji or "🤝",
+                    "ai": md.analysis or f"Consensus multi-modèles ({proba_pct:.1f}%).",
                     "_rank": rank_score,
                 }
         if best_for_match:
             best_for_match.pop("_rank", None)
             vip_candidates.append(best_for_match)
 
-    # 2. Complément éventuel via RapidOddsAPI si disponible
+    # Complément via RapidOddsAPI si disponible
     seen_keys = {c["norm_key"] for c in vip_candidates}
     for match in ws_matches:
         if not is_match_not_started(match.commence_time) or is_reserve_team(match.home_team) or is_reserve_team(match.away_team):
@@ -644,16 +736,15 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
         nkey = f"{normalize_name(match.home_team)}__{normalize_name(match.away_team)}"
         if nkey in seen_keys:
             continue
-        if (match.home_odds and match.home_odds < 1.30) or (match.away_odds and match.away_odds < 1.30):
+        if (match.home_odds and match.home_odds < 1.25) or (match.away_odds and match.away_odds < 1.25):
             continue
         sim = dixon_ws.simulate(match)
         if not sim:
             continue
-        for odd, proba, label, ai in [
-            (match.home_odds, sim.proba_home, f"Victoire {match.home_team} (1)", "Avantage domicile confirmé (cotes réelles)."),
-            (match.away_odds, sim.proba_away, f"Victoire {match.away_team} (2)", "Supériorité extérieure confirmée (cotes réelles)."),
-            (match.over_2_5, sim.proba_over_2_5, "Plus de 2.5 buts", "Profil offensif confirmé par les cotes."),
-            (match.btts_yes, sim.proba_btts, "BTTS Oui", "Deux attaques efficaces confirmées."),
+        for odd, proba, family, label, ai in [
+            (match.home_odds, sim.proba_home, "result", f"Victoire {match.home_team} (1)", "Supériorité domicile validée par les cotes réelles et le modèle Poisson."),
+            (match.away_odds, sim.proba_away, "result", f"Victoire {match.away_team} (2)", "Supériorité extérieure validée par les cotes réelles et le modèle Poisson."),
+            (match.over_2_5, sim.proba_over_2_5, "goals", "Plus de 2.5 buts", "Potentiel offensif confirmé par les cotes du marché."),
         ]:
             if not odd or odd < ODDS3_MIN_COTE_LEG or not passes_auth_proba_filter(proba):
                 continue
@@ -667,38 +758,37 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 "away": match.away_team,
                 "kickoff": match.commence_time,
                 "type": label,
+                "family": family,
                 "odds": odd,
                 "proba": proba,
                 "real_odd": odd,
+                "consensus": "🤝",
                 "ai": ai,
             })
             seen_keys.add(nkey)
             break
 
-    vip_candidates.sort(key=lambda x: (1 if x["real_odd"] else 0, x["odds"] * x["proba"] / 100.0, x["proba"]), reverse=True)
+    vip_candidates.sort(key=lambda x: (1 if x["real_odd"] else 0, 1 if x["family"] != "goals" else 0, x["proba"]), reverse=True)
 
-    for num_legs in range(2, AUTH_MAX_LEGS + 1):
-        if len(vip_candidates) < num_legs:
-            break
-        for combo in itertools.combinations(vip_candidates[:15], num_legs):
-            if len({c["norm_key"] for c in combo}) != num_legs:
+    # Construction du ticket Pro (2 matchs max, max 1 pari buts, réussite combinée >= 54%)
+    if len(vip_candidates) >= 2:
+        for combo in itertools.combinations(vip_candidates[:12], 2):
+            if len({c["norm_key"] for c in combo}) != 2:
+                continue
+            # Interdit d'empiler 2 paris buts (Over/Under) sur le ticket VIP
+            if sum(1 for c in combo if c["family"] == "goals") > 1:
                 continue
             tot_o = math.prod(c["odds"] for c in combo)
-            if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE:
-                tot_p = math.prod(c["proba"] / 100.0 for c in combo)
+            tot_p = math.prod(c["proba"] / 100.0 for c in combo)
+            if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE and tot_p >= AUTH_MIN_COMBINED_PROB:
                 if not coupon_passes_ev(tot_o, tot_p):
                     continue
                 real_count = sum(1 for c in combo if c["real_odd"])
-                if real_count == num_legs:
-                    sub = "Exclusif VIP • Cotes réelles"
-                elif real_count > 0:
-                    sub = f"Exclusif VIP • {real_count}/{num_legs} cotes réelles"
-                else:
-                    sub = "Exclusif VIP • Triple Consensus IA"
+                sub = "Sélection Pro VIP • Cotes réelles" if real_count == 2 else "Sélection Pro VIP • Haute Fiabilité"
                 locked_keys = {c["norm_key"] for c in combo}
                 return _build_auth_coupon(combo, sub, 95), locked_keys
 
-    print("  ℹ️ AUTH VIP : Aucune combinaison ne valide les critères stricts aujourd'hui.")
+    print("  ℹ️ AUTH VIP : Aucun duo ne réunit tous les critères de sécurité pro aujourd'hui.")
     return None, set()
 
 # =====================================================================
@@ -733,7 +823,6 @@ def build_mtft_coupon_and_bonus(pool, locked_keys: set):
             if htft.get(c, 0) > best_prob: best_prob, best_p = htft.get(c, 0), c
         if not best_p or best_prob < MTFIN_MIN_PROB: continue
 
-        # Vérifie que Gemini/Bzzoiro ne contredisent pas le favori
         fav_mk = "victoire_home" if best_p == "V1/V1" else "victoire_away"
         fav_consensus, _, _, _, emoji = compute_probability(md, fav_mk)
         if emoji == "⚠️" or (fav_consensus > 0 and fav_consensus < 0.50):
@@ -838,7 +927,7 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys:
                 if ODDS3_HYB_MIN_COTE <= tot_o <= ODDS3_HYB_MAX_COTE:
                     tot_p = math.prod(c['proba'] / 100.0 for c in combo)
                     if not coupon_passes_ev(tot_o, tot_p): continue
-                    legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 90, analysis=c['ai']) for c in combo]
+                    legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 90, analysis=clean_analysis_text(c['ai'], 260)) for c in combo]
                     return Coupon("Odds +3 HYBRIDE", "Mélange 3 sources", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
 
     for r in (3, 4):
@@ -851,7 +940,7 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys:
             if ODDS3_HYB_MIN_COTE <= tot_o <= ODDS3_HYB_MAX_COTE:
                 tot_p = math.prod(c['proba'] / 100.0 for c in combo)
                 if not coupon_passes_ev(tot_o, tot_p): continue
-                legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 85, analysis=c['ai']) for c in combo]
+                legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 85, analysis=clean_analysis_text(c['ai'], 260)) for c in combo]
                 return Coupon("Odds +3 HYBRIDE", "Top Value Multi-IA", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
     return None
 
@@ -865,7 +954,7 @@ async def scan(force: bool = False) -> bool:
             print(f"📦 Cache journalier actif ({today_str}) : {len(STATE['coupons'])} coupons chargés sans rescan.")
             return False
 
-        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "auth_proba": 0}
+        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0}
         ws_matches, odds_status = await fetch_rapidodds_odds()
         af_matches = await fetch_api_football_odds(today_str)
         
@@ -884,7 +973,6 @@ async def scan(force: bool = False) -> bool:
         if bzz_preds:
             pool = []
             for bz in bzz_preds:
-                # Fusionne les cotes natives Bzzoiro + InferSports fallback
                 base_odds = dict(infer_odds.get(bz["event_id"], {}))
                 base_odds.update(bz.get("real_odds", {}))
                 md = MatchData(bz["event_id"], bz.get("league", ""), bz["home"], bz["away"], bz.get("kickoff", ""), base_odds, bz.get("bzz_markets", {}), bz.get("bzz_confidence", 0))
@@ -899,7 +987,6 @@ async def scan(force: bool = False) -> bool:
             print(f"🎯 Top {min(len(pool), DOUBLE_SCAN_POOL_SIZE)} matchs sélectionnés pour Double Analyse Gemini")
             enriched_pool = await enrich_with_double_pass(pool[:GEMINI_MAX_CALLS_PER_SCAN])
 
-        # Passe en mode LIVE dès que des vraies cotes (Bzzoiro, RapidOdds ou API-Football) sont actives
         if ws_matches or af_matches or matched > 0:
             odds_status = "live"
         STATE["odds_api_mode"] = odds_status
@@ -955,7 +1042,7 @@ async def safe_send(cid, txt):
 async def broadcast_after_scan():
     mode = STATE.get("odds_api_mode", "unknown")
     mode_label = "🟢 LIVE" if mode == "live" else "🟡 FALLBACK" if mode == "fallback" else "⚪ ?"
-    if not STATE["coupons"]: msg = f"<b>📭 Aucun coupon fiable aujourd'hui</b>\n<i>(Critères Anti-Vague stricts : qualité > quantité)</i>"
+    if not STATE["coupons"]: msg = f"<b>📭 Aucun coupon fiable aujourd'hui</b>\n<i>(Critères Pro stricts : protection de bankroll)</i>"
     else:
         lignes = [f"{c.emoji} <b>{c.name}</b> • {len(c.legs)} paris • Cote <b>{c.combined_odds}</b>" for c in STATE["coupons"]]
         msg = f"<b>🔔 COUPONS DU JOUR !</b>\n<i>Mode : {mode_label}</i>\n\n" + "\n\n".join(lignes)
@@ -968,10 +1055,10 @@ def format_header():
     return f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n     <b>⚡ {BRAND_NAME.upper()} ⚡</b>\n<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n<i>{BRAND_TAGLINE}</i>\n<i>📅 {today_pretty()}</i>\n<i>{mode_icon} Mode : {mode_txt}</i>"
 
 def format_selection_block(s, idx, show_analysis):
-    lines = [f"<b>┌─ #{idx} {s.home} vs {s.away}</b>", f"│ 📅 <b>{format_kickoff(s.kickoff)}</b> • {s.league}", f"│ 🎯 <b>{s.pick_label}</b>", f"│ 📊 Proba : <b>{s.model_prob*100:.1f}%</b> {prob_bar(s.model_prob)}"]
+    lines = [f"<b>┌─ #{idx} {s.home} vs {s.away}</b>", f"│ 📅 <b>{format_kickoff(s.kickoff)}</b> • {s.league}", f"│ 🎯 <b>{s.pick_label}</b>", f"│ 📊 Confiance : <b>{s.model_prob*100:.1f}%</b> {prob_bar(s.model_prob)}"]
     if s.real_odd: lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b>")
     else: lines.append(f"│ 💰 Cote : <b>{s.odds}</b> <i>(estimée)</i>")
-    if show_analysis and s.analysis: lines.append(f"│ 🧠 <i>{s.analysis[:250]}</i>")
+    if show_analysis and s.analysis: lines.append(f"│ 🧠 <i>{clean_analysis_text(s.analysis, 320)}</i>")
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
@@ -999,7 +1086,7 @@ def format_coupon(c):
     else:
         ev = disp_odds * disp_prob if (disp_odds > 0 and disp_prob > 0) else 0
         ev_badge = f"<b>┃ 💎 EV : {ev:.2f}</b>" if ev > 0 else ""
-        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", "", f"<b>┏━━━━━━━━━━━━━━━┓</b>", f"<b>┃ 🎫 Cote : {disp_odds}</b>", f"<b>┃ 📈 Proba : {disp_prob*100:.1f}%</b>", ev_badge, f"<b>┗━━━━━━━━━━━━━━━┛</b>", ""]
+        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", "", f"<b>┏━━━━━━━━━━━━━━━┓</b>", f"<b>┃ 🎫 Cote : {disp_odds}</b>", f"<b>┃ 📈 Réussite est. : {disp_prob*100:.1f}%</b>", ev_badge, f"<b>┗━━━━━━━━━━━━━━━┛</b>", ""]
         for i, s in enumerate(active_legs, 1): lines.append(format_selection_block(s, i, True) + "\n")
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
@@ -1017,7 +1104,7 @@ async def b_odds3(m):
     if m.from_user.id != ADMIN_ID and not is_subscribed(m.from_user.id): await m.answer("❌ VIP requis."); return
     c = next((x for x in STATE["coupons"] if x.name == "Odds +3 AUTH"), None)
     if c: await safe_answer(m, format_coupon(c))
-    else: await safe_answer(m, "📭 Aucun ticket AUTH fiable aujourd'hui (Qualité > Quantité).")
+    else: await safe_answer(m, "📭 Aucun ticket VIP aujourd'hui : aucun match ne passe tous nos filtres de sécurité pro (protection de bankroll).")
     if m.from_user.id == ADMIN_ID:
         c_hyb = next((x for x in STATE["coupons"] if x.name == "Odds +3 HYBRIDE"), None)
         if c_hyb: await safe_answer(m, format_coupon(c_hyb))
@@ -1059,7 +1146,7 @@ async def scan_cmd(m):
 @dp.message(Command("rescan"))
 async def rescan_cmd(m):
     if m.from_user.id == ADMIN_ID:
-        await safe_answer(m, "🔄 <b>Rescan forcé en cours</b> (Double analyse + mise à jour du cache)...")
+        await safe_answer(m, "🔄 <b>Rescan forcé en cours</b> (Analyse Pro + mise à jour du cache)...")
         await scan(force=True)
         record_coupons(STATE["coupons"], datetime.now(TZ).strftime("%Y-%m-%d"))
         await broadcast_after_scan()
