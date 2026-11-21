@@ -7,7 +7,6 @@ import os
 import random
 import re
 import secrets
-import string
 import unicodedata
 import itertools
 from contextlib import asynccontextmanager
@@ -25,6 +24,7 @@ from aiogram.filters import Command
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
 
 # --- IMPORTS ---
@@ -192,7 +192,6 @@ bot = Bot(BOT_TOKEN); dp = Dispatcher()
 BTN_ODDS3 = "🎯 Odds +3"; BTN_MTFT = "⏱ MT-Fin"; BTN_DRAW = "🤝 Match Nul"
 BTN_SCAN = "🔄 Actualiser"; BTN_BILAN = "📊 Bilan"
 
-# ✅ Clavier abonné : UNIQUEMENT le bouton Odds +3
 USER_KEYBOARD = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_ODDS3)]], resize_keyboard=True)
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -206,7 +205,8 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup(
 STATE = {
     "ready": False, "coupons": [], "last_scan": None, "debug": {},
     "tracker": {"coupons": []}, "keys": {}, "users": {},
-    "scan_lock": asyncio.Lock(), "dixon_model": None, "last_scan_date": "",
+    "scan_lock": asyncio.Lock(), "verify_lock": asyncio.Lock(),
+    "dixon_model": None, "last_scan_date": "", "last_score_check": None,
     "double_scan_status": "", "double_scan_stats": {},
     "rejections": {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0},
 }
@@ -256,7 +256,6 @@ def redeem_access_key(user, raw_code: str) -> Tuple[bool, str]:
     now = datetime.now(TZ)
     days = int(key_info.get("days", 30))
 
-    # Prolonge si l'abonnement est déjà actif, sinon démarre maintenant
     base_dt = now
     if uid in STATE["users"]:
         try:
@@ -381,6 +380,16 @@ def normalize_name(s: str) -> str:
     for sfx in [" fc", " cf", " sc", " ac", " afc", " united", " utd", " city"]: s = s.replace(sfx, "")
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", s)).strip()
 
+def teams_match(name1: str, name2: str) -> bool:
+    n1, n2 = normalize_name(name1), normalize_name(name2)
+    if not n1 or not n2:
+        return False
+    if n1 == n2:
+        return True
+    if len(n1) >= 4 and len(n2) >= 4 and (n1 in n2 or n2 in n1):
+        return True
+    return False
+
 def is_reserve_team(name: str) -> bool: return any(kw in name.lower() for kw in RESERVE_KEYWORDS)
 
 def has_pro_red_flags(analysis_text: str) -> Tuple[bool, str]:
@@ -446,9 +455,276 @@ def record_coupons(coupons, date_str):
     for c in coupons:
         cid = f"{date_str}-{c.name}"
         if cid in existing: continue
-        legs = [{"event_id": s.event_id, "home": s.home, "away": s.away, "market": s.market, "pick_label": s.pick_label, "odds": s.odds, "kickoff": s.kickoff, "result": "pending"} for s in c.legs]
+        legs = [{"event_id": s.event_id, "home": s.home, "away": s.away, "market": s.market, "pick_label": s.pick_label, "odds": s.odds, "kickoff": s.kickoff, "result": "pending", "score": ""} for s in c.legs]
         tracker["coupons"].append({"id": cid, "date": date_str, "name": c.name, "combined_odds": c.combined_odds, "legs": legs, "status": "pending"})
     tracker["coupons"] = tracker["coupons"][-500:]; save_json(LOCAL_DB, tracker)
+
+# =====================================================================
+# ✅ VÉRIFICATION AUTOMATIQUE DES SCORES & CALCUL ROI PRO
+# =====================================================================
+def evaluate_pick_outcome(pick_label: str, ft_h: int, ft_a: int, ht_h: Optional[int] = None, ht_a: Optional[int] = None) -> Optional[str]:
+    """Évalue un pronostic (won / lost) à partir du score officiel 90' (et mi-temps si MT-Fin)."""
+    lbl = (pick_label or "").lower().strip()
+    total_goals = ft_h + ft_a
+
+    # 1. Mi-temps / Fin de match
+    if "mt/fin" in lbl or "v1/v1" in lbl or "v2/v2" in lbl:
+        if ht_h is None or ht_a is None:
+            return None
+        ht_res = "v1" if ht_h > ht_a else ("x" if ht_h == ht_a else "v2")
+        ft_res = "v1" if ft_h > ft_a else ("x" if ft_h == ft_a else "v2")
+        actual = f"{ht_res}/{ft_res}"
+        if "v1/v1" in lbl:
+            return "won" if actual == "v1/v1" else "lost"
+        if "v2/v2" in lbl:
+            return "won" if actual == "v2/v2" else "lost"
+        return None
+
+    # 2. Double Chance
+    if "(1x)" in lbl or "1x" in lbl:
+        return "won" if ft_h >= ft_a else "lost"
+    if "(x2)" in lbl or "x2" in lbl:
+        return "won" if ft_a >= ft_h else "lost"
+    if "double chance 12" in lbl or "(12)" in lbl:
+        return "won" if ft_h != ft_a else "lost"
+
+    # 3. Match Nul
+    if "match nul" in lbl or "(x)" in lbl:
+        return "won" if ft_h == ft_a else "lost"
+
+    # 4. Victoire 1 ou 2
+    if lbl.endswith("(1)") or "victoire" in lbl and "(1)" in lbl:
+        return "won" if ft_h > ft_a else "lost"
+    if lbl.endswith("(2)") or "victoire" in lbl and "(2)" in lbl:
+        return "won" if ft_a > ft_h else "lost"
+
+    # 5. Buts Over / Under
+    if "plus de 1.5" in lbl or "over 1.5" in lbl:
+        return "won" if total_goals >= 2 else "lost"
+    if "moins de 1.5" in lbl or "under 1.5" in lbl:
+        return "won" if total_goals <= 1 else "lost"
+    if "plus de 2.5" in lbl or "over 2.5" in lbl:
+        return "won" if total_goals >= 3 else "lost"
+    if "moins de 2.5" in lbl or "under 2.5" in lbl:
+        return "won" if total_goals <= 2 else "lost"
+    if "plus de 3.5" in lbl or "over 3.5" in lbl:
+        return "won" if total_goals >= 4 else "lost"
+    if "moins de 3.5" in lbl or "under 3.5" in lbl:
+        return "won" if total_goals <= 3 else "lost"
+
+    # 6. BTTS (Les 2 équipes marquent)
+    if "btts oui" in lbl or "2 équipes marquent" in lbl:
+        return "won" if (ft_h > 0 and ft_a > 0) else "lost"
+    if "btts non" in lbl:
+        return "won" if (ft_h == 0 or ft_a == 0) else "lost"
+
+    return None
+
+async def fetch_fixtures_by_date(date_iso: str) -> list:
+    """Récupère les scores officiels du jour via API-Football."""
+    if not API_FOOTBALL_KEY:
+        return []
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get(
+                "https://v3.football.api-sports.io/fixtures",
+                headers={"x-apisports-key": API_FOOTBALL_KEY},
+                params={"date": date_iso},
+                timeout=20.0,
+            )
+            if r.status_code == 200:
+                return r.json().get("response", [])
+        except Exception as e:
+            print(f"⚠️ Erreur fetch fixtures ({date_iso}) : {e}")
+    return []
+
+async def verify_pending_scores(notify: bool = True) -> dict:
+    """Vérifie tous les tickets en attente et met à jour les statuts + notifications."""
+    async with STATE["verify_lock"]:
+        coupons = STATE["tracker"].get("coupons", [])
+        pending_coupons = [c for c in coupons if c.get("status") == "pending"]
+        if not pending_coupons:
+            STATE["last_score_check"] = datetime.now(TZ).isoformat()
+            return {"checked": 0, "updated_legs": 0, "settled_coupons": 0}
+
+        # Dates à interroger (date du coupon + lendemain pour matchs tardifs)
+        dates_to_fetch = set()
+        for c in pending_coupons:
+            d = c.get("date")
+            if d:
+                dates_to_fetch.add(d)
+                try:
+                    dt = datetime.strptime(d, "%Y-%m-%d")
+                    dates_to_fetch.add((dt + timedelta(days=1)).strftime("%Y-%m-%d"))
+                except Exception:
+                    pass
+
+        all_fixtures = []
+        for d in sorted(dates_to_fetch):
+            all_fixtures.extend(await fetch_fixtures_by_date(d))
+            await asyncio.sleep(0.4)
+
+        if not all_fixtures:
+            return {"checked": len(pending_coupons), "updated_legs": 0, "settled_coupons": 0}
+
+        updated_legs = 0
+        newly_settled = []
+
+        for c in pending_coupons:
+            legs = c.get("legs", [])
+            changed = False
+
+            for leg in legs:
+                if leg.get("result") != "pending":
+                    continue
+                lh, la = leg.get("home", ""), leg.get("away", "")
+                matched_fix = None
+                for fx in all_fixtures:
+                    th = fx.get("teams", {}).get("home", {}).get("name", "")
+                    ta = fx.get("teams", {}).get("away", {}).get("name", "")
+                    if teams_match(lh, th) and teams_match(la, ta):
+                        matched_fix = fx
+                        break
+
+                if not matched_fix:
+                    continue
+
+                status_short = (matched_fix.get("fixture", {}).get("status", {}).get("short") or "").upper()
+
+                # Match terminé (90' officiel)
+                if status_short in ("FT", "AET", "PEN"):
+                    ft_score = matched_fix.get("score", {}).get("fulltime", {})
+                    ht_score = matched_fix.get("score", {}).get("halftime", {})
+                    ft_h = ft_score.get("home") if ft_score.get("home") is not None else matched_fix.get("goals", {}).get("home")
+                    ft_a = ft_score.get("away") if ft_score.get("away") is not None else matched_fix.get("goals", {}).get("away")
+                    ht_h = ht_score.get("home")
+                    ht_a = ht_score.get("away")
+
+                    if ft_h is not None and ft_a is not None:
+                        outcome = evaluate_pick_outcome(leg.get("pick_label", ""), int(ft_h), int(ft_a), ht_h, ht_a)
+                        if outcome:
+                            leg["result"] = outcome
+                            score_txt = f"{ft_h}-{ft_a}"
+                            if ht_h is not None and ht_a is not None and "mt/fin" in leg.get("pick_label", "").lower():
+                                score_txt += f" (MT {ht_h}-{ht_a})"
+                            leg["score"] = score_txt
+                            updated_legs += 1
+                            changed = True
+
+                # Match annulé / reporté -> cote neutre 1.00
+                elif status_short in ("PST", "CANC", "ABD", "AWD", "WO"):
+                    leg["result"] = "void"
+                    leg["odds"] = 1.0
+                    leg["score"] = f"Annulé ({status_short})"
+                    updated_legs += 1
+                    changed = True
+
+            if changed:
+                results = [l.get("result") for l in legs]
+                if "lost" in results:
+                    c["status"] = "lost"
+                    c["settled_at"] = datetime.now(TZ).isoformat()
+                    newly_settled.append(c)
+                elif all(r in ("won", "void") for r in results):
+                    eff_odds = round(math.prod(float(l.get("odds", 1.0)) for l in legs), 2)
+                    c["combined_odds"] = eff_odds
+                    c["status"] = "void" if all(r == "void" for r in results) else "won"
+                    c["settled_at"] = datetime.now(TZ).isoformat()
+                    newly_settled.append(c)
+
+        if updated_legs > 0 or newly_settled:
+            save_json(LOCAL_DB, STATE["tracker"])
+
+        STATE["last_score_check"] = datetime.now(TZ).isoformat()
+
+        if notify and newly_settled:
+            for c in newly_settled:
+                await notify_settled_coupon(c)
+
+        return {"checked": len(pending_coupons), "updated_legs": updated_legs, "settled_coupons": len(newly_settled)}
+
+async def notify_settled_coupon(c: dict):
+    """Notifie le bilan d'un ticket terminé (canal + admin si VIP gagné, admin sinon)."""
+    status = c.get("status")
+    if status not in ("won", "lost"):
+        return
+    is_win = status == "won"
+    header = "✅ <b>TICKET VIP VALIDÉ !</b>" if is_win else "❌ <b>BILAN TICKET</b>"
+    lines = [
+        header,
+        f"🎫 <b>{c.get('name')}</b> ({c.get('date')}) • Cote <b>{c.get('combined_odds')}</b>",
+        "",
+    ]
+    for l in c.get("legs", []):
+        r = l.get("result")
+        ico = "✅" if r == "won" else ("❌" if r == "lost" else "⚪")
+        sc = f" <b>[{l.get('score')}]</b>" if l.get("score") else ""
+        lines.append(f"{ico} {l.get('home')} vs {l.get('away')} — <i>{l.get('pick_label')}</i>{sc}")
+
+    msg = "\n".join(lines)
+    if is_win and c.get("name") == "Odds +3 AUTH":
+        for cid in TARGETS:
+            await safe_send(cid, msg)
+    elif ADMIN_ID:
+        await safe_send(ADMIN_ID, msg)
+
+def compute_roi_stats(coupons: list) -> dict:
+    won = [c for c in coupons if c.get("status") == "won"]
+    lost = [c for c in coupons if c.get("status") == "lost"]
+    pending = [c for c in coupons if c.get("status") == "pending"]
+    settled = len(won) + len(lost)
+    win_rate = (len(won) / settled * 100.0) if settled > 0 else 0.0
+    profit = sum(float(c.get("combined_odds", 0)) - 1.0 for c in won) - float(len(lost))
+    roi = (profit / settled * 100.0) if settled > 0 else 0.0
+    avg_win_odd = (sum(float(c.get("combined_odds", 0)) for c in won) / len(won)) if won else 0.0
+    return {
+        "won": len(won),
+        "lost": len(lost),
+        "pending": len(pending),
+        "settled": settled,
+        "win_rate": win_rate,
+        "profit": profit,
+        "roi": roi,
+        "avg_win_odd": avg_win_odd,
+    }
+
+def format_bilan_report() -> str:
+    all_c = STATE["tracker"].get("coupons", [])
+    vip_c = [c for c in all_c if c.get("name") == "Odds +3 AUTH"]
+
+    s_vip = compute_roi_stats(vip_c)
+    s_all = compute_roi_stats(all_c)
+
+    lines = [
+        f"<b>📊 BILAN PERFORMANCE & ROI</b>",
+        f"<i>Mise fixe : 1.00 unité / ticket</i>",
+        "",
+        f"<b>🛡️ VIP — ODDS +3 AUTH</b>",
+        f"• Terminés : <b>{s_vip['settled']}</b> (✅ {s_vip['won']} / ❌ {s_vip['lost']} / ⏳ {s_vip['pending']})",
+        f"• Taux de réussite : <b>{s_vip['win_rate']:.1f}%</b>",
+        f"• Cote moyenne gagnante : <b>{s_vip['avg_win_odd']:.2f}</b>",
+        f"• Profit Net : <b>{s_vip['profit']:+.2f} u</b>",
+        f"• ROI Réel : <b>{s_vip['roi']:+.1f}%</b>",
+        "",
+        f"<b>📈 GLOBAL (TOUS COUPONS)</b>",
+        f"• Terminés : <b>{s_all['settled']}</b> (✅ {s_all['won']} / ❌ {s_all['lost']} / ⏳ {s_all['pending']})",
+        f"• Réussite : <b>{s_all['win_rate']:.1f}%</b> • Profit : <b>{s_all['profit']:+.2f} u</b> (ROI <b>{s_all['roi']:+.1f}%</b>)",
+    ]
+
+    recent = list(reversed(all_c[-5:]))
+    if recent:
+        lines.append("\n<b>🕒 5 DERNIERS TICKETS :</b>")
+        for c in recent:
+            st = c.get("status")
+            badge = "✅" if st == "won" else ("❌" if st == "lost" else ("⚪" if st == "void" else "⏳"))
+            lines.append(f"\n{badge} <b>{c.get('name')}</b> ({c.get('date')}) • Cote <b>{c.get('combined_odds')}</b>")
+            for l in c.get("legs", []):
+                lr = l.get("result")
+                lico = "✅" if lr == "won" else ("❌" if lr == "lost" else ("⚪" if lr == "void" else "⏳"))
+                sc = f" [{l.get('score')}]" if l.get("score") else ""
+                lines.append(f"   {lico} {l.get('home')} - {l.get('away')} ({l.get('pick_label')}){sc}")
+
+    return "\n".join(lines)
 
 def prescore_match(md: MatchData) -> int:
     conf_score = int(md.bzz_confidence or 0)
@@ -1081,12 +1357,10 @@ async def scan(force: bool = False) -> bool:
             odds_status = "live"
         STATE["odds_api_mode"] = odds_status
 
-        # 1. EXCLUSIF VIP AUTH EN PREMIER (verrouille ses matchs)
         coupon_auth, locked_vip_keys = build_exclusive_vip_auth_coupon(enriched_pool, ws_matches)
         if locked_vip_keys:
             print(f"🔒 Matchs verrouillés pour VIP AUTH : {locked_vip_keys}")
 
-        # 2. MOTEURS SECONDAIRES (strictement différents des matchs AUTH)
         coupon_mtft, bonus_mtft = build_mtft_coupon_and_bonus(enriched_pool, locked_vip_keys) if enriched_pool else (None, [])
         coupon_draw, bonus_draw = build_draw_coupon_and_bonus(enriched_pool, locked_vip_keys) if enriched_pool else (None, [])
         third_pillar = build_third_pillar(enriched_pool, locked_vip_keys) if enriched_pool else []
@@ -1181,7 +1455,7 @@ def format_coupon(c):
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
 
-# --- COMMANDES UTILISATEUR & ADMIN CLÉS VIP ---
+# --- COMMANDES UTILISATEUR & ADMIN ---
 @dp.message(Command("start"))
 async def start_cmd(m: Message):
     kb = ADMIN_KEYBOARD if m.from_user.id == ADMIN_ID else USER_KEYBOARD
@@ -1191,6 +1465,7 @@ async def start_cmd(m: Message):
             f"• /genkey <code>[jours] [nb]</code> — Créer clé(s) VIP\n"
             f"• /vip — Liste des abonnés & clés\n"
             f"• /delvip <code>ID</code> — Révoquer un abonné\n"
+            f"• /bilan — Vérifier scores & voir le ROI\n"
             f"• /scan • /rescan"
         )
     elif is_subscribed(m.from_user.id):
@@ -1300,10 +1575,13 @@ async def b_draw(m: Message):
         else: await safe_answer(m, "📭 Aucun coupon Match Nul disponible.")
 
 @dp.message(F.text == BTN_BILAN)
+@dp.message(Command("bilan", "roi", "checkscores"))
 async def b_bilan(m: Message):
-    if m.from_user.id == ADMIN_ID:
-        total = len(STATE["tracker"].get("coupons", []))
-        await safe_answer(m, f"📊 <b>Bilan Tracker</b>\n• Coupons enregistrés : <b>{total}</b>\n• Dernier scan : <code>{STATE.get('last_scan') or 'N/A'}</code>")
+    if m.from_user.id != ADMIN_ID:
+        return
+    await safe_answer(m, "⏳ <i>Vérification des derniers scores en cours...</i>")
+    await verify_pending_scores(notify=False)
+    await safe_answer(m, format_bilan_report())
 
 @dp.message(F.text == "⚙️ Debug")
 async def b_debug(m: Message):
@@ -1315,6 +1593,7 @@ async def b_debug(m: Message):
             f"• Double Scan : <code>{STATE.get('double_scan_status', '?')}</code>\n"
             f"• Stats : <code>{STATE.get('double_scan_stats', {})}</code>\n"
             f"• Rejets : <code>{STATE.get('rejections', {})}</code>\n"
+            f"• Dernier check scores : <code>{STATE.get('last_score_check') or 'N/A'}</code>\n"
             f"• Clés libres : <b>{sum(1 for v in STATE['keys'].values() if not v.get('used'))}</b>",
         )
 
@@ -1374,11 +1653,20 @@ async def handle_key_redeem(m: Message):
 
 async def daily_broadcast():
     try:
+        await verify_pending_scores(notify=True)
         await scan(force=True)
         record_coupons(STATE["coupons"], datetime.now(TZ).strftime("%Y-%m-%d"))
     except Exception as e:
         print(f"❌ Erreur daily_broadcast : {e}")
     await broadcast_after_scan()
+
+async def periodic_score_check():
+    try:
+        res = await verify_pending_scores(notify=True)
+        if res.get("updated_legs"):
+            print(f"⚽ Score check : {res['updated_legs']} match(s) mis à jour, {res['settled_coupons']} coupon(s) réglé(s)")
+    except Exception as e:
+        print(f"⚠️ Erreur periodic_score_check : {e}")
 
 @asynccontextmanager
 async def lifespan(app):
@@ -1394,12 +1682,14 @@ async def lifespan(app):
     if train_model_if_needed: asyncio.create_task(asyncio.to_thread(train_model_if_needed))
     scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(daily_broadcast, CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ), id="daily")
+    scheduler.add_job(periodic_score_check, IntervalTrigger(minutes=45), id="score_check")
     scheduler.start()
     bot_task = asyncio.create_task(dp.start_polling(bot))
     async def bootstrap():
         try:
             if download_and_train: STATE["dixon_model"] = await download_and_train(); print("✅ Dixon chargé")
             await asyncio.sleep(5)
+            await periodic_score_check()
             curr_today = datetime.now(TZ).strftime("%Y-%m-%d")
             if not load_daily_cache(curr_today):
                 await daily_broadcast()
