@@ -6,8 +6,6 @@ import math
 import os
 import random
 import re
-import secrets
-import string
 import unicodedata
 import itertools
 from contextlib import asynccontextmanager
@@ -15,7 +13,6 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 from zoneinfo import ZoneInfo
-from collections import defaultdict
 
 import httpx
 import numpy as np
@@ -23,7 +20,7 @@ from scipy.stats import poisson
 import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
@@ -89,11 +86,10 @@ WEIGHT_BZZOIRO = float(os.getenv("WEIGHT_BZZOIRO","0.30"))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
 MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.94"))
 
-# ✅ CALIBRAGE PRONOSTIQUEUR PRO (VIP AUTH : 2 matchs max, haute probabilité de gain)
-AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "72.0"))
-AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "88.0"))
-AUTH_MAX_LEGS  = 2
-AUTH_MIN_COMBINED_PROB = 0.54
+# ✅ CALIBRAGE PRONOSTIQUEUR PRO — TRANCHE COTE 2.30 à 3.05 (ROI VIP)
+AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "62.0"))
+AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "82.0"))
+AUTH_MIN_COMBINED_PROB = 0.35
 
 DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "10"))
 DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.15"))
@@ -109,11 +105,11 @@ DRAW_MIN_SCORE = 70
 DRAW_MAX_ECART = 0.20
 DRAW_MIN_PROB = 0.28
 
-ODDS3_AUTH_MIN_COTE = 1.45
-ODDS3_AUTH_MAX_COTE = 2.30
-ODDS3_HYB_MIN_COTE = 3.00
+ODDS3_AUTH_MIN_COTE = 2.30
+ODDS3_AUTH_MAX_COTE = 3.05
+ODDS3_HYB_MIN_COTE = 3.20
 ODDS3_HYB_MAX_COTE = 5.50
-ODDS3_MIN_COTE_LEG = 1.22
+ODDS3_MIN_COTE_LEG = 1.24
 
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
@@ -355,9 +351,9 @@ def is_match_not_started(kickoff_str) -> bool:
     return dt > (datetime.now(TZ) + timedelta(minutes=MATCH_START_BUFFER_MINUTES))
 
 def prob_bar(p: float) -> str:
-    if p >= 0.80: return "🟢🟢🟢"
-    if p >= 0.74: return "🟢🟢⚪"
-    if p >= 0.68: return "🟢⚪⚪"
+    if p >= 0.75: return "🟢🟢🟢"
+    if p >= 0.67: return "🟢🟢⚪"
+    if p >= 0.62: return "🟢⚪⚪"
     return "⚪⚪⚪"
 
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
@@ -546,11 +542,6 @@ async def _enrich_single_pass(targets, pass_num):
                         if bzz_ctx.get("available"): md.has_h2h = True
                 if md.dixon_pred:
                     ctx["dixon_coles"] = md.dixon_pred
-                ctx["pro_tipster_instructions"] = (
-                    "Analyse ce match comme un pronostiqueur professionnel avec 20 ans d'expérience : "
-                    "évalue la dynamique récente, le rapport de force domicile/extérieur, l'enjeu sportif, "
-                    "la fatigue/rotation éventuelle et le style tactique. Signale clairement tout risque de rotation ou piège."
-                )
                 if predict_match_probas:
                     pred = await predict_match_probas(client, md.home, md.away, md.league, md.kickoff, context=ctx)
                     if pred and "markets" in pred:
@@ -612,7 +603,7 @@ async def enrich_with_double_pass(pool):
     return targets
 
 # =====================================================================
-# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (MÉTHODOLOGIE PRONOSTIQUEUR PRO)
+# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (STRATÉGIE PRO COTE 2.30 - 3.05)
 # =====================================================================
 def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
     total_odds = math.prod(c["odds"] for c in combo)
@@ -636,26 +627,38 @@ def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
     ]
     return Coupon("Odds +3 AUTH", f"{subtitle} • {len(combo)} sélections", "🛡️", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
 
+def _valid_pro_combo(combo, require_anchor: bool = False) -> bool:
+    if len({c["norm_key"] for c in combo}) != len(combo):
+        return False
+    # Anti-répétition : max 1 pari buts et max 1 pari BTTS par coupon VIP
+    if sum(1 for c in combo if c["family"] == "goals") > 1:
+        return False
+    if sum(1 for c in combo if c["family"] == "btts") > 1:
+        return False
+    # Pour un combiné de 3 matchs, exige au moins 1 match "Banquier/Ancrage" (>= 72%)
+    if require_anchor and not any(c["proba"] >= 72.0 for c in combo):
+        return False
+    return True
+
 def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: List[WS_MatchData]) -> Tuple[Optional[Coupon], set]:
     """
-    Sélection VIP construite selon une méthodologie de pronostiqueur pro :
-    - 2 matchs max pour maximiser le taux de réussite (> 54% combiné)
-    - Rejet automatique des matchs avec signaux de rotation/piège dans l'analyse
-    - Exigence de ligue calibrée (Dixon-Coles) ou cotes bookmakers réelles
-    - Choix du marché le plus adapté (1, 2, 1X, X2, Over 1.5) sans doubler les paris buts
-    - Verrouillage exclusif pour les abonnés VIP
+    Stratégie Pronostiqueur Pro (Objectif Cote 2.30 - 3.05 rentable) :
+    - Priorité 1 : Duo Value (2 matchs forts entre 62% et 72% -> cote 2.30 - 3.05)
+    - Priorité 2 : Pyramide Sécurisée (3 matchs : 1 Ancrage >= 72% + 2 Value -> cote 2.30 - 3.05)
+    - Priorité 3 : Repli sécurisé (2.05 - 2.30) si aucune combinaison sûre n'atteint 2.30
+    - Rejet systématique des matchs pièges et diversification des marchés
     """
     vip_candidates = []
 
-    # Marchés hiérarchisés par sécurité professionnelle (résultat/double chance prioritaire sur les buts)
     markets_map = [
         ("victoire_home", "home", "result", lambda m: f"Victoire {m.home} (1)"),
-        ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
         ("victoire_away", "away", "result", lambda m: f"Victoire {m.away} (2)"),
+        ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
         ("double_chance_X2", "dc_x2", "dc", lambda m: f"Double Chance Nul ou {m.away} (X2)"),
         ("over_1.5", "over_1.5", "goals", lambda m: "Plus de 1.5 buts"),
         ("over_2.5", "over_2.5", "goals", lambda m: "Plus de 2.5 buts"),
         ("under_2.5", "under_2.5", "goals", lambda m: "Moins de 2.5 buts"),
+        ("btts_yes", "btts_yes", "btts", lambda m: "Les 2 équipes marquent (BTTS Oui)"),
     ]
 
     for md in enriched_pool:
@@ -664,7 +667,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
         if is_reserve_team(md.home) or is_reserve_team(md.away):
             continue
 
-        # 1. Filtre ligue calibrée : pas de coupe/division obscure sans modèle Dixon ni cotes réelles
+        # 1. Filtre ligue calibrée (Dixon-Coles ou cotes bookmakers réelles)
         if not md.dixon_pred and not md.real_odds:
             continue
 
@@ -680,11 +683,10 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             prob, g, d, b, emoji = compute_probability(md, mk)
             proba_pct = prob * 100.0
 
-            # Exige consensus clair et probabilité dans la bande pro (72% - 88%)
             if emoji == "⚠️" or not passes_auth_proba_filter(proba_pct):
                 continue
 
-            # Victoire à l'extérieur sèche : exige triple consensus ou vraie cote
+            # Victoire à l'extérieur sèche : exige accord des modèles ou vraie cote
             if mk == "victoire_away" and emoji not in ("🤝", "🤝🤝") and not md.real_odds.get("away"):
                 continue
 
@@ -701,7 +703,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             if not passes_value_filter(prob, odd, is_real, emoji):
                 continue
 
-            # Bonus pro : priorité aux cotes réelles, au triple consensus (🤝🤝), et aux marchés résultat/DC
+            # Classement Pro : cotes réelles > triple consensus > victoires/DC > stabilité
             family_bonus = 2 if family in ("result", "dc") else 1
             consensus_bonus = 2 if emoji == "🤝🤝" else (1 if emoji == "🤝" else 0)
             stability_bonus = 1 if md.stability_flag == "stable" else 0
@@ -736,8 +738,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
         nkey = f"{normalize_name(match.home_team)}__{normalize_name(match.away_team)}"
         if nkey in seen_keys:
             continue
-        if (match.home_odds and match.home_odds < 1.25) or (match.away_odds and match.away_odds < 1.25):
-            continue
         sim = dixon_ws.simulate(match)
         if not sim:
             continue
@@ -768,27 +768,51 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             seen_keys.add(nkey)
             break
 
-    vip_candidates.sort(key=lambda x: (1 if x["real_odd"] else 0, 1 if x["family"] != "goals" else 0, x["proba"]), reverse=True)
+    vip_candidates.sort(key=lambda x: (1 if x["real_odd"] else 0, 1 if x["family"] in ("result", "dc") else 0, x["proba"]), reverse=True)
+    top_pool = vip_candidates[:14]
 
-    # Construction du ticket Pro (2 matchs max, max 1 pari buts, réussite combinée >= 54%)
-    if len(vip_candidates) >= 2:
-        for combo in itertools.combinations(vip_candidates[:12], 2):
-            if len({c["norm_key"] for c in combo}) != 2:
-                continue
-            # Interdit d'empiler 2 paris buts (Over/Under) sur le ticket VIP
-            if sum(1 for c in combo if c["family"] == "goals") > 1:
+    # 1. PRIORITÉ 1 : Duo Value Pro (2 matchs -> cote 2.30 à 3.05)
+    if len(top_pool) >= 2:
+        for combo in itertools.combinations(top_pool, 2):
+            if not _valid_pro_combo(combo, require_anchor=False):
                 continue
             tot_o = math.prod(c["odds"] for c in combo)
             tot_p = math.prod(c["proba"] / 100.0 for c in combo)
             if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE and tot_p >= AUTH_MIN_COMBINED_PROB:
                 if not coupon_passes_ev(tot_o, tot_p):
                     continue
-                real_count = sum(1 for c in combo if c["real_odd"])
-                sub = "Sélection Pro VIP • Cotes réelles" if real_count == 2 else "Sélection Pro VIP • Haute Fiabilité"
                 locked_keys = {c["norm_key"] for c in combo}
-                return _build_auth_coupon(combo, sub, 95), locked_keys
+                return _build_auth_coupon(combo, "Sélection Pro VIP • Duo Value", 96), locked_keys
 
-    print("  ℹ️ AUTH VIP : Aucun duo ne réunit tous les critères de sécurité pro aujourd'hui.")
+    # 2. PRIORITÉ 2 : Pyramide Sécurisée (3 matchs : 1 Ancrage >= 72% + 2 Value -> cote 2.30 à 3.05)
+    if len(top_pool) >= 3:
+        for combo in itertools.combinations(top_pool, 3):
+            if not _valid_pro_combo(combo, require_anchor=True):
+                continue
+            tot_o = math.prod(c["odds"] for c in combo)
+            tot_p = math.prod(c["proba"] / 100.0 for c in combo)
+            if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE and tot_p >= AUTH_MIN_COMBINED_PROB:
+                if not coupon_passes_ev(tot_o, tot_p):
+                    continue
+                locked_keys = {c["norm_key"] for c in combo}
+                return _build_auth_coupon(combo, "Sélection Pro VIP • Pyramide Sécurisée", 94), locked_keys
+
+    # 3. PRIORITÉ 3 : Repli Sécurisé (2.05 - 2.30) si aucune combinaison sûre n'atteint 2.30
+    for r in (2, 3):
+        if len(top_pool) < r:
+            continue
+        for combo in itertools.combinations(top_pool, r):
+            if not _valid_pro_combo(combo, require_anchor=(r == 3)):
+                continue
+            tot_o = math.prod(c["odds"] for c in combo)
+            tot_p = math.prod(c["proba"] / 100.0 for c in combo)
+            if 2.05 <= tot_o < ODDS3_AUTH_MIN_COTE and tot_p >= 0.42:
+                if not coupon_passes_ev(tot_o, tot_p):
+                    continue
+                locked_keys = {c["norm_key"] for c in combo}
+                return _build_auth_coupon(combo, "Sélection Pro VIP • Sécurité Renforcée", 92), locked_keys
+
+    print("  ℹ️ AUTH VIP : Aucune combinaison ne réunit tous les critères Pro aujourd'hui.")
     return None, set()
 
 # =====================================================================
