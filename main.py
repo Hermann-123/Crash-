@@ -21,7 +21,7 @@ from scipy.stats import poisson
 import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -91,6 +91,7 @@ MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.94"))
 AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "62.0"))
 AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "82.0"))
 AUTH_MIN_COMBINED_PROB = 0.35
+FALLBACK_BOOKMAKER_MARGIN = 0.90  # Décote réaliste bookmaker en mode FALLBACK
 
 DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "10"))
 DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.15"))
@@ -110,7 +111,7 @@ ODDS3_AUTH_MIN_COTE = 2.30
 ODDS3_AUTH_MAX_COTE = 3.05
 ODDS3_HYB_MIN_COTE = 3.20
 ODDS3_HYB_MAX_COTE = 5.50
-ODDS3_MIN_COTE_LEG = 1.24
+ODDS3_MIN_COTE_LEG = 1.20
 
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
@@ -132,7 +133,7 @@ PRO_TRAP_PHRASES = [
 
 ESPN_LEAGUE_SLUGS = [
     "eng.1", "eng.2", "esp.1", "ita.1", "ger.1", "fra.1",
-    "ned.1", "por.1", "bel.1", "tur.1", "sco.1",
+    "ned.1", "por.1", "bel.1", "tur.1", "sco.1", "gre.1",
     "uefa.champions", "uefa.europa", "uefa.europa.conf",
 ]
 
@@ -673,7 +674,6 @@ async def verify_pending_scores(notify: bool = True) -> dict:
                 for item in all_results:
                     if teams_match(lh, item["home"]) and teams_match(la, item["away"]):
                         matched_res = item
-                        # Priorité à Bzzoiro si score mi-temps disponible
                         if item.get("ht_h") is not None:
                             break
 
@@ -880,9 +880,11 @@ def passes_value_filter(proba, odd, is_real, consensus_emoji=""):
         return False
     return True
 
-def coupon_passes_ev(odds, prob):
+def coupon_passes_ev(odds, prob, has_real_odds: bool = True):
     if odds <= 0 or prob <= 0: return False
-    ok = (odds * prob) >= MIN_COUPON_EV
+    # En mode FALLBACK (cotes avec marge 0.90), l'EV théorique vaut ~0.73 ; on exige au moins 0.72
+    threshold = MIN_COUPON_EV if has_real_odds else 0.72
+    ok = (odds * prob) >= threshold
     if not ok: STATE["rejections"]["ev_coupon"] += 1
     return ok
 
@@ -1087,7 +1089,8 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 odd = real_odd
                 is_real = True
             else:
-                odd = round(1.0 / prob, 2) if prob > 0 else 0.0
+                # Coefficient 0.90 pour refléter la marge réelle du bookmaker en mode FALLBACK
+                odd = round(FALLBACK_BOOKMAKER_MARGIN / prob, 2) if prob > 0 else 0.0
                 is_real = False
 
             if odd < ODDS3_MIN_COTE_LEG:
@@ -1169,8 +1172,9 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 continue
             tot_o = math.prod(c["odds"] for c in combo)
             tot_p = math.prod(c["proba"] / 100.0 for c in combo)
+            has_real = all(c["real_odd"] is not None for c in combo)
             if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE and tot_p >= AUTH_MIN_COMBINED_PROB:
-                if not coupon_passes_ev(tot_o, tot_p):
+                if not coupon_passes_ev(tot_o, tot_p, has_real):
                     continue
                 locked_keys = {c["norm_key"] for c in combo}
                 return _build_auth_coupon(combo, "Sélection Pro VIP • Duo Value", 96), locked_keys
@@ -1181,8 +1185,9 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 continue
             tot_o = math.prod(c["odds"] for c in combo)
             tot_p = math.prod(c["proba"] / 100.0 for c in combo)
+            has_real = all(c["real_odd"] is not None for c in combo)
             if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE and tot_p >= AUTH_MIN_COMBINED_PROB:
-                if not coupon_passes_ev(tot_o, tot_p):
+                if not coupon_passes_ev(tot_o, tot_p, has_real):
                     continue
                 locked_keys = {c["norm_key"] for c in combo}
                 return _build_auth_coupon(combo, "Sélection Pro VIP • Pyramide Sécurisée", 94), locked_keys
@@ -1195,8 +1200,9 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 continue
             tot_o = math.prod(c["odds"] for c in combo)
             tot_p = math.prod(c["proba"] / 100.0 for c in combo)
+            has_real = all(c["real_odd"] is not None for c in combo)
             if 2.05 <= tot_o < ODDS3_AUTH_MIN_COTE and tot_p >= 0.42:
-                if not coupon_passes_ev(tot_o, tot_p):
+                if not coupon_passes_ev(tot_o, tot_p, has_real):
                     continue
                 locked_keys = {c["norm_key"] for c in combo}
                 return _build_auth_coupon(combo, "Sélection Pro VIP • Sécurité Renforcée", 92), locked_keys
@@ -1243,7 +1249,7 @@ def build_mtft_coupon_and_bonus(pool, locked_keys: set):
 
         pts = 15 + (10 if md.has_h2h else 0) + 10 + (30 if best_prob >= 0.65 else 20) + 15 + 10
         if pts < MTFIN_MIN_SCORE: continue
-        picks.append({"md": md, "pick": best_p, "prob": best_prob, "score": pts, "odd": round(1.0 / best_prob, 2), "htft": htft})
+        picks.append({"md": md, "pick": best_p, "prob": best_prob, "score": pts, "odd": round(FALLBACK_BOOKMAKER_MARGIN / best_prob, 2), "htft": htft})
 
     coupon = None
     picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
@@ -1262,7 +1268,7 @@ def build_mtft_coupon_and_bonus(pool, locked_keys: set):
         fav_prob = sum(p["htft"].get(f"{ht}/{ft_res}", 0) for ht in ("V1", "V2", "X"))
         is_est = False
         if not real_odd:
-            real_odd = round(1.0 / fav_prob, 2) if fav_prob > 0 else 0.0
+            real_odd = round(FALLBACK_BOOKMAKER_MARGIN / fav_prob, 2) if fav_prob > 0 else 0.0
             is_est = True
         if real_odd >= ODDS3_MIN_COTE_LEG and passes_value_filter(fav_prob, real_odd, not is_est):
             bonus_pool.append({"match": md, "type": fav_market, "odds": real_odd, "proba": fav_prob * 100, "ai": md.analysis, "real_odd": real_odd if not is_est else None, "source": "MT-FIN", "kickoff": md.kickoff})
@@ -1277,8 +1283,8 @@ def build_draw_coupon_and_bonus(pool, locked_keys: set):
         prob, g, d, b, emoji = compute_probability(md, "match_nul")
         if prob < DRAW_MIN_PROB or (g > 0 and g < 0.22) or emoji == "⚠️": continue
         draw_odd = md.real_odds.get("draw"); is_real = draw_odd is not None
-        if not draw_odd: draw_odd = round(1.0 / prob, 2) if prob > 0 else 3.20
-        if draw_odd < 3.10: continue
+        if not draw_odd: draw_odd = round(FALLBACK_BOOKMAKER_MARGIN / prob, 2) if prob > 0 else 3.10
+        if draw_odd < 3.00: continue
         if (md.real_odds.get("home") and md.real_odds.get("home") < 1.80) or (md.real_odds.get("away") and md.real_odds.get("away") < 1.80): continue
         if not passes_value_filter(prob, draw_odd, is_real, emoji): continue
         pts = 30 + (25 if prob >= 0.33 else 18) + (20 if g >= 0.30 else 12) + 10 + (5 if md.has_h2h else 0) + 10
@@ -1297,7 +1303,7 @@ def build_draw_coupon_and_bonus(pool, locked_keys: set):
         md = next((m for m in pool if m.event_id == c.event_id), None)
         if not md: continue
         p_h, _, _, _, _ = compute_probability(md, "victoire_home"); p_a, _, _, _, _ = compute_probability(md, "victoire_away")
-        p_12 = p_h + p_a; odd_12 = round(1.0 / p_12, 2) if p_12 > 0 else 0.0
+        p_12 = p_h + p_a; odd_12 = round(FALLBACK_BOOKMAKER_MARGIN / p_12, 2) if p_12 > 0 else 0.0
         if odd_12 >= ODDS3_MIN_COTE_LEG and passes_value_filter(p_12, odd_12, False):
             bonus_pool.append({"match": md, "type": "Double Chance 12", "odds": odd_12, "proba": p_12 * 100, "ai": md.analysis, "real_odd": None, "source": "MATCH-NUL", "kickoff": md.kickoff})
     return coupon, bonus_pool
@@ -1313,7 +1319,7 @@ def build_third_pillar(pool, locked_keys: set):
             prob, g, d, b, emoji = compute_probability(md, mk)
             if prob < 0.58 or emoji == "⚠️": continue
             odd = md.real_odds.get(mk); is_real = odd is not None
-            if not odd: odd = round(1.0 / prob, 2) if prob > 0 else 0.0; is_real = False
+            if not odd: odd = round(FALLBACK_BOOKMAKER_MARGIN / prob, 2) if prob > 0 else 0.0; is_real = False
             if odd >= ODDS3_MIN_COTE_LEG and passes_value_filter(prob, odd, is_real, emoji):
                 score = (1 if is_real else 0, prob * odd, prob)
                 if not best or score > best["_score"]:
@@ -1337,9 +1343,10 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys:
                 if not (any(c.get('source') == 'MT-FIN' for c in combo) and any(c.get('source') == 'MATCH-NUL' for c in combo) and any(c.get('source') == 'BZZOIRO' for c in combo)): continue
                 if not all(is_match_not_started(c.get('kickoff', '')) for c in combo): continue
                 tot_o = math.prod(x['odds'] for x in combo)
+                has_real = all(x.get('real_odd') is not None for x in combo)
                 if ODDS3_HYB_MIN_COTE <= tot_o <= ODDS3_HYB_MAX_COTE:
                     tot_p = math.prod(c['proba'] / 100.0 for c in combo)
-                    if not coupon_passes_ev(tot_o, tot_p): continue
+                    if not coupon_passes_ev(tot_o, tot_p, has_real): continue
                     legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 90, analysis=clean_analysis_text(c['ai'], 260)) for c in combo]
                     return Coupon("Odds +3 HYBRIDE", "Mélange 3 sources", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
 
@@ -1350,9 +1357,10 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys:
             if len(set(ids)) != len(ids): continue
             if not all(is_match_not_started(c.get('kickoff', '')) for c in combo): continue
             tot_o = math.prod(x['odds'] for x in combo)
+            has_real = all(x.get('real_odd') is not None for x in combo)
             if ODDS3_HYB_MIN_COTE <= tot_o <= ODDS3_HYB_MAX_COTE:
                 tot_p = math.prod(c['proba'] / 100.0 for c in combo)
-                if not coupon_passes_ev(tot_o, tot_p): continue
+                if not coupon_passes_ev(tot_o, tot_p, has_real): continue
                 legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 85, analysis=clean_analysis_text(c['ai'], 260)) for c in combo]
                 return Coupon("Odds +3 HYBRIDE", "Top Value Multi-IA", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
     return None
