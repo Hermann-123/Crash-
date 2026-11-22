@@ -88,9 +88,9 @@ WEIGHT_BZZOIRO = float(os.getenv("WEIGHT_BZZOIRO","0.30"))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
 MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.94"))
 
-# ✅ CALIBRAGE PRONOSTIQUEUR PRO — TRANCHE COTE 2.30 à 3.05 (ROI VIP)
-AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "62.0"))
-AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "82.0"))
+# ✅ CALIBRAGE PRONOSTIQUEUR PRO — FIDÉLITÉ AU SCÉNARIO & TRANCHE 2.30 à 3.05
+AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "68.0"))
+AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "88.0"))
 AUTH_MIN_COMBINED_PROB = 0.35
 
 DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "10"))
@@ -111,7 +111,7 @@ ODDS3_AUTH_MIN_COTE = 2.30
 ODDS3_AUTH_MAX_COTE = 3.05
 ODDS3_HYB_MIN_COTE = 3.20
 ODDS3_HYB_MAX_COTE = 5.50
-ODDS3_MIN_COTE_LEG = 1.24
+ODDS3_MIN_COTE_LEG = 1.16
 
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
@@ -947,7 +947,6 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
         except Exception as e:
             print(f"⚠️ The Odds API erreur : {e}")
 
-    # Secours RapidOddsAPI si configuré
     if RAPIDODDSAPI_API_KEY and fetch_rapidodds_odds_data:
         try:
             events = await fetch_rapidodds_odds_data()
@@ -1057,7 +1056,7 @@ async def enrich_with_double_pass(pool):
     return targets
 
 # =====================================================================
-# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (STRATÉGIE PRO COTE 2.30 - 3.05)
+# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (FIDÉLITÉ AU SCÉNARIO & COTE 2.30 - 3.05)
 # =====================================================================
 def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
     sorted_combo = sorted(combo, key=lambda c: parse_dt_safe(c.get("kickoff")) or datetime.max.replace(tzinfo=TZ))
@@ -1123,8 +1122,16 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             print(f"  🚩 Pro-Filter rejet ({md.home} vs {md.away}) : signal '{trap_reason}'")
             continue
 
+        # Détection d'un match à sens unique : interdit BTTS Oui pour rester fidèle au scénario réel
+        p_home_est, _, _, _, _ = compute_probability(md, "victoire_home")
+        p_away_est, _, _, _, _ = compute_probability(md, "victoire_away")
+        one_sided_match = (p_home_est >= 0.72) or (p_away_est >= 0.72)
+
         best_for_match = None
         for mk, odd_key, family, label_fn in markets_map:
+            if mk == "btts_yes" and one_sided_match:
+                continue
+
             prob, g, d, b, emoji = compute_probability(md, mk)
             proba_pct = prob * 100.0
 
@@ -1147,10 +1154,9 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             if not passes_value_filter(prob, odd, is_real, emoji):
                 continue
 
-            family_bonus = 2 if family in ("result", "dc") else 1
-            consensus_bonus = 2 if emoji == "🤝🤝" else (1 if emoji == "🤝" else 0)
-            stability_bonus = 1 if md.stability_flag == "stable" else 0
-            rank_score = (1 if is_real else 0, consensus_bonus, family_bonus, stability_bonus, proba_pct)
+            # Priorité stricte à la probabilité la plus élevée (le scénario réel du match)
+            consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
+            rank_score = (round(proba_pct, 1), consensus_bonus, 1 if family in ("result", "dc") else 0)
 
             if not best_for_match or rank_score > best_for_match["_rank"]:
                 best_for_match = {
@@ -1174,80 +1180,42 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             best_for_match.pop("_rank", None)
             vip_candidates.append(best_for_match)
 
-    seen_keys = {c["norm_key"] for c in vip_candidates}
-    for match in ws_matches:
-        if not is_match_not_started(match.commence_time) or is_reserve_team(match.home_team) or is_reserve_team(match.away_team):
-            continue
-        nkey = f"{normalize_name(match.home_team)}__{normalize_name(match.away_team)}"
-        if nkey in seen_keys:
-            continue
-        sim = dixon_ws.simulate(match)
-        if not sim:
-            continue
-        for mk, odd, proba, family, label, ai in [
-            ("victoire_home", match.home_odds, sim.proba_home, "result", f"Victoire {match.home_team} (1)", "Supériorité domicile validée par les cotes réelles et le modèle Poisson."),
-            ("victoire_away", match.away_odds, sim.proba_away, "result", f"Victoire {match.away_team} (2)", "Supériorité extérieure validée par les cotes réelles et le modèle Poisson."),
-            ("over_2.5", match.over_2_5, sim.proba_over_2_5, "goals", "Plus de 2.5 buts", "Potentiel offensif confirmé par les cotes du marché."),
-        ]:
-            if not odd or odd < ODDS3_MIN_COTE_LEG or not passes_auth_proba_filter(proba):
-                continue
-            if (proba / 100.0) * odd < (1.0 + MIN_EDGE):
-                continue
-            vip_candidates.append({
-                "event_id": match.match_id,
-                "norm_key": nkey,
-                "league": match.league,
-                "home": match.home_team,
-                "away": match.away_team,
-                "kickoff": match.commence_time,
-                "mk": mk,
-                "type": label,
-                "family": family,
-                "odds": odd,
-                "proba": proba,
-                "real_odd": odd,
-                "consensus": "🤝",
-                "ai": ai,
-            })
-            seen_keys.add(nkey)
-            break
-
-    vip_candidates.sort(key=lambda x: (1 if x["real_odd"] else 0, 1 if x["family"] in ("result", "dc") else 0, x["proba"]), reverse=True)
+    # Classement par confiance pure décroissante : les matchs les plus sûrs en premier
+    vip_candidates.sort(key=lambda x: (x["proba"], 1 if x["family"] in ("result", "dc") else 0), reverse=True)
     top_pool = vip_candidates[:14]
 
-    if len(top_pool) >= 2:
-        for combo in itertools.combinations(top_pool, 2):
-            if not _valid_pro_combo(combo, require_anchor=False):
+    # Recherche de la combinaison la plus sûre (2, 3 ou 4 matchs) atteignant 2.30 - 3.05
+    for r in (2, 3, 4):
+        if len(top_pool) < r:
+            continue
+        best_combo = None
+        best_combo_prob = 0.0
+        for combo in itertools.combinations(top_pool, r):
+            if not _valid_pro_combo(combo, require_anchor=(r >= 3)):
                 continue
             tot_o = math.prod(c["odds"] for c in combo)
             tot_p = math.prod(c["proba"] / 100.0 for c in combo)
             if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE and tot_p >= AUTH_MIN_COMBINED_PROB:
                 if not coupon_passes_ev(tot_o, tot_p):
                     continue
-                locked_keys = {c["norm_key"] for c in combo}
-                return _build_auth_coupon(combo, "Sélection Pro VIP • Duo Value", 96), locked_keys
+                if tot_p > best_combo_prob:
+                    best_combo = combo
+                    best_combo_prob = tot_p
+        if best_combo:
+            locked_keys = {c["norm_key"] for c in best_combo}
+            label = "Duo Haute Confiance" if r == 2 else ("Pyramide Sécurisée" if r == 3 else "Quatuor Haute Confiance")
+            return _build_auth_coupon(best_combo, f"Sélection Pro VIP • {label}", 96), locked_keys
 
-    if len(top_pool) >= 3:
-        for combo in itertools.combinations(top_pool, 3):
-            if not _valid_pro_combo(combo, require_anchor=True):
-                continue
-            tot_o = math.prod(c["odds"] for c in combo)
-            tot_p = math.prod(c["proba"] / 100.0 for c in combo)
-            if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE and tot_p >= AUTH_MIN_COMBINED_PROB:
-                if not coupon_passes_ev(tot_o, tot_p):
-                    continue
-                locked_keys = {c["norm_key"] for c in combo}
-                return _build_auth_coupon(combo, "Sélection Pro VIP • Pyramide Sécurisée", 94), locked_keys
-
-    for r in (2, 3):
+    # Repli sécurisé : jamais sous 2.00
+    for r in (2, 3, 4):
         if len(top_pool) < r:
             continue
         for combo in itertools.combinations(top_pool, r):
-            if not _valid_pro_combo(combo, require_anchor=(r == 3)):
+            if not _valid_pro_combo(combo, require_anchor=(r >= 3)):
                 continue
             tot_o = math.prod(c["odds"] for c in combo)
             tot_p = math.prod(c["proba"] / 100.0 for c in combo)
-            if 2.05 <= tot_o < ODDS3_AUTH_MIN_COTE and tot_p >= 0.42:
+            if 2.00 <= tot_o < ODDS3_AUTH_MIN_COTE and tot_p >= 0.40:
                 if not coupon_passes_ev(tot_o, tot_p):
                     continue
                 locked_keys = {c["norm_key"] for c in combo}
