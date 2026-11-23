@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import unicodedata
@@ -16,10 +17,31 @@ TZ = ZoneInfo(NOTIFY_TZ)
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
 
-# Calibrage Pro : haute sécurité (>= 72 %) + cotes équilibrées (1.16 - 1.45) -> cote globale ~15 à 28 sur 12-15 matchs
-WEEKLY_MIN_LEG_ODD = 1.16
+# Calibrage Pronostiqueur Pro (20 ans d'expérience) :
+# - Confiance >= 72 % par sélection
+# - Priorité aux compétitions majeures, exclusion des divisions inférieures (National League, League Two...)
+# - Équilibrage strict des marchés (Ancres 1/2, Boucliers 1X/X2, Moteurs offensifs Over 1.5/2.5)
+WEEKLY_MIN_LEG_ODD = 1.18
 WEEKLY_MIN_PROBA_PCT = 72.0
 WEEKLY_MAX_PROBA_PCT = 86.0
+
+TIER1_LEAGUES = [
+    "champions league", "europa league", "conference league",
+    "premier league", "la liga", "laliga", "serie a", "bundesliga", "ligue 1",
+    "eredivisie", "primeira liga", "liga portugal", "scottish premiership",
+    "pro league", "jupiler", "super lig", "super league",
+]
+
+TIER2_LEAGUES = [
+    "championship", "2. bundesliga", "serie b", "segunda", "ligue 2",
+    "league one", "ekstraklasa", "allsvenskan", "eliteserien", "superliga",
+]
+
+EXCLUDED_LOWER_LEAGUES = [
+    "national league", "league two", "serie c", "3. liga", "national 2",
+    "national 3", "regionalliga", "tercera", "non league", "isthmian", "southern league",
+    "northern premier", "youth", "reserve", "amateur",
+]
 
 PRO_TRAP_PHRASES = [
     "gestion d'effectif",
@@ -49,6 +71,18 @@ def _normalize_name(s: str) -> str:
 
 def _is_reserve_team(name: str) -> bool:
     return any(kw in name.lower() for kw in RESERVE_KEYWORDS)
+
+
+def _league_tier(league: str) -> int:
+    """Retourne 1 (Majeure), 2 (Solide D2/D3 pro), ou 0 (Division inférieure à exclure)."""
+    low = (league or "").lower().strip()
+    if any(ex in low for ex in EXCLUDED_LOWER_LEAGUES):
+        return 0
+    if any(t1 in low for t1 in TIER1_LEAGUES):
+        return 1
+    if any(t2 in low for t2 in TIER2_LEAGUES):
+        return 2
+    return 1
 
 
 def _has_pro_red_flags(analysis_text: str) -> bool:
@@ -137,15 +171,17 @@ async def fetch_bzzoiro_horizon(
                     if not h or not a or _is_reserve_team(h) or _is_reserve_team(a):
                         continue
 
+                    lg = ev.get("league") or item.get("league") or ""
+                    if isinstance(lg, dict):
+                        lg = lg.get("name", "")
+                    if _league_tier(str(lg)) == 0:
+                        continue
+
                     kickoff = ev.get("event_date") or ev.get("commence_time") or item.get("event_date") or ""
                     dt_k = _parse_dt_safe(kickoff)
                     if dt_k:
                         if dt_k < eff_start or dt_k <= (now + timedelta(minutes=MATCH_START_BUFFER_MINUTES)) or dt_k > eff_end:
                             continue
-
-                    lg = ev.get("league") or item.get("league") or ""
-                    if isinstance(lg, dict):
-                        lg = lg.get("name", "")
 
                     bzz_m = {}
                     for k_src, k_dst in [
@@ -225,11 +261,13 @@ async def analyze_weekly_top_matches(
     end_dt: Optional[datetime] = None,
 ) -> List[dict]:
     """
-    Sélectionne les N matchs les plus solides (>= 72 % de confiance) sur une plage de dates ou 2 à 4 jours :
-    - Favori net (>= 72 %) : Victoire sèche (1 ou 2)
-    - Match plus serré : Double Chance 1X / X2 sécurisée (>= 74 %)
-    - Match offensif : Plus de 1.5 buts (>= 75 %) ou Plus de 2.5 buts (>= 72 %)
-    - Fidélité stricte au scénario (zéro BTTS Oui sur match à sens unique)
+    Architecture Combiné Pro (20 ans d'expérience) :
+    1. Exclut les divisions inférieures (National League, League Two...) et priorise les ligues majeures.
+    2. Équilibre le ticket entre :
+       - Ancres : Victoires sèches à domicile (>= 73 %)
+       - Boucliers : Double Chance 1X / X2 alignée avec le favori (>= 74 %)
+       - Moteurs offensifs : Plus de 1.5 buts / Plus de 2.5 buts sur matchs à forts xG
+    3. Plafonne chaque famille de marché (max ~40 % du ticket par famille) pour éviter l'effet domino.
     """
     ws_matches, _ = await fetch_odds_fn()
     raw_items = await fetch_bzzoiro_horizon(days=days, min_conf=58.0, start_dt=start_dt, end_dt=end_dt)
@@ -238,6 +276,8 @@ async def analyze_weekly_top_matches(
 
     pool = []
     for bz in raw_items:
+        if _league_tier(bz.get("league", "")) == 0:
+            continue
         md = match_cls(
             event_id=bz["event_id"],
             league=bz.get("league", ""),
@@ -264,7 +304,9 @@ async def analyze_weekly_top_matches(
             if dt_k and start_dt <= dt_k <= end_dt:
                 filtered.append(md)
         pool = filtered
-    pool.sort(key=prescore_fn, reverse=True)
+
+    # Priorité aux ligues majeures (Tier 1) avant les ligues secondaires (Tier 2)
+    pool.sort(key=lambda m: (1 if _league_tier(m.league) == 1 else 0, prescore_fn(m)), reverse=True)
 
     scan_cap = min(len(pool), max(limit + 14, 28))
     targets = pool[:scan_cap]
@@ -294,6 +336,10 @@ async def analyze_weekly_top_matches(
         if _has_pro_red_flags(md.analysis):
             continue
 
+        tier = _league_tier(md.league)
+        if tier == 0:
+            continue
+
         p_home_est, g_h, _, _, _ = compute_prob_fn(md, "victoire_home")
         p_away_est, g_a, _, _, _ = compute_prob_fn(md, "victoire_away")
         one_sided = (p_home_est >= 0.72) or (p_away_est >= 0.72)
@@ -305,6 +351,9 @@ async def analyze_weekly_top_matches(
         best = None
         for mk, odd_key, family, label_fn in markets_map:
             if mk == "btts_yes" and one_sided:
+                continue
+
+            if mk == "victoire_away" and p_away_est < 0.74:
                 continue
 
             if mk == "double_chance_1X":
@@ -320,7 +369,7 @@ async def analyze_weekly_top_matches(
 
             prob, g, d, b, emoji = compute_prob_fn(md, mk)
             proba_pct = prob * 100.0
-            min_req = 74.0 if family == "dc" else WEEKLY_MIN_PROBA_PCT
+            min_req = 74.0 if family == "dc" else (73.0 if family == "result" else WEEKLY_MIN_PROBA_PCT)
             if proba_pct < min_req or proba_pct > WEEKLY_MAX_PROBA_PCT or emoji == "⚠️":
                 continue
 
@@ -330,16 +379,17 @@ async def analyze_weekly_top_matches(
                 continue
 
             if not tight_match and family == "result":
-                strategy_fit = 3
+                strategy_fit = 4
             elif tight_match and family == "dc":
-                strategy_fit = 3
+                strategy_fit = 4
             elif family == "goals":
                 strategy_fit = 2
             else:
                 strategy_fit = 1
 
+            tier_bonus = 1 if tier == 1 else 0
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
-            score = (strategy_fit, consensus_bonus, round(proba_pct, 1), 1 if real_odd else 0)
+            score = (tier_bonus, strategy_fit, consensus_bonus, round(proba_pct, 1), 1 if real_odd else 0)
 
             if not best or score > best["_score"]:
                 best = {
@@ -348,6 +398,8 @@ async def analyze_weekly_top_matches(
                     "league": md.league,
                     "kickoff": md.kickoff,
                     "pick": label_fn(md),
+                    "family": family,
+                    "tier": tier,
                     "proba": proba_pct,
                     "odd": odd,
                     "is_real": bool(real_odd),
@@ -358,7 +410,35 @@ async def analyze_weekly_top_matches(
             best.pop("_score", None)
             ranked_picks.append(best)
 
-    ranked_picks.sort(key=lambda x: (x["proba"], 1 if x["is_real"] else 0), reverse=True)
-    selected = ranked_picks[:limit]
+    ranked_picks.sort(
+        key=lambda x: (1 if x["tier"] == 1 else 0, x["proba"], 1 if x["is_real"] else 0),
+        reverse=True,
+    )
+
+    max_per_family = max(3, math.ceil(limit * 0.40))
+    family_counts = {"result": 0, "dc": 0, "goals": 0, "btts": 0}
+    selected = []
+    overflow = []
+
+    for item in ranked_picks:
+        fam = item.get("family", "goals")
+        if family_counts.get(fam, 0) < max_per_family:
+            selected.append(item)
+            family_counts[fam] = family_counts.get(fam, 0) + 1
+            if len(selected) >= limit:
+                break
+        else:
+            overflow.append(item)
+
+    if len(selected) < limit:
+        for item in overflow:
+            selected.append(item)
+            if len(selected) >= limit:
+                break
+
+    for item in selected:
+        item.pop("family", None)
+        item.pop("tier", None)
+
     selected.sort(key=lambda c: _parse_dt_safe(c.get("kickoff")) or datetime.max.replace(tzinfo=TZ))
     return selected
