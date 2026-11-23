@@ -16,10 +16,10 @@ TZ = ZoneInfo(NOTIFY_TZ)
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
 
-# Cible par sélection pour atteindre une cote globale de 20 à 35 sur 12-15 matchs
-WEEKLY_MIN_LEG_ODD = 1.22
-WEEKLY_IDEAL_MIN_ODD = 1.25
-WEEKLY_IDEAL_MAX_ODD = 1.62
+# Calibrage Pro : haute sécurité (>= 72 %) + cotes équilibrées (1.16 - 1.45) -> cote globale ~15 à 28 sur 12-15 matchs
+WEEKLY_MIN_LEG_ODD = 1.16
+WEEKLY_MIN_PROBA_PCT = 72.0
+WEEKLY_MAX_PROBA_PCT = 86.0
 
 PRO_TRAP_PHRASES = [
     "gestion d'effectif",
@@ -94,7 +94,7 @@ def _is_match_not_started(kickoff_str) -> bool:
     return dt > (datetime.now(TZ) + timedelta(minutes=MATCH_START_BUFFER_MINUTES))
 
 
-async def fetch_bzzoiro_horizon(days: int = 3, min_conf: float = 55.0) -> list[dict]:
+async def fetch_bzzoiro_horizon(days: int = 3, min_conf: float = 58.0) -> list[dict]:
     """Récupère les prédictions Bzzoiro sur les N prochains jours."""
     if not BZZOIRO_API_KEY:
         return []
@@ -217,15 +217,16 @@ async def analyze_weekly_top_matches(
     fallback_bzz_fn: Optional[Callable] = None,
 ) -> List[dict]:
     """
-    Sélectionne les N meilleurs matchs sur 2-3 jours calibrés pour un combiné rentable (cote 20 à 35) :
-    - Match à favori net (>= 64 %) : Victoire sèche (1 ou 2)
-    - Match serré / équilibré (écart < 18 %) : Double Chance Victoire ou Nul (1X ou X2) à cote >= 1.22
-    - Match offensif : Plus de 2.5 buts
+    Sélectionne les N matchs les plus solides (>= 72 % de confiance) sur 2 à 4 jours :
+    - Favori net (>= 72 %) : Victoire sèche (1 ou 2)
+    - Match plus serré : Double Chance 1X / X2 sécurisée (>= 74 %)
+    - Match offensif : Plus de 1.5 buts (>= 75 %) ou Plus de 2.5 buts (>= 72 %)
+    - Fidélité stricte au scénario (zéro BTTS Oui sur match à sens unique)
     """
     ws_matches, _ = await fetch_odds_fn()
-    raw_items = await fetch_bzzoiro_horizon(days=days, min_conf=55.0)
+    raw_items = await fetch_bzzoiro_horizon(days=days, min_conf=58.0)
     if not raw_items and fallback_bzz_fn:
-        raw_items = await fallback_bzz_fn(min_confidence=55.0)
+        raw_items = await fallback_bzz_fn(min_confidence=58.0)
 
     pool = []
     for bz in raw_items:
@@ -250,7 +251,7 @@ async def analyze_weekly_top_matches(
     pool = [md for md in pool if _is_match_not_started(md.kickoff)]
     pool.sort(key=prescore_fn, reverse=True)
 
-    scan_cap = min(len(pool), max(limit + 12, 25))
+    scan_cap = min(len(pool), max(limit + 14, 28))
     targets = pool[:scan_cap]
     if targets:
         r1 = await enrich_pass_fn(targets, 1)
@@ -265,9 +266,10 @@ async def analyze_weekly_top_matches(
         ("victoire_away", "away", "result", lambda m: f"Victoire {m.away} (2)"),
         ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
         ("double_chance_X2", "dc_x2", "dc", lambda m: f"Double Chance Nul ou {m.away} (X2)"),
+        ("over_1.5", "over_1.5", "goals", lambda m: "Plus de 1.5 buts"),
         ("over_2.5", "over_2.5", "goals", lambda m: "Plus de 2.5 buts"),
-        ("btts_yes", "btts_yes", "btts", lambda m: "Les 2 équipes marquent (BTTS Oui)"),
         ("under_2.5", "under_2.5", "goals", lambda m: "Moins de 2.5 buts"),
+        ("btts_yes", "btts_yes", "btts", lambda m: "Les 2 équipes marquent (BTTS Oui)"),
     ]
 
     ranked_picks = []
@@ -280,7 +282,7 @@ async def analyze_weekly_top_matches(
         p_home_est, g_h, _, _, _ = compute_prob_fn(md, "victoire_home")
         p_away_est, g_a, _, _, _ = compute_prob_fn(md, "victoire_away")
         one_sided = (p_home_est >= 0.72) or (p_away_est >= 0.72)
-        tight_match = abs(p_home_est - p_away_est) < 0.18
+        tight_match = abs(p_home_est - p_away_est) < 0.22
 
         real_h_odd = md.real_odds.get("home")
         real_a_odd = md.real_odds.get("away")
@@ -290,7 +292,7 @@ async def analyze_weekly_top_matches(
             if mk == "btts_yes" and one_sided:
                 continue
 
-            # Vérification de cohérence sur les Double Chances (1X / X2)
+            # Interdiction des Double Chances inversées contre un favori bookmaker ou IA
             if mk == "double_chance_1X":
                 if real_a_odd and real_a_odd < 1.95:
                     continue
@@ -304,7 +306,8 @@ async def analyze_weekly_top_matches(
 
             prob, g, d, b, emoji = compute_prob_fn(md, mk)
             proba_pct = prob * 100.0
-            if proba_pct < 62.0 or proba_pct > 82.0 or emoji == "⚠️":
+            min_req = 74.0 if family == "dc" else WEEKLY_MIN_PROBA_PCT
+            if proba_pct < min_req or proba_pct > WEEKLY_MAX_PROBA_PCT or emoji == "⚠️":
                 continue
 
             real_odd = md.real_odds.get(odd_key)
@@ -312,20 +315,18 @@ async def analyze_weekly_top_matches(
             if odd < WEEKLY_MIN_LEG_ODD:
                 continue
 
-            in_ideal_odd = 1 if (WEEKLY_IDEAL_MIN_ODD <= odd <= WEEKLY_IDEAL_MAX_ODD) else 0
-
-            # Logique Pro : Victoire sèche si favori net, Victoire ou Nul (1X/X2) si match serré
-            if tight_match and family == "dc":
+            # Priorité : Victoire sèche si favori écrasant, 1X/X2 si match plus serré, puis Over 1.5/2.5
+            if not tight_match and family == "result":
                 strategy_fit = 3
-            elif not tight_match and family == "result":
+            elif tight_match and family == "dc":
                 strategy_fit = 3
-            elif family == "goals" and mk == "over_2.5":
+            elif family == "goals":
                 strategy_fit = 2
             else:
                 strategy_fit = 1
 
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
-            score = (in_ideal_odd, strategy_fit, consensus_bonus, round(proba_pct, 1))
+            score = (strategy_fit, consensus_bonus, round(proba_pct, 1), 1 if real_odd else 0)
 
             if not best or score > best["_score"]:
                 best = {
@@ -344,7 +345,7 @@ async def analyze_weekly_top_matches(
             best.pop("_score", None)
             ranked_picks.append(best)
 
-    ranked_picks.sort(key=lambda x: (x["proba"], x["odd"]), reverse=True)
+    ranked_picks.sort(key=lambda x: (x["proba"], 1 if x["is_real"] else 0), reverse=True)
     selected = ranked_picks[:limit]
     selected.sort(key=lambda c: _parse_dt_safe(c.get("kickoff")) or datetime.max.replace(tzinfo=TZ))
     return selected
