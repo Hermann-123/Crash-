@@ -94,14 +94,20 @@ def _is_match_not_started(kickoff_str) -> bool:
     return dt > (datetime.now(TZ) + timedelta(minutes=MATCH_START_BUFFER_MINUTES))
 
 
-async def fetch_bzzoiro_horizon(days: int = 3, min_conf: float = 58.0) -> list[dict]:
-    """Récupère les prédictions Bzzoiro sur les N prochains jours."""
+async def fetch_bzzoiro_horizon(
+    days: int = 3,
+    min_conf: float = 58.0,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+) -> list[dict]:
+    """Récupère les prédictions Bzzoiro sur une plage de dates précise ou sur les N prochains jours."""
     if not BZZOIRO_API_KEY:
         return []
     now = datetime.now(TZ)
-    end_dt = now + timedelta(days=days)
-    d_from = now.strftime("%Y-%m-%d")
-    d_to = end_dt.strftime("%Y-%m-%d")
+    eff_start = start_dt if start_dt else (now + timedelta(minutes=MATCH_START_BUFFER_MINUTES))
+    eff_end = end_dt if end_dt else (now + timedelta(days=days))
+    d_from = eff_start.strftime("%Y-%m-%d")
+    d_to = eff_end.strftime("%Y-%m-%d")
     headers = {"Authorization": f"Token {BZZOIRO_API_KEY}"}
     url = "https://sports.bzzoiro.com/api/predictions/"
     collected = []
@@ -134,7 +140,7 @@ async def fetch_bzzoiro_horizon(days: int = 3, min_conf: float = 58.0) -> list[d
                     kickoff = ev.get("event_date") or ev.get("commence_time") or item.get("event_date") or ""
                     dt_k = _parse_dt_safe(kickoff)
                     if dt_k:
-                        if dt_k <= (now + timedelta(minutes=MATCH_START_BUFFER_MINUTES)) or dt_k > end_dt:
+                        if dt_k < eff_start or dt_k <= (now + timedelta(minutes=MATCH_START_BUFFER_MINUTES)) or dt_k > eff_end:
                             continue
 
                     lg = ev.get("league") or item.get("league") or ""
@@ -215,16 +221,18 @@ async def analyze_weekly_top_matches(
     enrich_pass_fn: Callable,
     compute_prob_fn: Callable,
     fallback_bzz_fn: Optional[Callable] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
 ) -> List[dict]:
     """
-    Sélectionne les N matchs les plus solides (>= 72 % de confiance) sur 2 à 4 jours :
+    Sélectionne les N matchs les plus solides (>= 72 % de confiance) sur une plage de dates ou 2 à 4 jours :
     - Favori net (>= 72 %) : Victoire sèche (1 ou 2)
     - Match plus serré : Double Chance 1X / X2 sécurisée (>= 74 %)
     - Match offensif : Plus de 1.5 buts (>= 75 %) ou Plus de 2.5 buts (>= 72 %)
     - Fidélité stricte au scénario (zéro BTTS Oui sur match à sens unique)
     """
     ws_matches, _ = await fetch_odds_fn()
-    raw_items = await fetch_bzzoiro_horizon(days=days, min_conf=58.0)
+    raw_items = await fetch_bzzoiro_horizon(days=days, min_conf=58.0, start_dt=start_dt, end_dt=end_dt)
     if not raw_items and fallback_bzz_fn:
         raw_items = await fallback_bzz_fn(min_confidence=58.0)
 
@@ -249,6 +257,13 @@ async def analyze_weekly_top_matches(
 
     inject_odds_fn(pool, ws_matches)
     pool = [md for md in pool if _is_match_not_started(md.kickoff)]
+    if start_dt and end_dt:
+        filtered = []
+        for md in pool:
+            dt_k = _parse_dt_safe(md.kickoff)
+            if dt_k and start_dt <= dt_k <= end_dt:
+                filtered.append(md)
+        pool = filtered
     pool.sort(key=prescore_fn, reverse=True)
 
     scan_cap = min(len(pool), max(limit + 14, 28))
@@ -292,7 +307,6 @@ async def analyze_weekly_top_matches(
             if mk == "btts_yes" and one_sided:
                 continue
 
-            # Interdiction des Double Chances inversées contre un favori bookmaker ou IA
             if mk == "double_chance_1X":
                 if real_a_odd and real_a_odd < 1.95:
                     continue
@@ -315,7 +329,6 @@ async def analyze_weekly_top_matches(
             if odd < WEEKLY_MIN_LEG_ODD:
                 continue
 
-            # Priorité : Victoire sèche si favori écrasant, 1X/X2 si match plus serré, puis Over 1.5/2.5
             if not tight_match and family == "result":
                 strategy_fit = 3
             elif tight_match and family == "dc":
