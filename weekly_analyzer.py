@@ -213,9 +213,9 @@ async def analyze_weekly_top_matches(
 ) -> List[dict]:
     """
     Analyse et classe les N meilleurs matchs sur 2 à 3+ jours selon la méthodologie Pro :
-    - Croisement Dixon-Coles + XGBoost + Bzzoiro + Gemini
-    - Blocage strict du BTTS Oui sur les matchs à sens unique (>= 72 %)
-    - Priorité absolue à la probabilité réelle la plus sûre du scénario
+    - Exige une analyse IA Gemini réelle sur chaque match retenu (zéro texte générique)
+    - Bloque les Double Chances 1X/X2 inversées contre un favori bookmaker (< 1.90) ou non confirmées par l'IA
+    - Bloque strictement le BTTS Oui sur les matchs à sens unique (>= 72 %)
     """
     ws_matches, _ = await fetch_odds_fn()
     raw_items = await fetch_bzzoiro_horizon(days=days, min_conf=55.0)
@@ -245,8 +245,8 @@ async def analyze_weekly_top_matches(
     pool = [md for md in pool if _is_match_not_started(md.kickoff)]
     pool.sort(key=prescore_fn, reverse=True)
 
-    # Enrichissement Gemini sur les meilleurs candidats de la période
-    scan_cap = min(len(pool), max(limit + 6, 18))
+    # Élargissement à 25 matchs pour garantir >= 15 matchs avec vraie analyse Gemini
+    scan_cap = min(len(pool), max(limit + 12, 25))
     targets = pool[:scan_cap]
     if targets:
         r1 = await enrich_pass_fn(targets, 1)
@@ -268,18 +268,37 @@ async def analyze_weekly_top_matches(
     ]
 
     ranked_picks = []
-    for md in pool:
+    for md in targets:
+        # Garde-fou #1 : analyse Gemini obligatoire pour éviter les scores Dixon-Coles isolés sans contexte
+        if not md.analysis or not md.gemini_markets:
+            continue
         if _has_pro_red_flags(md.analysis):
             continue
 
-        p_home_est, _, _, _, _ = compute_prob_fn(md, "victoire_home")
-        p_away_est, _, _, _, _ = compute_prob_fn(md, "victoire_away")
+        p_home_est, g_h, _, _, _ = compute_prob_fn(md, "victoire_home")
+        p_away_est, g_a, _, _, _ = compute_prob_fn(md, "victoire_away")
         one_sided = (p_home_est >= 0.72) or (p_away_est >= 0.72)
+
+        real_h_odd = md.real_odds.get("home")
+        real_a_odd = md.real_odds.get("away")
 
         best = None
         for mk, odd_key, family, label_fn in markets_map:
             if mk == "btts_yes" and one_sided:
                 continue
+
+            # Garde-fou #2 : interdire les Double Chances inversées contre un favori bookmaker ou l'analyse Gemini
+            if mk == "double_chance_1X":
+                if real_a_odd and real_a_odd < 1.90:
+                    continue
+                if g_a > 0 and g_h > 0 and g_a > (g_h + 0.12):
+                    continue
+            elif mk == "double_chance_X2":
+                if real_h_odd and real_h_odd < 1.90:
+                    continue
+                if g_h > 0 and g_a > 0 and g_h > (g_a + 0.12):
+                    continue
+
             prob, g, d, b, emoji = compute_prob_fn(md, mk)
             proba_pct = prob * 100.0
             if proba_pct < 60.0 or emoji == "⚠️":
@@ -290,7 +309,8 @@ async def analyze_weekly_top_matches(
             if odd < 1.15:
                 continue
 
-            score = (round(proba_pct, 1), 1 if real_odd else 0, 1 if family in ("result", "dc") else 0)
+            consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
+            score = (round(proba_pct, 1), consensus_bonus, 1 if real_odd else 0, 1 if family in ("result", "dc") else 0)
             if not best or score > best["_score"]:
                 best = {
                     "home": md.home,
@@ -301,7 +321,7 @@ async def analyze_weekly_top_matches(
                     "proba": proba_pct,
                     "odd": odd,
                     "is_real": bool(real_odd),
-                    "ai": _clean_analysis_text(md.analysis, 230) if md.analysis else f"Supériorité statistique confirmée ({proba_pct:.1f}%).",
+                    "ai": _clean_analysis_text(md.analysis, 230),
                     "_score": score,
                 }
         if best:
