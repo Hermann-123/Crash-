@@ -17,12 +17,12 @@ TZ = ZoneInfo(NOTIFY_TZ)
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
 
-# =====================================================================
-# RÈGLES D'OR DU COMBINÉ PRO (20 ANS D'EXPÉRIENCE — VERROUILLÉ)
-# =====================================================================
-WEEKLY_MIN_LEG_ODD = 1.22       # Zéro cote "poison" (1.08 - 1.19) qui dilue le risque
-WEEKLY_MIN_PROBA_PCT = 68.0     # Seuil minimal global
-WEEKLY_MAX_PROBA_PCT = 86.0     # Évite les cotes trop basses (< 1.16)
+# Calibrage Pronostiqueur Pro (20 ans d'expérience) :
+# - Élimination des cotes poison (< 1.20) et des Over 1.5 sans cote bookmaker réelle
+# - Seuils calibrés par famille pour un vrai équilibre Ancres (1/2) / Boucliers (1X/X2) / Moteurs offensifs (Over 2.5)
+WEEKLY_MIN_LEG_ODD = 1.20
+WEEKLY_MIN_PROBA_PCT = 68.0
+WEEKLY_MAX_PROBA_PCT = 86.0
 
 TIER1_LEAGUES = [
     "champions league", "europa league", "conference league",
@@ -73,7 +73,7 @@ def _is_reserve_team(name: str) -> bool:
 
 
 def _league_tier(league: str) -> int:
-    """1 = Ligue majeure, 2 = D2/D3 pro solide, 0 = Division inférieure exclue."""
+    """Retourne 1 (Majeure), 2 (Solide D2/D3 pro), ou 0 (Division inférieure à exclure)."""
     low = (league or "").lower().strip()
     if any(ex in low for ex in EXCLUDED_LOWER_LEAGUES):
         return 0
@@ -125,23 +125,6 @@ def _is_match_not_started(kickoff_str) -> bool:
     if not dt or (dt.hour == 0 and dt.minute == 0):
         return True
     return dt > (datetime.now(TZ) + timedelta(minutes=MATCH_START_BUFFER_MINUTES))
-
-
-def _realistic_estimated_odd(prob: float, market_key: str) -> float:
-    """
-    Calcule une cote estimée réaliste intégrant la marge bookmaker (~6-8%)
-    et le plancher réel du marché (ex: Over 1.5 tourne à ~1.12-1.22, jamais 1.39 sur un favori).
-    """
-    if prob <= 0:
-        return 0.0
-    fair_odd = 1.0 / prob
-    # Marge bookmaker réaliste
-    margin_factor = 0.92 if market_key in ("over_1.5", "double_chance_1X", "double_chance_X2") else 0.94
-    est = round(fair_odd * margin_factor, 2)
-    if market_key == "over_1.5":
-        # Un Over 1.5 avec >= 78 % de proba dépasse rarement 1.20 chez un bookmaker réel
-        est = min(est, 1.20)
-    return est
 
 
 async def fetch_bzzoiro_horizon(
@@ -228,7 +211,6 @@ async def fetch_bzzoiro_horizon(
                         ("odds_draw", "draw"),
                         ("odds_away", "away"),
                         ("odds_over_25", "over_2.5"),
-                        ("odds_under_25", "under_2.5"),
                     ]:
                         ov = ev.get(ok_src) or item.get(ok_src)
                         if ov:
@@ -278,13 +260,11 @@ async def analyze_weekly_top_matches(
     end_dt: Optional[datetime] = None,
 ) -> List[dict]:
     """
-    Version finale verrouillée (Pronostiqueur Pro 20 ans) :
-    1. Exclut les divisions inférieures et priorise les ligues majeures (Tier 1).
-    2. Interdit les cotes < 1.22 et interdit 'Over 1.5' sans vraie cote bookmaker >= 1.22
-       (élimine définitivement les cotes réelles à 1.08 - 1.15 vues sur ton bookmaker).
-    3. Déduit les vraies cotes Double Chance (1X / X2) depuis les cotes réelles 1-N-2 quand disponibles.
-    4. Équilibre strictement le ticket (max 40 % par famille : Victoires sèches, Double Chance, Buts)
-       sans réinjecter un marché déjà saturé.
+    Architecture Combiné Pro (20 ans d'expérience) — Calibrage Bookmaker Réel :
+    1. Exclut les divisions inférieures (National League, League Two...) et priorise les ligues majeures.
+    2. Interdit les 'Plus de 1.5 buts' sans vraie cote bookmaker >= 1.22 (évite les cotes réelles à 1.08 - 1.15).
+    3. Équilibre strictement les familles (Ancres 1/2 >= 68%, Boucliers 1X/X2 >= 71%, Moteurs offensifs Over 2.5 / BTTS)
+       avec un plafond strict par famille pour éviter les tickets 100% buts.
     """
     ws_matches, _ = await fetch_odds_fn()
     raw_items = await fetch_bzzoiro_horizon(days=days, min_conf=58.0, start_dt=start_dt, end_dt=end_dt)
@@ -322,20 +302,7 @@ async def analyze_weekly_top_matches(
                 filtered.append(md)
         pool = filtered
 
-    # Calcul des vraies cotes Double Chance 1X et X2 à partir des cotes réelles 1-N-2 du bookmaker
-    for md in pool:
-        oh = md.real_odds.get("home")
-        od = md.real_odds.get("draw")
-        oa = md.real_odds.get("away")
-        if oh and od and "dc_1x" not in md.real_odds:
-            implied_1x = (1.0 / oh) + (1.0 / od)
-            if implied_1x > 0:
-                md.real_odds["dc_1x"] = round(1.0 / implied_1x, 2)
-        if oa and od and "dc_x2" not in md.real_odds:
-            implied_x2 = (1.0 / oa) + (1.0 / od)
-            if implied_x2 > 0:
-                md.real_odds["dc_x2"] = round(1.0 / implied_x2, 2)
-
+    # Priorité aux ligues majeures (Tier 1) avant les ligues secondaires (Tier 2)
     pool.sort(key=lambda m: (1 if _league_tier(m.league) == 1 else 0, prescore_fn(m)), reverse=True)
 
     scan_cap = min(len(pool), max(limit + 16, 30))
@@ -354,8 +321,8 @@ async def analyze_weekly_top_matches(
         ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
         ("double_chance_X2", "dc_x2", "dc", lambda m: f"Double Chance Nul ou {m.away} (X2)"),
         ("over_2.5", "over_2.5", "goals", lambda m: "Plus de 2.5 buts"),
-        ("under_2.5", "under_2.5", "goals", lambda m: "Moins de 2.5 buts"),
         ("over_1.5", "over_1.5", "goals", lambda m: "Plus de 1.5 buts"),
+        ("under_2.5", "under_2.5", "goals", lambda m: "Moins de 2.5 buts"),
         ("btts_yes", "btts_yes", "btts", lambda m: "Les 2 équipes marquent (BTTS Oui)"),
     ]
 
@@ -380,65 +347,69 @@ async def analyze_weekly_top_matches(
 
         best = None
         for mk, odd_key, family, label_fn in markets_map:
-            # 1. Jamais de BTTS Oui sur un match à sens unique
             if mk == "btts_yes" and one_sided:
                 continue
 
-            # 2. Jamais de Over 1.5 sans vraie cote bookmaker >= 1.22 (évite les cotes réelles à 1.08 - 1.15)
-            real_odd = md.real_odds.get(odd_key)
-            if mk == "over_1.5" and not real_odd:
+            if mk == "victoire_away" and p_away_est < 0.70:
                 continue
 
-            # 3. Victoire à l'extérieur uniquement si très solide (>= 72 %)
-            if mk == "victoire_away" and p_away_est < 0.72:
-                continue
-
-            # 4. Zéro Double Chance inversée contre le favori bookmaker ou IA
+            # Interdiction stricte des Double Chances inversées contre un favori bookmaker ou IA
             if mk == "double_chance_1X":
-                if real_a_odd and real_a_odd < 1.95:
+                if real_a_odd and real_a_odd < 2.00:
                     continue
-                if g_a > 0 and g_h > 0 and g_a > (g_h + 0.08):
+                if g_a > 0 and g_h > 0 and g_a > (g_h + 0.06):
                     continue
             elif mk == "double_chance_X2":
-                if real_h_odd and real_h_odd < 1.95:
+                if real_h_odd and real_h_odd < 2.00:
                     continue
-                if g_h > 0 and g_a > 0 and g_h > (g_a + 0.08):
+                if g_h > 0 and g_a > 0 and g_h > (g_a + 0.06):
                     continue
 
             prob, g, d, b, emoji = compute_prob_fn(md, mk)
             proba_pct = prob * 100.0
 
-            # Seuils calibrés par famille pour un vrai mélange 1/2 + 1X/X2 + Buts
+            # Seuils calibrés Pro :
+            # - Victoire sèche (1/2) : >= 68 %
+            # - Double Chance (1X/X2) : >= 71 %
+            # - Buts (Over 2.5 / BTTS) : >= 72 % (et Over 1.5 exige >= 76 % + vraie cote >= 1.22)
             if family == "result":
                 min_req = 68.0
             elif family == "dc":
-                min_req = 72.0
+                min_req = 71.0
+            elif mk == "over_1.5":
+                min_req = 76.0
             else:
-                min_req = 73.0
+                min_req = 72.0
 
             if proba_pct < min_req or proba_pct > WEEKLY_MAX_PROBA_PCT or emoji == "⚠️":
                 continue
 
-            odd = real_odd if real_odd else _realistic_estimated_odd(prob, mk)
+            real_odd = md.real_odds.get(odd_key)
+
+            # Anti-cote poison : un Over 1.5 sans cote bookmaker réelle >= 1.22 vaut souvent 1.08-1.15 en réel
+            if mk == "over_1.5" and (not real_odd or real_odd < 1.22):
+                continue
+
+            odd = real_odd if real_odd else (round(1.0 / prob, 2) if prob > 0 else 0.0)
             if odd < WEEKLY_MIN_LEG_ODD:
                 continue
 
-            # Priorité stratégique : Résultat sec / Double Chance > Buts
+            # Priorité à l'architecture Pro : Ancre (1/2) sur favori, Bouclier (1X/X2) sur choc serré, Over 2.5 sur match ouvert
             if not tight_match and family == "result":
                 strategy_fit = 5
             elif tight_match and family == "dc":
                 strategy_fit = 5
-            elif family in ("result", "dc"):
-                strategy_fit = 4
-            elif family == "goals":
-                strategy_fit = 2
+            elif mk == "over_2.5":
+                strategy_fit = 3
+            elif family == "btts":
+                strategy_fit = 3
             else:
-                strategy_fit = 1
+                strategy_fit = 2
 
             tier_bonus = 1 if tier == 1 else 0
             real_odd_bonus = 1 if real_odd else 0
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
-            score = (tier_bonus, real_odd_bonus, strategy_fit, consensus_bonus, round(proba_pct, 1))
+            score = (tier_bonus, strategy_fit, real_odd_bonus, consensus_bonus, round(proba_pct, 1))
 
             if not best or score > best["_score"]:
                 best = {
@@ -449,6 +420,7 @@ async def analyze_weekly_top_matches(
                     "pick": label_fn(md),
                     "family": family,
                     "tier": tier,
+                    "strategy_fit": strategy_fit,
                     "proba": proba_pct,
                     "odd": odd,
                     "is_real": bool(real_odd),
@@ -459,15 +431,22 @@ async def analyze_weekly_top_matches(
             best.pop("_score", None)
             ranked_picks.append(best)
 
+    # Tri Pro : Ligue Majeure > Adéquation Stratégique > Cote Réelle > Probabilité
     ranked_picks.sort(
-        key=lambda x: (1 if x["tier"] == 1 else 0, 1 if x["is_real"] else 0, x["proba"]),
+        key=lambda x: (
+            1 if x["tier"] == 1 else 0,
+            x["strategy_fit"],
+            1 if x["is_real"] else 0,
+            x["proba"],
+        ),
         reverse=True,
     )
 
-    # Équilibrage STRICT des marchés : max 40 % par famille, sans réinjecter une famille saturée
-    max_per_family = max(2, math.ceil(limit * 0.40))
+    # Plafond strict par famille (max ~35-40 % par marché) pour garantir un ticket équilibré
+    max_per_family = max(2, math.ceil(limit * 0.38))
     family_counts = {"result": 0, "dc": 0, "goals": 0, "btts": 0}
     selected = []
+    overflow = []
 
     for item in ranked_picks:
         fam = item.get("family", "goals")
@@ -476,10 +455,19 @@ async def analyze_weekly_top_matches(
             family_counts[fam] = family_counts.get(fam, 0) + 1
             if len(selected) >= limit:
                 break
+        else:
+            overflow.append(item)
+
+    if len(selected) < limit:
+        for item in overflow:
+            selected.append(item)
+            if len(selected) >= limit:
+                break
 
     for item in selected:
         item.pop("family", None)
         item.pop("tier", None)
+        item.pop("strategy_fit", None)
 
     selected.sort(key=lambda c: _parse_dt_safe(c.get("kickoff")) or datetime.max.replace(tzinfo=TZ))
     return selected
