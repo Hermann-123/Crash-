@@ -53,6 +53,13 @@ except: fetch_rapidodds_odds_data = None
 try: from dixon_coles import download_and_train
 except: download_and_train = None
 
+try:
+    from weekly_analyzer import analyze_weekly_top_matches
+    print("✅ weekly_analyzer chargé")
+except Exception as e:
+    analyze_weekly_top_matches = None
+    print(f"⚠️ weekly_analyzer non chargé : {e}")
+
 # --- VARIABLES & ENV ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -196,13 +203,13 @@ class Coupon:
 
 bot = Bot(BOT_TOKEN); dp = Dispatcher()
 BTN_ODDS3 = "🎯 Odds +3"; BTN_MTFT = "⏱ MT-Fin"; BTN_DRAW = "🤝 Match Nul"
-BTN_SCAN = "🔄 Actualiser"; BTN_BILAN = "📊 Bilan"
+BTN_WEEKLY = "📅 Top Semaine"; BTN_SCAN = "🔄 Actualiser"; BTN_BILAN = "📊 Bilan"
 
 USER_KEYBOARD = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_ODDS3)]], resize_keyboard=True)
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ODDS3), KeyboardButton(text=BTN_MTFT)],
-        [KeyboardButton(text=BTN_DRAW)],
+        [KeyboardButton(text=BTN_DRAW), KeyboardButton(text=BTN_WEEKLY)],
         [KeyboardButton(text=BTN_SCAN), KeyboardButton(text=BTN_BILAN), KeyboardButton(text="⚙️ Debug")],
     ],
     resize_keyboard=True,
@@ -884,7 +891,6 @@ def passes_auth_proba_filter(proba):
 # APIS COTES (The Odds API LIVE + Secours RapidOddsAPI)
 # =====================================================================
 async def fetch_rapidodds_odds() -> Tuple[list, str]:
-    """Récupère les vraies cotes bookmakers EU (1X2 + Over/Under 2.5) via The Odds API."""
     if THE_ODDS_API_KEY:
         try:
             url = "https://api.the-odds-api.com/v4/sports/upcoming/odds"
@@ -1122,7 +1128,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             print(f"  🚩 Pro-Filter rejet ({md.home} vs {md.away}) : signal '{trap_reason}'")
             continue
 
-        # Détection d'un match à sens unique : interdit BTTS Oui pour rester fidèle au scénario réel
         p_home_est, _, _, _, _ = compute_probability(md, "victoire_home")
         p_away_est, _, _, _, _ = compute_probability(md, "victoire_away")
         one_sided_match = (p_home_est >= 0.72) or (p_away_est >= 0.72)
@@ -1154,7 +1159,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             if not passes_value_filter(prob, odd, is_real, emoji):
                 continue
 
-            # Priorité stricte à la probabilité la plus élevée (le scénario réel du match)
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
             rank_score = (round(proba_pct, 1), consensus_bonus, 1 if family in ("result", "dc") else 0)
 
@@ -1180,11 +1184,9 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             best_for_match.pop("_rank", None)
             vip_candidates.append(best_for_match)
 
-    # Classement par confiance pure décroissante : les matchs les plus sûrs en premier
     vip_candidates.sort(key=lambda x: (x["proba"], 1 if x["family"] in ("result", "dc") else 0), reverse=True)
     top_pool = vip_candidates[:14]
 
-    # Recherche de la combinaison la plus sûre (2, 3 ou 4 matchs) atteignant 2.30 - 3.05
     for r in (2, 3, 4):
         if len(top_pool) < r:
             continue
@@ -1206,7 +1208,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             label = "Duo Haute Confiance" if r == 2 else ("Pyramide Sécurisée" if r == 3 else "Quatuor Haute Confiance")
             return _build_auth_coupon(best_combo, f"Sélection Pro VIP • {label}", 96), locked_keys
 
-    # Repli sécurisé : jamais sous 2.00
     for r in (2, 3, 4):
         if len(top_pool) < r:
             continue
@@ -1528,6 +1529,7 @@ async def start_cmd(m: Message):
     if m.from_user.id == ADMIN_ID:
         msg = (
             f"{format_header()}\n\n<b>👋 Mode Admin</b>\n"
+            f"• /semaine <code>[jours] [matchs]</code> — Top matchs sur 2-3 jours\n"
             f"• /genkey <code>[jours] [nb]</code> — Créer clé(s) VIP\n"
             f"• /vip — Liste des abonnés & clés\n"
             f"• /delvip <code>ID</code> — Révoquer un abonné\n"
@@ -1539,6 +1541,67 @@ async def start_cmd(m: Message):
     else:
         msg = f"{format_header()}\n\n<b>🔒 Accès VIP requis</b>\n\n{get_subscription_message(m.from_user.id)}"
     await safe_answer(m, msg, reply_markup=kb)
+
+@dp.message(F.text == BTN_WEEKLY)
+@dp.message(Command("semaine", "week", "top"))
+async def semaine_cmd(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    if not analyze_weekly_top_matches:
+        await safe_answer(m, "⚠️ Module <code>weekly_analyzer.py</code> introuvable sur le serveur.")
+        return
+
+    parts = (m.text or "").split()
+    days = 3
+    limit = 15
+    try:
+        if len(parts) >= 2 and parts[1].isdigit():
+            days = max(1, min(7, int(parts[1])))
+        if len(parts) >= 3 and parts[2].isdigit():
+            limit = max(5, min(30, int(parts[2])))
+    except Exception:
+        pass
+
+    await safe_answer(
+        m,
+        f"⏳ <b>Analyse Pro Multi-Jours en cours...</b>\n"
+        f"📅 Horizon : <b>{days} jours</b> • 🎯 Objectif : <b>Top {limit} matchs</b>\n"
+        f"<i>Croisement Dixon-Coles + XGBoost + Bzzoiro + Gemini (patiente ~30-45 sec)...</i>",
+    )
+
+    picks = await analyze_weekly_top_matches(
+        days=days,
+        limit=limit,
+        match_cls=MatchData,
+        dixon_model=STATE.get("dixon_model"),
+        fetch_odds_fn=fetch_rapidodds_odds,
+        inject_odds_fn=inject_all_real_odds,
+        prescore_fn=prescore_match,
+        enrich_pass_fn=_enrich_single_pass,
+        compute_prob_fn=compute_probability,
+        fallback_bzz_fn=fetch_bzzoiro_predictions_direct,
+    )
+
+    if not picks:
+        await safe_answer(m, f"📭 Aucun match fiable trouvé sur les {days} prochains jours.")
+        return
+
+    lines = [
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>",
+        f"<b>📅 TOP {len(picks)} MATCHS • HORIZON {days} JOURS</b>",
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>",
+        f"<i>Stratégie Pro (20 ans) : Fidélité au scénario & haute confiance</i>\n",
+    ]
+    for i, p in enumerate(picks, 1):
+        odd_tag = f"<b>{p['odd']}</b>" if p["is_real"] else f"<b>{p['odd']}</b> <i>(est.)</i>"
+        lines.append(
+            f"<b>#{i} {p['home']} vs {p['away']}</b>\n"
+            f"📅 {format_kickoff(p['kickoff'])} • {p['league']}\n"
+            f"🎯 <b>{p['pick']}</b> | 📊 <b>{p['proba']:.1f}%</b> | 💰 {odd_tag}\n"
+            f"🧠 <i>{p['ai']}</i>\n"
+        )
+    lines.append(f"<i>{PUBLIC_FOOTER}</i>")
+    await safe_answer(m, "\n".join(lines))
 
 @dp.message(Command("genkey", "gen", "newkey"))
 async def genkey_cmd(m: Message):
@@ -1736,8 +1799,13 @@ async def periodic_score_check():
 
 @asynccontextmanager
 async def lifespan(app):
-    try: await bot.delete_webhook(drop_pending_updates=True)
-    except: pass
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        me = await bot.get_me()
+        print(f"🤖 Bot Telegram connecté : @{me.username} (ID: {me.id})")
+    except Exception as e:
+        print(f"❌ ERREUR CONNEXION TELEGRAM : {e}")
+
     STATE["tracker"] = load_json(LOCAL_DB, {"coupons": []})
     STATE["keys"] = load_json(KEYS_DB, {})
     STATE["users"] = load_json(USERS_DB, {})
@@ -1745,25 +1813,43 @@ async def lifespan(app):
     today_str = datetime.now(TZ).strftime("%Y-%m-%d")
     if load_daily_cache(today_str):
         print(f"📦 Cache du jour restauré au démarrage ({len(STATE['coupons'])} coupons)")
-    if train_model_if_needed: asyncio.create_task(asyncio.to_thread(train_model_if_needed))
+    if train_model_if_needed:
+        asyncio.create_task(asyncio.to_thread(train_model_if_needed))
+
     scheduler = AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(daily_broadcast, CronTrigger(hour=NOTIFY_HOUR, minute=NOTIFY_MINUTE, timezone=TZ), id="daily")
     scheduler.add_job(periodic_score_check, IntervalTrigger(minutes=45), id="score_check")
     scheduler.start()
-    bot_task = asyncio.create_task(dp.start_polling(bot))
+
+    async def run_polling():
+        try:
+            print("📡 Démarrage de l'écoute Telegram (polling)...")
+            await dp.start_polling(bot, handle_signals=False)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"❌ CRASH POLLING TELEGRAM : {e}")
+
+    bot_task = asyncio.create_task(run_polling())
+
     async def bootstrap():
         try:
-            if download_and_train: STATE["dixon_model"] = await download_and_train(); print("✅ Dixon chargé")
+            if download_and_train:
+                STATE["dixon_model"] = await download_and_train()
+                print("✅ Dixon chargé")
             await asyncio.sleep(5)
             await periodic_score_check()
             curr_today = datetime.now(TZ).strftime("%Y-%m-%d")
             if not load_daily_cache(curr_today):
                 await daily_broadcast()
                 STATE["last_scan_date"] = curr_today
-        except: pass
+        except Exception as e:
+            print(f"⚠️ Erreur bootstrap : {e}")
+
     asyncio.create_task(bootstrap())
     yield
-    scheduler.shutdown(wait=False); bot_task.cancel()
+    scheduler.shutdown(wait=False)
+    bot_task.cancel()
 
 app = FastAPI(title="Value Bot", lifespan=lifespan)
 
