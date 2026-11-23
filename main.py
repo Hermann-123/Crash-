@@ -57,6 +57,7 @@ except: download_and_train = None
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BZZOIRO_API_KEY = os.getenv("BZZOIRO_API_KEY", "")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "99f9731b68429ed4aaf0383cd7ca8cd4")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "5968288964")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "-1003982738017")
 RAPIDODDSAPI_API_KEY = os.getenv("RAPIDODDSAPI_API_KEY", "")
@@ -128,12 +129,6 @@ PRO_TRAP_PHRASES = [
     "aucun enjeu",
     "sans enjeu",
     "en pleine crise",
-]
-
-ESPN_LEAGUE_SLUGS = [
-    "eng.1", "eng.2", "esp.1", "ita.1", "ger.1", "fra.1",
-    "ned.1", "por.1", "bel.1", "tur.1", "sco.1",
-    "uefa.champions", "uefa.europa", "uefa.europa.conf",
 ]
 
 TELEGRAM_MAX_LEN = 3800
@@ -465,7 +460,7 @@ def record_coupons(coupons, date_str):
     tracker["coupons"] = tracker["coupons"][-500:]; save_json(LOCAL_DB, tracker)
 
 # =====================================================================
-# ✅ VÉRIFICATION AUTOMATIQUE DES SCORES (BZZOIRO + SECOURS ESPN GRATUIT)
+# ✅ VÉRIFICATION AUTOMATIQUE DES SCORES & CALCUL ROI PRO
 # =====================================================================
 def evaluate_pick_outcome(pick_label: str, ft_h: int, ft_a: int, ht_h: Optional[int] = None, ht_a: Optional[int] = None) -> Optional[str]:
     """Évalue un pronostic (won / lost) à partir du score officiel 90' (et mi-temps si MT-Fin)."""
@@ -498,9 +493,9 @@ def evaluate_pick_outcome(pick_label: str, ft_h: int, ft_a: int, ht_h: Optional[
         return "won" if ft_h == ft_a else "lost"
 
     # 4. Victoire 1 ou 2
-    if lbl.endswith("(1)") or ("victoire" in lbl and "(1)" in lbl):
+    if lbl.endswith("(1)") or "victoire" in lbl and "(1)" in lbl:
         return "won" if ft_h > ft_a else "lost"
-    if lbl.endswith("(2)") or ("victoire" in lbl and "(2)" in lbl):
+    if lbl.endswith("(2)") or "victoire" in lbl and "(2)" in lbl:
         return "won" if ft_a > ft_h else "lost"
 
     # 5. Buts Over / Under
@@ -525,109 +520,26 @@ def evaluate_pick_outcome(pick_label: str, ft_h: int, ft_a: int, ht_h: Optional[
 
     return None
 
-def _extract_bzzoiro_score(ev: dict) -> Optional[dict]:
-    """Normalise un événement Bzzoiro vers {home, away, status, ft_h, ft_a, ht_h, ht_a}."""
-    h = ev.get("home_team") or ev.get("home") or (ev.get("home_team_obj") or {}).get("name") or ""
-    a = ev.get("away_team") or ev.get("away") or (ev.get("away_team_obj") or {}).get("name") or ""
-    if isinstance(h, dict): h = h.get("name", "")
-    if isinstance(a, dict): a = a.get("name", "")
-    if not h or not a:
-        return None
-
-    raw_st = str(ev.get("status") or ev.get("event_status") or "").lower()
-    ft_h = ev.get("home_score") if ev.get("home_score") is not None else ev.get("home_goals")
-    ft_a = ev.get("away_score") if ev.get("away_score") is not None else ev.get("away_goals")
-    ht_h = ev.get("home_score_ht") if ev.get("home_score_ht") is not None else ev.get("ht_home_score")
-    ht_a = ev.get("away_score_ht") if ev.get("away_score_ht") is not None else ev.get("ht_away_score")
-
-    if any(k in raw_st for k in ("postponed", "cancel", "abandon", "pst", "canc")):
-        return {"home": h, "away": a, "status": "VOID", "ft_h": None, "ft_a": None, "ht_h": None, "ht_a": None}
-
-    if any(k in raw_st for k in ("fin", "ft", "ended", "complet", "full")) and ft_h is not None and ft_a is not None:
-        return {
-            "home": h, "away": a, "status": "FT",
-            "ft_h": int(ft_h), "ft_a": int(ft_a),
-            "ht_h": int(ht_h) if ht_h is not None else None,
-            "ht_a": int(ht_a) if ht_a is not None else None,
-        }
-    return None
-
-async def fetch_bzzoiro_finished_scores(date_iso: str) -> list[dict]:
-    """Récupère les scores terminés via Bzzoiro API (sans API-Football)."""
-    if not BZZOIRO_API_KEY:
+async def fetch_fixtures_by_date(date_iso: str) -> list:
+    """Récupère les scores officiels du jour via API-Football."""
+    if not API_FOOTBALL_KEY:
         return []
-    results = []
-    headers = {"Authorization": f"Token {BZZOIRO_API_KEY}"}
-    urls = [
-        ("https://sports.bzzoiro.com/api/events/", {"date": date_iso}),
-        ("https://sports.bzzoiro.com/api/events/", {"date_from": date_iso, "date_to": date_iso}),
-    ]
     async with httpx.AsyncClient() as client:
-        for url, params in urls:
-            try:
-                r = await client.get(url, headers=headers, params=params, timeout=15.0)
-                if r.status_code != 200:
-                    continue
-                payload = r.json()
-                items = payload.get("results", payload) if isinstance(payload, dict) else payload
-                if not isinstance(items, list):
-                    continue
-                for ev in items:
-                    parsed = _extract_bzzoiro_score(ev)
-                    if parsed:
-                        results.append(parsed)
-                if results:
-                    break
-            except Exception as e:
-                print(f"⚠️ Bzzoiro scores ({date_iso}) : {e}")
-    return results
-
-async def fetch_espn_finished_scores(date_iso: str) -> list[dict]:
-    """Secours 100% gratuit sans clé API via ESPN Scoreboard."""
-    date_compact = date_iso.replace("-", "")
-    results = []
-    async with httpx.AsyncClient() as client:
-        for slug in ESPN_LEAGUE_SLUGS:
-            try:
-                url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
-                r = await client.get(url, params={"dates": date_compact}, timeout=10.0)
-                if r.status_code != 200:
-                    continue
-                for ev in r.json().get("events", []):
-                    comps = ev.get("competitions", [])
-                    if not comps:
-                        continue
-                    comp = comps[0]
-                    st_obj = comp.get("status", {}).get("type", {})
-                    st_name = (st_obj.get("name") or "").upper()
-                    completed = bool(st_obj.get("completed"))
-
-                    competitors = comp.get("competitors", [])
-                    home_c = next((c for c in competitors if c.get("homeAway") == "home"), None)
-                    away_c = next((c for c in competitors if c.get("homeAway") == "away"), None)
-                    if not home_c or not away_c:
-                        continue
-
-                    h_name = home_c.get("team", {}).get("displayName") or home_c.get("team", {}).get("name") or ""
-                    a_name = away_c.get("team", {}).get("displayName") or away_c.get("team", {}).get("name") or ""
-                    if not h_name or not a_name:
-                        continue
-
-                    if "POSTPONED" in st_name or "CANCELED" in st_name:
-                        results.append({"home": h_name, "away": a_name, "status": "VOID", "ft_h": None, "ft_a": None, "ht_h": None, "ht_a": None})
-                    elif completed:
-                        try:
-                            ft_h = int(float(home_c.get("score", 0)))
-                            ft_a = int(float(away_c.get("score", 0)))
-                            results.append({"home": h_name, "away": a_name, "status": "FT", "ft_h": ft_h, "ft_a": ft_a, "ht_h": None, "ht_a": None})
-                        except Exception:
-                            pass
-            except Exception:
-                continue
-    return results
+        try:
+            r = await client.get(
+                "https://v3.football.api-sports.io/fixtures",
+                headers={"x-apisports-key": API_FOOTBALL_KEY},
+                params={"date": date_iso},
+                timeout=20.0,
+            )
+            if r.status_code == 200:
+                return r.json().get("response", [])
+        except Exception as e:
+            print(f"⚠️ Erreur fetch fixtures ({date_iso}) : {e}")
+    return []
 
 async def verify_pending_scores(notify: bool = True) -> dict:
-    """Vérifie tous les tickets en attente via Bzzoiro + ESPN et met à jour le ROI."""
+    """Vérifie tous les tickets en attente et met à jour les statuts + notifications."""
     async with STATE["verify_lock"]:
         coupons = STATE["tracker"].get("coupons", [])
         pending_coupons = [c for c in coupons if c.get("status") == "pending"]
@@ -635,6 +547,7 @@ async def verify_pending_scores(notify: bool = True) -> dict:
             STATE["last_score_check"] = datetime.now(TZ).isoformat()
             return {"checked": 0, "updated_legs": 0, "settled_coupons": 0}
 
+        # Dates à interroger (date du coupon + lendemain pour matchs tardifs)
         dates_to_fetch = set()
         for c in pending_coupons:
             d = c.get("date")
@@ -646,16 +559,12 @@ async def verify_pending_scores(notify: bool = True) -> dict:
                 except Exception:
                     pass
 
-        all_results = []
+        all_fixtures = []
         for d in sorted(dates_to_fetch):
-            bzz_res = await fetch_bzzoiro_finished_scores(d)
-            espn_res = await fetch_espn_finished_scores(d)
-            all_results.extend(bzz_res)
-            all_results.extend(espn_res)
-            await asyncio.sleep(0.3)
+            all_fixtures.extend(await fetch_fixtures_by_date(d))
+            await asyncio.sleep(0.4)
 
-        if not all_results:
-            STATE["last_score_check"] = datetime.now(TZ).isoformat()
+        if not all_fixtures:
             return {"checked": len(pending_coupons), "updated_legs": 0, "settled_coupons": 0}
 
         updated_legs = 0
@@ -669,34 +578,44 @@ async def verify_pending_scores(notify: bool = True) -> dict:
                 if leg.get("result") != "pending":
                     continue
                 lh, la = leg.get("home", ""), leg.get("away", "")
-                matched_res = None
-                for item in all_results:
-                    if teams_match(lh, item["home"]) and teams_match(la, item["away"]):
-                        matched_res = item
-                        # Priorité à Bzzoiro si score mi-temps disponible
-                        if item.get("ht_h") is not None:
-                            break
+                matched_fix = None
+                for fx in all_fixtures:
+                    th = fx.get("teams", {}).get("home", {}).get("name", "")
+                    ta = fx.get("teams", {}).get("away", {}).get("name", "")
+                    if teams_match(lh, th) and teams_match(la, ta):
+                        matched_fix = fx
+                        break
 
-                if not matched_res:
+                if not matched_fix:
                     continue
 
-                if matched_res["status"] == "FT":
-                    ft_h, ft_a = matched_res["ft_h"], matched_res["ft_a"]
-                    ht_h, ht_a = matched_res.get("ht_h"), matched_res.get("ht_a")
-                    outcome = evaluate_pick_outcome(leg.get("pick_label", ""), ft_h, ft_a, ht_h, ht_a)
-                    if outcome:
-                        leg["result"] = outcome
-                        score_txt = f"{ft_h}-{ft_a}"
-                        if ht_h is not None and ht_a is not None and "mt/fin" in leg.get("pick_label", "").lower():
-                            score_txt += f" (MT {ht_h}-{ht_a})"
-                        leg["score"] = score_txt
-                        updated_legs += 1
-                        changed = True
+                status_short = (matched_fix.get("fixture", {}).get("status", {}).get("short") or "").upper()
 
-                elif matched_res["status"] == "VOID":
+                # Match terminé (90' officiel)
+                if status_short in ("FT", "AET", "PEN"):
+                    ft_score = matched_fix.get("score", {}).get("fulltime", {})
+                    ht_score = matched_fix.get("score", {}).get("halftime", {})
+                    ft_h = ft_score.get("home") if ft_score.get("home") is not None else matched_fix.get("goals", {}).get("home")
+                    ft_a = ft_score.get("away") if ft_score.get("away") is not None else matched_fix.get("goals", {}).get("away")
+                    ht_h = ht_score.get("home")
+                    ht_a = ht_score.get("away")
+
+                    if ft_h is not None and ft_a is not None:
+                        outcome = evaluate_pick_outcome(leg.get("pick_label", ""), int(ft_h), int(ft_a), ht_h, ht_a)
+                        if outcome:
+                            leg["result"] = outcome
+                            score_txt = f"{ft_h}-{ft_a}"
+                            if ht_h is not None and ht_a is not None and "mt/fin" in leg.get("pick_label", "").lower():
+                                score_txt += f" (MT {ht_h}-{ht_a})"
+                            leg["score"] = score_txt
+                            updated_legs += 1
+                            changed = True
+
+                # Match annulé / reporté -> cote neutre 1.00
+                elif status_short in ("PST", "CANC", "ABD", "AWD", "WO"):
                     leg["result"] = "void"
                     leg["odds"] = 1.0
-                    leg["score"] = "Reporté/Annulé"
+                    leg["score"] = f"Annulé ({status_short})"
                     updated_legs += 1
                     changed = True
 
@@ -893,7 +812,7 @@ def passes_auth_proba_filter(proba):
     return ok
 
 # =====================================================================
-# APIS COTES (RapidOddsAPI + Bzzoiro)
+# APIS (RapidOddsAPI + API-Football)
 # =====================================================================
 async def fetch_rapidodds_odds() -> Tuple[list, str]:
     if not RAPIDODDSAPI_API_KEY or not fetch_rapidodds_odds_data: return [], "fallback"
@@ -906,7 +825,31 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
         print(f"⚠️ RapidOddsAPI erreur : {e}")
         return [], "fallback"
 
-def inject_all_real_odds(pool, ws_matches):
+async def fetch_api_football_odds(today_iso: str) -> list:
+    if not API_FOOTBALL_KEY: return []
+    results = []
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get("https://v3.football.api-sports.io/odds", headers={"x-apisports-key": API_FOOTBALL_KEY}, params={"date": today_iso}, timeout=15.0)
+            if r.status_code == 200:
+                for item in r.json().get("response", []):
+                    fid = item.get("fixture", {}).get("id"); h = item.get("teams", {}).get("home", {}).get("name"); a = item.get("teams", {}).get("away", {}).get("name")
+                    if not fid or not h or not a: continue
+                    md = WS_MatchData(f"af_{fid}", item.get("league", {}).get("name", ""), h, a, None, None, None, commence_time=item.get("fixture", {}).get("date", ""))
+                    for bk in item.get("bookmakers", []):
+                        for bet in bk.get("bets", []):
+                            bn = (bet.get("name") or "").lower()
+                            if "match winner" in bn:
+                                for v in bet.get("values", []):
+                                    val = (v.get("value") or "").lower(); odd = float(v.get("odd", 0))
+                                    if val == "home" and not md.home_odds: md.home_odds = odd
+                                    elif val == "draw" and not md.draw_odds: md.draw_odds = odd
+                                    elif val == "away" and not md.away_odds: md.away_odds = odd
+                    if md.home_odds: results.append(md)
+        except: pass
+    return results
+
+def inject_all_real_odds(pool, ws_matches, af_matches):
     matched = 0
     for md in pool:
         had_initial_odds = bool(md.real_odds)
@@ -921,6 +864,13 @@ def inject_all_real_odds(pool, ws_matches):
                 if ws.btts_yes: md.real_odds["btts_yes"] = ws.btts_yes
                 if ws.btts_no: md.real_odds["btts_no"] = ws.btts_no
                 if ws.commence_time: md.kickoff = ws.commence_time
+                break
+        for af in af_matches:
+            if (hn in normalize_name(af.home_team) or normalize_name(af.home_team) in hn) and (an in normalize_name(af.away_team) or normalize_name(af.away_team) in an):
+                if af.home_odds and not md.real_odds.get("home"): md.real_odds["home"] = af.home_odds
+                if af.draw_odds and not md.real_odds.get("draw"): md.real_odds["draw"] = af.draw_odds
+                if af.away_odds and not md.real_odds.get("away"): md.real_odds["away"] = af.away_odds
+                if not md.kickoff and af.commence_time: md.kickoff = af.commence_time
                 break
         if bool(md.real_odds) or had_initial_odds:
             matched += 1
@@ -1163,6 +1113,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
     vip_candidates.sort(key=lambda x: (1 if x["real_odd"] else 0, 1 if x["family"] in ("result", "dc") else 0, x["proba"]), reverse=True)
     top_pool = vip_candidates[:14]
 
+    # 1. Duo Value Pro (2 matchs -> cote 2.30 à 3.05)
     if len(top_pool) >= 2:
         for combo in itertools.combinations(top_pool, 2):
             if not _valid_pro_combo(combo, require_anchor=False):
@@ -1175,6 +1126,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 locked_keys = {c["norm_key"] for c in combo}
                 return _build_auth_coupon(combo, "Sélection Pro VIP • Duo Value", 96), locked_keys
 
+    # 2. Pyramide Sécurisée (3 matchs : 1 Ancrage >= 72% + 2 Value -> cote 2.30 à 3.05)
     if len(top_pool) >= 3:
         for combo in itertools.combinations(top_pool, 3):
             if not _valid_pro_combo(combo, require_anchor=True):
@@ -1187,6 +1139,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 locked_keys = {c["norm_key"] for c in combo}
                 return _build_auth_coupon(combo, "Sélection Pro VIP • Pyramide Sécurisée", 94), locked_keys
 
+    # 3. Repli Sécurisé (2.05 - 2.30)
     for r in (2, 3):
         if len(top_pool) < r:
             continue
@@ -1369,6 +1322,7 @@ async def scan(force: bool = False) -> bool:
 
         STATE["rejections"] = {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0}
         ws_matches, odds_status = await fetch_rapidodds_odds()
+        af_matches = await fetch_api_football_odds(today_str)
         
         bzz_preds = []
         if fetch_bzzoiro_predictions_direct and BZZOIRO_API_KEY:
@@ -1392,14 +1346,14 @@ async def scan(force: bool = False) -> bool:
                     try: md.dixon_pred = STATE["dixon_model"].predict_all(md.home, md.away)
                     except: pass
                 pool.append(md)
-            matched = inject_all_real_odds(pool, ws_matches)
+            matched = inject_all_real_odds(pool, ws_matches, af_matches)
             print(f"⏰ Total matchs avec vraies cotes : {matched}/{len(pool)}")
             pool = [md for md in pool if is_match_not_started(md.kickoff)]
             pool.sort(key=prescore_match, reverse=True)
             print(f"🎯 Top {min(len(pool), DOUBLE_SCAN_POOL_SIZE)} matchs sélectionnés pour Double Analyse Gemini")
             enriched_pool = await enrich_with_double_pass(pool[:GEMINI_MAX_CALLS_PER_SCAN])
 
-        if ws_matches or matched > 0:
+        if ws_matches or af_matches or matched > 0:
             odds_status = "live"
         STATE["odds_api_mode"] = odds_status
 
@@ -1625,7 +1579,7 @@ async def b_draw(m: Message):
 async def b_bilan(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
-    await safe_answer(m, "⏳ <i>Vérification des scores (Bzzoiro + ESPN) en cours...</i>")
+    await safe_answer(m, "⏳ <i>Vérification des derniers scores en cours...</i>")
     await verify_pending_scores(notify=False)
     await safe_answer(m, format_bilan_report())
 
