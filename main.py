@@ -1522,6 +1522,52 @@ def format_coupon(c):
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
 
+def _parse_date_range_args(parts: list[str]) -> tuple[Optional[datetime], Optional[datetime], int, int, str]:
+    """Parse '/semaine 24/11-25/11 15', '/semaine 24/11 25/11 15' ou '/semaine 3 15'."""
+    now = datetime.now(TZ)
+    days = 3
+    limit = 15
+    start_dt = None
+    end_dt = None
+
+    def _make_dt(day_s: str, month_s: str, end_of_day: bool = False) -> datetime:
+        d, mo = int(day_s), int(month_s)
+        yr = now.year + (1 if mo < now.month and (now.month - mo) > 6 else 0)
+        if end_of_day:
+            return datetime(yr, mo, d, 23, 59, 59, tzinfo=TZ)
+        return datetime(yr, mo, d, 0, 0, 0, tzinfo=TZ)
+
+    args = parts[1:]
+    if args:
+        m_range = re.match(r"^(\d{1,2})/(\d{1,2})\s*[-–]\s*(\d{1,2})/(\d{1,2})$", args[0])
+        if m_range:
+            start_dt = _make_dt(m_range.group(1), m_range.group(2), end_of_day=False)
+            end_dt = _make_dt(m_range.group(3), m_range.group(4), end_of_day=True)
+            days = max(1, (end_dt.date() - start_dt.date()).days + 1)
+            period_label = f"Du {start_dt.strftime('%d/%m')} au {end_dt.strftime('%d/%m')}"
+            if len(args) >= 2 and args[1].isdigit():
+                limit = max(5, min(30, int(args[1])))
+            return start_dt, end_dt, days, limit, period_label
+
+        if len(args) >= 2:
+            m1 = re.match(r"^(\d{1,2})/(\d{1,2})$", args[0])
+            m2 = re.match(r"^(\d{1,2})/(\d{1,2})$", args[1])
+            if m1 and m2:
+                start_dt = _make_dt(m1.group(1), m1.group(2), end_of_day=False)
+                end_dt = _make_dt(m2.group(1), m2.group(2), end_of_day=True)
+                days = max(1, (end_dt.date() - start_dt.date()).days + 1)
+                period_label = f"Du {start_dt.strftime('%d/%m')} au {end_dt.strftime('%d/%m')}"
+                if len(args) >= 3 and args[2].isdigit():
+                    limit = max(5, min(30, int(args[2])))
+                return start_dt, end_dt, days, limit, period_label
+
+        if args[0].isdigit():
+            days = max(1, min(7, int(args[0])))
+        if len(args) >= 2 and args[1].isdigit():
+            limit = max(5, min(30, int(args[1])))
+
+    return None, None, days, limit, f"{days} jours"
+
 # --- COMMANDES UTILISATEUR & ADMIN ---
 @dp.message(Command("start"))
 async def start_cmd(m: Message):
@@ -1529,7 +1575,8 @@ async def start_cmd(m: Message):
     if m.from_user.id == ADMIN_ID:
         msg = (
             f"{format_header()}\n\n<b>👋 Mode Admin</b>\n"
-            f"• /semaine <code>[jours] [matchs]</code> — Top matchs sur 2-3 jours\n"
+            f"• /semaine <code>24/11-25/11 15</code> — Top matchs sur dates précises\n"
+            f"• /semaine <code>[jours] [matchs]</code> — Top matchs sur N jours\n"
             f"• /genkey <code>[jours] [nb]</code> — Créer clé(s) VIP\n"
             f"• /vip — Liste des abonnés & clés\n"
             f"• /delvip <code>ID</code> — Révoquer un abonné\n"
@@ -1552,20 +1599,12 @@ async def semaine_cmd(m: Message):
         return
 
     parts = (m.text or "").split()
-    days = 3
-    limit = 15
-    try:
-        if len(parts) >= 2 and parts[1].isdigit():
-            days = max(1, min(7, int(parts[1])))
-        if len(parts) >= 3 and parts[2].isdigit():
-            limit = max(5, min(30, int(parts[2])))
-    except Exception:
-        pass
+    start_dt, end_dt, days, limit, period_label = _parse_date_range_args(parts)
 
     await safe_answer(
         m,
         f"⏳ <b>Analyse Pro Multi-Jours en cours...</b>\n"
-        f"📅 Horizon : <b>{days} jours</b> • 🎯 Objectif : <b>Top {limit} matchs</b>\n"
+        f"📅 Période : <b>{period_label}</b> • 🎯 Objectif : <b>Top {limit} matchs</b>\n"
         f"<i>Croisement Dixon-Coles + XGBoost + Bzzoiro + Gemini (patiente ~30-45 sec)...</i>",
     )
 
@@ -1580,15 +1619,19 @@ async def semaine_cmd(m: Message):
         enrich_pass_fn=_enrich_single_pass,
         compute_prob_fn=compute_probability,
         fallback_bzz_fn=fetch_bzzoiro_predictions_direct,
+        start_dt=start_dt,
+        end_dt=end_dt,
     )
 
     if not picks:
-        await safe_answer(m, f"📭 Aucun match fiable trouvé sur les {days} prochains jours.")
+        await safe_answer(m, f"📭 Aucun match fiable trouvé pour la période <b>{period_label}</b>.")
         return
 
+    total_odd = round(math.prod(p["odd"] for p in picks), 2)
     lines = [
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>",
-        f"<b>📅 TOP {len(picks)} MATCHS • HORIZON {days} JOURS</b>",
+        f"<b>📅 TOP {len(picks)} MATCHS • {period_label.upper()}</b>",
+        f"<b>🎫 COTE COMBINÉE TOTALE : {total_odd}</b>",
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>",
         f"<i>Stratégie Pro (20 ans) : Fidélité au scénario & haute confiance</i>\n",
     ]
