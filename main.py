@@ -1586,8 +1586,6 @@ def _valid_pro_combo(combo, require_anchor: bool = True) -> bool:
         return False
     if sum(1 for c in combo if c["family"] == "btts") > 1:
         return False
-    if sum(1 for c in combo if c["family"] == "dc12") > 1:
-        return False
     if sum(1 for c in combo if c.get("mk") == "victoire_away") > 1:
         return False
     if require_anchor and not any(c["proba"] >= 71.0 or (c["family"] == "result" and c["proba"] >= 66.0) for c in combo):
@@ -1675,9 +1673,8 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 if clear_home_win or clear_away_win:
                     continue  # Pas d'hésitation : Victoire sèche (1 ou 2) privilégiée !
                 p_draw_est, _, _, _, _ = compute_probability(md, "match_nul")
-                # Sollicité uniquement sur duel ouvert sans favori écrasant mais avec vrai potentiel offensif des deux camps
-                if p_draw_est > 0.25 or p_home_est < 0.28 or p_away_est < 0.28:
-                    continue
+                if p_draw_est >= 0.27:
+                    continue  # Match trop fermé / risque de nul trop élevé pour 12
 
             prob, g, d, b, emoji = compute_probability(md, mk)
             proba_pct = prob * 100.0
@@ -1705,16 +1702,15 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             odd = round(float(real_odd), 2)
             is_real = True
 
-            min_leg_odd = 1.18 if mk == "double_chance_12" else ODDS3_MIN_COTE_LEG
-            if odd < min_leg_odd:
+            if odd < ODDS3_MIN_COTE_LEG:
                 continue
             if not passes_value_filter(prob, odd, is_real, emoji):
                 continue
 
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
             stakes_bonus = compute_stakes_score(md.league, md.analysis)
-            # Priorité absolue à la victoire sèche (3) devant les Double Chances 1X/X2/12 et buts (2), pondérée par l'enjeu réel
-            market_priority = 3 if family == "result" else (2 if family in ("dc", "dc12", "goals", "btts") else 1)
+            # Priorité absolue à la victoire sèche (3) devant la Double Chance (2) et les buts (1), pondérée par l'enjeu réel
+            market_priority = 3 if family == "result" else (2 if family in ("dc", "goals", "btts") else 1)
             rank_score = (market_priority, stakes_bonus, consensus_bonus, round(proba_pct, 1))
 
             match_options.append({
@@ -1734,17 +1730,20 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 "ai": md.analysis or f"Consensus multi-modèles ({proba_pct:.1f}%).",
                 "_rank": rank_score,
             })
-        # On garde jusqu'à 2 meilleures options par match pour laisser le combinateur choisir la synergie optimale
+        # On garde la meilleure option principale par match, et une option secondaire uniquement
+        # si elle n'est pas un '12' forcé et si sa cote/proba complète le combinateur quand l'occasion se présente.
         match_options.sort(key=lambda x: x["_rank"], reverse=True)
         kept = 0
         for opt in match_options:
+            if opt.get("mk") == "double_chance_12" and kept >= 1:
+                continue
             opt.pop("_rank", None)
             vip_candidates.append(opt)
             kept += 1
             if kept >= 2:
                 break
 
-    vip_candidates.sort(key=lambda x: (3 if x["family"] == "result" else (2 if x["family"] in ("dc", "dc12", "goals", "btts") else 1), compute_stakes_score(x["league"], x["ai"]), x["proba"]), reverse=True)
+    vip_candidates.sort(key=lambda x: (3 if x["family"] == "result" else (2 if x["family"] in ("dc", "goals", "btts") else 1), compute_stakes_score(x["league"], x["ai"]), x["proba"]), reverse=True)
     top_pool = vip_candidates[:28]
 
     # Priorité exacte du moteur 22/11 : Pyramide Sécurisée (3 sélections), puis Duo (2), puis Quatuor (4)
@@ -1772,7 +1771,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
 
     print("  ℹ️ AUTH VIP : Aucune combinaison >= 71% avec EV >= 1.00 aujourd'hui (protection bankroll).")
     return None, set()
-
 # =====================================================================
 # MOTEURS SECONDAIRES (ALIGNÉS SUR LA MÊME RIGUEUR PRO — ZÉRO EV NÉGATIVE)
 # =====================================================================
