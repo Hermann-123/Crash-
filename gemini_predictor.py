@@ -1,5 +1,6 @@
 """
 Prédicteur Gemini Pro — Analyse quantitative + contextuelle (Méthode Pro & Café Foot en 4 temps).
+Compatible avec main.py et weekly_analyzer.py.
 """
 from __future__ import annotations
 
@@ -60,7 +61,7 @@ def format_context(context: Optional[dict], kickoff: str = "") -> str:
         if stat_bits:
             parts.append("Modèle statistique Dixon-Coles : " + " | ".join(stat_bits))
 
-    # 3. Cotes bookmaker réelles (marché)
+    # 3. Cotes bookmaker réelles
     odds = context.get("bookmaker_odds")
     if isinstance(odds, dict) and odds:
         odd_bits = []
@@ -186,7 +187,7 @@ def _sanitize_prediction(parsed: dict) -> Optional[dict]:
     risk_level = str(parsed.get("risk_level") or "MEDIUM").upper().strip()
     trap_warning = bool(parsed.get("trap_warning", False))
 
-    # Signal explicite dans l'analyse pour le filtre anti-piège de main.py
+    # Signal explicite dans l'analyse pour le filtre anti-piège de main.py et weekly_analyzer.py
     if (trap_warning or risk_level == "HIGH") and "match piège" not in analysis.lower():
         analysis = f"{analysis} (Match piège / risque élevé détecté).".strip()
 
@@ -217,8 +218,6 @@ def _extract_json_from_response(data: dict) -> Optional[dict]:
 async def call_gemini(client: httpx.AsyncClient, model: str, prompt: str) -> Optional[dict]:
     url = f"{GEMINI_BASE_URL}/{model}:generateContent?key={GEMINI_API_KEY}"
 
-    # Tentative 1 : Avec Google Search Grounding (camelCase) pour l'actualité/classement/absences du jour
-    # Tentative 2 : Mode JSON structuré natif si le modèle lite ne supporte pas l'outil Search
     payloads = [
         {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -248,7 +247,6 @@ async def call_gemini(client: httpx.AsyncClient, model: str, prompt: str) -> Opt
                     await asyncio.sleep(wait)
                     continue
                 if r.status_code >= 400:
-                    # Si Google Search n'est pas supporté par ce modèle (400), on passe au payload JSON natif
                     break
 
                 parsed = _extract_json_from_response(r.json())
