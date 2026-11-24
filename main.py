@@ -507,6 +507,20 @@ def is_match_not_started(kickoff_str) -> bool:
     if not dt or (dt.hour == 0 and dt.minute == 0): return True
     return dt > (datetime.now(TZ) + timedelta(minutes=MATCH_START_BUFFER_MINUTES))
 
+def is_match_today(kickoff_str) -> bool:
+    """Vérifie strictement que le match se joue aujourd'hui (dans le fuseau TZ) et n'a pas encore commencé."""
+    if not kickoff_str:
+        return False
+    dt = parse_dt_safe(kickoff_str)
+    if not dt:
+        return False
+    now = datetime.now(TZ)
+    if dt.date() != now.date():
+        return False
+    if dt.hour == 0 and dt.minute == 0:
+        return True
+    return dt > (now + timedelta(minutes=MATCH_START_BUFFER_MINUTES))
+
 def calibrated_odd(prob: float, real_odd: Optional[float]) -> float:
     """Strictement vraies cotes bookmaker uniquement — zéro estimation artificielle."""
     if real_odd and float(real_odd) > 1.01:
@@ -901,6 +915,9 @@ def compute_probability(md, market_key):
         elif market_key == "double_chance_X2" and md.gemini_markets.get("victoire_away") is not None and md.gemini_markets.get("match_nul") is not None:
             try: gem = (float(md.gemini_markets["victoire_away"]) + float(md.gemini_markets["match_nul"])) / 100.0; gem_avail = True
             except: pass
+        elif market_key == "double_chance_12" and md.gemini_markets.get("victoire_home") is not None and md.gemini_markets.get("victoire_away") is not None:
+            try: gem = (float(md.gemini_markets["victoire_home"]) + float(md.gemini_markets["victoire_away"])) / 100.0; gem_avail = True
+            except: pass
 
     if fused:
         if market_key == "double_chance_1X" and fused.get("p_home") is not None and fused.get("p_draw") is not None:
@@ -908,6 +925,9 @@ def compute_probability(md, market_key):
             except: pass
         elif market_key == "double_chance_X2" and fused.get("p_away") is not None and fused.get("p_draw") is not None:
             try: dix = float(fused["p_away"]) + float(fused["p_draw"]); dix_avail = True
+            except: pass
+        elif market_key == "double_chance_12" and fused.get("p_home") is not None and fused.get("p_away") is not None:
+            try: dix = float(fused["p_home"]) + float(fused["p_away"]); dix_avail = True
             except: pass
         else:
             dk = {"victoire_home":"p_home","match_nul":"p_draw","victoire_away":"p_away","over_2.5":"over_2.5","under_2.5":"under_2.5","over_3.5":"over_3.5","over_1.5":"over_1.5","under_1.5":"under_1.5","btts_yes":"btts_yes","btts_no":"btts_no"}.get(market_key)
@@ -1223,7 +1243,7 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
 
     # 1. ESPN Public Odds (Scoreboard + Pickcenter)
     try:
-        espn_ws = await fetch_espn_prematch_odds(days_ahead=3)
+        espn_ws = await fetch_espn_prematch_odds(days_ahead=0)
         for item in espn_ws:
             nk = f"{normalize_name(item.home_team)}__{normalize_name(item.away_team)}"
             ws_by_key[nk] = item
@@ -1232,7 +1252,7 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
 
     # 2. Bzzoiro Free Odds (/api/events/ & /api/predictions/)
     try:
-        bzz_ws = await fetch_bzzoiro_free_odds(days_ahead=3)
+        bzz_ws = await fetch_bzzoiro_free_odds(days_ahead=0)
         for item in bzz_ws:
             nk = f"{normalize_name(item.home_team)}__{normalize_name(item.away_team)}"
             existing = ws_by_key.get(nk)
@@ -1476,6 +1496,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
     markets_map = [
         ("victoire_home", "home", "result", lambda m: f"Victoire {m.home} (1)"),
         ("victoire_away", "away", "result", lambda m: f"Victoire {m.away} (2)"),
+        ("double_chance_12", "dc_12", "dc12", lambda m: "Une équipe gagne (12)"),
         ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
         ("double_chance_X2", "dc_x2", "dc", lambda m: f"Double Chance Nul ou {m.away} (X2)"),
         ("over_2.5", "over_2.5", "goals", lambda m: "Plus de 2.5 buts"),
@@ -1485,7 +1506,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
     ]
 
     for md in enriched_pool:
-        if not md.home or not md.away or not is_match_not_started(md.kickoff):
+        if not md.home or not md.away or not is_match_today(md.kickoff):
             continue
         if is_reserve_team(md.home) or is_reserve_team(md.away):
             continue
@@ -1513,6 +1534,10 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             inv_x2 = (1.0 / float(md.real_odds["away"])) + (1.0 / float(md.real_odds["draw"]))
             if inv_x2 > 0:
                 md.real_odds["dc_x2"] = round(max(1.03, (1.0 / inv_x2) * 0.96), 2)
+        if md.real_odds.get("home") and md.real_odds.get("away") and not md.real_odds.get("dc_12"):
+            inv_12 = (1.0 / float(md.real_odds["home"])) + (1.0 / float(md.real_odds["away"]))
+            if inv_12 > 0:
+                md.real_odds["dc_12"] = round(max(1.03, (1.0 / inv_12) * 0.96), 2)
 
         p_home_est, g_h, _, _, em_h = compute_probability(md, "victoire_home")
         p_away_est, g_a, _, _, em_a = compute_probability(md, "victoire_away")
@@ -1542,6 +1567,12 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                     continue
                 if p_home_est > (p_away_est + 0.08):
                     continue
+            elif mk == "double_chance_12":
+                if clear_home_win or clear_away_win:
+                    continue  # Pas d'hésitation : Victoire sèche (1 ou 2) privilégiée !
+                p_draw_est, _, _, _, _ = compute_probability(md, "match_nul")
+                if p_draw_est >= 0.27:
+                    continue  # Match trop fermé / risque de nul trop élevé pour 12
 
             prob, g, d, b, emoji = compute_probability(md, mk)
             proba_pct = prob * 100.0
@@ -1577,7 +1608,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
             stakes_bonus = compute_stakes_score(md.league, md.analysis)
             # Priorité absolue à la victoire sèche (3) devant la Double Chance (2) et les buts (1), pondérée par l'enjeu réel
-            market_priority = 3 if family == "result" else (2 if family == "dc" else (1 if mk in ("over_2.5", "btts_yes") else 0))
+            market_priority = 3 if family == "result" else (2 if family in ("dc12", "goals", "btts") else 1)
             rank_score = (market_priority, stakes_bonus, consensus_bonus, round(proba_pct, 1))
 
             if not best_for_match or rank_score > best_for_match["_rank"]:
@@ -1602,7 +1633,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             best_for_match.pop("_rank", None)
             vip_candidates.append(best_for_match)
 
-    vip_candidates.sort(key=lambda x: (2 if x["family"] == "result" else (1 if x["family"] == "dc" else 0), compute_stakes_score(x["league"], x["ai"]), x["proba"]), reverse=True)
+    vip_candidates.sort(key=lambda x: (3 if x["family"] == "result" else (2 if x["family"] in ("dc12", "goals", "btts") else 1), compute_stakes_score(x["league"], x["ai"]), x["proba"]), reverse=True)
     top_pool = vip_candidates[:16]
 
     # Priorité exacte du moteur 22/11 : Pyramide Sécurisée (3 sélections), puis Duo (2), puis Quatuor (4)
@@ -1656,7 +1687,7 @@ def build_mtft_coupon_and_bonus(pool, locked_keys: set):
     for md in pool:
         nkey = f"{normalize_name(md.home)}__{normalize_name(md.away)}"
         if nkey in locked_keys: continue
-        if not md.home or not md.away or not md.dixon_pred or not is_match_not_started(md.kickoff): continue
+        if not md.home or not md.away or not md.dixon_pred or not is_match_today(md.kickoff): continue
         if is_reserve_team(md.home) or is_reserve_team(md.away): continue
         is_trap, _ = has_pro_red_flags(md.analysis, md.league)
         if is_trap: continue
@@ -1706,7 +1737,7 @@ def build_draw_coupon_and_bonus(pool, locked_keys: set):
     for md in pool:
         nkey = f"{normalize_name(md.home)}__{normalize_name(md.away)}"
         if nkey in locked_keys: continue
-        if not md.home or not md.away or not is_match_not_started(md.kickoff): continue
+        if not md.home or not md.away or not is_match_today(md.kickoff): continue
         if is_reserve_team(md.home) or is_reserve_team(md.away): continue
         is_trap, _ = has_pro_red_flags(md.analysis, md.league)
         if is_trap: continue
@@ -1749,7 +1780,7 @@ def build_third_pillar(pool, locked_keys: set):
     for md in pool:
         nkey = f"{normalize_name(md.home)}__{normalize_name(md.away)}"
         if nkey in locked_keys: continue
-        if not md.home or not md.away or not is_match_not_started(md.kickoff) or is_reserve_team(md.home) or is_reserve_team(md.away): continue
+        if not md.home or not md.away or not is_match_today(md.kickoff) or is_reserve_team(md.home) or is_reserve_team(md.away): continue
         is_trap, _ = has_pro_red_flags(md.analysis, md.league)
         if is_trap: continue
 
@@ -1782,7 +1813,7 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys:
                 ids = [_get_match_id(c) for c in combo]
                 if len(set(ids)) != len(ids): continue
                 if not (any(c.get('source') == 'MT-FIN' for c in combo) and any(c.get('source') == 'MATCH-NUL' for c in combo) and any(c.get('source') == 'BZZOIRO' for c in combo)): continue
-                if not all(is_match_not_started(c.get('kickoff', '')) for c in combo): continue
+                if not all(is_match_today(c.get('kickoff', '')) for c in combo): continue
                 tot_o = math.prod(x['odds'] for x in combo)
                 if ODDS3_HYB_MIN_COTE <= tot_o <= ODDS3_HYB_MAX_COTE:
                     tot_p = math.prod(c['proba'] / 100.0 for c in combo)
@@ -1796,7 +1827,7 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys:
         for combo in itertools.combinations(combined[:12], r):
             ids = [_get_match_id(c) for c in combo]
             if len(set(ids)) != len(ids): continue
-            if not all(is_match_not_started(c.get('kickoff', '')) for c in combo): continue
+            if not all(is_match_today(c.get('kickoff', '')) for c in combo): continue
             tot_o = math.prod(x['odds'] for x in combo)
             if ODDS3_HYB_MIN_COTE <= tot_o <= ODDS3_HYB_MAX_COTE:
                 tot_p = math.prod(c['proba'] / 100.0 for c in combo)
@@ -1866,7 +1897,7 @@ async def scan(force: bool = False) -> bool:
             print(f"⏰ Total matchs avec vraies cotes : {matched}/{len(pool)}")
             pool = [
                 md for md in pool
-                if is_match_not_started(md.kickoff)
+                if is_match_today(md.kickoff)
                 and not is_low_stakes_competition(md.league)
                 and bool(md.real_odds)
             ]
