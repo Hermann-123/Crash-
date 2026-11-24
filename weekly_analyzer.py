@@ -129,14 +129,10 @@ def _is_match_not_started(kickoff_str) -> bool:
 
 
 def _calibrated_odd(prob: float, real_odd: Optional[float]) -> float:
-    """Retourne la vraie cote si disponible, sinon une cote estimée intégrant la marge bookmaker (~7%)."""
-    if real_odd and real_odd > 1.01:
+    """Strictement vraies cotes bookmaker uniquement — zéro estimation."""
+    if real_odd and float(real_odd) > 1.01:
         return round(float(real_odd), 2)
-    if prob <= 0.01:
-        return 0.0
-    fair_odd = 1.0 / prob
-    bookie_odd = max(1.06, round(fair_odd * 0.93, 2))
-    return bookie_odd
+    return 0.0
 
 
 async def fetch_bzzoiro_horizon(
@@ -310,8 +306,45 @@ async def analyze_weekly_top_matches(
 
     if ws_matches:
         inject_odds_fn(pool, ws_matches)
+        existing_wkeys = {f"{_normalize_name(m.home)}__{_normalize_name(m.away)}" for m in pool}
+        for ws in ws_matches:
+            nk = f"{_normalize_name(ws.home_team)}__{_normalize_name(ws.away_team)}"
+            if nk in existing_wkeys or _league_tier(ws.league) == 0:
+                continue
+            r_odds = {}
+            if ws.home_odds: r_odds["home"] = ws.home_odds
+            if ws.draw_odds: r_odds["draw"] = ws.draw_odds
+            if ws.away_odds: r_odds["away"] = ws.away_odds
+            if ws.over_2_5: r_odds["over_2.5"] = ws.over_2_5
+            if ws.under_2_5: r_odds["under_2.5"] = ws.under_2_5
+            md = match_cls(
+                event_id=ws.match_id,
+                league=ws.league,
+                home=ws.home_team,
+                away=ws.away_team,
+                kickoff=ws.commence_time,
+                real_odds=r_odds,
+                bzz_markets={},
+                bzz_confidence=70.0,
+            )
+            if dixon_model:
+                try:
+                    md.dixon_pred = dixon_model.predict_all(md.home, md.away)
+                except Exception:
+                    pass
+            pool.append(md)
+            existing_wkeys.add(nk)
 
-    pool = [md for md in pool if _is_match_not_started(md.kickoff)]
+    pool = [md for md in pool if _is_match_not_started(md.kickoff) and bool(md.real_odds)]
+    for md in pool:
+        if md.real_odds.get("home") and md.real_odds.get("draw") and not md.real_odds.get("dc_1x"):
+            inv_1x = (1.0 / float(md.real_odds["home"])) + (1.0 / float(md.real_odds["draw"]))
+            if inv_1x > 0:
+                md.real_odds["dc_1x"] = round(max(1.03, (1.0 / inv_1x) * 0.96), 2)
+        if md.real_odds.get("away") and md.real_odds.get("draw") and not md.real_odds.get("dc_x2"):
+            inv_x2 = (1.0 / float(md.real_odds["away"])) + (1.0 / float(md.real_odds["draw"]))
+            if inv_x2 > 0:
+                md.real_odds["dc_x2"] = round(max(1.03, (1.0 / inv_x2) * 0.96), 2)
     if start_dt and end_dt:
         filtered = []
         for md in pool:
@@ -401,7 +434,9 @@ async def analyze_weekly_top_matches(
                     continue
 
                 real_odd = md.real_odds.get(odd_key)
-                odd = _calibrated_odd(prob, real_odd)
+                if not real_odd or float(real_odd) <= 1.01:
+                    continue
+                odd = round(float(real_odd), 2)
                 if odd < WEEKLY_MIN_LEG_ODD:
                     continue
 
