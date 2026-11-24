@@ -1358,6 +1358,120 @@ def inject_all_real_odds(pool, ws_matches):
 # =====================================================================
 # DOUBLE SCAN
 # =====================================================================
+
+GEMINI_MODEL_CANDIDATES = [
+    os.getenv("GEMINI_MODEL", "").strip(),
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+GEMINI_MODEL_CANDIDATES = [m for i, m in enumerate(GEMINI_MODEL_CANDIDATES) if m and m not in GEMINI_MODEL_CANDIDATES[:i]]
+
+def _build_coffee_prompt(home: str, away: str, league: str, kickoff: str, context: dict) -> str:
+    ctx_json = json.dumps(context or {}, ensure_ascii=False, default=str)
+    today_date = datetime.now(TZ).strftime("%d/%m/%Y")
+    return f"""Tu es un analyste football d'élite dans le style "Café Foot / Briefing du jour" (direct, chiffré, vivant, lucide et nuancé).
+Date actuelle : {today_date}. Utilise tes connaissances actuelles et la recherche web disponible pour vérifier la forme récente, le classement actuel et les absences du jour.
+
+Analyse ce match selon cette méthode exacte en 4 temps :
+1. **Enjeu & dynamique actuelle** : situation au classement/compétition (points, course au titre/top 8/maintien) et état de forme récent des deux équipes.
+2. **Séries Domicile / Extérieur & scénarios de buts** : bilan précis de {home} à domicile et de {away} à l'extérieur (victoires/défaites récentes, buts marqués/encaissés, tendance à ouvrir le score ou encaisser en premier, matchs ouverts Over 2.5/BTTS ou fermés).
+3. **Facteurs clés (Joueurs, Absences, Coach & Contexte)** : buteurs/joueurs décisifs en forme, blessés/suspendus confirmés, changement d'entraîneur ou contexte psychologique (derby, revanche, retrouvailles).
+4. **Nuance & Verdict tranché** : pèse le contre-argument (*"Mais attention..."* / *"Petit doute..."*) puis tranche clairement sur le pari le plus solide avec ton raisonnement actuel en 3 à 5 phrases percutantes et chiffrées.
+
+Match : {home} vs {away}
+Compétition : {league or "Compétition officielle"}
+Coup d'envoi : {kickoff or "Aujourd'hui"}
+Données statistiques & cotes bookmaker : {ctx_json}
+
+Réponds UNIQUEMENT avec un objet JSON valide (sans texte avant ni après) respectant ce schéma exact :
+{{
+  "markets": {{
+    "victoire_home": <nombre 0-100>,
+    "match_nul": <nombre 0-100>,
+    "victoire_away": <nombre 0-100>,
+    "double_chance_1X": <nombre 0-100>,
+    "double_chance_X2": <nombre 0-100>,
+    "double_chance_12": <nombre 0-100>,
+    "over_1.5": <nombre 0-100>,
+    "over_2.5": <nombre 0-100>,
+    "under_2.5": <nombre 0-100>,
+    "btts_yes": <nombre 0-100>,
+    "btts_no": <nombre 0-100>
+  }},
+  "analysis": "<Raisonnement actuel style Café Foot (3 à 5 phrases précises avec chiffres récents, dynamique dom/ext, joueur clé ou absence, nuance et conclusion claire)>"
+}}"""
+
+def _parse_gemini_json_payload(raw_text: str) -> Optional[dict]:
+    if not raw_text:
+        return None
+    cleaned = raw_text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(cleaned[start:end + 1])
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("markets"), dict):
+        return None
+    markets = {}
+    for k, v in data["markets"].items():
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+            if 0.0 <= fv <= 100.0:
+                markets[k] = round(fv, 1)
+        except Exception:
+            continue
+    if not markets:
+        return None
+    analysis_txt = clean_analysis_text(str(data.get("analysis") or ""), 540)
+    return {"markets": markets, "analysis": analysis_txt}
+
+async def coffee_style_gemini_predict(client: httpx.AsyncClient, home: str, away: str, league: str, kickoff: str, context: dict) -> Optional[dict]:
+    if not GEMINI_API_KEY:
+        return None
+    prompt = _build_coffee_prompt(home, away, league, kickoff, context)
+    for model_name in GEMINI_MODEL_CANDIDATES:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        # Tentative 1 : Avec Google Search Grounding pour récupérer l'actualité réelle du jour (classement, blessés, séries)
+        payloads = [
+            {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "tools": [{"google_search": {}}],
+                "generationConfig": {"temperature": 0.30},
+            },
+            {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.30,
+                    "responseMimeType": "application/json",
+                },
+            },
+        ]
+        for payload in payloads:
+            try:
+                resp = await client.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=40.0)
+                if resp.status_code != 200:
+                    continue
+                body = resp.json()
+                cands = body.get("candidates") or []
+                if not cands:
+                    continue
+                parts = ((cands[0].get("content") or {}).get("parts")) or []
+                txt = "".join(str(p.get("text") or "") for p in parts if isinstance(p, dict))
+                parsed = _parse_gemini_json_payload(txt)
+                if parsed:
+                    return parsed
+            except Exception:
+                continue
+    return None
+
 async def _enrich_single_pass(targets, pass_num):
     results = {}
     errors = 0
@@ -1373,14 +1487,19 @@ async def _enrich_single_pass(targets, pass_num):
                         if bzz_ctx.get("available"): md.has_h2h = True
                 if md.dixon_pred:
                     ctx["dixon_coles"] = md.dixon_pred
+                if md.real_odds:
+                    ctx["bookmaker_odds"] = md.real_odds
+                if md.bzz_markets:
+                    ctx["bzzoiro_probas"] = md.bzz_markets
 
-                if predict_match_probas:
+                pred = await coffee_style_gemini_predict(client, md.home, md.away, md.league, md.kickoff, context=ctx)
+                if not pred and predict_match_probas:
                     pred = await predict_match_probas(client, md.home, md.away, md.league, md.kickoff, context=ctx)
-                    if pred and "markets" in pred:
-                        results[md.event_id] = {"markets": pred.get("markets", {}), "analysis": pred.get("analysis", "")}
-                        errors = 0
-                    else:
-                        errors += 1
+                if pred and "markets" in pred:
+                    results[md.event_id] = {"markets": pred.get("markets", {}), "analysis": pred.get("analysis", "")}
+                    errors = 0
+                else:
+                    errors += 1
                 await asyncio.sleep(2.0)
             except Exception as e:
                 errors += 1
@@ -1454,7 +1573,7 @@ def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
             model_prob=c["proba"] / 100.0,
             real_odd=c["real_odd"],
             quality=quality,
-            analysis=clean_analysis_text(c["ai"], 320),
+            analysis=clean_analysis_text(c["ai"], 520),
         )
         for c in sorted_combo
     ]
@@ -1466,6 +1585,8 @@ def _valid_pro_combo(combo, require_anchor: bool = True) -> bool:
     if sum(1 for c in combo if c["family"] == "goals") > 1:
         return False
     if sum(1 for c in combo if c["family"] == "btts") > 1:
+        return False
+    if sum(1 for c in combo if c["family"] == "dc12") > 1:
         return False
     if sum(1 for c in combo if c.get("mk") == "victoire_away") > 1:
         return False
@@ -1554,8 +1675,9 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 if clear_home_win or clear_away_win:
                     continue  # Pas d'hésitation : Victoire sèche (1 ou 2) privilégiée !
                 p_draw_est, _, _, _, _ = compute_probability(md, "match_nul")
-                if p_draw_est >= 0.27:
-                    continue  # Match trop fermé / risque de nul trop élevé pour 12
+                # Sollicité uniquement sur duel ouvert sans favori écrasant mais avec vrai potentiel offensif des deux camps
+                if p_draw_est > 0.25 or p_home_est < 0.28 or p_away_est < 0.28:
+                    continue
 
             prob, g, d, b, emoji = compute_probability(md, mk)
             proba_pct = prob * 100.0
@@ -1583,15 +1705,16 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             odd = round(float(real_odd), 2)
             is_real = True
 
-            if odd < ODDS3_MIN_COTE_LEG:
+            min_leg_odd = 1.18 if mk == "double_chance_12" else ODDS3_MIN_COTE_LEG
+            if odd < min_leg_odd:
                 continue
             if not passes_value_filter(prob, odd, is_real, emoji):
                 continue
 
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
             stakes_bonus = compute_stakes_score(md.league, md.analysis)
-            # Priorité absolue à la victoire sèche (3) devant la Double Chance (2) et les buts (1), pondérée par l'enjeu réel
-            market_priority = 3 if family == "result" else (2 if family in ("dc", "goals", "btts") else 1)
+            # Priorité absolue à la victoire sèche (3) devant les Double Chances 1X/X2/12 et buts (2), pondérée par l'enjeu réel
+            market_priority = 3 if family == "result" else (2 if family in ("dc", "dc12", "goals", "btts") else 1)
             rank_score = (market_priority, stakes_bonus, consensus_bonus, round(proba_pct, 1))
 
             match_options.append({
@@ -1611,20 +1734,17 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 "ai": md.analysis or f"Consensus multi-modèles ({proba_pct:.1f}%).",
                 "_rank": rank_score,
             })
-        # On garde la meilleure option principale par match, et une option secondaire uniquement
-        # si elle n'est pas un '12' forcé et si sa cote/proba complète le combinateur quand l'occasion se présente.
+        # On garde jusqu'à 2 meilleures options par match pour laisser le combinateur choisir la synergie optimale
         match_options.sort(key=lambda x: x["_rank"], reverse=True)
         kept = 0
         for opt in match_options:
-            if opt.get("mk") == "double_chance_12" and kept >= 1:
-                continue
             opt.pop("_rank", None)
             vip_candidates.append(opt)
             kept += 1
             if kept >= 2:
                 break
 
-    vip_candidates.sort(key=lambda x: (3 if x["family"] == "result" else (2 if x["family"] in ("dc", "goals", "btts") else 1), compute_stakes_score(x["league"], x["ai"]), x["proba"]), reverse=True)
+    vip_candidates.sort(key=lambda x: (3 if x["family"] == "result" else (2 if x["family"] in ("dc", "dc12", "goals", "btts") else 1), compute_stakes_score(x["league"], x["ai"]), x["proba"]), reverse=True)
     top_pool = vip_candidates[:28]
 
     # Priorité exacte du moteur 22/11 : Pyramide Sécurisée (3 sélections), puis Duo (2), puis Quatuor (4)
@@ -1969,7 +2089,7 @@ def format_selection_block(s, idx, show_analysis):
     lines = [f"<b>┌─ #{idx} {s.home} vs {s.away}</b>", f"│ 📅 <b>{format_kickoff(s.kickoff)}</b> • {s.league}", f"│ 🎯 <b>{s.pick_label}</b>", f"│ 📊 Confiance : <b>{s.model_prob*100:.1f}%</b> {prob_bar(s.model_prob)}"]
     if s.real_odd: lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b>")
     else: lines.append(f"│ 💰 Cote : <b>{s.odds}</b>")
-    if show_analysis and s.analysis: lines.append(f"│ 🧠 <i>{clean_analysis_text(s.analysis, 320)}</i>")
+    if show_analysis and s.analysis: lines.append(f"│ 🧠 <i>{clean_analysis_text(s.analysis, 520)}</i>")
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
