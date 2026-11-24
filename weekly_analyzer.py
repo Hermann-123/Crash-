@@ -17,10 +17,6 @@ TZ = ZoneInfo(NOTIFY_TZ)
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
 
-# Calibrage Pronostiqueur Pro (20 ans d'expérience) — Mode 100 % autonome (sans dépendance à l'API Odds) :
-# - Cotes estimées calibrées avec marge bookmaker réelle (0.93) pour refléter les vraies cotes (ex: 1.15 - 1.25)
-# - Équilibre strict des marchés (Ancres 1/2, Boucliers 1X/X2, Moteurs offensifs Over 1.5 / Over 2.5 / BTTS)
-# - Garanti de toujours atteindre le nombre de matchs demandé (limit = 10, 15, etc.)
 WEEKLY_MIN_LEG_ODD = 1.15
 WEEKLY_MIN_PROBA_PCT = 67.0
 WEEKLY_MAX_PROBA_PCT = 86.0
@@ -51,6 +47,7 @@ PRO_TRAP_PHRASES = [
     "blessures majeures",
     "déplacement piège",
     "match piège",
+    "risque élevé",
     "irrégularité chronique",
     "très imprévisible",
     "aucun enjeu",
@@ -268,11 +265,10 @@ async def analyze_weekly_top_matches(
     end_dt: Optional[datetime] = None,
 ) -> List[dict]:
     """
-    Architecture Combiné Pro (20 ans d'expérience) — Autonome sans API Odds :
+    Architecture Combiné Pro Multi-Jours :
     1. Exclut les divisions inférieures et priorise les ligues majeures (Tier 1 puis Tier 2).
-    2. Fonctionne 100% avec les cotes estimées calibrées (marge bookmaker 0.93 intégrée) quand l'API Odds est absente.
+    2. Croise les vraies cotes bookmaker (ESPN + Bzzoiro + The Odds API) avec Dixon-Coles, ML et Gemini.
     3. Équilibre le ticket entre Victoires sèches (1/2), Double Chance (1X/X2) et Buts (Over 2.5 / Over 1.5 / BTTS).
-    4. Scanne un vivier large et applique un repêchage contrôlé pour toujours atteindre `limit` (10, 15, etc.).
     """
     try:
         ws_matches, _ = await fetch_odds_fn()
@@ -357,10 +353,8 @@ async def analyze_weekly_top_matches(
                 filtered.append(md)
         pool = filtered
 
-    # Priorité aux ligues majeures (Tier 1) avant les ligues secondaires (Tier 2)
     pool.sort(key=lambda m: (1 if _league_tier(m.league) == 1 else 0, prescore_fn(m)), reverse=True)
 
-    # Vivier large pour garantir d'atteindre 10 ou 15 sélections qualifiées
     scan_cap = min(len(pool), max(limit * 2 + 12, 42))
     targets = pool[:scan_cap]
     if targets:
@@ -411,7 +405,6 @@ async def analyze_weekly_top_matches(
                 if mk == "victoire_away" and p_away_est < (min_res + 2.0) / 100.0:
                     continue
 
-                # Interdiction stricte des Double Chances inversées contre un favori bookmaker ou IA
                 if mk == "double_chance_1X":
                     if real_a_odd and real_a_odd < 2.00:
                         continue
@@ -479,7 +472,7 @@ async def analyze_weekly_top_matches(
                         "proba": proba_pct,
                         "odd": odd,
                         "is_real": bool(real_odd),
-                        "ai": _clean_analysis_text(md.analysis, 230),
+                        "ai": _clean_analysis_text(md.analysis, 340),
                         "_score": score,
                     }
             if best:
@@ -487,10 +480,8 @@ async def analyze_weekly_top_matches(
                 picks.append(best)
         return picks
 
-    # Passe 1 : Standards Pro (67% Victoire, 70% Double Chance, 71% Over 2.5/BTTS, 74% Over 1.5)
     ranked_picks = _evaluate_candidates(min_res=67.0, min_dc=70.0, min_goals=71.0, min_over15=74.0)
 
-    # Passe 2 (repêchage contrôlé) : si on n'a pas encore assez de matchs pour atteindre `limit` (ex: 10 ou 15)
     if len(ranked_picks) < limit:
         existing_ids = {p["event_id"] for p in ranked_picks}
         backup_picks = _evaluate_candidates(min_res=63.0, min_dc=67.0, min_goals=68.0, min_over15=71.0)
@@ -508,9 +499,8 @@ async def analyze_weekly_top_matches(
         reverse=True,
     )
 
-    # Équilibrage par famille (max ~40 % par marché) avec complétion garantie jusqu'à `limit`
     max_per_family = max(3, math.ceil(limit * 0.40))
-    family_counts = {"result": 0, "dc": 0, "goals": 0, "btts": 0}
+    family_counts = {"result": 0, "dc": 0, "dc12": 0, "goals": 0, "btts": 0}
     selected = []
     overflow = []
 
