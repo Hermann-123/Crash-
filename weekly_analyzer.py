@@ -92,7 +92,7 @@ def _has_pro_red_flags(analysis_text: str) -> bool:
     return any(phrase in low for phrase in PRO_TRAP_PHRASES)
 
 
-def _clean_analysis_text(text: str, max_len: int = 230) -> str:
+def _clean_analysis_text(text: str, max_len: int = 420) -> str:
     if not text:
         return ""
     text = re.sub(r"\s+", " ", text).strip()
@@ -345,6 +345,10 @@ async def analyze_weekly_top_matches(
             inv_x2 = (1.0 / float(md.real_odds["away"])) + (1.0 / float(md.real_odds["draw"]))
             if inv_x2 > 0:
                 md.real_odds["dc_x2"] = round(max(1.03, (1.0 / inv_x2) * 0.96), 2)
+        if md.real_odds.get("home") and md.real_odds.get("away") and not md.real_odds.get("dc_12"):
+            inv_12 = (1.0 / float(md.real_odds["home"])) + (1.0 / float(md.real_odds["away"]))
+            if inv_12 > 0:
+                md.real_odds["dc_12"] = round(max(1.03, (1.0 / inv_12) * 0.96), 2)
     if start_dt and end_dt:
         filtered = []
         for md in pool:
@@ -370,6 +374,7 @@ async def analyze_weekly_top_matches(
     markets_map = [
         ("victoire_home", "home", "result", lambda m: f"Victoire {m.home} (1)"),
         ("victoire_away", "away", "result", lambda m: f"Victoire {m.away} (2)"),
+        ("double_chance_12", "dc_12", "dc12", lambda m: "Une équipe gagne (12)"),
         ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
         ("double_chance_X2", "dc_x2", "dc", lambda m: f"Double Chance Nul ou {m.away} (X2)"),
         ("over_2.5", "over_2.5", "goals", lambda m: "Plus de 2.5 buts"),
@@ -417,13 +422,17 @@ async def analyze_weekly_top_matches(
                         continue
                     if g_h > 0 and g_a > 0 and g_h > (g_a + 0.06):
                         continue
+                elif mk == "double_chance_12":
+                    p_draw_est, _, _, _, _ = compute_prob_fn(md, "match_nul")
+                    if one_sided or p_draw_est > 0.25 or p_home_est < 0.28 or p_away_est < 0.28:
+                        continue
 
                 prob, g, d, b, emoji = compute_prob_fn(md, mk)
                 proba_pct = prob * 100.0
 
                 if family == "result":
                     min_req = min_res
-                elif family == "dc":
+                elif family in ("dc", "dc12"):
                     min_req = min_dc
                 elif mk == "over_1.5":
                     min_req = min_over15
@@ -437,12 +446,13 @@ async def analyze_weekly_top_matches(
                 if not real_odd or float(real_odd) <= 1.01:
                     continue
                 odd = round(float(real_odd), 2)
-                if odd < WEEKLY_MIN_LEG_ODD:
+                min_w_odd = 1.18 if mk == "double_chance_12" else WEEKLY_MIN_LEG_ODD
+                if odd < min_w_odd:
                     continue
 
                 if not tight_match and family == "result":
                     strategy_fit = 5
-                elif tight_match and family == "dc":
+                elif tight_match and family in ("dc", "dc12"):
                     strategy_fit = 5
                 elif mk == "over_2.5":
                     strategy_fit = 4
