@@ -93,15 +93,15 @@ WEIGHT_GEMINI  = float(os.getenv("WEIGHT_GEMINI", "0.35"))
 WEIGHT_BZZOIRO = float(os.getenv("WEIGHT_BZZOIRO","0.30"))
 
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
-MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.94"))
+MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.90"))
 
-# ✅ CALIBRAGE PRONOSTIQUEUR PRO — FIDÉLITÉ AU SCÉNARIO & TRANCHE 2.30 à 3.05
-AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "68.0"))
+# ✅ CALIBRAGE PRONOSTIQUEUR PRO — AUTONOME SANS API ODDS (COTE 2.15 à 3.25)
+AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "64.0"))
 AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "88.0"))
-AUTH_MIN_COMBINED_PROB = 0.35
+AUTH_MIN_COMBINED_PROB = 0.30
 
-DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "10"))
-DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.15"))
+DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "12"))
+DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.16"))
 DOUBLE_SCAN_MIN_STABLE      = int(os.getenv("DOUBLE_SCAN_MIN_STABLE", "3"))
 DOUBLE_SCAN_PAUSE_SECONDS   = int(os.getenv("DOUBLE_SCAN_PAUSE_SECONDS", "3"))
 
@@ -114,11 +114,11 @@ DRAW_MIN_SCORE = 70
 DRAW_MAX_ECART = 0.20
 DRAW_MIN_PROB = 0.28
 
-ODDS3_AUTH_MIN_COTE = 2.30
-ODDS3_AUTH_MAX_COTE = 3.05
+ODDS3_AUTH_MIN_COTE = 2.15
+ODDS3_AUTH_MAX_COTE = 3.25
 ODDS3_HYB_MIN_COTE = 3.20
 ODDS3_HYB_MAX_COTE = 5.50
-ODDS3_MIN_COTE_LEG = 1.16
+ODDS3_MIN_COTE_LEG = 1.15
 
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
@@ -447,6 +447,14 @@ def is_match_not_started(kickoff_str) -> bool:
     dt = parse_dt_safe(kickoff_str)
     if not dt or (dt.hour == 0 and dt.minute == 0): return True
     return dt > (datetime.now(TZ) + timedelta(minutes=MATCH_START_BUFFER_MINUTES))
+
+def calibrated_odd(prob: float, real_odd: Optional[float]) -> float:
+    """Retourne la vraie cote si disponible, sinon cote estimée avec marge bookmaker (~7%)."""
+    if real_odd and real_odd > 1.01:
+        return round(float(real_odd), 2)
+    if prob <= 0.01:
+        return 0.0
+    return max(1.06, round((1.0 / prob) * 0.93, 2))
 
 def prob_bar(p: float) -> str:
     if p >= 0.75: return "🟢🟢🟢"
@@ -1062,7 +1070,7 @@ async def enrich_with_double_pass(pool):
     return targets
 
 # =====================================================================
-# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (FIDÉLITÉ AU SCÉNARIO & COTE 2.30 - 3.05)
+# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (AUTONOME SANS API ODDS)
 # =====================================================================
 def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
     sorted_combo = sorted(combo, key=lambda c: parse_dt_safe(c.get("kickoff")) or datetime.max.replace(tzinfo=TZ))
@@ -1096,7 +1104,7 @@ def _valid_pro_combo(combo, require_anchor: bool = False) -> bool:
         return False
     if sum(1 for c in combo if c.get("mk") == "victoire_away") > 1:
         return False
-    if require_anchor and not any(c["proba"] >= 72.0 for c in combo):
+    if require_anchor and not any(c["proba"] >= 70.0 for c in combo):
         return False
     return True
 
@@ -1108,8 +1116,8 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
         ("victoire_away", "away", "result", lambda m: f"Victoire {m.away} (2)"),
         ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
         ("double_chance_X2", "dc_x2", "dc", lambda m: f"Double Chance Nul ou {m.away} (X2)"),
-        ("over_1.5", "over_1.5", "goals", lambda m: "Plus de 1.5 buts"),
         ("over_2.5", "over_2.5", "goals", lambda m: "Plus de 2.5 buts"),
+        ("over_1.5", "over_1.5", "goals", lambda m: "Plus de 1.5 buts"),
         ("under_2.5", "under_2.5", "goals", lambda m: "Moins de 2.5 buts"),
         ("btts_yes", "btts_yes", "btts", lambda m: "Les 2 équipes marquent (BTTS Oui)"),
     ]
@@ -1119,7 +1127,8 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             continue
         if is_reserve_team(md.home) or is_reserve_team(md.away):
             continue
-        if not md.dixon_pred and not md.real_odds:
+        # Autonome : accepte tout match ayant Dixon-Coles, Gemini ou Bzzoiro (sans exiger real_odds)
+        if not md.dixon_pred and not md.gemini_markets and not md.bzz_markets and not md.real_odds:
             continue
 
         is_trap, trap_reason = has_pro_red_flags(md.analysis)
@@ -1128,8 +1137,8 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             print(f"  🚩 Pro-Filter rejet ({md.home} vs {md.away}) : signal '{trap_reason}'")
             continue
 
-        p_home_est, _, _, _, _ = compute_probability(md, "victoire_home")
-        p_away_est, _, _, _, _ = compute_probability(md, "victoire_away")
+        p_home_est, g_h, _, _, _ = compute_probability(md, "victoire_home")
+        p_away_est, g_a, _, _, _ = compute_probability(md, "victoire_away")
         one_sided_match = (p_home_est >= 0.72) or (p_away_est >= 0.72)
 
         best_for_match = None
@@ -1137,13 +1146,25 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             if mk == "btts_yes" and one_sided_match:
                 continue
 
+            # Empêche toute Double Chance inversée contre le favori
+            if mk == "double_chance_1X":
+                if g_a > 0 and g_h > 0 and g_a > (g_h + 0.06):
+                    continue
+                if p_away_est > (p_home_est + 0.08):
+                    continue
+            elif mk == "double_chance_X2":
+                if g_h > 0 and g_a > 0 and g_h > (g_a + 0.06):
+                    continue
+                if p_home_est > (p_away_est + 0.08):
+                    continue
+
             prob, g, d, b, emoji = compute_probability(md, mk)
             proba_pct = prob * 100.0
 
             if emoji == "⚠️" or not passes_auth_proba_filter(proba_pct):
                 continue
 
-            if mk == "victoire_away" and emoji not in ("🤝", "🤝🤝") and not md.real_odds.get("away"):
+            if mk == "victoire_away" and p_away_est < 0.68:
                 continue
 
             real_odd = md.real_odds.get(odd_key)
@@ -1151,7 +1172,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 odd = real_odd
                 is_real = True
             else:
-                odd = round(1.0 / prob, 2) if prob > 0 else 0.0
+                odd = calibrated_odd(prob, None)
                 is_real = False
 
             if odd < ODDS3_MIN_COTE_LEG:
@@ -1160,7 +1181,9 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 continue
 
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
-            rank_score = (round(proba_pct, 1), consensus_bonus, 1 if family in ("result", "dc") else 0)
+            # Favorise les marchés structurés (1, 2, 1X, X2, Over 2.5) pour atteindre la cote cible ~2.50-3.00 en 2-3 matchs
+            market_priority = 2 if family in ("result", "dc") else (1 if mk in ("over_2.5", "btts_yes") else 0)
+            rank_score = (market_priority, consensus_bonus, round(proba_pct, 1))
 
             if not best_for_match or rank_score > best_for_match["_rank"]:
                 best_for_match = {
@@ -1184,8 +1207,8 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             best_for_match.pop("_rank", None)
             vip_candidates.append(best_for_match)
 
-    vip_candidates.sort(key=lambda x: (x["proba"], 1 if x["family"] in ("result", "dc") else 0), reverse=True)
-    top_pool = vip_candidates[:14]
+    vip_candidates.sort(key=lambda x: (1 if x["family"] in ("result", "dc") else 0, x["proba"]), reverse=True)
+    top_pool = vip_candidates[:16]
 
     for r in (2, 3, 4):
         if len(top_pool) < r:
@@ -1208,19 +1231,24 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             label = "Duo Haute Confiance" if r == 2 else ("Pyramide Sécurisée" if r == 3 else "Quatuor Haute Confiance")
             return _build_auth_coupon(best_combo, f"Sélection Pro VIP • {label}", 96), locked_keys
 
+    # Secours contrôlé : plage élargie (1.90 à 3.60) pour garantir un ticket fiable même les jours de faible affiche
     for r in (2, 3, 4):
         if len(top_pool) < r:
             continue
+        best_fb = None
+        best_fb_prob = 0.0
         for combo in itertools.combinations(top_pool, r):
-            if not _valid_pro_combo(combo, require_anchor=(r >= 3)):
+            if not _valid_pro_combo(combo, require_anchor=False):
                 continue
             tot_o = math.prod(c["odds"] for c in combo)
             tot_p = math.prod(c["proba"] / 100.0 for c in combo)
-            if 2.00 <= tot_o < ODDS3_AUTH_MIN_COTE and tot_p >= 0.40:
-                if not coupon_passes_ev(tot_o, tot_p):
-                    continue
-                locked_keys = {c["norm_key"] for c in combo}
-                return _build_auth_coupon(combo, "Sélection Pro VIP • Sécurité Renforcée", 92), locked_keys
+            if 1.90 <= tot_o <= 3.60 and tot_p >= 0.28:
+                if tot_p > best_fb_prob:
+                    best_fb = combo
+                    best_fb_prob = tot_p
+        if best_fb:
+            locked_keys = {c["norm_key"] for c in best_fb}
+            return _build_auth_coupon(best_fb, "Sélection Pro VIP • Sécurité Renforcée", 92), locked_keys
 
     print("  ℹ️ AUTH VIP : Aucune combinaison ne réunit tous les critères Pro aujourd'hui.")
     return None, set()
@@ -1264,7 +1292,7 @@ def build_mtft_coupon_and_bonus(pool, locked_keys: set):
 
         pts = 15 + (10 if md.has_h2h else 0) + 10 + (30 if best_prob >= 0.65 else 20) + 15 + 10
         if pts < MTFIN_MIN_SCORE: continue
-        picks.append({"md": md, "pick": best_p, "prob": best_prob, "score": pts, "odd": round(1.0 / best_prob, 2), "htft": htft})
+        picks.append({"md": md, "pick": best_p, "prob": best_prob, "score": pts, "odd": calibrated_odd(best_prob, None), "htft": htft})
 
     coupon = None
     picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
@@ -1283,7 +1311,7 @@ def build_mtft_coupon_and_bonus(pool, locked_keys: set):
         fav_prob = sum(p["htft"].get(f"{ht}/{ft_res}", 0) for ht in ("V1", "V2", "X"))
         is_est = False
         if not real_odd:
-            real_odd = round(1.0 / fav_prob, 2) if fav_prob > 0 else 0.0
+            real_odd = calibrated_odd(fav_prob, None)
             is_est = True
         if real_odd >= ODDS3_MIN_COTE_LEG and passes_value_filter(fav_prob, real_odd, not is_est):
             bonus_pool.append({"match": md, "type": fav_market, "odds": real_odd, "proba": fav_prob * 100, "ai": md.analysis, "real_odd": real_odd if not is_est else None, "source": "MT-FIN", "kickoff": md.kickoff})
@@ -1298,8 +1326,8 @@ def build_draw_coupon_and_bonus(pool, locked_keys: set):
         prob, g, d, b, emoji = compute_probability(md, "match_nul")
         if prob < DRAW_MIN_PROB or (g > 0 and g < 0.22) or emoji == "⚠️": continue
         draw_odd = md.real_odds.get("draw"); is_real = draw_odd is not None
-        if not draw_odd: draw_odd = round(1.0 / prob, 2) if prob > 0 else 3.20
-        if draw_odd < 3.10: continue
+        if not draw_odd: draw_odd = calibrated_odd(prob, None) if prob > 0 else 3.10
+        if draw_odd < 2.95: continue
         if (md.real_odds.get("home") and md.real_odds.get("home") < 1.80) or (md.real_odds.get("away") and md.real_odds.get("away") < 1.80): continue
         if not passes_value_filter(prob, draw_odd, is_real, emoji): continue
         pts = 30 + (25 if prob >= 0.33 else 18) + (20 if g >= 0.30 else 12) + 10 + (5 if md.has_h2h else 0) + 10
@@ -1318,7 +1346,7 @@ def build_draw_coupon_and_bonus(pool, locked_keys: set):
         md = next((m for m in pool if m.event_id == c.event_id), None)
         if not md: continue
         p_h, _, _, _, _ = compute_probability(md, "victoire_home"); p_a, _, _, _, _ = compute_probability(md, "victoire_away")
-        p_12 = p_h + p_a; odd_12 = round(1.0 / p_12, 2) if p_12 > 0 else 0.0
+        p_12 = p_h + p_a; odd_12 = calibrated_odd(p_12, None)
         if odd_12 >= ODDS3_MIN_COTE_LEG and passes_value_filter(p_12, odd_12, False):
             bonus_pool.append({"match": md, "type": "Double Chance 12", "odds": odd_12, "proba": p_12 * 100, "ai": md.analysis, "real_odd": None, "source": "MATCH-NUL", "kickoff": md.kickoff})
     return coupon, bonus_pool
@@ -1334,7 +1362,7 @@ def build_third_pillar(pool, locked_keys: set):
             prob, g, d, b, emoji = compute_probability(md, mk)
             if prob < 0.58 or emoji == "⚠️": continue
             odd = md.real_odds.get(mk); is_real = odd is not None
-            if not odd: odd = round(1.0 / prob, 2) if prob > 0 else 0.0; is_real = False
+            if not odd: odd = calibrated_odd(prob, None); is_real = False
             if odd >= ODDS3_MIN_COTE_LEG and passes_value_filter(prob, odd, is_real, emoji):
                 score = (1 if is_real else 0, prob * odd, prob)
                 if not best or score > best["_score"]:
@@ -1472,7 +1500,7 @@ async def safe_send(cid, txt):
 
 async def broadcast_after_scan():
     mode = STATE.get("odds_api_mode", "unknown")
-    mode_label = "🟢 LIVE" if mode == "live" else "🟡 FALLBACK" if mode == "fallback" else "⚪ ?"
+    mode_label = "🟢 LIVE" if mode == "live" else "🟡 IA CALIBRÉ" if mode == "fallback" else "⚪ ?"
     if not STATE["coupons"]: msg = f"<b>📭 Aucun coupon fiable aujourd'hui</b>\n<i>(Critères Pro stricts : protection de bankroll)</i>"
     else:
         lignes = [f"{c.emoji} <b>{c.name}</b> • {len(c.legs)} paris • Cote <b>{c.combined_odds}</b>" for c in STATE["coupons"]]
@@ -1482,7 +1510,7 @@ async def broadcast_after_scan():
 def format_header():
     mode = STATE.get("odds_api_mode", "unknown")
     mode_icon = "🟢" if mode == "live" else "🟡" if mode == "fallback" else "⚪"
-    mode_txt = "LIVE" if mode == "live" else "FALLBACK" if mode == "fallback" else "?"
+    mode_txt = "LIVE" if mode == "live" else "IA CALIBRÉ" if mode == "fallback" else "?"
     return f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n     <b>⚡ {BRAND_NAME.upper()} ⚡</b>\n<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n<i>{BRAND_TAGLINE}</i>\n<i>📅 {today_pretty()}</i>\n<i>{mode_icon} Mode : {mode_txt}</i>"
 
 def format_selection_block(s, idx, show_analysis):
@@ -1523,7 +1551,7 @@ def format_coupon(c):
     return "\n".join(lines)
 
 def _parse_date_range_args(parts: list[str]) -> tuple[Optional[datetime], Optional[datetime], int, int, str]:
-    """Parse '/semaine 24/11-25/11 15', '/semaine 24/11 25/11 15' ou '/semaine 3 15'."""
+    """Parse '/semaine 24/11-25/11 15', '/semaine 24/11 25/11 15', '/semaine 24/11 15', '/semaine 15' ou '/semaine 3 15'."""
     now = datetime.now(TZ)
     days = 3
     limit = 15
@@ -1539,6 +1567,7 @@ def _parse_date_range_args(parts: list[str]) -> tuple[Optional[datetime], Option
 
     args = parts[1:]
     if args:
+        # Format 1 : /semaine 24/11-25/11 [15]
         m_range = re.match(r"^(\d{1,2})/(\d{1,2})\s*[-–]\s*(\d{1,2})/(\d{1,2})$", args[0])
         if m_range:
             start_dt = _make_dt(m_range.group(1), m_range.group(2), end_of_day=False)
@@ -1546,9 +1575,10 @@ def _parse_date_range_args(parts: list[str]) -> tuple[Optional[datetime], Option
             days = max(1, (end_dt.date() - start_dt.date()).days + 1)
             period_label = f"Du {start_dt.strftime('%d/%m')} au {end_dt.strftime('%d/%m')}"
             if len(args) >= 2 and args[1].isdigit():
-                limit = max(5, min(30, int(args[1])))
+                limit = max(3, min(30, int(args[1])))
             return start_dt, end_dt, days, limit, period_label
 
+        # Format 2 : /semaine 24/11 25/11 [15]
         if len(args) >= 2:
             m1 = re.match(r"^(\d{1,2})/(\d{1,2})$", args[0])
             m2 = re.match(r"^(\d{1,2})/(\d{1,2})$", args[1])
@@ -1558,13 +1588,29 @@ def _parse_date_range_args(parts: list[str]) -> tuple[Optional[datetime], Option
                 days = max(1, (end_dt.date() - start_dt.date()).days + 1)
                 period_label = f"Du {start_dt.strftime('%d/%m')} au {end_dt.strftime('%d/%m')}"
                 if len(args) >= 3 and args[2].isdigit():
-                    limit = max(5, min(30, int(args[2])))
+                    limit = max(3, min(30, int(args[2])))
                 return start_dt, end_dt, days, limit, period_label
 
+        # Format 3 : /semaine 24/11 [15] (date unique ciblée)
+        m_single = re.match(r"^(\d{1,2})/(\d{1,2})$", args[0])
+        if m_single:
+            start_dt = _make_dt(m_single.group(1), m_single.group(2), end_of_day=False)
+            end_dt = _make_dt(m_single.group(1), m_single.group(2), end_of_day=True)
+            days = 1
+            period_label = f"Le {start_dt.strftime('%d/%m')}"
+            if len(args) >= 2 and args[1].isdigit():
+                limit = max(3, min(30, int(args[1])))
+            return start_dt, end_dt, days, limit, period_label
+
+        # Format 4 : /semaine 15 (si un seul nombre >= 8 -> c'est le nombre de matchs, sinon nombre de jours)
         if args[0].isdigit():
-            days = max(1, min(7, int(args[0])))
+            val0 = int(args[0])
+            if len(args) == 1 and val0 >= 8:
+                limit = max(3, min(30, val0))
+            else:
+                days = max(1, min(7, val0))
         if len(args) >= 2 and args[1].isdigit():
-            limit = max(5, min(30, int(args[1])))
+            limit = max(3, min(30, int(args[1])))
 
     return None, None, days, limit, f"{days} jours"
 
@@ -1576,6 +1622,7 @@ async def start_cmd(m: Message):
         msg = (
             f"{format_header()}\n\n<b>👋 Mode Admin</b>\n"
             f"• /semaine <code>24/11-25/11 15</code> — Top matchs sur dates précises\n"
+            f"• /semaine <code>24/11 10</code> — Top matchs sur une date unique\n"
             f"• /semaine <code>[jours] [matchs]</code> — Top matchs sur N jours\n"
             f"• /genkey <code>[jours] [nb]</code> — Créer clé(s) VIP\n"
             f"• /vip — Liste des abonnés & clés\n"
