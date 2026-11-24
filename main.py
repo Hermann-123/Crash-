@@ -116,8 +116,8 @@ DRAW_MIN_SCORE = 70
 DRAW_MAX_ECART = 0.20
 DRAW_MIN_PROB = 0.30
 
-ODDS3_AUTH_MIN_COTE = 2.25
-ODDS3_AUTH_MAX_COTE = 3.40
+ODDS3_AUTH_MIN_COTE = 1.85
+ODDS3_AUTH_MAX_COTE = 2.35
 ODDS3_HYB_MIN_COTE = 3.20
 ODDS3_HYB_MAX_COTE = 5.50
 ODDS3_MIN_COTE_LEG = 1.15
@@ -988,110 +988,240 @@ def _american_to_decimal(ml) -> Optional[float]:
     except Exception:
         return None
 
+def _parse_espn_odds_list(odds_list: list) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    h_odd = d_odd = a_odd = o25 = u25 = None
+    for od in (odds_list or []):
+        if not isinstance(od, dict):
+            continue
+        h_ml = (od.get("homeTeamOdds") or {}).get("moneyLine")
+        a_ml = (od.get("awayTeamOdds") or {}).get("moneyLine")
+        d_ml = (od.get("drawOdds") or {}).get("moneyLine")
+        if h_ml is not None and not h_odd:
+            h_odd = _american_to_decimal(h_ml)
+        if a_ml is not None and not a_odd:
+            a_odd = _american_to_decimal(a_ml)
+        if d_ml is not None and not d_odd:
+            d_odd = _american_to_decimal(d_ml)
+
+        ou_line = od.get("overUnder")
+        if ou_line is not None and abs(float(ou_line) - 2.5) < 0.01:
+            ov_dec = _american_to_decimal(od.get("overOdds"))
+            un_dec = _american_to_decimal(od.get("underOdds"))
+            if ov_dec and not o25:
+                o25 = ov_dec
+            if un_dec and not u25:
+                u25 = un_dec
+
+        if h_odd and a_odd and d_odd:
+            break
+    return h_odd, d_odd, a_odd, o25, u25
+
 ESPN_ODDS_SLUGS = [
-    "eng.1", "eng.2", "eng.3", "eng.fa", "eng.league_cup",
-    "esp.1", "esp.2", "esp.copa_del_rey",
-    "ita.1", "ita.2", "ita.coppa_italia",
-    "ger.1", "ger.2", "ger.dfb_pokal",
-    "fra.1", "fra.2", "fra.coupe_de_france",
-    "ned.1", "por.1", "bel.1", "tur.1", "sco.1", "gre.1", "aut.1", "sui.1",
+    "all",
     "uefa.champions", "uefa.europa", "uefa.europa.conf",
-    "conmebol.libertadores", "conmebol.sudamericana", "usa.1", "mex.1", "bra.1", "arg.1",
+    "eng.1", "eng.2", "esp.1", "ita.1", "ger.1", "fra.1",
+    "ned.1", "por.1", "bel.1", "tur.1", "sco.1",
+    "conmebol.libertadores", "usa.1", "mex.1", "bra.1", "arg.1",
 ]
 
+async def _fetch_espn_slug_date(client: httpx.AsyncClient, slug: str, d_str: str) -> list[dict]:
+    items = []
+    try:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
+        r = await client.get(url, params={"dates": d_str, "limit": 200})
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        default_league = (data.get("leagues") or [{}])[0].get("name") or slug
+        for ev in data.get("events", []):
+            comps = ev.get("competitions", [])
+            if not comps:
+                continue
+            comp = comps[0]
+            st_type = comp.get("status", {}).get("type", {})
+            if st_type.get("completed") or st_type.get("state") in ("in", "post"):
+                continue
+            competitors = comp.get("competitors", [])
+            home_c = next((c for c in competitors if c.get("homeAway") == "home"), None)
+            away_c = next((c for c in competitors if c.get("homeAway") == "away"), None)
+            if not home_c or not away_c:
+                continue
+            home_name = home_c.get("team", {}).get("displayName") or home_c.get("team", {}).get("name") or ""
+            away_name = away_c.get("team", {}).get("displayName") or away_c.get("team", {}).get("name") or ""
+            if not home_name or not away_name:
+                continue
+            lg_name = (ev.get("league") or {}).get("name") or default_league
+            items.append({
+                "raw_id": str(ev.get("id", "")),
+                "slug": slug,
+                "league": lg_name,
+                "home": home_name,
+                "away": away_name,
+                "date": ev.get("date", ""),
+                "odds": comp.get("odds") or [],
+            })
+    except Exception:
+        pass
+    return items
+
+async def _fetch_espn_event_summary_odds(client: httpx.AsyncClient, slug: str, raw_id: str) -> list:
+    try:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/summary"
+        r = await client.get(url, params={"event": raw_id})
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return data.get("pickcenter") or data.get("odds") or []
+    except Exception:
+        return []
+
 async def fetch_espn_prematch_odds(days_ahead: int = 3) -> list[WS_MatchData]:
-    """Récupère gratuitement les vraies cotes bookmaker d'avant-match via l'API publique ESPN (0 €)."""
+    """Récupère gratuitement les vraies cotes bookmaker d'avant-match via ESPN (scoreboard + pickcenter, 0 €)."""
     now = datetime.now(TZ)
     date_strings = [(now + timedelta(days=d)).strftime("%Y%m%d") for d in range(max(1, days_ahead + 1))]
     ws_map = {}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
 
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        for slug in ESPN_ODDS_SLUGS:
-            for d_str in date_strings:
-                try:
-                    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
-                    r = await client.get(url, params={"dates": d_str})
-                    if r.status_code != 200:
-                        continue
-                    data = r.json()
-                    league_name = (data.get("leagues") or [{}])[0].get("name") or slug
-                    for ev in data.get("events", []):
-                        ev_id = f"espn_{ev.get('id', '')}"
-                        if ev_id in ws_map:
-                            continue
-                        comps = ev.get("competitions", [])
-                        if not comps:
-                            continue
-                        comp = comps[0]
-                        st_type = comp.get("status", {}).get("type", {})
-                        if st_type.get("completed") or st_type.get("state") in ("in", "post"):
-                            continue
+    async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
+        tasks = [_fetch_espn_slug_date(client, slug, d_str) for slug in ESPN_ODDS_SLUGS for d_str in date_strings]
+        batches = await asyncio.gather(*tasks, return_exceptions=True)
 
-                        competitors = comp.get("competitors", [])
-                        home_c = next((c for c in competitors if c.get("homeAway") == "home"), None)
-                        away_c = next((c for c in competitors if c.get("homeAway") == "away"), None)
-                        if not home_c or not away_c:
-                            continue
-                        home_name = home_c.get("team", {}).get("displayName") or home_c.get("team", {}).get("name") or ""
-                        away_name = away_c.get("team", {}).get("displayName") or away_c.get("team", {}).get("name") or ""
-                        if not home_name or not away_name:
-                            continue
-
-                        odds_list = comp.get("odds") or []
-                        if not odds_list:
-                            continue
-
-                        h_odd = d_odd = a_odd = o25 = u25 = None
-                        for od in odds_list:
-                            if not isinstance(od, dict):
-                                continue
-                            h_ml = (od.get("homeTeamOdds") or {}).get("moneyLine")
-                            a_ml = (od.get("awayTeamOdds") or {}).get("moneyLine")
-                            d_ml = (od.get("drawOdds") or {}).get("moneyLine")
-                            if h_ml is not None and not h_odd:
-                                h_odd = _american_to_decimal(h_ml)
-                            if a_ml is not None and not a_odd:
-                                a_odd = _american_to_decimal(a_ml)
-                            if d_ml is not None and not d_odd:
-                                d_odd = _american_to_decimal(d_ml)
-
-                            ou_line = od.get("overUnder")
-                            if ou_line is not None and abs(float(ou_line) - 2.5) < 0.01:
-                                ov_dec = _american_to_decimal(od.get("overOdds"))
-                                un_dec = _american_to_decimal(od.get("underOdds"))
-                                if ov_dec and not o25:
-                                    o25 = ov_dec
-                                if un_dec and not u25:
-                                    u25 = un_dec
-
-                            if h_odd and a_odd and d_odd:
-                                break
-
-                        if h_odd and a_odd:
-                            ws_map[ev_id] = WS_MatchData(
-                                match_id=ev_id,
-                                league=league_name,
-                                home_team=home_name,
-                                away_team=away_name,
-                                home_odds=h_odd,
-                                draw_odds=d_odd,
-                                away_odds=a_odd,
-                                over_2_5=o25,
-                                under_2_5=u25,
-                                commence_time=ev.get("date", ""),
-                            )
-                except Exception:
+        candidates_without_odds = []
+        for batch in batches:
+            if not isinstance(batch, list):
+                continue
+            for item in batch:
+                ev_id = f"espn_{item['raw_id']}"
+                if ev_id in ws_map:
                     continue
+                h_odd, d_odd, a_odd, o25, u25 = _parse_espn_odds_list(item["odds"])
+                if h_odd and a_odd:
+                    ws_map[ev_id] = WS_MatchData(
+                        match_id=ev_id,
+                        league=item["league"],
+                        home_team=item["home"],
+                        away_team=item["away"],
+                        home_odds=h_odd,
+                        draw_odds=d_odd,
+                        away_odds=a_odd,
+                        over_2_5=o25,
+                        under_2_5=u25,
+                        commence_time=item["date"],
+                    )
+                elif item["raw_id"] and item["slug"] != "all":
+                    candidates_without_odds.append(item)
+
+        # Fallback pickcenter (résumé d'avant-match ESPN) sur les matchs majeurs où scoreboard n'affiche pas encore les cotes
+        if candidates_without_odds:
+            seen_raw = set()
+            unique_missing = []
+            for it in candidates_without_odds:
+                if it["raw_id"] not in seen_raw and f"espn_{it['raw_id']}" not in ws_map:
+                    seen_raw.add(it["raw_id"])
+                    unique_missing.append(it)
+            summary_tasks = [_fetch_espn_event_summary_odds(client, it["slug"], it["raw_id"]) for it in unique_missing[:35]]
+            summary_results = await asyncio.gather(*summary_tasks, return_exceptions=True)
+            for it, s_odds in zip(unique_missing[:35], summary_results):
+                if not isinstance(s_odds, list) or not s_odds:
+                    continue
+                h_odd, d_odd, a_odd, o25, u25 = _parse_espn_odds_list(s_odds)
+                if h_odd and a_odd:
+                    ev_id = f"espn_{it['raw_id']}"
+                    ws_map[ev_id] = WS_MatchData(
+                        match_id=ev_id,
+                        league=it["league"],
+                        home_team=it["home"],
+                        away_team=it["away"],
+                        home_odds=h_odd,
+                        draw_odds=d_odd,
+                        away_odds=a_odd,
+                        over_2_5=o25,
+                        under_2_5=u25,
+                        commence_time=it["date"],
+                    )
 
     res = list(ws_map.values())
     print(f"🆓 ESPN Vraies Cotes Gratuites : {len(res)} matchs récupérés (0 €)")
     return res
 
+async def fetch_bzzoiro_free_odds(days_ahead: int = 3) -> list[WS_MatchData]:
+    """Récupère les vraies cotes bookmaker gratuites déjà incluses dans l'API Bzzoiro (/api/events/ et /api/predictions/)."""
+    if not BZZOIRO_API_KEY:
+        return []
+    now = datetime.now(TZ)
+    d_from = now.strftime("%Y-%m-%d")
+    d_to = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    headers = {"Authorization": f"Token {BZZOIRO_API_KEY}"}
+    ws_map = {}
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for endpoint in ("https://sports.bzzoiro.com/api/events/", "https://sports.bzzoiro.com/api/predictions/"):
+            try:
+                r = await client.get(endpoint, headers=headers, params={"date_from": d_from, "date_to": d_to, "limit": 250})
+                if r.status_code != 200:
+                    continue
+                payload = r.json()
+                items = payload.get("results", payload) if isinstance(payload, dict) else payload
+                if not isinstance(items, list):
+                    continue
+                for raw in items:
+                    ev = raw.get("event") if isinstance(raw.get("event"), dict) else raw
+                    h = ev.get("home_team") or raw.get("home_team") or ""
+                    a = ev.get("away_team") or raw.get("away_team") or ""
+                    if isinstance(h, dict): h = h.get("name", "")
+                    if isinstance(a, dict): a = a.get("name", "")
+                    if not h or not a:
+                        continue
+                    lg = ev.get("league") or raw.get("league") or ""
+                    if isinstance(lg, dict): lg = lg.get("name", "")
+
+                    def _f(v):
+                        try:
+                            fv = float(v)
+                            return round(fv, 2) if fv > 1.01 else None
+                        except Exception:
+                            return None
+
+                    h_odd = _f(ev.get("odds_home") or raw.get("odds_home") or ev.get("home_odds"))
+                    d_odd = _f(ev.get("odds_draw") or raw.get("odds_draw") or ev.get("draw_odds"))
+                    a_odd = _f(ev.get("odds_away") or raw.get("odds_away") or ev.get("away_odds"))
+                    o25 = _f(ev.get("odds_over_25") or raw.get("odds_over_25") or ev.get("over_2_5_odds"))
+                    u25 = _f(ev.get("odds_under_25") or raw.get("odds_under_25") or ev.get("under_2_5_odds"))
+                    b_yes = _f(ev.get("odds_btts_yes") or raw.get("odds_btts_yes"))
+                    b_no = _f(ev.get("odds_btts_no") or raw.get("odds_btts_no"))
+
+                    if h_odd and a_odd:
+                        nk = f"{normalize_name(h)}__{normalize_name(a)}"
+                        if nk not in ws_map:
+                            ws_map[nk] = WS_MatchData(
+                                match_id=str(ev.get("id") or raw.get("id") or nk),
+                                league=str(lg),
+                                home_team=str(h),
+                                away_team=str(a),
+                                home_odds=h_odd,
+                                draw_odds=d_odd,
+                                away_odds=a_odd,
+                                over_2_5=o25,
+                                under_2_5=u25,
+                                btts_yes=b_yes,
+                                btts_no=b_no,
+                                commence_time=str(ev.get("event_date") or ev.get("commence_time") or ""),
+                            )
+            except Exception:
+                continue
+
+    res = list(ws_map.values())
+    print(f"🆓 Bzzoiro Vraies Cotes Gratuites : {len(res)} matchs récupérés (0 €)")
+    return res
+
 async def fetch_rapidodds_odds() -> Tuple[list, str]:
-    """Fusionne les vraies cotes gratuites ESPN (0 €) + The Odds API gratuit (1 crédit/jour) + RapidOddsAPI."""
+    """Fusionne ESPN (scoreboard + pickcenter) + Bzzoiro gratuit + The Odds API gratuit (1 crédit/jour)."""
     ws_by_key = {}
 
-    # 1. Source principale 100% gratuite et illimitée : ESPN Public Odds (Bet365 / ESPN BET)
+    # 1. ESPN Public Odds (Scoreboard + Pickcenter)
     try:
         espn_ws = await fetch_espn_prematch_odds(days_ahead=3)
         for item in espn_ws:
@@ -1100,7 +1230,24 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
     except Exception as e:
         print(f"⚠️ ESPN Odds erreur : {e}")
 
-    # 2. Complément gratuit : The Odds API (1 seule requête/jour = 30 crédits/mois sur 500 gratuits)
+    # 2. Bzzoiro Free Odds (/api/events/ & /api/predictions/)
+    try:
+        bzz_ws = await fetch_bzzoiro_free_odds(days_ahead=3)
+        for item in bzz_ws:
+            nk = f"{normalize_name(item.home_team)}__{normalize_name(item.away_team)}"
+            existing = ws_by_key.get(nk)
+            if existing:
+                if not existing.draw_odds and item.draw_odds: existing.draw_odds = item.draw_odds
+                if not existing.over_2_5 and item.over_2_5: existing.over_2_5 = item.over_2_5
+                if not existing.under_2_5 and item.under_2_5: existing.under_2_5 = item.under_2_5
+                if not existing.btts_yes and item.btts_yes: existing.btts_yes = item.btts_yes
+                if not existing.btts_no and item.btts_no: existing.btts_no = item.btts_no
+            else:
+                ws_by_key[nk] = item
+    except Exception as e:
+        print(f"⚠️ Bzzoiro Odds erreur : {e}")
+
+    # 3. Complément gratuit : The Odds API (1 requête/jour sur /sports/upcoming/odds)
     if THE_ODDS_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1168,7 +1315,7 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
         except Exception as e:
             print(f"⚠️ The Odds API erreur : {e}")
 
-    # 3. Secours optionnel RapidOddsAPI si configuré
+    # 4. Secours optionnel RapidOddsAPI si configuré
     if RAPIDODDSAPI_API_KEY and fetch_rapidodds_odds_data:
         try:
             events = await fetch_rapidodds_odds_data()
