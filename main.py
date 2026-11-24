@@ -116,8 +116,8 @@ DRAW_MIN_SCORE = 70
 DRAW_MAX_ECART = 0.20
 DRAW_MIN_PROB = 0.30
 
-ODDS3_AUTH_MIN_COTE = 1.85
-ODDS3_AUTH_MAX_COTE = 2.35
+ODDS3_AUTH_MIN_COTE = 2.00
+ODDS3_AUTH_MAX_COTE = 2.65
 ODDS3_HYB_MIN_COTE = 3.20
 ODDS3_HYB_MAX_COTE = 5.50
 ODDS3_MIN_COTE_LEG = 1.15
@@ -126,6 +126,8 @@ MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
 
 PRO_TRAP_PHRASES = [
+    "match piège",
+    "risque élevé",
     "effectif remanié",
     "équipe bis",
     "équipe b",
@@ -1358,121 +1360,10 @@ def inject_all_real_odds(pool, ws_matches):
 # =====================================================================
 # DOUBLE SCAN
 # =====================================================================
-
-GEMINI_MODEL_CANDIDATES = [
-    os.getenv("GEMINI_MODEL", "").strip(),
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-]
-GEMINI_MODEL_CANDIDATES = [m for i, m in enumerate(GEMINI_MODEL_CANDIDATES) if m and m not in GEMINI_MODEL_CANDIDATES[:i]]
-
-def _build_coffee_prompt(home: str, away: str, league: str, kickoff: str, context: dict) -> str:
-    ctx_json = json.dumps(context or {}, ensure_ascii=False, default=str)
-    today_date = datetime.now(TZ).strftime("%d/%m/%Y")
-    return f"""Tu es un analyste football d'élite dans le style "Café Foot / Briefing du jour" (direct, chiffré, vivant, lucide et nuancé).
-Date actuelle : {today_date}. Utilise tes connaissances actuelles et la recherche web disponible pour vérifier la forme récente, le classement actuel et les absences du jour.
-
-Analyse ce match selon cette méthode exacte en 4 temps :
-1. **Enjeu & dynamique actuelle** : situation au classement/compétition (points, course au titre/top 8/maintien) et état de forme récent des deux équipes.
-2. **Séries Domicile / Extérieur & scénarios de buts** : bilan précis de {home} à domicile et de {away} à l'extérieur (victoires/défaites récentes, buts marqués/encaissés, tendance à ouvrir le score ou encaisser en premier, matchs ouverts Over 2.5/BTTS ou fermés).
-3. **Facteurs clés (Joueurs, Absences, Coach & Contexte)** : buteurs/joueurs décisifs en forme, blessés/suspendus confirmés, changement d'entraîneur ou contexte psychologique (derby, revanche, retrouvailles).
-4. **Nuance & Verdict tranché** : pèse le contre-argument (*"Mais attention..."* / *"Petit doute..."*) puis tranche clairement sur le pari le plus solide avec ton raisonnement actuel en 3 à 5 phrases percutantes et chiffrées.
-
-Match : {home} vs {away}
-Compétition : {league or "Compétition officielle"}
-Coup d'envoi : {kickoff or "Aujourd'hui"}
-Données statistiques & cotes bookmaker : {ctx_json}
-
-Réponds UNIQUEMENT avec un objet JSON valide (sans texte avant ni après) respectant ce schéma exact :
-{{
-  "markets": {{
-    "victoire_home": <nombre 0-100>,
-    "match_nul": <nombre 0-100>,
-    "victoire_away": <nombre 0-100>,
-    "double_chance_1X": <nombre 0-100>,
-    "double_chance_X2": <nombre 0-100>,
-    "double_chance_12": <nombre 0-100>,
-    "over_1.5": <nombre 0-100>,
-    "over_2.5": <nombre 0-100>,
-    "under_2.5": <nombre 0-100>,
-    "btts_yes": <nombre 0-100>,
-    "btts_no": <nombre 0-100>
-  }},
-  "analysis": "<Raisonnement actuel style Café Foot (3 à 5 phrases précises avec chiffres récents, dynamique dom/ext, joueur clé ou absence, nuance et conclusion claire)>"
-}}"""
-
-def _parse_gemini_json_payload(raw_text: str) -> Optional[dict]:
-    if not raw_text:
-        return None
-    cleaned = raw_text.strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    try:
-        data = json.loads(cleaned[start:end + 1])
-    except Exception:
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("markets"), dict):
-        return None
-    markets = {}
-    for k, v in data["markets"].items():
-        if v is None:
-            continue
-        try:
-            fv = float(v)
-            if 0.0 <= fv <= 100.0:
-                markets[k] = round(fv, 1)
-        except Exception:
-            continue
-    if not markets:
-        return None
-    analysis_txt = clean_analysis_text(str(data.get("analysis") or ""), 540)
-    return {"markets": markets, "analysis": analysis_txt}
-
-async def coffee_style_gemini_predict(client: httpx.AsyncClient, home: str, away: str, league: str, kickoff: str, context: dict) -> Optional[dict]:
-    if not GEMINI_API_KEY:
-        return None
-    prompt = _build_coffee_prompt(home, away, league, kickoff, context)
-    for model_name in GEMINI_MODEL_CANDIDATES:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-        # Tentative 1 : Avec Google Search Grounding pour récupérer l'actualité réelle du jour (classement, blessés, séries)
-        payloads = [
-            {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "tools": [{"google_search": {}}],
-                "generationConfig": {"temperature": 0.30},
-            },
-            {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.30,
-                    "responseMimeType": "application/json",
-                },
-            },
-        ]
-        for payload in payloads:
-            try:
-                resp = await client.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=40.0)
-                if resp.status_code != 200:
-                    continue
-                body = resp.json()
-                cands = body.get("candidates") or []
-                if not cands:
-                    continue
-                parts = ((cands[0].get("content") or {}).get("parts")) or []
-                txt = "".join(str(p.get("text") or "") for p in parts if isinstance(p, dict))
-                parsed = _parse_gemini_json_payload(txt)
-                if parsed:
-                    return parsed
-            except Exception:
-                continue
-    return None
-
 async def _enrich_single_pass(targets, pass_num):
+    if not predict_match_probas:
+        print("⚠️ gemini_predictor.py non disponible.")
+        return {}
     results = {}
     errors = 0
     async with httpx.AsyncClient(timeout=70.0) as client:
@@ -1492,9 +1383,7 @@ async def _enrich_single_pass(targets, pass_num):
                 if md.bzz_markets:
                     ctx["bzzoiro_probas"] = md.bzz_markets
 
-                pred = await coffee_style_gemini_predict(client, md.home, md.away, md.league, md.kickoff, context=ctx)
-                if not pred and predict_match_probas:
-                    pred = await predict_match_probas(client, md.home, md.away, md.league, md.kickoff, context=ctx)
+                pred = await predict_match_probas(client, md.home, md.away, md.league, md.kickoff, context=ctx)
                 if pred and "markets" in pred:
                     results[md.event_id] = {"markets": pred.get("markets", {}), "analysis": pred.get("analysis", "")}
                     errors = 0
