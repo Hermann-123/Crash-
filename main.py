@@ -92,13 +92,15 @@ WEIGHT_ALGO    = float(os.getenv("WEIGHT_ALGO",   "0.35"))
 WEIGHT_GEMINI  = float(os.getenv("WEIGHT_GEMINI", "0.35"))
 WEIGHT_BZZOIRO = float(os.getenv("WEIGHT_BZZOIRO","0.30"))
 
+# ✅ CALIBRAGE PRO GLOBAL — ZÉRO EV NÉGATIVE SUR TOUTES LES CATÉGORIES
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
-MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.90"))
+MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "1.00"))
+MIN_REAL_COUPON_EV = float(os.getenv("MIN_REAL_COUPON_EV", "1.05"))
 
-# ✅ CALIBRAGE PRONOSTIQUEUR PRO — AUTONOME SANS API ODDS (COTE 2.15 à 3.25)
-AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "64.0"))
+# ✅ CALIBRAGE MOTEUR DU 22 NOVEMBRE (PYRAMIDE SÉCURISÉE >= 71%, EV >= 1.00)
+AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "71.0"))
 AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "88.0"))
-AUTH_MIN_COMBINED_PROB = 0.30
+AUTH_MIN_COMBINED_PROB = 0.36
 
 DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "12"))
 DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.16"))
@@ -106,16 +108,16 @@ DOUBLE_SCAN_MIN_STABLE      = int(os.getenv("DOUBLE_SCAN_MIN_STABLE", "3"))
 DOUBLE_SCAN_PAUSE_SECONDS   = int(os.getenv("DOUBLE_SCAN_PAUSE_SECONDS", "3"))
 
 MTFIN_MIN_SCORE = 70
-MTFIN_MIN_PROB = 0.38
+MTFIN_MIN_PROB = 0.42
 MTFIN_SIMULATIONS = 2000
 MTFIN_FIRST_HALF_RATIO = 0.45
 
 DRAW_MIN_SCORE = 70
 DRAW_MAX_ECART = 0.20
-DRAW_MIN_PROB = 0.28
+DRAW_MIN_PROB = 0.30
 
-ODDS3_AUTH_MIN_COTE = 2.15
-ODDS3_AUTH_MAX_COTE = 3.25
+ODDS3_AUTH_MIN_COTE = 2.25
+ODDS3_AUTH_MAX_COTE = 3.40
 ODDS3_HYB_MIN_COTE = 3.20
 ODDS3_HYB_MAX_COTE = 5.50
 ODDS3_MIN_COTE_LEG = 1.15
@@ -449,12 +451,12 @@ def is_match_not_started(kickoff_str) -> bool:
     return dt > (datetime.now(TZ) + timedelta(minutes=MATCH_START_BUFFER_MINUTES))
 
 def calibrated_odd(prob: float, real_odd: Optional[float]) -> float:
-    """Retourne la vraie cote si disponible, sinon cote estimée avec marge bookmaker (~7%)."""
+    """Retourne la vraie cote si disponible, sinon la cote juste 1/prob (EV = 1.00, moteur du 22/11)."""
     if real_odd and real_odd > 1.01:
         return round(float(real_odd), 2)
     if prob <= 0.01:
         return 0.0
-    return max(1.06, round((1.0 / prob) * 0.93, 2))
+    return max(1.10, round(1.0 / prob, 2))
 
 def prob_bar(p: float) -> str:
     if p >= 0.75: return "🟢🟢🟢"
@@ -873,20 +875,31 @@ def compute_probability(md, market_key):
     return final, gem, dix, bzz, emoji
 
 def passes_value_filter(proba, odd, is_real, consensus_emoji=""):
-    if proba <= 0 or odd <= 0: return False
-    if is_real:
-        ok = (proba * odd) >= (1.0 + MIN_EDGE)
-        if not ok: STATE["rejections"]["value"] += 1
-        return ok
+    """Verrou global : aucune EV négative sur aucune catégorie."""
+    if proba <= 0 or odd <= 0:
+        return False
     if consensus_emoji == "⚠️":
         STATE["rejections"]["value"] += 1
         return False
-    return True
+    if is_real:
+        ok = (proba * odd) >= (1.0 + MIN_EDGE)
+        if not ok:
+            STATE["rejections"]["value"] += 1
+        return ok
+    # En mode estimé (cote = round(1/prob, 2)), tolérance arrondi 0.995 pour garantir EV >= 1.00
+    ok = (proba * odd) >= 0.995
+    if not ok:
+        STATE["rejections"]["value"] += 1
+    return ok
 
-def coupon_passes_ev(odds, prob):
-    if odds <= 0 or prob <= 0: return False
-    ok = (odds * prob) >= MIN_COUPON_EV
-    if not ok: STATE["rejections"]["ev_coupon"] += 1
+def coupon_passes_ev(odds, prob, has_real_odds: bool = False):
+    """Verrou global coupon : EV >= 1.05 si cotes réelles, EV >= 1.00 sinon."""
+    if odds <= 0 or prob <= 0:
+        return False
+    min_ev = MIN_REAL_COUPON_EV if has_real_odds else MIN_COUPON_EV
+    ok = (odds * prob) >= min_ev
+    if not ok:
+        STATE["rejections"]["ev_coupon"] += 1
     return ok
 
 def passes_auth_proba_filter(proba):
@@ -1070,7 +1083,7 @@ async def enrich_with_double_pass(pool):
     return targets
 
 # =====================================================================
-# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (AUTONOME SANS API ODDS)
+# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (CALIBRAGE 22 NOVEMBRE — ZÉRO EV NÉGATIVE)
 # =====================================================================
 def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
     sorted_combo = sorted(combo, key=lambda c: parse_dt_safe(c.get("kickoff")) or datetime.max.replace(tzinfo=TZ))
@@ -1095,7 +1108,7 @@ def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
     ]
     return Coupon("Odds +3 AUTH", f"{subtitle} • {len(legs)} sélections", "🛡️", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
 
-def _valid_pro_combo(combo, require_anchor: bool = False) -> bool:
+def _valid_pro_combo(combo, require_anchor: bool = True) -> bool:
     if len({c["norm_key"] for c in combo}) != len(combo):
         return False
     if sum(1 for c in combo if c["family"] == "goals") > 1:
@@ -1104,7 +1117,7 @@ def _valid_pro_combo(combo, require_anchor: bool = False) -> bool:
         return False
     if sum(1 for c in combo if c.get("mk") == "victoire_away") > 1:
         return False
-    if require_anchor and not any(c["proba"] >= 70.0 for c in combo):
+    if require_anchor and not any(c["proba"] >= 72.0 for c in combo):
         return False
     return True
 
@@ -1127,7 +1140,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             continue
         if is_reserve_team(md.home) or is_reserve_team(md.away):
             continue
-        # Autonome : accepte tout match ayant Dixon-Coles, Gemini ou Bzzoiro (sans exiger real_odds)
         if not md.dixon_pred and not md.gemini_markets and not md.bzz_markets and not md.real_odds:
             continue
 
@@ -1146,7 +1158,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             if mk == "btts_yes" and one_sided_match:
                 continue
 
-            # Empêche toute Double Chance inversée contre le favori
             if mk == "double_chance_1X":
                 if g_a > 0 and g_h > 0 and g_a > (g_h + 0.06):
                     continue
@@ -1164,7 +1175,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             if emoji == "⚠️" or not passes_auth_proba_filter(proba_pct):
                 continue
 
-            if mk == "victoire_away" and p_away_est < 0.68:
+            if mk == "victoire_away" and p_away_est < 0.71:
                 continue
 
             real_odd = md.real_odds.get(odd_key)
@@ -1181,7 +1192,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 continue
 
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
-            # Favorise les marchés structurés (1, 2, 1X, X2, Over 2.5) pour atteindre la cote cible ~2.50-3.00 en 2-3 matchs
             market_priority = 2 if family in ("result", "dc") else (1 if mk in ("over_2.5", "btts_yes") else 0)
             rank_score = (market_priority, consensus_bonus, round(proba_pct, 1))
 
@@ -1210,51 +1220,34 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
     vip_candidates.sort(key=lambda x: (1 if x["family"] in ("result", "dc") else 0, x["proba"]), reverse=True)
     top_pool = vip_candidates[:16]
 
-    for r in (2, 3, 4):
+    # Priorité exacte du moteur 22/11 : Pyramide Sécurisée (3 sélections), puis Duo (2), puis Quatuor (4)
+    for r in (3, 2, 4):
         if len(top_pool) < r:
             continue
         best_combo = None
         best_combo_prob = 0.0
         for combo in itertools.combinations(top_pool, r):
-            if not _valid_pro_combo(combo, require_anchor=(r >= 3)):
+            if not _valid_pro_combo(combo, require_anchor=True):
                 continue
             tot_o = math.prod(c["odds"] for c in combo)
             tot_p = math.prod(c["proba"] / 100.0 for c in combo)
+            has_real = any(c["real_odd"] is not None for c in combo)
             if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE and tot_p >= AUTH_MIN_COMBINED_PROB:
-                if not coupon_passes_ev(tot_o, tot_p):
+                if not coupon_passes_ev(tot_o, tot_p, has_real_odds=has_real):
                     continue
                 if tot_p > best_combo_prob:
                     best_combo = combo
                     best_combo_prob = tot_p
         if best_combo:
             locked_keys = {c["norm_key"] for c in best_combo}
-            label = "Duo Haute Confiance" if r == 2 else ("Pyramide Sécurisée" if r == 3 else "Quatuor Haute Confiance")
+            label = "Pyramide Sécurisée" if r == 3 else ("Duo Haute Confiance" if r == 2 else "Quatuor Haute Confiance")
             return _build_auth_coupon(best_combo, f"Sélection Pro VIP • {label}", 96), locked_keys
 
-    # Secours contrôlé : plage élargie (1.90 à 3.60) pour garantir un ticket fiable même les jours de faible affiche
-    for r in (2, 3, 4):
-        if len(top_pool) < r:
-            continue
-        best_fb = None
-        best_fb_prob = 0.0
-        for combo in itertools.combinations(top_pool, r):
-            if not _valid_pro_combo(combo, require_anchor=False):
-                continue
-            tot_o = math.prod(c["odds"] for c in combo)
-            tot_p = math.prod(c["proba"] / 100.0 for c in combo)
-            if 1.90 <= tot_o <= 3.60 and tot_p >= 0.28:
-                if tot_p > best_fb_prob:
-                    best_fb = combo
-                    best_fb_prob = tot_p
-        if best_fb:
-            locked_keys = {c["norm_key"] for c in best_fb}
-            return _build_auth_coupon(best_fb, "Sélection Pro VIP • Sécurité Renforcée", 92), locked_keys
-
-    print("  ℹ️ AUTH VIP : Aucune combinaison ne réunit tous les critères Pro aujourd'hui.")
+    print("  ℹ️ AUTH VIP : Aucune combinaison >= 71% avec EV >= 1.00 aujourd'hui (protection bankroll).")
     return None, set()
 
 # =====================================================================
-# MOTEURS SECONDAIRES (EXCLUANT LES MATCHS VIP AUTH)
+# MOTEURS SECONDAIRES (ALIGNÉS SUR LA MÊME RIGUEUR PRO — ZÉRO EV NÉGATIVE)
 # =====================================================================
 def _poisson_sample(lam):
     if lam <= 0: return 0
@@ -1278,7 +1271,11 @@ def build_mtft_coupon_and_bonus(pool, locked_keys: set):
     for md in pool:
         nkey = f"{normalize_name(md.home)}__{normalize_name(md.away)}"
         if nkey in locked_keys: continue
-        if not md.home or not md.away or not md.dixon_pred or is_reserve_team(md.home) or is_reserve_team(md.away): continue
+        if not md.home or not md.away or not md.dixon_pred or not is_match_not_started(md.kickoff): continue
+        if is_reserve_team(md.home) or is_reserve_team(md.away): continue
+        is_trap, _ = has_pro_red_flags(md.analysis)
+        if is_trap: continue
+
         htft = simulate_htft(md.dixon_pred.get("lambda_home", 1.3), md.dixon_pred.get("lambda_away", 1.1))
         best_p, best_prob = None, 0.0
         for c in ("V1/V1", "V2/V2"):
@@ -1287,21 +1284,26 @@ def build_mtft_coupon_and_bonus(pool, locked_keys: set):
 
         fav_mk = "victoire_home" if best_p == "V1/V1" else "victoire_away"
         fav_consensus, _, _, _, emoji = compute_probability(md, fav_mk)
-        if emoji == "⚠️" or (fav_consensus > 0 and fav_consensus < 0.50):
+        if emoji == "⚠️" or fav_consensus < 0.62:
+            continue
+
+        odd = calibrated_odd(best_prob, None)
+        if not passes_value_filter(best_prob, odd, False, emoji):
             continue
 
         pts = 15 + (10 if md.has_h2h else 0) + 10 + (30 if best_prob >= 0.65 else 20) + 15 + 10
         if pts < MTFIN_MIN_SCORE: continue
-        picks.append({"md": md, "pick": best_p, "prob": best_prob, "score": pts, "odd": calibrated_odd(best_prob, None), "htft": htft})
+        picks.append({"md": md, "pick": best_p, "prob": best_prob, "score": pts, "odd": odd, "htft": htft})
 
     coupon = None
     picks.sort(key=lambda x: (x["prob"], x["score"]), reverse=True)
     top3 = picks[:3]
     if top3:
         legs = [Selection(p["md"].event_id, p["md"].league, p["md"].home, p["md"].away, p["md"].kickoff, "MT-Fin", f"MT/Fin : {p['pick']}", p["odd"], p["prob"], None, -1.0, p["score"], htft_pick=p["pick"]) for p in top3]
-        co, cp = 1.0, 1.0
-        for s in legs: co *= s.odds; cp *= s.model_prob
-        coupon = Coupon("MT-Fin", f"{len(legs)} matchs", "⏱", legs, round(co, 2), round(cp, 4), is_list=True)
+        co = round(math.prod(s.odds for s in legs), 2)
+        cp = round(math.prod(s.model_prob for s in legs), 4)
+        if coupon_passes_ev(co, cp, has_real_odds=False):
+            coupon = Coupon("MT-Fin", f"Sélection Pro • {len(legs)} matchs", "⏱", legs, co, cp, is_list=True)
 
     for p in top3:
         md = p["md"]
@@ -1322,11 +1324,15 @@ def build_draw_coupon_and_bonus(pool, locked_keys: set):
     for md in pool:
         nkey = f"{normalize_name(md.home)}__{normalize_name(md.away)}"
         if nkey in locked_keys: continue
-        if not md.home or not md.away or is_reserve_team(md.home) or is_reserve_team(md.away): continue
+        if not md.home or not md.away or not is_match_not_started(md.kickoff): continue
+        if is_reserve_team(md.home) or is_reserve_team(md.away): continue
+        is_trap, _ = has_pro_red_flags(md.analysis)
+        if is_trap: continue
+
         prob, g, d, b, emoji = compute_probability(md, "match_nul")
-        if prob < DRAW_MIN_PROB or (g > 0 and g < 0.22) or emoji == "⚠️": continue
+        if prob < DRAW_MIN_PROB or (g > 0 and g < 0.25) or emoji == "⚠️": continue
         draw_odd = md.real_odds.get("draw"); is_real = draw_odd is not None
-        if not draw_odd: draw_odd = calibrated_odd(prob, None) if prob > 0 else 3.10
+        if not draw_odd: draw_odd = calibrated_odd(prob, None)
         if draw_odd < 2.95: continue
         if (md.real_odds.get("home") and md.real_odds.get("home") < 1.80) or (md.real_odds.get("away") and md.real_odds.get("away") < 1.80): continue
         if not passes_value_filter(prob, draw_odd, is_real, emoji): continue
@@ -1337,9 +1343,11 @@ def build_draw_coupon_and_bonus(pool, locked_keys: set):
     candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
     top3 = candidates[:3]
     if top3:
-        co, cp = 1.0, 1.0
-        for s in top3: co *= s.odds; cp *= s.model_prob
-        coupon = Coupon("Match Nul", f"{len(top3)} nuls", "🤝", top3, round(co, 2), round(cp, 4), is_list=True)
+        co = round(math.prod(s.odds for s in top3), 2)
+        cp = round(math.prod(s.model_prob for s in top3), 4)
+        has_real = any(s.real_odd is not None for s in top3)
+        if coupon_passes_ev(co, cp, has_real_odds=has_real):
+            coupon = Coupon("Match Nul", f"Sélection Pro • {len(top3)} nuls", "🤝", top3, co, cp, is_list=True)
 
     candidates.sort(key=lambda x: x.model_prob)
     for c in candidates[:3]:
@@ -1357,10 +1365,13 @@ def build_third_pillar(pool, locked_keys: set):
         nkey = f"{normalize_name(md.home)}__{normalize_name(md.away)}"
         if nkey in locked_keys: continue
         if not md.home or not md.away or not is_match_not_started(md.kickoff) or is_reserve_team(md.home) or is_reserve_team(md.away): continue
+        is_trap, _ = has_pro_red_flags(md.analysis)
+        if is_trap: continue
+
         best = None
         for mk, lbl in {"btts_yes": "BTTS Oui", "btts_no": "BTTS Non", "over_1.5": "Over 1.5", "under_2.5": "Under 2.5", "over_2.5": "Over 2.5"}.items():
             prob, g, d, b, emoji = compute_probability(md, mk)
-            if prob < 0.58 or emoji == "⚠️": continue
+            if prob < 0.62 or emoji == "⚠️": continue
             odd = md.real_odds.get(mk); is_real = odd is not None
             if not odd: odd = calibrated_odd(prob, None); is_real = False
             if odd >= ODDS3_MIN_COTE_LEG and passes_value_filter(prob, odd, is_real, emoji):
@@ -1388,9 +1399,10 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys:
                 tot_o = math.prod(x['odds'] for x in combo)
                 if ODDS3_HYB_MIN_COTE <= tot_o <= ODDS3_HYB_MAX_COTE:
                     tot_p = math.prod(c['proba'] / 100.0 for c in combo)
-                    if not coupon_passes_ev(tot_o, tot_p): continue
+                    has_real = any(c.get('real_odd') is not None for c in combo)
+                    if not coupon_passes_ev(tot_o, tot_p, has_real_odds=has_real): continue
                     legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 90, analysis=clean_analysis_text(c['ai'], 260)) for c in combo]
-                    return Coupon("Odds +3 HYBRIDE", "Mélange 3 sources", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
+                    return Coupon("Odds +3 HYBRIDE", f"Mélange 3 sources • {len(legs)} sélections", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
 
     for r in (3, 4):
         if len(combined) < r: break
@@ -1401,9 +1413,10 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys:
             tot_o = math.prod(x['odds'] for x in combo)
             if ODDS3_HYB_MIN_COTE <= tot_o <= ODDS3_HYB_MAX_COTE:
                 tot_p = math.prod(c['proba'] / 100.0 for c in combo)
-                if not coupon_passes_ev(tot_o, tot_p): continue
+                has_real = any(c.get('real_odd') is not None for c in combo)
+                if not coupon_passes_ev(tot_o, tot_p, has_real_odds=has_real): continue
                 legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 85, analysis=clean_analysis_text(c['ai'], 260)) for c in combo]
-                return Coupon("Odds +3 HYBRIDE", "Top Value Multi-IA", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
+                return Coupon("Odds +3 HYBRIDE", f"Top Value Multi-IA • {len(legs)} sélections", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
     return None
 
 # =====================================================================
@@ -1476,7 +1489,7 @@ async def scan(force: bool = False) -> bool:
         print(f"──────── RÉSUMÉ ────────")
         print(f"Rejets filtres : {STATE['rejections']}")
         print(f"Coupons validés : {len(STATE['coupons'])}")
-        for c in STATE["coupons"]: print(f"  • {c.name} : {len(c.legs)} matchs, cote {c.combined_odds}, proba {c.combined_prob*100:.1f}%")
+        for c in STATE["coupons"]: print(f"  • {c.name} : {len(c.legs)} matchs, cote {c.combined_odds}, proba {c.combined_prob*100:.1f}%, EV {c.combined_odds*c.combined_prob:.2f}")
         print("────────────────────────")
         return True
 
@@ -1510,7 +1523,7 @@ async def broadcast_after_scan():
 def format_header():
     mode = STATE.get("odds_api_mode", "unknown")
     mode_icon = "🟢" if mode == "live" else "🟡" if mode == "fallback" else "⚪"
-    mode_txt = "LIVE" if mode == "live" else "IA CALIBRÉ" if mode == "fallback" else "?"
+    mode_txt = "LIVE" if mode == "live" else "FALLBACK" if mode == "fallback" else "?"
     return f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n     <b>⚡ {BRAND_NAME.upper()} ⚡</b>\n<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n<i>{BRAND_TAGLINE}</i>\n<i>📅 {today_pretty()}</i>\n<i>{mode_icon} Mode : {mode_txt}</i>"
 
 def format_selection_block(s, idx, show_analysis):
@@ -1535,17 +1548,19 @@ def format_coupon(c):
     if len(active_legs) < len(c.legs):
         disp_odds = round(math.prod(s.odds for s in active_legs), 2)
         disp_prob = round(math.prod(s.model_prob for s in active_legs), 4)
+        disp_sub = re.sub(r"\d+\s+(sélections|matchs|nuls)", f"{len(active_legs)} \\1", c.subtitle)
     else:
         disp_odds = c.combined_odds
         disp_prob = c.combined_prob
+        disp_sub = c.subtitle
 
     if c.is_list:
-        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", ""]
+        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{disp_sub}</i>", ""]
         for i, s in enumerate(active_legs, 1): lines.append(format_selection_block(s, i, False) + "\n")
     else:
         ev = disp_odds * disp_prob if (disp_odds > 0 and disp_prob > 0) else 0
         ev_badge = f"<b>┃ 💎 EV : {ev:.2f}</b>" if ev > 0 else ""
-        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{c.subtitle}</i>", "", f"<b>┏━━━━━━━━━━━━━━━┓</b>", f"<b>┃ 🎫 Cote : {disp_odds}</b>", f"<b>┃ 📈 Réussite est. : {disp_prob*100:.1f}%</b>", ev_badge, f"<b>┗━━━━━━━━━━━━━━━┛</b>", ""]
+        lines = [format_header(), "", f"<b>{c.emoji} {c.name.upper()}</b>", f"<i>{disp_sub}</i>", "", f"<b>┏━━━━━━━━━━━━━━━┓</b>", f"<b>┃ 🎫 Cote : {disp_odds}</b>", f"<b>┃ 📈 Réussite est. : {disp_prob*100:.1f}%</b>", ev_badge, f"<b>┗━━━━━━━━━━━━━━━┛</b>", ""]
         for i, s in enumerate(active_legs, 1): lines.append(format_selection_block(s, i, True) + "\n")
     lines.append(f"<i>{PUBLIC_FOOTER}</i>")
     return "\n".join(lines)
@@ -1567,7 +1582,6 @@ def _parse_date_range_args(parts: list[str]) -> tuple[Optional[datetime], Option
 
     args = parts[1:]
     if args:
-        # Format 1 : /semaine 24/11-25/11 [15]
         m_range = re.match(r"^(\d{1,2})/(\d{1,2})\s*[-–]\s*(\d{1,2})/(\d{1,2})$", args[0])
         if m_range:
             start_dt = _make_dt(m_range.group(1), m_range.group(2), end_of_day=False)
@@ -1578,7 +1592,6 @@ def _parse_date_range_args(parts: list[str]) -> tuple[Optional[datetime], Option
                 limit = max(3, min(30, int(args[1])))
             return start_dt, end_dt, days, limit, period_label
 
-        # Format 2 : /semaine 24/11 25/11 [15]
         if len(args) >= 2:
             m1 = re.match(r"^(\d{1,2})/(\d{1,2})$", args[0])
             m2 = re.match(r"^(\d{1,2})/(\d{1,2})$", args[1])
@@ -1591,7 +1604,6 @@ def _parse_date_range_args(parts: list[str]) -> tuple[Optional[datetime], Option
                     limit = max(3, min(30, int(args[2])))
                 return start_dt, end_dt, days, limit, period_label
 
-        # Format 3 : /semaine 24/11 [15] (date unique ciblée)
         m_single = re.match(r"^(\d{1,2})/(\d{1,2})$", args[0])
         if m_single:
             start_dt = _make_dt(m_single.group(1), m_single.group(2), end_of_day=False)
@@ -1602,7 +1614,6 @@ def _parse_date_range_args(parts: list[str]) -> tuple[Optional[datetime], Option
                 limit = max(3, min(30, int(args[1])))
             return start_dt, end_dt, days, limit, period_label
 
-        # Format 4 : /semaine 15 (si un seul nombre >= 8 -> c'est le nombre de matchs, sinon nombre de jours)
         if args[0].isdigit():
             val0 = int(args[0])
             if len(args) == 1 and val0 >= 8:
@@ -1670,19 +1681,31 @@ async def semaine_cmd(m: Message):
         end_dt=end_dt,
     )
 
-    if not picks:
-        await safe_answer(m, f"📭 Aucun match fiable trouvé pour la période <b>{period_label}</b>.")
+    # Filtre strict Pro appliqué aussi sur Top Semaine (aucune EV négative)
+    filtered_picks = []
+    for p in (picks or []):
+        prob = float(p.get("proba", 0)) / 100.0
+        is_real = bool(p.get("is_real"))
+        odd = float(p.get("odd", 0)) if is_real else calibrated_odd(prob, None)
+        if passes_value_filter(prob, odd, is_real):
+            p["odd"] = odd
+            filtered_picks.append(p)
+
+    if not filtered_picks:
+        await safe_answer(m, f"📭 Aucun match fiable à EV positive trouvé pour la période <b>{period_label}</b>.")
         return
 
-    total_odd = round(math.prod(p["odd"] for p in picks), 2)
+    total_odd = round(math.prod(p["odd"] for p in filtered_picks), 2)
+    total_prob = round(math.prod(p["proba"] / 100.0 for p in filtered_picks), 4)
+    total_ev = total_odd * total_prob
     lines = [
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>",
-        f"<b>📅 TOP {len(picks)} MATCHS • {period_label.upper()}</b>",
-        f"<b>🎫 COTE COMBINÉE TOTALE : {total_odd}</b>",
+        f"<b>📅 TOP {len(filtered_picks)} MATCHS • {period_label.upper()}</b>",
+        f"<b>🎫 COTE COMBINÉE : {total_odd} • 💎 EV : {total_ev:.2f}</b>",
         f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>",
         f"<i>Stratégie Pro (20 ans) : Fidélité au scénario & haute confiance</i>\n",
     ]
-    for i, p in enumerate(picks, 1):
+    for i, p in enumerate(filtered_picks, 1):
         odd_tag = f"<b>{p['odd']}</b>" if p["is_real"] else f"<b>{p['odd']}</b> <i>(est.)</i>"
         lines.append(
             f"<b>#{i} {p['home']} vs {p['away']}</b>\n"
