@@ -100,7 +100,7 @@ MIN_REAL_COUPON_EV = float(os.getenv("MIN_REAL_COUPON_EV", "1.05"))
 # ✅ CALIBRAGE MOTEUR DU 22 NOVEMBRE (PYRAMIDE SÉCURISÉE >= 71%, EV >= 1.00)
 AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "71.0"))
 AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "88.0"))
-AUTH_MIN_COMBINED_PROB = 0.36
+AUTH_MIN_COMBINED_PROB = 0.31
 
 DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "12"))
 DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.16"))
@@ -129,6 +129,9 @@ PRO_TRAP_PHRASES = [
     "gestion d'effectif",
     "rotation",
     "effectif remanié",
+    "équipe bis",
+    "équipe b",
+    "remplaçants",
     "nombreux absents",
     "blessures majeures",
     "déplacement piège",
@@ -137,7 +140,42 @@ PRO_TRAP_PHRASES = [
     "très imprévisible",
     "aucun enjeu",
     "sans enjeu",
+    "peu d'enjeu",
+    "faible enjeu",
+    "déjà qualifié",
+    "déjà éliminé",
+    "déjà champion",
+    "relâchement",
+    "manque de motivation",
+    "motivation limitée",
+    "match amical",
+    "coupe secondaire",
     "en pleine crise",
+    "démobilisé",
+    "se défile",
+    "lève le pied",
+]
+
+LOW_STAKES_LEAGUE_KEYWORDS = [
+    "friendly", "amical", "club friendlies", "efl trophy", "checkatrade",
+    "premier league cup", "premier league 2", "u21", "u23", "u19", "youth",
+    "reserve", "oberliga", "regionalliga", "taca da liga", "league cup",
+]
+
+HIGH_STAKES_LEAGUE_KEYWORDS = [
+    "champions league", "europa league", "conference league",
+    "premier league", "la liga", "laliga", "serie a", "bundesliga", "ligue 1",
+    "championship", "eredivisie", "primeira liga", "pro league", "super lig",
+    "world cup", "coupe du monde", "euro", "can", "africa cup", "copa america",
+    "libertadores", "sudamericana", "playoff", "barrage",
+]
+
+HIGH_STAKES_ANALYSIS_PHRASES = [
+    "qualification", "qualifier", "course au titre", "titre", "podium",
+    "maintien", "relégation", "zone rouge", "top 4", "top 8", "place européenne",
+    "europe", "montée", "promotion", "play-off", "barrage", "derby",
+    "revanche", "impératif", "victoire obligatoire", "doit gagner", "enjeu majeur",
+    "crucial", "décisif", "capital", "sous pression",
 ]
 
 ESPN_LEAGUE_SLUGS = [
@@ -407,7 +445,26 @@ def teams_match(name1: str, name2: str) -> bool:
 
 def is_reserve_team(name: str) -> bool: return any(kw in name.lower() for kw in RESERVE_KEYWORDS)
 
-def has_pro_red_flags(analysis_text: str) -> Tuple[bool, str]:
+def is_low_stakes_competition(league_name: str) -> bool:
+    if not league_name:
+        return False
+    low = league_name.lower()
+    return any(kw in low for kw in LOW_STAKES_LEAGUE_KEYWORDS)
+
+def compute_stakes_score(league_name: str, analysis_text: str = "") -> int:
+    """Évalue l'enjeu sportif réel du match (bonus positif si fort enjeu, pénalité si faible)."""
+    score = 0
+    low_lg = (league_name or "").lower()
+    low_an = (analysis_text or "").lower()
+    if any(kw in low_lg for kw in HIGH_STAKES_LEAGUE_KEYWORDS):
+        score += 20
+    if any(ph in low_an for ph in HIGH_STAKES_ANALYSIS_PHRASES):
+        score += 15
+    return score
+
+def has_pro_red_flags(analysis_text: str, league_name: str = "") -> Tuple[bool, str]:
+    if is_low_stakes_competition(league_name):
+        return True, f"compétition à faible enjeu ({league_name})"
     if not analysis_text:
         return False, ""
     low = analysis_text.lower()
@@ -813,12 +870,15 @@ def format_bilan_report() -> str:
     return "\n".join(lines)
 
 def prescore_match(md: MatchData) -> int:
+    if is_low_stakes_competition(md.league):
+        return -999
     conf_score = int(md.bzz_confidence or 0)
     real_bonus = 40 if (md.real_odds.get("home") or md.real_odds.get("away")) else (20 if md.real_odds else 0)
     bzz_bonus = 15 if md.bzz_markets else 0
     dixon_bonus = 25 if md.dixon_pred else 0
     h2h_bonus = 10 if md.has_h2h else 0
-    return conf_score + real_bonus + bzz_bonus + dixon_bonus + h2h_bonus
+    stakes_bonus = compute_stakes_score(md.league, md.analysis)
+    return conf_score + real_bonus + bzz_bonus + dixon_bonus + h2h_bonus + stakes_bonus
 
 def _get_match_id(item: dict) -> str:
     m = item["match"]
@@ -1022,6 +1082,11 @@ async def _enrich_single_pass(targets, pass_num):
                         if bzz_ctx.get("available"): md.has_h2h = True
                 if md.dixon_pred:
                     ctx["dixon_coles"] = md.dixon_pred
+                ctx["regle_enjeu"] = (
+                    "OBLIGATOIRE : Évalue l'enjeu sportif réel (qualification, titre, maintien, barrage). "
+                    "Si une équipe est déjà qualifiée/éliminée, fait tourner son effectif ou joue sans enjeu, "
+                    "écris explicitement 'sans enjeu' ou 'rotation' dans l'analyse."
+                )
                 if predict_match_probas:
                     pred = await predict_match_probas(client, md.home, md.away, md.league, md.kickoff, context=ctx)
                     if pred and "markets" in pred:
@@ -1117,7 +1182,7 @@ def _valid_pro_combo(combo, require_anchor: bool = True) -> bool:
         return False
     if sum(1 for c in combo if c.get("mk") == "victoire_away") > 1:
         return False
-    if require_anchor and not any(c["proba"] >= 72.0 for c in combo):
+    if require_anchor and not any(c["proba"] >= 71.0 or (c["family"] == "result" and c["proba"] >= 66.0) for c in combo):
         return False
     return True
 
@@ -1143,15 +1208,31 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
         if not md.dixon_pred and not md.gemini_markets and not md.bzz_markets and not md.real_odds:
             continue
 
-        is_trap, trap_reason = has_pro_red_flags(md.analysis)
+        is_trap, trap_reason = has_pro_red_flags(md.analysis, md.league)
         if is_trap:
             STATE["rejections"]["pro_trap"] += 1
             print(f"  🚩 Pro-Filter rejet ({md.home} vs {md.away}) : signal '{trap_reason}'")
             continue
 
-        p_home_est, g_h, _, _, _ = compute_probability(md, "victoire_home")
-        p_away_est, g_a, _, _, _ = compute_probability(md, "victoire_away")
+        # Calcul des cotes Double Chance réelles à partir des cotes 1X2 réelles si disponibles
+        # (avec facteur de marge bookmaker 0.96 pour coller aux cotes réelles type 1xBet/Betclic)
+        if md.real_odds.get("home") and md.real_odds.get("draw") and not md.real_odds.get("dc_1x"):
+            inv_1x = (1.0 / float(md.real_odds["home"])) + (1.0 / float(md.real_odds["draw"]))
+            if inv_1x > 0:
+                md.real_odds["dc_1x"] = round(max(1.03, (1.0 / inv_1x) * 0.96), 2)
+        if md.real_odds.get("away") and md.real_odds.get("draw") and not md.real_odds.get("dc_x2"):
+            inv_x2 = (1.0 / float(md.real_odds["away"])) + (1.0 / float(md.real_odds["draw"]))
+            if inv_x2 > 0:
+                md.real_odds["dc_x2"] = round(max(1.03, (1.0 / inv_x2) * 0.96), 2)
+
+        p_home_est, g_h, _, _, em_h = compute_probability(md, "victoire_home")
+        p_away_est, g_a, _, _, em_a = compute_probability(md, "victoire_away")
         one_sided_match = (p_home_est >= 0.72) or (p_away_est >= 0.72)
+
+        # Règle Pro "Sans hésitation" : quand l'issue 1 ou 2 est claire, on joue la victoire sèche (1 ou 2)
+        # et on interdit la Double Chance frileuse (1.05 - 1.16) qui plombe la cote du coupon !
+        clear_home_win = (p_home_est >= 0.64 and (p_home_est - p_away_est) >= 0.30 and em_h != "⚠️")
+        clear_away_win = (p_away_est >= 0.65 and (p_away_est - p_home_est) >= 0.32 and em_a != "⚠️")
 
         best_for_match = None
         for mk, odd_key, family, label_fn in markets_map:
@@ -1159,11 +1240,15 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 continue
 
             if mk == "double_chance_1X":
+                if clear_home_win:
+                    continue  # Pas d'hésitation : Victoire (1) sèche privilégiée !
                 if g_a > 0 and g_h > 0 and g_a > (g_h + 0.06):
                     continue
                 if p_away_est > (p_home_est + 0.08):
                     continue
             elif mk == "double_chance_X2":
+                if clear_away_win:
+                    continue  # Pas d'hésitation : Victoire (2) sèche privilégiée !
                 if g_h > 0 and g_a > 0 and g_h > (g_a + 0.06):
                     continue
                 if p_home_est > (p_away_est + 0.08):
@@ -1172,10 +1257,20 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             prob, g, d, b, emoji = compute_probability(md, mk)
             proba_pct = prob * 100.0
 
-            if emoji == "⚠️" or not passes_auth_proba_filter(proba_pct):
+            if emoji == "⚠️":
                 continue
 
-            if mk == "victoire_away" and p_away_est < 0.71:
+            # Pour une victoire sèche (1 ou 2) où l'issue est claire, on autorise dès 64% (cote ~1.40 - 1.75)
+            # Pour les autres marchés (DC, Over/Under, BTTS), on exige >= 71%
+            if mk in ("victoire_home", "victoire_away") and (clear_home_win or clear_away_win):
+                if proba_pct < 64.0 or proba_pct > AUTH_PROBA_MAX:
+                    STATE["rejections"]["auth_proba"] += 1
+                    continue
+            else:
+                if not passes_auth_proba_filter(proba_pct):
+                    continue
+
+            if mk == "victoire_away" and p_away_est < 0.65:
                 continue
 
             real_odd = md.real_odds.get(odd_key)
@@ -1192,7 +1287,8 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 continue
 
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
-            market_priority = 2 if family in ("result", "dc") else (1 if mk in ("over_2.5", "btts_yes") else 0)
+            # Priorité absolue à la victoire sèche (3) devant la Double Chance (2) et les buts (1)
+            market_priority = 3 if family == "result" else (2 if family == "dc" else (1 if mk in ("over_2.5", "btts_yes") else 0))
             rank_score = (market_priority, consensus_bonus, round(proba_pct, 1))
 
             if not best_for_match or rank_score > best_for_match["_rank"]:
@@ -1217,7 +1313,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             best_for_match.pop("_rank", None)
             vip_candidates.append(best_for_match)
 
-    vip_candidates.sort(key=lambda x: (1 if x["family"] in ("result", "dc") else 0, x["proba"]), reverse=True)
+    vip_candidates.sort(key=lambda x: (2 if x["family"] == "result" else (1 if x["family"] == "dc" else 0), x["proba"]), reverse=True)
     top_pool = vip_candidates[:16]
 
     # Priorité exacte du moteur 22/11 : Pyramide Sécurisée (3 sélections), puis Duo (2), puis Quatuor (4)
@@ -1273,7 +1369,7 @@ def build_mtft_coupon_and_bonus(pool, locked_keys: set):
         if nkey in locked_keys: continue
         if not md.home or not md.away or not md.dixon_pred or not is_match_not_started(md.kickoff): continue
         if is_reserve_team(md.home) or is_reserve_team(md.away): continue
-        is_trap, _ = has_pro_red_flags(md.analysis)
+        is_trap, _ = has_pro_red_flags(md.analysis, md.league)
         if is_trap: continue
 
         htft = simulate_htft(md.dixon_pred.get("lambda_home", 1.3), md.dixon_pred.get("lambda_away", 1.1))
@@ -1326,7 +1422,7 @@ def build_draw_coupon_and_bonus(pool, locked_keys: set):
         if nkey in locked_keys: continue
         if not md.home or not md.away or not is_match_not_started(md.kickoff): continue
         if is_reserve_team(md.home) or is_reserve_team(md.away): continue
-        is_trap, _ = has_pro_red_flags(md.analysis)
+        is_trap, _ = has_pro_red_flags(md.analysis, md.league)
         if is_trap: continue
 
         prob, g, d, b, emoji = compute_probability(md, "match_nul")
@@ -1365,7 +1461,7 @@ def build_third_pillar(pool, locked_keys: set):
         nkey = f"{normalize_name(md.home)}__{normalize_name(md.away)}"
         if nkey in locked_keys: continue
         if not md.home or not md.away or not is_match_not_started(md.kickoff) or is_reserve_team(md.home) or is_reserve_team(md.away): continue
-        is_trap, _ = has_pro_red_flags(md.analysis)
+        is_trap, _ = has_pro_red_flags(md.analysis, md.league)
         if is_trap: continue
 
         best = None
@@ -1456,7 +1552,7 @@ async def scan(force: bool = False) -> bool:
                 pool.append(md)
             matched = inject_all_real_odds(pool, ws_matches)
             print(f"⏰ Total matchs avec vraies cotes : {matched}/{len(pool)}")
-            pool = [md for md in pool if is_match_not_started(md.kickoff)]
+            pool = [md for md in pool if is_match_not_started(md.kickoff) and not is_low_stakes_competition(md.league)]
             pool.sort(key=prescore_match, reverse=True)
             print(f"🎯 Top {min(len(pool), DOUBLE_SCAN_POOL_SIZE)} matchs sélectionnés pour Double Analyse Gemini")
             enriched_pool = await enrich_with_double_pass(pool[:GEMINI_MAX_CALLS_PER_SCAN])
@@ -1681,15 +1777,20 @@ async def semaine_cmd(m: Message):
         end_dt=end_dt,
     )
 
-    # Filtre strict Pro appliqué aussi sur Top Semaine (aucune EV négative)
+    # Filtre strict Pro appliqué aussi sur Top Semaine (aucune EV négative + enjeu réel obligatoire)
     filtered_picks = []
     for p in (picks or []):
+        is_trap, _ = has_pro_red_flags(p.get("ai", ""), p.get("league", ""))
+        if is_trap:
+            continue
         prob = float(p.get("proba", 0)) / 100.0
         is_real = bool(p.get("is_real"))
         odd = float(p.get("odd", 0)) if is_real else calibrated_odd(prob, None)
         if passes_value_filter(prob, odd, is_real):
             p["odd"] = odd
+            p["_stakes"] = compute_stakes_score(p.get("league", ""), p.get("ai", ""))
             filtered_picks.append(p)
+    filtered_picks.sort(key=lambda x: (x.get("_stakes", 0), x.get("proba", 0)), reverse=True)
 
     if not filtered_picks:
         await safe_answer(m, f"📭 Aucun match fiable à EV positive trouvé pour la période <b>{period_label}</b>.")
