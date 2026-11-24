@@ -261,7 +261,7 @@ STATE = {
     "scan_lock": asyncio.Lock(), "verify_lock": asyncio.Lock(),
     "dixon_model": None, "last_scan_date": "", "last_score_check": None,
     "double_scan_status": "", "double_scan_stats": {},
-    "rejections": {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0},
+    "rejections": {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0, "unstable": 0},
 }
 
 TARGETS = []
@@ -1131,7 +1131,7 @@ def _compare_two_passes(targets, r1, r2):
 
 async def enrich_with_double_pass(pool):
     if not pool: STATE["double_scan_status"] = "EMPTY"; return pool
-    targets = pool[:DOUBLE_SCAN_POOL_SIZE]
+    targets = pool[:max(DOUBLE_SCAN_POOL_SIZE, min(len(pool), GEMINI_MAX_CALLS_PER_SCAN))]
     r1 = await _enrich_single_pass(targets, 1)
     await asyncio.sleep(DOUBLE_SCAN_PAUSE_SECONDS)
     r2 = await _enrich_single_pass(targets, 2)
@@ -1206,6 +1206,11 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
         if is_reserve_team(md.home) or is_reserve_team(md.away):
             continue
         if not md.dixon_pred and not md.gemini_markets and not md.bzz_markets and not md.real_odds:
+            continue
+
+        if getattr(md, "stability_flag", "") == "unstable":
+            STATE["rejections"]["unstable"] += 1
+            print(f"  ⚠️ Double-Scan rejet ({md.home} vs {md.away}) : analyse instable (>16% d'écart)")
             continue
 
         is_trap, trap_reason = has_pro_red_flags(md.analysis, md.league)
@@ -1287,9 +1292,10 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 continue
 
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
-            # Priorité absolue à la victoire sèche (3) devant la Double Chance (2) et les buts (1)
+            stakes_bonus = compute_stakes_score(md.league, md.analysis)
+            # Priorité absolue à la victoire sèche (3) devant la Double Chance (2) et les buts (1), pondérée par l'enjeu réel
             market_priority = 3 if family == "result" else (2 if family == "dc" else (1 if mk in ("over_2.5", "btts_yes") else 0))
-            rank_score = (market_priority, consensus_bonus, round(proba_pct, 1))
+            rank_score = (market_priority, stakes_bonus, consensus_bonus, round(proba_pct, 1))
 
             if not best_for_match or rank_score > best_for_match["_rank"]:
                 best_for_match = {
@@ -1313,7 +1319,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             best_for_match.pop("_rank", None)
             vip_candidates.append(best_for_match)
 
-    vip_candidates.sort(key=lambda x: (2 if x["family"] == "result" else (1 if x["family"] == "dc" else 0), x["proba"]), reverse=True)
+    vip_candidates.sort(key=lambda x: (2 if x["family"] == "result" else (1 if x["family"] == "dc" else 0), compute_stakes_score(x["league"], x["ai"]), x["proba"]), reverse=True)
     top_pool = vip_candidates[:16]
 
     # Priorité exacte du moteur 22/11 : Pyramide Sécurisée (3 sélections), puis Duo (2), puis Quatuor (4)
@@ -1525,7 +1531,7 @@ async def scan(force: bool = False) -> bool:
             print(f"📦 Cache journalier actif ({today_str}) : {len(STATE['coupons'])} coupons chargés sans rescan.")
             return False
 
-        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0}
+        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0, "unstable": 0}
         ws_matches, odds_status = await fetch_rapidodds_odds()
         
         bzz_preds = []
