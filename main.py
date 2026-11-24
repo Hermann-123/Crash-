@@ -261,7 +261,7 @@ STATE = {
     "scan_lock": asyncio.Lock(), "verify_lock": asyncio.Lock(),
     "dixon_model": None, "last_scan_date": "", "last_score_check": None,
     "double_scan_status": "", "double_scan_stats": {},
-    "rejections": {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0, "unstable": 0},
+    "rejections": {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0, "unstable": 0, "no_real_odds": 0},
 }
 
 TARGETS = []
@@ -508,12 +508,10 @@ def is_match_not_started(kickoff_str) -> bool:
     return dt > (datetime.now(TZ) + timedelta(minutes=MATCH_START_BUFFER_MINUTES))
 
 def calibrated_odd(prob: float, real_odd: Optional[float]) -> float:
-    """Retourne la vraie cote si disponible, sinon la cote juste 1/prob (EV = 1.00, moteur du 22/11)."""
-    if real_odd and real_odd > 1.01:
+    """Strictement vraies cotes bookmaker uniquement — zéro estimation artificielle."""
+    if real_odd and float(real_odd) > 1.01:
         return round(float(real_odd), 2)
-    if prob <= 0.01:
-        return 0.0
-    return max(1.10, round(1.0 / prob, 2))
+    return 0.0
 
 def prob_bar(p: float) -> str:
     if p >= 0.75: return "🟢🟢🟢"
@@ -971,20 +969,153 @@ def passes_auth_proba_filter(proba):
 # =====================================================================
 # APIS COTES (The Odds API LIVE + Secours RapidOddsAPI)
 # =====================================================================
+def _american_to_decimal(ml) -> Optional[float]:
+    """Convertit une cote américaine ESPN (+150 / -200 / EVEN) en cote décimale européenne."""
+    if ml is None:
+        return None
+    try:
+        s = str(ml).strip().upper()
+        if s in ("EVEN", "EV", "PK"):
+            return 2.00
+        val = float(s.replace("+", ""))
+        if val == 0:
+            return None
+        if val > 0:
+            dec = 1.0 + (val / 100.0)
+        else:
+            dec = 1.0 + (100.0 / abs(val))
+        return round(dec, 2) if dec > 1.01 else None
+    except Exception:
+        return None
+
+ESPN_ODDS_SLUGS = [
+    "eng.1", "eng.2", "eng.3", "eng.fa", "eng.league_cup",
+    "esp.1", "esp.2", "esp.copa_del_rey",
+    "ita.1", "ita.2", "ita.coppa_italia",
+    "ger.1", "ger.2", "ger.dfb_pokal",
+    "fra.1", "fra.2", "fra.coupe_de_france",
+    "ned.1", "por.1", "bel.1", "tur.1", "sco.1", "gre.1", "aut.1", "sui.1",
+    "uefa.champions", "uefa.europa", "uefa.europa.conf",
+    "conmebol.libertadores", "conmebol.sudamericana", "usa.1", "mex.1", "bra.1", "arg.1",
+]
+
+async def fetch_espn_prematch_odds(days_ahead: int = 3) -> list[WS_MatchData]:
+    """Récupère gratuitement les vraies cotes bookmaker d'avant-match via l'API publique ESPN (0 €)."""
+    now = datetime.now(TZ)
+    date_strings = [(now + timedelta(days=d)).strftime("%Y%m%d") for d in range(max(1, days_ahead + 1))]
+    ws_map = {}
+
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        for slug in ESPN_ODDS_SLUGS:
+            for d_str in date_strings:
+                try:
+                    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
+                    r = await client.get(url, params={"dates": d_str})
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                    league_name = (data.get("leagues") or [{}])[0].get("name") or slug
+                    for ev in data.get("events", []):
+                        ev_id = f"espn_{ev.get('id', '')}"
+                        if ev_id in ws_map:
+                            continue
+                        comps = ev.get("competitions", [])
+                        if not comps:
+                            continue
+                        comp = comps[0]
+                        st_type = comp.get("status", {}).get("type", {})
+                        if st_type.get("completed") or st_type.get("state") in ("in", "post"):
+                            continue
+
+                        competitors = comp.get("competitors", [])
+                        home_c = next((c for c in competitors if c.get("homeAway") == "home"), None)
+                        away_c = next((c for c in competitors if c.get("homeAway") == "away"), None)
+                        if not home_c or not away_c:
+                            continue
+                        home_name = home_c.get("team", {}).get("displayName") or home_c.get("team", {}).get("name") or ""
+                        away_name = away_c.get("team", {}).get("displayName") or away_c.get("team", {}).get("name") or ""
+                        if not home_name or not away_name:
+                            continue
+
+                        odds_list = comp.get("odds") or []
+                        if not odds_list:
+                            continue
+
+                        h_odd = d_odd = a_odd = o25 = u25 = None
+                        for od in odds_list:
+                            if not isinstance(od, dict):
+                                continue
+                            h_ml = (od.get("homeTeamOdds") or {}).get("moneyLine")
+                            a_ml = (od.get("awayTeamOdds") or {}).get("moneyLine")
+                            d_ml = (od.get("drawOdds") or {}).get("moneyLine")
+                            if h_ml is not None and not h_odd:
+                                h_odd = _american_to_decimal(h_ml)
+                            if a_ml is not None and not a_odd:
+                                a_odd = _american_to_decimal(a_ml)
+                            if d_ml is not None and not d_odd:
+                                d_odd = _american_to_decimal(d_ml)
+
+                            ou_line = od.get("overUnder")
+                            if ou_line is not None and abs(float(ou_line) - 2.5) < 0.01:
+                                ov_dec = _american_to_decimal(od.get("overOdds"))
+                                un_dec = _american_to_decimal(od.get("underOdds"))
+                                if ov_dec and not o25:
+                                    o25 = ov_dec
+                                if un_dec and not u25:
+                                    u25 = un_dec
+
+                            if h_odd and a_odd and d_odd:
+                                break
+
+                        if h_odd and a_odd:
+                            ws_map[ev_id] = WS_MatchData(
+                                match_id=ev_id,
+                                league=league_name,
+                                home_team=home_name,
+                                away_team=away_name,
+                                home_odds=h_odd,
+                                draw_odds=d_odd,
+                                away_odds=a_odd,
+                                over_2_5=o25,
+                                under_2_5=u25,
+                                commence_time=ev.get("date", ""),
+                            )
+                except Exception:
+                    continue
+
+    res = list(ws_map.values())
+    print(f"🆓 ESPN Vraies Cotes Gratuites : {len(res)} matchs récupérés (0 €)")
+    return res
+
 async def fetch_rapidodds_odds() -> Tuple[list, str]:
+    """Fusionne les vraies cotes gratuites ESPN (0 €) + The Odds API gratuit (1 crédit/jour) + RapidOddsAPI."""
+    ws_by_key = {}
+
+    # 1. Source principale 100% gratuite et illimitée : ESPN Public Odds (Bet365 / ESPN BET)
+    try:
+        espn_ws = await fetch_espn_prematch_odds(days_ahead=3)
+        for item in espn_ws:
+            nk = f"{normalize_name(item.home_team)}__{normalize_name(item.away_team)}"
+            ws_by_key[nk] = item
+    except Exception as e:
+        print(f"⚠️ ESPN Odds erreur : {e}")
+
+    # 2. Complément gratuit : The Odds API (1 seule requête/jour = 30 crédits/mois sur 500 gratuits)
     if THE_ODDS_API_KEY:
         try:
-            url = "https://api.the-odds-api.com/v4/sports/upcoming/odds"
-            params = {
-                "apiKey": THE_ODDS_API_KEY,
-                "regions": "eu",
-                "markets": "h2h,totals",
-                "oddsFormat": "decimal",
-            }
             async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(url, params=params)
+                r = await client.get(
+                    "https://api.the-odds-api.com/v4/sports/upcoming/odds",
+                    params={
+                        "apiKey": THE_ODDS_API_KEY,
+                        "regions": "eu,uk",
+                        "markets": "h2h,totals",
+                        "oddsFormat": "decimal",
+                    },
+                )
                 if r.status_code == 200:
-                    ws = []
+                    rem = r.headers.get("x-requests-remaining", "?")
+                    added = 0
                     for ev in r.json():
                         if not str(ev.get("sport_key", "")).startswith("soccer_"):
                             continue
@@ -994,56 +1125,62 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
 
                         for bk in ev.get("bookmakers", []):
                             for mkt in bk.get("markets", []):
-                                if mkt.get("key") == "h2h" and not h_odd:
+                                if mkt.get("key") == "h2h":
                                     for out in mkt.get("outcomes", []):
-                                        if out.get("name") == home:
+                                        if out.get("name") == home and not h_odd:
                                             h_odd = float(out["price"])
-                                        elif out.get("name") == away:
+                                        elif out.get("name") == away and not a_odd:
                                             a_odd = float(out["price"])
-                                        elif out.get("name") == "Draw":
+                                        elif out.get("name") == "Draw" and not d_odd:
                                             d_odd = float(out["price"])
-                                elif mkt.get("key") == "totals" and not o25:
+                                elif mkt.get("key") == "totals":
                                     for out in mkt.get("outcomes", []):
                                         if float(out.get("point", 0)) == 2.5:
-                                            if out.get("name") == "Over":
+                                            if out.get("name") == "Over" and not o25:
                                                 o25 = float(out["price"])
-                                            elif out.get("name") == "Under":
+                                            elif out.get("name") == "Under" and not u25:
                                                 u25 = float(out["price"])
-                            if h_odd and a_odd and o25:
+                            if h_odd and a_odd and d_odd and o25 and u25:
                                 break
 
                         if h_odd and a_odd:
-                            ws.append(WS_MatchData(
-                                match_id=str(ev.get("id", "")),
-                                league=ev.get("sport_title", ""),
-                                home_team=home,
-                                away_team=away,
-                                home_odds=h_odd,
-                                draw_odds=d_odd,
-                                away_odds=a_odd,
-                                over_2_5=o25,
-                                under_2_5=u25,
-                                commence_time=ev.get("commence_time", ""),
-                            ))
-                    if ws:
-                        rem = r.headers.get("x-requests-remaining", "?")
-                        print(f"✅ The Odds API LIVE : {len(ws)} matchs avec vraies cotes (crédits restants : {rem})")
-                        return ws, "live"
-                else:
-                    print(f"⚠️ The Odds API HTTP {r.status_code} : {r.text[:150]}")
+                            nk = f"{normalize_name(home)}__{normalize_name(away)}"
+                            existing = ws_by_key.get(nk)
+                            if existing:
+                                if not existing.draw_odds and d_odd: existing.draw_odds = d_odd
+                                if not existing.over_2_5 and o25: existing.over_2_5 = o25
+                                if not existing.under_2_5 and u25: existing.under_2_5 = u25
+                            else:
+                                ws_by_key[nk] = WS_MatchData(
+                                    match_id=str(ev.get("id", "")),
+                                    league=ev.get("sport_title", ""),
+                                    home_team=home,
+                                    away_team=away,
+                                    home_odds=h_odd,
+                                    draw_odds=d_odd,
+                                    away_odds=a_odd,
+                                    over_2_5=o25,
+                                    under_2_5=u25,
+                                    commence_time=ev.get("commence_time", ""),
+                                )
+                                added += 1
+                    print(f"✅ The Odds API (1 req/jour) : +{added} matchs (crédits restants : {rem})")
         except Exception as e:
             print(f"⚠️ The Odds API erreur : {e}")
 
+    # 3. Secours optionnel RapidOddsAPI si configuré
     if RAPIDODDSAPI_API_KEY and fetch_rapidodds_odds_data:
         try:
             events = await fetch_rapidodds_odds_data()
-            if events:
-                ws = [WS_MatchData(e["match_id"], e.get("league", ""), e["home_team"], e["away_team"], e.get("home_odds"), e.get("draw_odds"), e.get("away_odds"), e.get("over_2_5"), e.get("under_2_5"), e.get("btts_yes"), e.get("btts_no"), e.get("commence_time", "")) for e in events]
-                return ws, "live"
+            for e in (events or []):
+                nk = f"{normalize_name(e['home_team'])}__{normalize_name(e['away_team'])}"
+                if nk not in ws_by_key and e.get("home_odds") and e.get("away_odds"):
+                    ws_by_key[nk] = WS_MatchData(e["match_id"], e.get("league", ""), e["home_team"], e["away_team"], e.get("home_odds"), e.get("draw_odds"), e.get("away_odds"), e.get("over_2_5"), e.get("under_2_5"), e.get("btts_yes"), e.get("btts_no"), e.get("commence_time", ""))
         except Exception as e:
             print(f"⚠️ RapidOddsAPI erreur : {e}")
 
-    return [], "fallback"
+    ws = list(ws_by_key.values())
+    return ws, ("live" if ws else "fallback")
 
 def inject_all_real_odds(pool, ws_matches):
     matched = 0
@@ -1279,12 +1416,11 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 continue
 
             real_odd = md.real_odds.get(odd_key)
-            if real_odd:
-                odd = real_odd
-                is_real = True
-            else:
-                odd = calibrated_odd(prob, None)
-                is_real = False
+            if not real_odd or float(real_odd) <= 1.01:
+                STATE["rejections"]["no_real_odds"] += 1
+                continue
+            odd = round(float(real_odd), 2)
+            is_real = True
 
             if odd < ODDS3_MIN_COTE_LEG:
                 continue
@@ -1413,12 +1549,9 @@ def build_mtft_coupon_and_bonus(pool, locked_keys: set):
         real_odd = md.real_odds.get("home") if p["pick"] == "V1/V1" else md.real_odds.get("away")
         ft_res = p["pick"].split("/")[1]
         fav_prob = sum(p["htft"].get(f"{ht}/{ft_res}", 0) for ht in ("V1", "V2", "X"))
-        is_est = False
-        if not real_odd:
-            real_odd = calibrated_odd(fav_prob, None)
-            is_est = True
-        if real_odd >= ODDS3_MIN_COTE_LEG and passes_value_filter(fav_prob, real_odd, not is_est):
-            bonus_pool.append({"match": md, "type": fav_market, "odds": real_odd, "proba": fav_prob * 100, "ai": md.analysis, "real_odd": real_odd if not is_est else None, "source": "MT-FIN", "kickoff": md.kickoff})
+        if real_odd and float(real_odd) >= ODDS3_MIN_COTE_LEG and passes_value_filter(fav_prob, float(real_odd), True):
+            r_val = round(float(real_odd), 2)
+            bonus_pool.append({"match": md, "type": fav_market, "odds": r_val, "proba": fav_prob * 100, "ai": md.analysis, "real_odd": r_val, "source": "MT-FIN", "kickoff": md.kickoff})
     return coupon, bonus_pool
 
 def build_draw_coupon_and_bonus(pool, locked_keys: set):
@@ -1433,13 +1566,15 @@ def build_draw_coupon_and_bonus(pool, locked_keys: set):
 
         prob, g, d, b, emoji = compute_probability(md, "match_nul")
         if prob < DRAW_MIN_PROB or (g > 0 and g < 0.25) or emoji == "⚠️": continue
-        draw_odd = md.real_odds.get("draw"); is_real = draw_odd is not None
-        if not draw_odd: draw_odd = calibrated_odd(prob, None)
-        if draw_odd < 2.95: continue
+        draw_odd = md.real_odds.get("draw")
+        if not draw_odd or float(draw_odd) < 2.95:
+            STATE["rejections"]["no_real_odds"] += 1
+            continue
+        draw_odd = round(float(draw_odd), 2)
         if (md.real_odds.get("home") and md.real_odds.get("home") < 1.80) or (md.real_odds.get("away") and md.real_odds.get("away") < 1.80): continue
-        if not passes_value_filter(prob, draw_odd, is_real, emoji): continue
+        if not passes_value_filter(prob, draw_odd, True, emoji): continue
         pts = 30 + (25 if prob >= 0.33 else 18) + (20 if g >= 0.30 else 12) + 10 + (5 if md.has_h2h else 0) + 10
-        if pts >= DRAW_MIN_SCORE: candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, "Match Nul", "Match Nul (X)", draw_odd, prob, draw_odd if is_real else None, (prob*draw_odd)-1, pts))
+        if pts >= DRAW_MIN_SCORE: candidates.append(Selection(md.event_id, md.league, md.home, md.away, md.kickoff, "Match Nul", "Match Nul (X)", draw_odd, prob, draw_odd, (prob*draw_odd)-1, pts))
 
     coupon = None
     candidates.sort(key=lambda x: (x.quality, x.model_prob), reverse=True)
@@ -1447,18 +1582,19 @@ def build_draw_coupon_and_bonus(pool, locked_keys: set):
     if top3:
         co = round(math.prod(s.odds for s in top3), 2)
         cp = round(math.prod(s.model_prob for s in top3), 4)
-        has_real = any(s.real_odd is not None for s in top3)
-        if coupon_passes_ev(co, cp, has_real_odds=has_real):
+        if coupon_passes_ev(co, cp, has_real_odds=True):
             coupon = Coupon("Match Nul", f"Sélection Pro • {len(top3)} nuls", "🤝", top3, co, cp, is_list=True)
 
     candidates.sort(key=lambda x: x.model_prob)
     for c in candidates[:3]:
         md = next((m for m in pool if m.event_id == c.event_id), None)
-        if not md: continue
+        if not md or not md.real_odds.get("home") or not md.real_odds.get("away"): continue
         p_h, _, _, _, _ = compute_probability(md, "victoire_home"); p_a, _, _, _, _ = compute_probability(md, "victoire_away")
-        p_12 = p_h + p_a; odd_12 = calibrated_odd(p_12, None)
-        if odd_12 >= ODDS3_MIN_COTE_LEG and passes_value_filter(p_12, odd_12, False):
-            bonus_pool.append({"match": md, "type": "Double Chance 12", "odds": odd_12, "proba": p_12 * 100, "ai": md.analysis, "real_odd": None, "source": "MATCH-NUL", "kickoff": md.kickoff})
+        p_12 = p_h + p_a
+        inv_12 = (1.0 / float(md.real_odds["home"])) + (1.0 / float(md.real_odds["away"]))
+        odd_12 = round(max(1.03, (1.0 / inv_12) * 0.96), 2) if inv_12 > 0 else 0.0
+        if odd_12 >= ODDS3_MIN_COTE_LEG and passes_value_filter(p_12, odd_12, True):
+            bonus_pool.append({"match": md, "type": "Double Chance 12", "odds": odd_12, "proba": p_12 * 100, "ai": md.analysis, "real_odd": odd_12, "source": "MATCH-NUL", "kickoff": md.kickoff})
     return coupon, bonus_pool
 
 def build_third_pillar(pool, locked_keys: set):
@@ -1474,12 +1610,14 @@ def build_third_pillar(pool, locked_keys: set):
         for mk, lbl in {"btts_yes": "BTTS Oui", "btts_no": "BTTS Non", "over_1.5": "Over 1.5", "under_2.5": "Under 2.5", "over_2.5": "Over 2.5"}.items():
             prob, g, d, b, emoji = compute_probability(md, mk)
             if prob < 0.62 or emoji == "⚠️": continue
-            odd = md.real_odds.get(mk); is_real = odd is not None
-            if not odd: odd = calibrated_odd(prob, None); is_real = False
-            if odd >= ODDS3_MIN_COTE_LEG and passes_value_filter(prob, odd, is_real, emoji):
-                score = (1 if is_real else 0, prob * odd, prob)
+            real_odd = md.real_odds.get(mk)
+            if not real_odd or float(real_odd) <= 1.01:
+                continue
+            odd = round(float(real_odd), 2)
+            if odd >= ODDS3_MIN_COTE_LEG and passes_value_filter(prob, odd, True, emoji):
+                score = (1, prob * odd, prob)
                 if not best or score > best["_score"]:
-                    best = {"match": md, "type": lbl, "odds": odd, "proba": prob * 100, "ai": md.analysis, "real_odd": odd if is_real else None, "source": "BZZOIRO", "kickoff": md.kickoff, "_score": score}
+                    best = {"match": md, "type": lbl, "odds": odd, "proba": prob * 100, "ai": md.analysis, "real_odd": odd, "source": "BZZOIRO", "kickoff": md.kickoff, "_score": score}
         if best:
             best.pop("_score", None)
             pool_result.append(best)
@@ -1531,7 +1669,7 @@ async def scan(force: bool = False) -> bool:
             print(f"📦 Cache journalier actif ({today_str}) : {len(STATE['coupons'])} coupons chargés sans rescan.")
             return False
 
-        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0, "unstable": 0}
+        STATE["rejections"] = {"value": 0, "ev_coupon": 0, "auth_proba": 0, "pro_trap": 0, "unstable": 0, "no_real_odds": 0}
         ws_matches, odds_status = await fetch_rapidodds_odds()
         
         bzz_preds = []
@@ -1546,19 +1684,46 @@ async def scan(force: bool = False) -> bool:
 
         enriched_pool = []
         matched = 0
-        if bzz_preds:
-            pool = []
-            for bz in bzz_preds:
-                base_odds = dict(infer_odds.get(bz["event_id"], {}))
-                base_odds.update(bz.get("real_odds", {}))
-                md = MatchData(bz["event_id"], bz.get("league", ""), bz["home"], bz["away"], bz.get("kickoff", ""), base_odds, bz.get("bzz_markets", {}), bz.get("bzz_confidence", 0))
-                if STATE.get("dixon_model"):
-                    try: md.dixon_pred = STATE["dixon_model"].predict_all(md.home, md.away)
-                    except: pass
-                pool.append(md)
+        pool = []
+        seen_pool_keys = set()
+        for bz in (bzz_preds or []):
+            base_odds = dict(infer_odds.get(bz["event_id"], {}))
+            base_odds.update(bz.get("real_odds", {}))
+            md = MatchData(bz["event_id"], bz.get("league", ""), bz["home"], bz["away"], bz.get("kickoff", ""), base_odds, bz.get("bzz_markets", {}), bz.get("bzz_confidence", 0))
+            if STATE.get("dixon_model"):
+                try: md.dixon_pred = STATE["dixon_model"].predict_all(md.home, md.away)
+                except: pass
+            pool.append(md)
+            seen_pool_keys.add(f"{normalize_name(md.home)}__{normalize_name(md.away)}")
+
+        # Ajout des matchs ESPN cotés non encore présents dans Bzzoiro
+        for ws in ws_matches:
+            nk = f"{normalize_name(ws.home_team)}__{normalize_name(ws.away_team)}"
+            if nk in seen_pool_keys:
+                continue
+            r_odds = {}
+            if ws.home_odds: r_odds["home"] = ws.home_odds
+            if ws.draw_odds: r_odds["draw"] = ws.draw_odds
+            if ws.away_odds: r_odds["away"] = ws.away_odds
+            if ws.over_2_5: r_odds["over_2.5"] = ws.over_2_5
+            if ws.under_2_5: r_odds["under_2.5"] = ws.under_2_5
+            md = MatchData(ws.match_id, ws.league, ws.home_team, ws.away_team, ws.commence_time, r_odds, {}, 70.0)
+            if STATE.get("dixon_model"):
+                try: md.dixon_pred = STATE["dixon_model"].predict_all(md.home, md.away)
+                except: pass
+            pool.append(md)
+            seen_pool_keys.add(nk)
+
+        if pool:
             matched = inject_all_real_odds(pool, ws_matches)
             print(f"⏰ Total matchs avec vraies cotes : {matched}/{len(pool)}")
-            pool = [md for md in pool if is_match_not_started(md.kickoff) and not is_low_stakes_competition(md.league)]
+            pool = [
+                md for md in pool
+                if is_match_not_started(md.kickoff)
+                and not is_low_stakes_competition(md.league)
+                and bool(md.real_odds)
+            ]
+            print(f"💰 Matchs retenus après verrou VRAIES COTES uniquement : {len(pool)}")
             pool.sort(key=prescore_match, reverse=True)
             print(f"🎯 Top {min(len(pool), DOUBLE_SCAN_POOL_SIZE)} matchs sélectionnés pour Double Analyse Gemini")
             enriched_pool = await enrich_with_double_pass(pool[:GEMINI_MAX_CALLS_PER_SCAN])
@@ -1631,7 +1796,7 @@ def format_header():
 def format_selection_block(s, idx, show_analysis):
     lines = [f"<b>┌─ #{idx} {s.home} vs {s.away}</b>", f"│ 📅 <b>{format_kickoff(s.kickoff)}</b> • {s.league}", f"│ 🎯 <b>{s.pick_label}</b>", f"│ 📊 Confiance : <b>{s.model_prob*100:.1f}%</b> {prob_bar(s.model_prob)}"]
     if s.real_odd: lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b>")
-    else: lines.append(f"│ 💰 Cote : <b>{s.odds}</b> <i>(estimée)</i>")
+    else: lines.append(f"│ 💰 Cote : <b>{s.odds}</b>")
     if show_analysis and s.analysis: lines.append(f"│ 🧠 <i>{clean_analysis_text(s.analysis, 320)}</i>")
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
@@ -1791,8 +1956,10 @@ async def semaine_cmd(m: Message):
             continue
         prob = float(p.get("proba", 0)) / 100.0
         is_real = bool(p.get("is_real"))
-        odd = float(p.get("odd", 0)) if is_real else calibrated_odd(prob, None)
-        if passes_value_filter(prob, odd, is_real):
+        if not is_real:
+            continue
+        odd = round(float(p.get("odd", 0)), 2)
+        if passes_value_filter(prob, odd, True):
             p["odd"] = odd
             p["_stakes"] = compute_stakes_score(p.get("league", ""), p.get("ai", ""))
             filtered_picks.append(p)
@@ -1813,7 +1980,7 @@ async def semaine_cmd(m: Message):
         f"<i>Stratégie Pro (20 ans) : Fidélité au scénario & haute confiance</i>\n",
     ]
     for i, p in enumerate(filtered_picks, 1):
-        odd_tag = f"<b>{p['odd']}</b>" if p["is_real"] else f"<b>{p['odd']}</b> <i>(est.)</i>"
+        odd_tag = f"<b>{p['odd']}</b>"
         lines.append(
             f"<b>#{i} {p['home']} vs {p['away']}</b>\n"
             f"📅 {format_kickoff(p['kickoff'])} • {p['league']}\n"
