@@ -460,7 +460,7 @@ def has_pro_red_flags(analysis_text: str, league_name: str = "") -> Tuple[bool, 
             return True, phrase
     return False, ""
 
-def clean_analysis_text(text: str, max_len: int = 320) -> str:
+def clean_analysis_text(text: str, max_len: int = 520) -> str:
     if not text:
         return ""
     text = re.sub(r"\s+", " ", text).strip()
@@ -469,7 +469,7 @@ def clean_analysis_text(text: str, max_len: int = 320) -> str:
     cut = text[:max_len]
     for sep in (". ", "! ", "? "):
         idx = cut.rfind(sep)
-        if idx > 80:
+        if idx > 100:
             return cut[:idx + 1]
     return cut.rsplit(" ", 1)[0] + "..."
 
@@ -883,10 +883,44 @@ def _get_match_id(item: dict) -> str:
     m = item["match"]
     return str(m.event_id if hasattr(m, "event_id") else m.match_id)
 
+def _ensure_dixon_pred(md: MatchData):
+    """Garantit une modélisation Dixon-Coles / Poisson (xG et probas) même hors Top 5 championnats."""
+    if md.dixon_pred:
+        return
+    if STATE.get("dixon_model"):
+        try:
+            md.dixon_pred = STATE["dixon_model"].predict_all(md.home, md.away)
+        except Exception:
+            pass
+    if not md.dixon_pred and md.real_odds.get("home") and md.real_odds.get("away"):
+        try:
+            h_o = float(md.real_odds["home"])
+            a_o = float(md.real_odds["away"])
+            d_o = float(md.real_odds["draw"]) if md.real_odds.get("draw") else None
+            sim = dixon_ws.simulate(WS_MatchData(md.event_id, md.league, md.home, md.away, h_o, d_o, a_o))
+            if sim:
+                lx = round((1.0 / h_o) * 1.8 * 1.15, 2)
+                my = round((1.0 / a_o) * 1.8, 2)
+                md.dixon_pred = {
+                    "lambda_home": lx,
+                    "lambda_away": my,
+                    "p_home": round(sim.proba_home / 100.0, 4),
+                    "p_draw": round(sim.proba_draw / 100.0, 4),
+                    "p_away": round(sim.proba_away / 100.0, 4),
+                    "over_1.5": round(sim.proba_over_1_5 / 100.0, 4),
+                    "over_2.5": round(sim.proba_over_2_5 / 100.0, 4),
+                    "under_2.5": round(max(0.01, 1.0 - sim.proba_over_2_5 / 100.0), 4),
+                    "btts_yes": round(sim.proba_btts / 100.0, 4),
+                    "btts_no": round(max(0.01, 1.0 - sim.proba_btts / 100.0), 4),
+                }
+        except Exception:
+            pass
+
 # =====================================================================
 # CALCUL PROBABILITÉ (Dixon + ML + Gemini + Bzzoiro + Double Chance)
 # =====================================================================
 def compute_probability(md, market_key):
+    _ensure_dixon_pred(md)
     dixon_pred = md.dixon_pred if md.dixon_pred else {}
     ml_probas = predict_ml(dixon_pred, md.bzz_confidence) if predict_ml else None
     fused = fuse_probas(dixon_pred, ml_probas) if fuse_probas and ml_probas else dixon_pred
@@ -1121,7 +1155,6 @@ async def fetch_espn_prematch_odds(days_ahead: int = 3) -> list[WS_MatchData]:
                 elif item["raw_id"] and item["slug"] != "all":
                     candidates_without_odds.append(item)
 
-        # Fallback pickcenter (résumé d'avant-match ESPN) sur les matchs majeurs où scoreboard n'affiche pas encore les cotes
         if candidates_without_odds:
             seen_raw = set()
             unique_missing = []
@@ -1228,7 +1261,6 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
     """Fusionne ESPN (scoreboard + pickcenter) + Bzzoiro gratuit + The Odds API gratuit (1 crédit/jour)."""
     ws_by_key = {}
 
-    # 1. ESPN Public Odds (Scoreboard + Pickcenter)
     try:
         espn_ws = await fetch_espn_prematch_odds(days_ahead=1)
         for item in espn_ws:
@@ -1237,7 +1269,6 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
     except Exception as e:
         print(f"⚠️ ESPN Odds erreur : {e}")
 
-    # 2. Bzzoiro Free Odds (/api/events/ & /api/predictions/)
     try:
         bzz_ws = await fetch_bzzoiro_free_odds(days_ahead=1)
         for item in bzz_ws:
@@ -1254,7 +1285,6 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
     except Exception as e:
         print(f"⚠️ Bzzoiro Odds erreur : {e}")
 
-    # 3. Complément gratuit : The Odds API (1 requête/jour sur /sports/upcoming/odds)
     if THE_ODDS_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1322,7 +1352,6 @@ async def fetch_rapidodds_odds() -> Tuple[list, str]:
         except Exception as e:
             print(f"⚠️ The Odds API erreur : {e}")
 
-    # 4. Secours optionnel RapidOddsAPI si configuré
     if RAPIDODDSAPI_API_KEY and fetch_rapidodds_odds_data:
         try:
             events = await fetch_rapidodds_odds_data()
@@ -1351,36 +1380,104 @@ def inject_all_real_odds(pool, ws_matches):
                 if ws.btts_no: md.real_odds["btts_no"] = ws.btts_no
                 if ws.commence_time: md.kickoff = ws.commence_time
                 break
+        _ensure_dixon_pred(md)
         if bool(md.real_odds) or had_initial_odds:
             matched += 1
     return matched
 
 # =====================================================================
-# DOUBLE SCAN
+# DOUBLE SCAN & ENRICHISSEMENT IA COMPLET
 # =====================================================================
+def _build_quant_analysis(md: MatchData, pick_label: str, proba_pct: float, odd: float) -> str:
+    """Génère une synthèse statistique chiffrée (xG, Dixon-Coles, Bzzoiro, EV) si Gemini est indisponible."""
+    _ensure_dixon_pred(md)
+    dp = md.dixon_pred or {}
+    lh = dp.get("lambda_home")
+    la = dp.get("lambda_away")
+    ev = round((proba_pct / 100.0) * odd, 2)
+    parts = []
+    if lh is not None and la is not None:
+        xg_tot = round(float(lh) + float(la), 2)
+        if float(lh) >= float(la) + 0.35:
+            parts.append(f"{md.home} affiche un avantage statistique net à domicile (xG {float(lh):.2f} contre {float(la):.2f} pour {md.away}, total attendu {xg_tot:.2f} buts).")
+        elif float(la) >= float(lh) + 0.35:
+            parts.append(f"{md.away} présente une supériorité offensive marquée en déplacement (xG {float(la):.2f} contre {float(lh):.2f} pour {md.home}, total attendu {xg_tot:.2f} buts).")
+        else:
+            parts.append(f"Duel équilibré sur les projections Dixon-Coles avec un rythme attendu de {xg_tot:.2f} buts (xG {float(lh):.2f} - {float(la):.2f}) en {md.league}.")
+    else:
+        parts.append(f"Analyse croisée Dixon-Coles et Bzzoiro sur cette affiche de {md.league} entre {md.home} et {md.away}.")
+
+    bzz_note = "avec convergence des modèles Bzzoiro" if md.bzz_markets else "selon la modélisation Poisson et les cotes du marché"
+    h2h_note = " et l'historique des confrontations directes" if md.has_h2h else ""
+    parts.append(f"La probabilité estimée à {proba_pct:.1f}% {bzz_note}{h2h_note} confirme la solidité du scénario.")
+    parts.append(f"À une cote bookmaker de {odd:.2f} (EV {ev:.2f}), l'option {pick_label} offre une value statistique cohérente.")
+    return " ".join(parts)
+
+async def _fetch_gemini_analysis_for_match(client: httpx.AsyncClient, md: MatchData) -> Optional[dict]:
+    _ensure_dixon_pred(md)
+    ctx = {}
+    if enrich_match_with_bzzoiro:
+        try:
+            date_iso = parse_dt_safe(md.kickoff).strftime("%Y-%m-%d") if parse_dt_safe(md.kickoff) else datetime.now(TZ).strftime("%Y-%m-%d")
+            bzz_ctx = await enrich_match_with_bzzoiro(md.home, md.away, date_iso)
+            if isinstance(bzz_ctx, dict):
+                ctx.update(bzz_ctx)
+                if bzz_ctx.get("available"):
+                    md.has_h2h = True
+        except Exception:
+            pass
+    if md.dixon_pred:
+        ctx["dixon_coles"] = md.dixon_pred
+    if md.real_odds:
+        ctx["bookmaker_odds"] = md.real_odds
+    if md.bzz_markets:
+        ctx["bzzoiro_probas"] = md.bzz_markets
+
+    if predict_match_probas:
+        pred = await predict_match_probas(client, md.home, md.away, md.league, md.kickoff, context=ctx)
+        if pred and isinstance(pred, dict) and ("markets" in pred or pred.get("analysis")):
+            return {"markets": pred.get("markets", {}), "analysis": str(pred.get("analysis") or "").strip()}
+    return None
+
+async def _enrich_selected_legs_ai(combo: tuple | list):
+    """Garantit une analyse IA complète sur les 2 à 4 matchs finalement sélectionnés dans un coupon."""
+    need_ai = [c for c in combo if not c.get("ai") or len(str(c.get("ai")).strip()) < 60]
+    if not need_ai:
+        return
+    async with httpx.AsyncClient(timeout=55.0) as client:
+        for c in need_ai:
+            md: Optional[MatchData] = c.get("_md") or c.get("match")
+            if not md:
+                continue
+            if md.analysis and len(md.analysis.strip()) >= 60:
+                c["ai"] = md.analysis.strip()
+                continue
+            try:
+                pred = await _fetch_gemini_analysis_for_match(client, md)
+                if pred and pred.get("analysis") and len(pred["analysis"].strip()) >= 60:
+                    md.analysis = pred["analysis"].strip()
+                    if pred.get("markets") and not md.gemini_markets:
+                        md.gemini_markets = pred["markets"]
+                    c["ai"] = md.analysis
+                    print(f"🧠 Enrichissement IA ciblé réussi : {md.home} vs {md.away}")
+                    await asyncio.sleep(1.5)
+                    continue
+            except Exception as e:
+                print(f"⚠️ Enrichissement IA ciblé ({md.home} vs {md.away}) : {e}")
+            c["ai"] = _build_quant_analysis(md, c.get("type", ""), float(c.get("proba", 70.0)), float(c.get("odds", 1.30)))
+
 async def _enrich_single_pass(targets, pass_num):
     results = {}
     errors = 0
     async with httpx.AsyncClient(timeout=70.0) as client:
         for md in targets:
             try:
-                ctx = {}
-                if enrich_match_with_bzzoiro:
-                    date_iso = parse_dt_safe(md.kickoff).strftime("%Y-%m-%d") if parse_dt_safe(md.kickoff) else datetime.now(TZ).strftime("%Y-%m-%d")
-                    bzz_ctx = await enrich_match_with_bzzoiro(md.home, md.away, date_iso)
-                    if isinstance(bzz_ctx, dict):
-                        ctx.update(bzz_ctx)
-                        if bzz_ctx.get("available"): md.has_h2h = True
-                if md.dixon_pred:
-                    ctx["dixon_coles"] = md.dixon_pred
-
-                if predict_match_probas:
-                    pred = await predict_match_probas(client, md.home, md.away, md.league, md.kickoff, context=ctx)
-                    if pred and "markets" in pred:
-                        results[md.event_id] = {"markets": pred.get("markets", {}), "analysis": pred.get("analysis", "")}
-                        errors = 0
-                    else:
-                        errors += 1
+                pred = await _fetch_gemini_analysis_for_match(client, md)
+                if pred:
+                    results[md.event_id] = pred
+                    errors = 0
+                else:
+                    errors += 1
                 await asyncio.sleep(2.0)
             except Exception as e:
                 errors += 1
@@ -1412,7 +1509,7 @@ def _compare_two_passes(targets, r1, r2):
         a1, a2 = p1.get("analysis", "") or "", p2.get("analysis", "") or ""
         base = a1 if len(a1) >= len(a2) else a2
         if is_stable: md.analysis = base; md.stability_flag = "stable"; stats["stable"] += 1; stable_list.append(md)
-        else: md.analysis = f"⚠️ Variable. {base[:200]}"; md.stability_flag = "unstable"; stats["unstable"] += 1
+        else: md.analysis = f"⚠️ Variable. {base[:280]}"; md.stability_flag = "unstable"; stats["unstable"] += 1
         enriched_list.append(md)
     return stable_list, enriched_list, stats
 
@@ -1454,7 +1551,7 @@ def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
             model_prob=c["proba"] / 100.0,
             real_odd=c["real_odd"],
             quality=quality,
-            analysis=clean_analysis_text(c["ai"], 320),
+            analysis=clean_analysis_text(c["ai"], 520),
         )
         for c in sorted_combo
     ]
@@ -1473,7 +1570,7 @@ def _valid_pro_combo(combo, require_anchor: bool = True) -> bool:
         return False
     return True
 
-def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: List[WS_MatchData]) -> Tuple[Optional[Coupon], set]:
+async def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: List[WS_MatchData]) -> Tuple[Optional[Coupon], set]:
     vip_candidates = []
 
     markets_map = [
@@ -1493,6 +1590,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             continue
         if is_reserve_team(md.home) or is_reserve_team(md.away):
             continue
+        _ensure_dixon_pred(md)
         if not md.dixon_pred and not md.gemini_markets and not md.bzz_markets and not md.real_odds:
             continue
 
@@ -1507,8 +1605,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             print(f"  🚩 Pro-Filter rejet ({md.home} vs {md.away}) : signal '{trap_reason}'")
             continue
 
-        # Calcul des cotes Double Chance réelles à partir des cotes 1X2 réelles si disponibles
-        # (avec facteur de marge bookmaker 0.96 pour coller aux cotes réelles type 1xBet/Betclic)
         if md.real_odds.get("home") and md.real_odds.get("draw") and not md.real_odds.get("dc_1x"):
             inv_1x = (1.0 / float(md.real_odds["home"])) + (1.0 / float(md.real_odds["draw"]))
             if inv_1x > 0:
@@ -1526,8 +1622,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
         p_away_est, g_a, _, _, em_a = compute_probability(md, "victoire_away")
         one_sided_match = (p_home_est >= 0.72) or (p_away_est >= 0.72)
 
-        # Règle Pro "Sans hésitation" : quand l'issue 1 ou 2 est claire, on joue la victoire sèche (1 ou 2)
-        # et on interdit la Double Chance frileuse (1.05 - 1.16) qui plombe la cote du coupon !
         clear_home_win = (p_home_est >= 0.62 and (p_home_est - p_away_est) >= 0.28 and em_h != "⚠️")
         clear_away_win = (p_away_est >= 0.63 and (p_away_est - p_home_est) >= 0.30 and em_a != "⚠️")
 
@@ -1538,24 +1632,24 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
 
             if mk == "double_chance_1X":
                 if clear_home_win:
-                    continue  # Pas d'hésitation : Victoire (1) sèche privilégiée !
+                    continue
                 if g_a > 0 and g_h > 0 and g_a > (g_h + 0.06):
                     continue
                 if p_away_est > (p_home_est + 0.08):
                     continue
             elif mk == "double_chance_X2":
                 if clear_away_win:
-                    continue  # Pas d'hésitation : Victoire (2) sèche privilégiée !
+                    continue
                 if g_h > 0 and g_a > 0 and g_h > (g_a + 0.06):
                     continue
                 if p_home_est > (p_away_est + 0.08):
                     continue
             elif mk == "double_chance_12":
                 if clear_home_win or clear_away_win:
-                    continue  # Pas d'hésitation : Victoire sèche (1 ou 2) privilégiée !
+                    continue
                 p_draw_est, _, _, _, _ = compute_probability(md, "match_nul")
                 if p_draw_est >= 0.27:
-                    continue  # Match trop fermé / risque de nul trop élevé pour 12
+                    continue
 
             prob, g, d, b, emoji = compute_probability(md, mk)
             proba_pct = prob * 100.0
@@ -1563,8 +1657,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
             if emoji == "⚠️":
                 continue
 
-            # Pour une victoire sèche (1 ou 2) où l'issue est claire, on autorise dès 64% (cote ~1.40 - 1.75)
-            # Pour les autres marchés (DC, Over/Under, BTTS), on exige >= 71%
             if mk in ("victoire_home", "victoire_away") and (clear_home_win or clear_away_win):
                 if proba_pct < 62.0 or proba_pct > AUTH_PROBA_MAX:
                     STATE["rejections"]["auth_proba"] += 1
@@ -1590,7 +1682,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
 
             consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
             stakes_bonus = compute_stakes_score(md.league, md.analysis)
-            # Priorité absolue à la victoire sèche (3) devant la Double Chance (2) et les buts (1), pondérée par l'enjeu réel
             market_priority = 3 if family == "result" else (2 if family in ("dc", "goals", "btts") else 1)
             rank_score = (market_priority, stakes_bonus, consensus_bonus, round(proba_pct, 1))
 
@@ -1608,11 +1699,10 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                 "proba": proba_pct,
                 "real_odd": real_odd,
                 "consensus": emoji or "🤝",
-                "ai": md.analysis or f"Consensus multi-modèles ({proba_pct:.1f}%).",
+                "ai": (md.analysis or "").strip(),
+                "_md": md,
                 "_rank": rank_score,
             })
-        # On garde la meilleure option principale par match, et une option secondaire uniquement
-        # si elle n'est pas un '12' forcé et si sa cote/proba complète le combinateur quand l'occasion se présente.
         match_options.sort(key=lambda x: x["_rank"], reverse=True)
         kept = 0
         for opt in match_options:
@@ -1627,7 +1717,6 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
     vip_candidates.sort(key=lambda x: (3 if x["family"] == "result" else (2 if x["family"] in ("dc", "goals", "btts") else 1), compute_stakes_score(x["league"], x["ai"]), x["proba"]), reverse=True)
     top_pool = vip_candidates[:28]
 
-    # Priorité exacte du moteur 22/11 : Pyramide Sécurisée (3 sélections), puis Duo (2), puis Quatuor (4)
     for r in (3, 2, 4):
         if len(top_pool) < r:
             continue
@@ -1646,6 +1735,7 @@ def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_matches: 
                     best_combo = combo
                     best_combo_prob = tot_p
         if best_combo:
+            await _enrich_selected_legs_ai(best_combo)
             locked_keys = {c["norm_key"] for c in best_combo}
             label = "Pyramide Sécurisée" if r == 3 else ("Duo Haute Confiance" if r == 2 else "Quatuor Haute Confiance")
             return _build_auth_coupon(best_combo, f"Sélection Pro VIP • {label}", 96), locked_keys
@@ -1793,7 +1883,7 @@ def build_third_pillar(pool, locked_keys: set):
     pool_result.sort(key=lambda x: (1 if x["real_odd"] else 0, x["odds"] * x["proba"] / 100.0, x["proba"]), reverse=True)
     return pool_result[:5]
 
-def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys: set):
+async def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys: set):
     combined = [c for c in (bonus_mtft + bonus_draw + third_pillar) if f"{normalize_name(c['match'].home)}__{normalize_name(c['match'].away)}" not in locked_keys]
     if not combined: return None
     combined.sort(key=lambda x: (1 if x.get('real_odd') else 0, x['odds'] * x['proba'] / 100.0, x['proba']), reverse=True)
@@ -1810,7 +1900,8 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys:
                     tot_p = math.prod(c['proba'] / 100.0 for c in combo)
                     has_real = any(c.get('real_odd') is not None for c in combo)
                     if not coupon_passes_ev(tot_o, tot_p, has_real_odds=has_real): continue
-                    legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 90, analysis=clean_analysis_text(c['ai'], 260)) for c in combo]
+                    await _enrich_selected_legs_ai(combo)
+                    legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 90, analysis=clean_analysis_text(c['ai'], 520)) for c in combo]
                     return Coupon("Odds +3 HYBRIDE", f"Mélange 3 sources • {len(legs)} sélections", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
 
     for r in (3, 4):
@@ -1824,7 +1915,8 @@ def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_keys:
                 tot_p = math.prod(c['proba'] / 100.0 for c in combo)
                 has_real = any(c.get('real_odd') is not None for c in combo)
                 if not coupon_passes_ev(tot_o, tot_p, has_real_odds=has_real): continue
-                legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 85, analysis=clean_analysis_text(c['ai'], 260)) for c in combo]
+                await _enrich_selected_legs_ai(combo)
+                legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 85, analysis=clean_analysis_text(c['ai'], 520)) for c in combo]
                 return Coupon("Odds +3 HYBRIDE", f"Top Value Multi-IA • {len(legs)} sélections", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
     return None
 
@@ -1859,13 +1951,10 @@ async def scan(force: bool = False) -> bool:
             base_odds = dict(infer_odds.get(bz["event_id"], {}))
             base_odds.update(bz.get("real_odds", {}))
             md = MatchData(bz["event_id"], bz.get("league", ""), bz["home"], bz["away"], bz.get("kickoff", ""), base_odds, bz.get("bzz_markets", {}), bz.get("bzz_confidence", 0))
-            if STATE.get("dixon_model"):
-                try: md.dixon_pred = STATE["dixon_model"].predict_all(md.home, md.away)
-                except: pass
+            _ensure_dixon_pred(md)
             pool.append(md)
             seen_pool_keys.add(f"{normalize_name(md.home)}__{normalize_name(md.away)}")
 
-        # Ajout des matchs ESPN cotés non encore présents dans Bzzoiro
         for ws in ws_matches:
             nk = f"{normalize_name(ws.home_team)}__{normalize_name(ws.away_team)}"
             if nk in seen_pool_keys:
@@ -1877,9 +1966,7 @@ async def scan(force: bool = False) -> bool:
             if ws.over_2_5: r_odds["over_2.5"] = ws.over_2_5
             if ws.under_2_5: r_odds["under_2.5"] = ws.under_2_5
             md = MatchData(ws.match_id, ws.league, ws.home_team, ws.away_team, ws.commence_time, r_odds, {}, 70.0)
-            if STATE.get("dixon_model"):
-                try: md.dixon_pred = STATE["dixon_model"].predict_all(md.home, md.away)
-                except: pass
+            _ensure_dixon_pred(md)
             pool.append(md)
             seen_pool_keys.add(nk)
 
@@ -1901,14 +1988,14 @@ async def scan(force: bool = False) -> bool:
             odds_status = "live"
         STATE["odds_api_mode"] = odds_status
 
-        coupon_auth, locked_vip_keys = build_exclusive_vip_auth_coupon(enriched_pool, ws_matches)
+        coupon_auth, locked_vip_keys = await build_exclusive_vip_auth_coupon(enriched_pool, ws_matches)
         if locked_vip_keys:
             print(f"🔒 Matchs verrouillés pour VIP AUTH : {locked_vip_keys}")
 
         coupon_mtft, bonus_mtft = build_mtft_coupon_and_bonus(enriched_pool, locked_vip_keys) if enriched_pool else (None, [])
         coupon_draw, bonus_draw = build_draw_coupon_and_bonus(enriched_pool, locked_vip_keys) if enriched_pool else (None, [])
         third_pillar = build_third_pillar(enriched_pool, locked_vip_keys) if enriched_pool else []
-        coupon_hybrid = build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_vip_keys)
+        coupon_hybrid = await build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked_vip_keys)
 
         coupons = []
         if coupon_auth: coupons.append(coupon_auth)
@@ -1969,7 +2056,7 @@ def format_selection_block(s, idx, show_analysis):
     lines = [f"<b>┌─ #{idx} {s.home} vs {s.away}</b>", f"│ 📅 <b>{format_kickoff(s.kickoff)}</b> • {s.league}", f"│ 🎯 <b>{s.pick_label}</b>", f"│ 📊 Confiance : <b>{s.model_prob*100:.1f}%</b> {prob_bar(s.model_prob)}"]
     if s.real_odd: lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b>")
     else: lines.append(f"│ 💰 Cote : <b>{s.odds}</b>")
-    if show_analysis and s.analysis: lines.append(f"│ 🧠 <i>{clean_analysis_text(s.analysis, 320)}</i>")
+    if show_analysis and s.analysis: lines.append(f"│ 🧠 <i>{clean_analysis_text(s.analysis, 520)}</i>")
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
@@ -2120,7 +2207,6 @@ async def semaine_cmd(m: Message):
         end_dt=end_dt,
     )
 
-    # Filtre strict Pro appliqué aussi sur Top Semaine (aucune EV négative + enjeu réel obligatoire)
     filtered_picks = []
     for p in (picks or []):
         is_trap, _ = has_pro_red_flags(p.get("ai", ""), p.get("league", ""))
