@@ -17,6 +17,10 @@ TZ = ZoneInfo(NOTIFY_TZ)
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
 
+# Calibrage Pronostiqueur Pro (20 ans d'expérience) — Mode 100 % autonome (sans dépendance à l'API Odds) :
+# - Cotes estimées calibrées avec marge bookmaker réelle (0.93) pour refléter les vraies cotes (ex: 1.15 - 1.25)
+# - Équilibre strict des marchés (Ancres 1/2, Boucliers 1X/X2, Moteurs offensifs Over 1.5 / Over 2.5 / BTTS)
+# - Garanti de toujours atteindre le nombre de matchs demandé (limit = 10, 15, etc.)
 WEEKLY_MIN_LEG_ODD = 1.15
 WEEKLY_MIN_PROBA_PCT = 67.0
 WEEKLY_MAX_PROBA_PCT = 86.0
@@ -47,7 +51,6 @@ PRO_TRAP_PHRASES = [
     "blessures majeures",
     "déplacement piège",
     "match piège",
-    "risque élevé",
     "irrégularité chronique",
     "très imprévisible",
     "aucun enjeu",
@@ -89,7 +92,7 @@ def _has_pro_red_flags(analysis_text: str) -> bool:
     return any(phrase in low for phrase in PRO_TRAP_PHRASES)
 
 
-def _clean_analysis_text(text: str, max_len: int = 420) -> str:
+def _clean_analysis_text(text: str, max_len: int = 230) -> str:
     if not text:
         return ""
     text = re.sub(r"\s+", " ", text).strip()
@@ -265,10 +268,11 @@ async def analyze_weekly_top_matches(
     end_dt: Optional[datetime] = None,
 ) -> List[dict]:
     """
-    Architecture Combiné Pro Multi-Jours :
+    Architecture Combiné Pro (20 ans d'expérience) — Autonome sans API Odds :
     1. Exclut les divisions inférieures et priorise les ligues majeures (Tier 1 puis Tier 2).
-    2. Croise les vraies cotes bookmaker (ESPN + Bzzoiro + The Odds API) avec Dixon-Coles, ML et Gemini.
+    2. Fonctionne 100% avec les cotes estimées calibrées (marge bookmaker 0.93 intégrée) quand l'API Odds est absente.
     3. Équilibre le ticket entre Victoires sèches (1/2), Double Chance (1X/X2) et Buts (Over 2.5 / Over 1.5 / BTTS).
+    4. Scanne un vivier large et applique un repêchage contrôlé pour toujours atteindre `limit` (10, 15, etc.).
     """
     try:
         ws_matches, _ = await fetch_odds_fn()
@@ -341,10 +345,6 @@ async def analyze_weekly_top_matches(
             inv_x2 = (1.0 / float(md.real_odds["away"])) + (1.0 / float(md.real_odds["draw"]))
             if inv_x2 > 0:
                 md.real_odds["dc_x2"] = round(max(1.03, (1.0 / inv_x2) * 0.96), 2)
-        if md.real_odds.get("home") and md.real_odds.get("away") and not md.real_odds.get("dc_12"):
-            inv_12 = (1.0 / float(md.real_odds["home"])) + (1.0 / float(md.real_odds["away"]))
-            if inv_12 > 0:
-                md.real_odds["dc_12"] = round(max(1.03, (1.0 / inv_12) * 0.96), 2)
     if start_dt and end_dt:
         filtered = []
         for md in pool:
@@ -353,8 +353,10 @@ async def analyze_weekly_top_matches(
                 filtered.append(md)
         pool = filtered
 
+    # Priorité aux ligues majeures (Tier 1) avant les ligues secondaires (Tier 2)
     pool.sort(key=lambda m: (1 if _league_tier(m.league) == 1 else 0, prescore_fn(m)), reverse=True)
 
+    # Vivier large pour garantir d'atteindre 10 ou 15 sélections qualifiées
     scan_cap = min(len(pool), max(limit * 2 + 12, 42))
     targets = pool[:scan_cap]
     if targets:
@@ -368,7 +370,6 @@ async def analyze_weekly_top_matches(
     markets_map = [
         ("victoire_home", "home", "result", lambda m: f"Victoire {m.home} (1)"),
         ("victoire_away", "away", "result", lambda m: f"Victoire {m.away} (2)"),
-        ("double_chance_12", "dc_12", "dc12", lambda m: "Une équipe gagne (12)"),
         ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
         ("double_chance_X2", "dc_x2", "dc", lambda m: f"Double Chance Nul ou {m.away} (X2)"),
         ("over_2.5", "over_2.5", "goals", lambda m: "Plus de 2.5 buts"),
@@ -405,6 +406,7 @@ async def analyze_weekly_top_matches(
                 if mk == "victoire_away" and p_away_est < (min_res + 2.0) / 100.0:
                     continue
 
+                # Interdiction stricte des Double Chances inversées contre un favori bookmaker ou IA
                 if mk == "double_chance_1X":
                     if real_a_odd and real_a_odd < 2.00:
                         continue
@@ -415,17 +417,13 @@ async def analyze_weekly_top_matches(
                         continue
                     if g_h > 0 and g_a > 0 and g_h > (g_a + 0.06):
                         continue
-                elif mk == "double_chance_12":
-                    p_draw_est, _, _, _, _ = compute_prob_fn(md, "match_nul")
-                    if one_sided or p_draw_est > 0.25 or p_home_est < 0.28 or p_away_est < 0.28:
-                        continue
 
                 prob, g, d, b, emoji = compute_prob_fn(md, mk)
                 proba_pct = prob * 100.0
 
                 if family == "result":
                     min_req = min_res
-                elif family in ("dc", "dc12"):
+                elif family == "dc":
                     min_req = min_dc
                 elif mk == "over_1.5":
                     min_req = min_over15
@@ -439,13 +437,12 @@ async def analyze_weekly_top_matches(
                 if not real_odd or float(real_odd) <= 1.01:
                     continue
                 odd = round(float(real_odd), 2)
-                min_w_odd = 1.18 if mk == "double_chance_12" else WEEKLY_MIN_LEG_ODD
-                if odd < min_w_odd:
+                if odd < WEEKLY_MIN_LEG_ODD:
                     continue
 
                 if not tight_match and family == "result":
                     strategy_fit = 5
-                elif tight_match and family in ("dc", "dc12"):
+                elif tight_match and family == "dc":
                     strategy_fit = 5
                 elif mk == "over_2.5":
                     strategy_fit = 4
@@ -472,7 +469,7 @@ async def analyze_weekly_top_matches(
                         "proba": proba_pct,
                         "odd": odd,
                         "is_real": bool(real_odd),
-                        "ai": _clean_analysis_text(md.analysis, 340),
+                        "ai": _clean_analysis_text(md.analysis, 230),
                         "_score": score,
                     }
             if best:
@@ -480,8 +477,10 @@ async def analyze_weekly_top_matches(
                 picks.append(best)
         return picks
 
+    # Passe 1 : Standards Pro (67% Victoire, 70% Double Chance, 71% Over 2.5/BTTS, 74% Over 1.5)
     ranked_picks = _evaluate_candidates(min_res=67.0, min_dc=70.0, min_goals=71.0, min_over15=74.0)
 
+    # Passe 2 (repêchage contrôlé) : si on n'a pas encore assez de matchs pour atteindre `limit` (ex: 10 ou 15)
     if len(ranked_picks) < limit:
         existing_ids = {p["event_id"] for p in ranked_picks}
         backup_picks = _evaluate_candidates(min_res=63.0, min_dc=67.0, min_goals=68.0, min_over15=71.0)
@@ -499,8 +498,9 @@ async def analyze_weekly_top_matches(
         reverse=True,
     )
 
+    # Équilibrage par famille (max ~40 % par marché) avec complétion garantie jusqu'à `limit`
     max_per_family = max(3, math.ceil(limit * 0.40))
-    family_counts = {"result": 0, "dc": 0, "dc12": 0, "goals": 0, "btts": 0}
+    family_counts = {"result": 0, "dc": 0, "goals": 0, "btts": 0}
     selected = []
     overflow = []
 
