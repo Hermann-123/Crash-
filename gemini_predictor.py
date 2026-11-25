@@ -1,5 +1,6 @@
 """
-Prédicteur Gemini Pro — Analyse quantitative + contextuelle (méthodologie pronostiqueur 20+ ans).
+Prédicteur Gemini Pro — Analyse quantitative + contextuelle (Méthode Pro & Café Foot en 4 temps).
+Compatible avec main.py et weekly_analyzer.py.
 """
 from __future__ import annotations
 
@@ -7,13 +8,23 @@ import asyncio
 import json
 import os
 import re
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
+_ENV_MODEL = os.getenv("GEMINI_MODEL", "").strip()
+_BASE_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+]
+GEMINI_MODELS = ([_ENV_MODEL] if _ENV_MODEL and _ENV_MODEL not in _BASE_MODELS else []) + _BASE_MODELS
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+TZ = ZoneInfo(os.getenv("NOTIFY_TZ", "Africa/Abidjan"))
 
 
 def format_context(context: Optional[dict], kickoff: str = "") -> str:
@@ -55,7 +66,34 @@ def format_context(context: Optional[dict], kickoff: str = "") -> str:
         if stat_bits:
             parts.append("Modèle statistique Dixon-Coles : " + " | ".join(stat_bits))
 
-    # 3. Forme / classement éventuels fournis par Bzzoiro
+    # 3. Cotes bookmaker réelles
+    odds = context.get("bookmaker_odds")
+    if isinstance(odds, dict) and odds:
+        odd_bits = []
+        for k, lbl in (
+            ("home", "1"),
+            ("draw", "X"),
+            ("away", "2"),
+            ("over_2.5", "Over 2.5"),
+            ("under_2.5", "Under 2.5"),
+            ("btts_yes", "BTTS Oui"),
+        ):
+            if odds.get(k):
+                odd_bits.append(f"{lbl}={odds[k]}")
+        if odd_bits:
+            parts.append("Cotes bookmaker réelles : " + " | ".join(odd_bits))
+
+    # 4. Probabilités natives Bzzoiro
+    bzz_m = context.get("bzzoiro_probas")
+    if isinstance(bzz_m, dict) and bzz_m:
+        bzz_bits = []
+        for k, lbl in (("victoire_home", "1"), ("match_nul", "X"), ("victoire_away", "2"), ("over_2.5", "Over 2.5"), ("btts_yes", "BTTS")):
+            if bzz_m.get(k) is not None:
+                bzz_bits.append(f"{lbl}={bzz_m[k]}%")
+        if bzz_bits:
+            parts.append("Modèle Bzzoiro : " + " | ".join(bzz_bits))
+
+    # 5. Forme / classement éventuels fournis par Bzzoiro
     for key, label in (("home_form", "Forme domicile"), ("away_form", "Forme extérieur"), ("summary", "Données terrain")):
         val = context.get(key)
         if val:
@@ -65,17 +103,19 @@ def format_context(context: Optional[dict], kickoff: str = "") -> str:
 
 
 def build_prompt(home: str, away: str, league: str, ctx_block: str) -> str:
-    return f"""Tu es un pronostiqueur sportif professionnel avec plus de 20 ans d'expérience dans les paris football et la gestion de bankroll VIP.
+    today_date = datetime.now(TZ).strftime("%d/%m/%Y")
+    return f"""Tu es un pronostiqueur sportif professionnel d'élite (20+ ans d'expérience) dans le style "Café Foot / Briefing du jour" (direct, chiffré, vivant, lucide et nuancé).
+Date actuelle : {today_date}. Utilise tes connaissances actuelles et la recherche web disponible pour vérifier le classement actuel, la forme récente et les absences du jour.
 Analyse ce match avec une rigueur absolue : {home} (Domicile) vs {away} (Extérieur) — Compétition : {league}.
 {ctx_block}
 
-MÉTHODOLOGIE D'ANALYSE PRO (OBLIGATOIRE) :
-1. RAPPORT DE FORCE RÉEL : Compare le niveau des effectifs, la solidité à domicile de {home} vs le rendement à l'extérieur de {away}, et les données statistiques fournies ci-dessus.
-2. FILTRE ANTI-PIÈGE : Identifie tout facteur de risque majeur (rotation d'effectif avant/après coupe d'Europe, match de coupe nationale déséquilibré, blessures clés, équipe sans enjeu ou en crise). Si un risque existe, passe "trap_warning" à true.
-3. CALIBRATION RÉALISTE DES PROBABILITÉS : Ne gonfle jamais artificiellement un favori. En football réel, même un grand favori dépasse rarement 75-82% de victoire sèche. Utilise la Double Chance (1X ou X2) si un favori joue à l'extérieur ou face à un bloc bas.
-4. COHÉRENCE TOTALE : Le marché ayant la plus forte probabilité dans le JSON DOIT correspondre exactement à la conclusion de ton texte "analysis".
+MÉTHODOLOGIE D'ANALYSE PRO EN 4 TEMPS (OBLIGATOIRE) :
+1. ENJEU & DYNAMIQUE ACTUELLE : Situe les deux équipes au classement/compétition (points, course au titre/top 8/maintien) et leur état de forme récent.
+2. SÉRIES DOMICILE / EXTÉRIEUR & SCÉNARIOS DE BUTS : Compare le rendement précis de {home} à domicile vs {away} à l'extérieur (victoires/défaites récentes, buts marqués/encaissés, tendance à ouvrir le score ou encaisser, matchs ouverts Over 2.5/BTTS ou fermés).
+3. FACTEURS CLÉS & FILTRE ANTI-PIÈGE : Vérifie les joueurs décisifs/absences confirmées, changements de coach ou contexte (derby, revanche). Identifie tout risque majeur (rotation avant/après coupe d'Europe, équipe sans enjeu ou en crise) : si un piège existe, passe "trap_warning" à true et "risk_level" à "HIGH".
+4. NUANCE & VERDICT TRANCHÉ : Pèse brièvement le contre-argument ("Mais attention..." / "Petit doute...") puis tranche clairement sur le pari le plus solide. Le marché ayant la plus forte probabilité dans le JSON DOIT correspondre exactement à la conclusion de ton texte "analysis".
 
-Retourne UNIQUEMENT ce JSON valide :
+Retourne UNIQUEMENT ce JSON valide (sans texte avant ni après) :
 {{
   "markets": {{
     "victoire_home": 0,
@@ -95,14 +135,14 @@ Retourne UNIQUEMENT ce JSON valide :
   }},
   "risk_level": "LOW",
   "trap_warning": false,
-  "analysis": "Analyse d'expert en 3 phrases courtes et percutantes : rapport de force, dynamique/enjeu, et justification du pari le plus sûr.",
+  "analysis": "Raisonnement style Café Foot en 3 à 5 phrases précises et chiffrées : enjeu & dynamique dom/ext, joueur clé ou absence, nuance (Mais attention...) et conclusion claire sur le pari le plus solide.",
   "advices": [
     {{"text": "Recommandation principale de pro", "confidence": 0}}
   ]
 }}
 
 RÈGLES MATHÉMATIQUES STRICTES :
-- Probabilités entières entre 2 et 96.
+- Probabilités entières entre 2 et 96 (ne gonfle jamais artificiellement un favori : même un grand favori dépasse rarement 75-82% en victoire sèche).
 - victoire_home + match_nul + victoire_away = 100.
 - over_1.5 + under_1.5 = 100 | over_2.5 + under_2.5 = 100 | over_3.5 + under_3.5 = 100.
 - btts_yes + btts_no = 100.
@@ -152,7 +192,6 @@ def _sanitize_prediction(parsed: dict) -> Optional[dict]:
     risk_level = str(parsed.get("risk_level") or "MEDIUM").upper().strip()
     trap_warning = bool(parsed.get("trap_warning", False))
 
-    # Signal explicite dans l'analyse pour le filtre anti-piège de main.py
     if (trap_warning or risk_level == "HIGH") and "match piège" not in analysis.lower():
         analysis = f"{analysis} (Match piège / risque élevé détecté).".strip()
 
@@ -163,52 +202,106 @@ def _sanitize_prediction(parsed: dict) -> Optional[dict]:
     return parsed
 
 
+def _extract_json_from_response(data: dict) -> Optional[dict]:
+    try:
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return None
+        parts = candidates[0].get("content", {}).get("parts") or []
+        # Ignorer les blocs de réflexion interne (thought=True) et conserver le texte final
+        text_chunks = [
+            str(p.get("text") or "")
+            for p in parts
+            if isinstance(p, dict) and not p.get("thought", False)
+        ]
+        if not text_chunks:
+            text_chunks = [str(p.get("text") or "") for p in parts if isinstance(p, dict)]
+        text = "".join(text_chunks).strip()
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text).strip()
+
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    end = -1
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    raw_json = text[start : end + 1] if end != -1 else text[start:]
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return None
+    return _sanitize_prediction(parsed)
+
+
 async def call_gemini(client: httpx.AsyncClient, model: str, prompt: str) -> Optional[dict]:
     url = f"{GEMINI_BASE_URL}/{model}:generateContent?key={GEMINI_API_KEY}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.15,
-            "maxOutputTokens": 1200,
-            "responseMimeType": "application/json",
-        },
-    }
 
-    for attempt in range(2):
-        try:
-            r = await client.post(url, json=payload, timeout=45.0)
-            if r.status_code in (503, 429):
-                wait = 2 * (attempt + 1)
-                print(f"  ⏳ Gemini {model} {r.status_code}, retry {attempt+1}/2...")
-                await asyncio.sleep(wait)
-                continue
-            if r.status_code >= 400:
-                print(f"  ⚠️ Gemini {model} HTTP {r.status_code}")
-                return None
+    # Tentative 1 : Avec Google Search Grounding pour classement/forme/absences en direct
+    # Tentative 2 : Mode JSON structuré natif (si le modèle lite ne supporte pas googleSearch)
+    payloads = [
+        (
+            "search",
+            {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "tools": [{"googleSearch": {}}],
+                "generationConfig": {
+                    "temperature": 0.25,
+                    "maxOutputTokens": 4096,
+                },
+            },
+        ),
+        (
+            "json",
+            {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.20,
+                    "maxOutputTokens": 4096,
+                    "responseMimeType": "application/json",
+                },
+            },
+        ),
+    ]
 
-            data = r.json()
+    for mode_name, payload in payloads:
+        for attempt in range(2):
             try:
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-            except (KeyError, IndexError, TypeError):
-                return None
+                r = await client.post(url, json=payload, timeout=50.0)
+                if r.status_code in (503, 429):
+                    wait = 3 * (attempt + 1)
+                    print(f"  ⏳ Gemini {model} ({mode_name}) HTTP {r.status_code}, retry {attempt+1}/2...")
+                    await asyncio.sleep(wait)
+                    continue
+                if r.status_code >= 400:
+                    err_snippet = re.sub(r"\s+", " ", r.text)[:180]
+                    print(f"  ⚠️ Gemini {model} ({mode_name}) HTTP {r.status_code} : {err_snippet}")
+                    break
 
-            m = re.search(r"\{[\s\S]*\}", text)
-            if not m:
-                return None
-            try:
-                parsed = json.loads(m.group())
-            except json.JSONDecodeError:
-                return None
-
-            return _sanitize_prediction(parsed)
-        except Exception as e:
-            print(f"  ⚠️ Gemini {model} crash: {repr(e)}")
-            await asyncio.sleep(1.5)
+                parsed = _extract_json_from_response(r.json())
+                if parsed is not None:
+                    return parsed
+                print(f"  ⚠️ Gemini {model} ({mode_name}) : réponse non-JSON")
+                break
+            except Exception as e:
+                print(f"  ⚠️ Gemini {model} ({mode_name}) crash: {repr(e)}")
+                await asyncio.sleep(1.5)
     return None
 
 
 async def predict_match_probas(client, home, away, league, kickoff, context=None):
     if not GEMINI_API_KEY:
+        print("  ❌ GEMINI_API_KEY absente")
         return None
     ctx_block = format_context(context, kickoff=str(kickoff or ""))
     prompt = build_prompt(home, away, league, ctx_block)
@@ -220,5 +313,3 @@ async def predict_match_probas(client, home, away, league, kickoff, context=None
         if i < len(GEMINI_MODELS) - 1:
             print(f"  🔄 Bascule vers {GEMINI_MODELS[i+1]}")
     return None
-
-Voici le fichier
