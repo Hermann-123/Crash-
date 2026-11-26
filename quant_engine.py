@@ -1,10 +1,9 @@
 """
 quant_engine.py — Moteur Quantitatif Multi-Compétitions & Anti-Risque pour VOLATILITY INDEX
-Sources de données :
-- Bzzoiro Sports Data (matchs du jour & xG pré-match toutes compétitions)
-- ESPN Public API (stade réel, terrain neutre, classement, forme, blessures)
-- The Odds API (découverte dynamique des compétitions actives + cotes marché)
-- Gemini AI (analyse verrouillée sur les faits et le marché sélectionné)
+- Résolution dynamique de toutes les compétitions mondiales (ESPN + The Odds API + Bzzoiro)
+- Vérification pré-match ESPN (stade réel, terrain neutre neutralSite, classement, blessures)
+- Modèle Dixon-Coles corrigé terrain neutre + Lissage bayésien contre les cotes bookmaker
+- Verrous anti-faux Under 2.5, anti-EV gonflée et anti-hallucination
 """
 
 from __future__ import annotations
@@ -13,10 +12,9 @@ import logging
 import math
 import os
 import unicodedata
-from itertools import combinations
 from typing import Any
 
-import requests
+import httpx
 
 logger = logging.getLogger("volatility_index.quant")
 
@@ -24,7 +22,6 @@ ESPN_BASE = "https://site.api.espn.com/apis"
 BZZOIRO_EVENTS_URL = "https://sports.bzzoiro.com/api/events/"
 ODDS_API_BASE = "https://api.the-odds-api.com/v4/sports"
 
-# Table étendue des compétitions mondiales -> Slug ESPN & Sport Key Odds API
 LEAGUE_CONFIG: dict[str, dict[str, str]] = {
     # Coupes d'Europe & Compétitions Internationales
     "UEFA Champions League": {"espn": "uefa.champions", "odds": "soccer_uefa_champs_league"},
@@ -42,6 +39,8 @@ LEAGUE_CONFIG: dict[str, dict[str, str]] = {
     # Angleterre
     "Premier League": {"espn": "eng.1", "odds": "soccer_epl"},
     "Championship": {"espn": "eng.2", "odds": "soccer_efl_champ"},
+    "League One": {"espn": "eng.3", "odds": "soccer_england_league1"},
+    "League Two": {"espn": "eng.4", "odds": "soccer_england_league2"},
     "FA Cup": {"espn": "eng.fa", "odds": "soccer_fa_cup"},
     "EFL Cup": {"espn": "eng.league_cup", "odds": "soccer_england_efl_cup"},
     "Carabao Cup": {"espn": "eng.league_cup", "odds": "soccer_england_efl_cup"},
@@ -90,75 +89,84 @@ LEAGUE_CONFIG: dict[str, dict[str, str]] = {
     "J1 League": {"espn": "jpn.1", "odds": "soccer_japan_j_league"},
 }
 
-# Mots-clés des compétitions mineures / jeunes / réserves à exclure par sécurité
+ALL_ESPN_SLUGS: list[str] = [
+    "all",
+    "uefa.champions", "uefa.europa", "uefa.europa.conf", "uefa.nations",
+    "eng.1", "eng.2", "eng.3", "eng.fa", "eng.league_cup",
+    "esp.1", "esp.2", "esp.copa_del_rey",
+    "ita.1", "ita.2", "ita.coppa_italia",
+    "ger.1", "ger.2", "ger.dfb_pokal",
+    "fra.1", "fra.2", "fra.coupe_de_france",
+    "ned.1", "por.1", "bel.1", "tur.1", "sco.1", "sui.1", "aut.1", "gre.1",
+    "nor.1", "swe.1", "den.1",
+    "conmebol.libertadores", "conmebol.sudamericana",
+    "bra.1", "arg.1", "usa.1", "mex.1", "sau.1", "jpn.1",
+    "fifa.world", "caf.nations",
+]
+
 EXCLUDED_LEAGUE_KEYWORDS = (
     "u17", "u18", "u19", "u20", "u21", "u23", "youth", "reserve",
-    "friendly", "amical", "women", "feminin", "oberliga", "regionalliga",
-    "national league north", "national league south", "istmian",
+    "friendly", "amical", "club friendlies", "women", "feminin",
+    "oberliga", "regionalliga", "national league north", "national league south",
+    "istmian", "efl trophy", "checkatrade", "premier league 2", "premier league cup",
 )
 
 _DYNAMIC_ODDS_SPORTS_CACHE: list[dict[str, Any]] | None = None
 
 
-def _normalize_name(name: str) -> str:
-    """Normalise un nom d'équipe ou de compétition pour faciliter le matching multi-sources."""
+def normalize_team_name(name: str) -> str:
     text = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode("ascii")
     cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
-    stop_words = {"fc", "jk", "sk", "sc", "cf", "ac", "as", "olympique", "de", "the", "club"}
+    stop_words = {"fc", "jk", "sk", "sc", "cf", "ac", "as", "afc", "olympique", "de", "the", "club", "united", "utd", "city"}
     tokens = [t for t in cleaned.split() if t not in stop_words]
     return " ".join(tokens)
 
 
-def _teams_match(name_a: str, name_b: str) -> bool:
-    """Vérifie si deux noms d'équipes désignent le même club."""
-    na, nb = _normalize_name(name_a), _normalize_name(name_b)
+def teams_match_strict(name_a: str, name_b: str) -> bool:
+    na, nb = normalize_team_name(name_a), normalize_team_name(name_b)
     if not na or not nb:
         return False
-    return na in nb or nb in na or bool(set(na.split()) & set(nb.split()))
+    if na == nb:
+        return True
+    if len(na) >= 4 and len(nb) >= 4 and (na in nb or nb in na):
+        return True
+    ta, tb = set(na.split()), set(nb.split())
+    return bool(ta & tb and max(len(t) for t in (ta & tb)) >= 5)
 
 
 def is_eligible_competition(league_name: str) -> bool:
-    """Filtre les compétitions amateurs, jeunes ou amicales instables."""
-    low = (league_name or "").lower()
+    low = (league_name or "").lower().strip()
     if not low:
-        return False
+        return True
     return not any(bad in low for bad in EXCLUDED_LEAGUE_KEYWORDS)
 
 
-def discover_active_odds_sports(api_key: str | None = None) -> list[dict[str, Any]]:
-    """
-    Interroge /v4/sports/ (gratuit, 0 quota consommé) pour récupérer toutes
-    les compétitions de football actives sur The Odds API.
-    """
+async def discover_active_odds_sports_async(api_key: str | None = None) -> list[dict[str, Any]]:
+    """Interroge /v4/sports/ (0 crédit consommé) pour découvrir toutes les ligues foot actives."""
     global _DYNAMIC_ODDS_SPORTS_CACHE
     if _DYNAMIC_ODDS_SPORTS_CACHE is not None:
         return _DYNAMIC_ODDS_SPORTS_CACHE
 
-    key = api_key or os.getenv("ODDS_API_KEY", "")
+    key = api_key or os.getenv("THE_ODDS_API_KEY", "") or os.getenv("ODDS_API_KEY", "")
     if not key:
         return []
 
     try:
-        resp = requests.get(f"{ODDS_API_BASE}/", params={"apiKey": key}, timeout=10)
-        if resp.ok:
-            soccer_sports = [
-                s for s in resp.json()
-                if str(s.get("key", "")).startswith("soccer_") and s.get("active", True)
-            ]
-            _DYNAMIC_ODDS_SPORTS_CACHE = soccer_sports
-            return soccer_sports
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{ODDS_API_BASE}/", params={"apiKey": key})
+            if resp.status_code == 200:
+                soccer_sports = [
+                    s for s in resp.json()
+                    if str(s.get("key", "")).startswith("soccer_") and s.get("active", True)
+                ]
+                _DYNAMIC_ODDS_SPORTS_CACHE = soccer_sports
+                return soccer_sports
     except Exception as exc:
-        logger.warning("Impossible de charger la liste dynamique des ligues Odds API: %s", exc)
-
+        logger.warning("Erreur découverte dynamique Odds API: %s", exc)
     return []
 
 
 def resolve_league_config(league_name: str, country_name: str = "") -> dict[str, str]:
-    """
-    Résout dynamiquement le slug ESPN et la clé Odds API pour TOUTES les compétitions :
-    1. Correspondance exacte ou partielle dans LEAGUE_CONFIG (45+ compétitions)
-    2. Recherche dynamique dans le catalogue actif The Odds API (/v4/sports/)
-    """
     clean_league = (league_name or "").strip()
     if clean_league in LEAGUE_CONFIG:
         return LEAGUE_CONFIG[clean_league]
@@ -168,45 +176,39 @@ def resolve_league_config(league_name: str, country_name: str = "") -> dict[str,
         if key.lower() == low or key.lower() in low or low in key.lower():
             return cfg
 
-    # Recherche dynamique dans les sports actifs The Odds API
-    active_sports = discover_active_odds_sports()
-    norm_target = _normalize_name(f"{country_name} {clean_league}".strip())
+    active_sports = _DYNAMIC_ODDS_SPORTS_CACHE or []
+    norm_target = normalize_team_name(f"{country_name} {clean_league}".strip())
     target_tokens = set(norm_target.split())
-
     best_sport_key = ""
     best_overlap = 0
     for sp in active_sports:
-        sp_title = _normalize_name(f"{sp.get('group', '')} {sp.get('title', '')}")
-        sp_tokens = set(sp_title.split())
-        overlap = len(target_tokens & sp_tokens)
-        if overlap > best_overlap and overlap >= 1:
+        sp_title = normalize_team_name(f"{sp.get('group', '')} {sp.get('title', '')}")
+        overlap = len(target_tokens & set(sp_title.split()))
+        if overlap > best_overlap:
             best_overlap = overlap
             best_sport_key = sp.get("key", "")
 
-    return {
-        "espn": "",
-        "odds": best_sport_key,
-    }
+    return {"espn": "", "odds": best_sport_key}
 
 
 # ==============================================================================
-# 1. VÉRIFICATION PRÉ-MATCH VIA ESPN (SANS API-FOOTBALL)
+# 1. VÉRIFICATION PRÉ-MATCH ESPN (STADE, TERRAIN NEUTRE, CLASSEMENT, BLESSURES)
 # ==============================================================================
 
-def fetch_espn_prematch_context(
-    slug: str,
+async def fetch_espn_prematch_context_async(
+    league_name: str,
     date_yyyymmdd: str,
+    home_team: str,
+    away_team: str,
     event_id: str | None = None,
-    home_team: str = "",
-    away_team: str = "",
 ) -> dict[str, Any]:
-    """
-    Récupère stade réel, terrain neutre (neutralSite), classement, forme récente,
-    blessures et cotes de clôture ESPN. Si `slug` est vide (compétition secondaire),
-    retourne un contexte neutre valide pour ne pas bloquer l'analyse Bzzoiro + Odds API.
-    """
+    cfg = resolve_league_config(league_name)
+    slug = cfg.get("espn", "")
+    slugs_to_try = [slug] if slug else ["all", "uefa.champions", "uefa.europa", "uefa.europa.conf"]
+
     context: dict[str, Any] = {
-        "espn_event_id": event_id,
+        "espn_event_id": None,
+        "resolved_slug": slug,
         "venue_name": "Stade officiel",
         "venue_city": "Domicile",
         "neutral_venue": False,
@@ -215,257 +217,132 @@ def fetch_espn_prematch_context(
         "home_form": "",
         "away_form": "",
         "injuries": [],
-        "espn_closing_odds": {},
     }
-
-    if not slug:
-        return context
 
     home_id: str | None = None
     away_id: str | None = None
+    found_slug = ""
 
-    try:
-        sb_url = f"{ESPN_BASE}/site/v2/sports/soccer/{slug}/scoreboard?dates={date_yyyymmdd}"
-        resp = requests.get(sb_url, timeout=10)
-        resp.raise_for_status()
-        sb_data = resp.json()
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for s in slugs_to_try:
+            if not s:
+                continue
+            try:
+                sb_url = f"{ESPN_BASE}/site/v2/sports/soccer/{s}/scoreboard"
+                resp = await client.get(sb_url, params={"dates": date_yyyymmdd, "limit": 200})
+                if resp.status_code != 200:
+                    continue
+                for event in resp.json().get("events", []):
+                    ev_id = str(event.get("id", ""))
+                    comp = (event.get("competitions") or [{}])[0]
+                    competitors = comp.get("competitors", [])
+                    ev_home = next((c.get("team", {}).get("displayName", "") for c in competitors if c.get("homeAway") == "home"), "")
+                    ev_away = next((c.get("team", {}).get("displayName", "") for c in competitors if c.get("homeAway") == "away"), "")
 
-        for event in sb_data.get("events", []):
-            ev_id = str(event.get("id", ""))
-            comp = event.get("competitions", [{}])[0]
-            competitors = comp.get("competitors", [])
+                    clean_ev_id = str(event_id).replace("espn_", "") if event_id else ""
+                    id_match = bool(clean_ev_id and ev_id == clean_ev_id)
+                    name_match = bool(teams_match_strict(home_team, ev_home) and teams_match_strict(away_team, ev_away))
 
-            ev_home = next((c.get("team", {}).get("displayName", "") for c in competitors if c.get("homeAway") == "home"), "")
-            ev_away = next((c.get("team", {}).get("displayName", "") for c in competitors if c.get("homeAway") == "away"), "")
+                    if not (id_match or name_match):
+                        continue
 
-            id_matches = bool(event_id and ev_id == str(event_id))
-            name_matches = bool(home_team and away_team and _teams_match(home_team, ev_home) and _teams_match(away_team, ev_away))
+                    found_slug = s if s != "all" else slug
+                    context["espn_event_id"] = ev_id
+                    context["resolved_slug"] = found_slug
+                    venue = comp.get("venue") or {}
+                    context["neutral_venue"] = bool(comp.get("neutralSite", False))
+                    if venue.get("fullName"):
+                        context["venue_name"] = venue["fullName"]
+                    city = (venue.get("address") or {}).get("city")
+                    if city:
+                        context["venue_city"] = city
 
-            if not (id_matches or name_matches):
+                    for c in competitors:
+                        if c.get("homeAway") == "home":
+                            home_id = str(c.get("team", {}).get("id", ""))
+                            context["home_form"] = c.get("form", "")
+                        elif c.get("homeAway") == "away":
+                            away_id = str(c.get("team", {}).get("id", ""))
+                            context["away_form"] = c.get("form", "")
+                    break
+                if context["espn_event_id"]:
+                    break
+            except Exception:
                 continue
 
-            context["espn_event_id"] = ev_id
-            venue = comp.get("venue", {})
-            context["neutral_venue"] = bool(comp.get("neutralSite", False))
-            context["venue_name"] = venue.get("fullName", "Stade officiel")
-            context["venue_city"] = venue.get("address", {}).get("city", "Domicile")
+        if found_slug and (home_id or away_id):
+            try:
+                st_res = await client.get(f"{ESPN_BASE}/v2/sports/soccer/{found_slug}/standings")
+                if st_res.status_code == 200:
+                    for child in st_res.json().get("children", []):
+                        for entry in (child.get("standings") or {}).get("entries", []):
+                            tid = str((entry.get("team") or {}).get("id", ""))
+                            stats = {st["name"]: st.get("displayValue") for st in entry.get("stats", []) if "name" in st}
+                            if tid == home_id and stats.get("rank"):
+                                context["home_rank"] = stats["rank"]
+                            elif tid == away_id and stats.get("rank"):
+                                context["away_rank"] = stats["rank"]
+            except Exception:
+                pass
 
-            for c in competitors:
-                if c.get("homeAway") == "home":
-                    home_id = str(c.get("team", {}).get("id", ""))
-                    context["home_form"] = c.get("form", "")
-                elif c.get("homeAway") == "away":
-                    away_id = str(c.get("team", {}).get("id", ""))
-                    context["away_form"] = c.get("form", "")
-
-            odds_list = comp.get("odds", [])
-            if odds_list:
-                context["espn_closing_odds"] = odds_list[0]
-            break
-    except Exception as exc:
-        logger.warning("Erreur ESPN Scoreboard (%s): %s", slug, exc)
-
-    # Classement exact (/standings)
-    if home_id or away_id:
-        try:
-            st_url = f"{ESPN_BASE}/v2/sports/soccer/{slug}/standings"
-            st_res = requests.get(st_url, timeout=10)
-            if st_res.ok:
-                for child in st_res.json().get("children", []):
-                    for entry in child.get("standings", {}).get("entries", []):
-                        tid = str(entry.get("team", {}).get("id", ""))
-                        stats = {s["name"]: s.get("displayValue") for s in entry.get("stats", [])}
-                        if tid == home_id:
-                            context["home_rank"] = stats.get("rank", "N/A")
-                        elif tid == away_id:
-                            context["away_rank"] = stats.get("rank", "N/A")
-        except Exception as exc:
-            logger.warning("Erreur ESPN Standings (%s): %s", slug, exc)
-
-    # Blessures & absents (/summary)
-    resolved_id = context.get("espn_event_id")
-    if resolved_id:
-        try:
-            sum_url = f"{ESPN_BASE}/site/v2/sports/soccer/{slug}/summary?event={resolved_id}"
-            sum_res = requests.get(sum_url, timeout=10)
-            if sum_res.ok:
-                for team_inj in sum_res.json().get("injuries", []):
-                    t_name = team_inj.get("team", {}).get("displayName", "")
-                    for item in team_inj.get("injuries", []):
-                        athlete = item.get("athlete", {}).get("displayName", "")
-                        status = item.get("status", "")
-                        if athlete:
-                            context["injuries"].append(f"{athlete} ({t_name} - {status})")
-        except Exception as exc:
-            logger.warning("Erreur ESPN Summary (%s): %s", resolved_id, exc)
+        if found_slug and context["espn_event_id"]:
+            try:
+                sum_res = await client.get(
+                    f"{ESPN_BASE}/site/v2/sports/soccer/{found_slug}/summary",
+                    params={"event": context["espn_event_id"]},
+                )
+                if sum_res.status_code == 200:
+                    for team_inj in sum_res.json().get("injuries", []):
+                        t_name = (team_inj.get("team") or {}).get("displayName", "")
+                        for item in team_inj.get("injuries", []):
+                            athlete = (item.get("athlete") or {}).get("displayName", "")
+                            status = item.get("status", "")
+                            if athlete:
+                                context["injuries"].append(f"{athlete} ({t_name} - {status})")
+            except Exception:
+                pass
 
     return context
 
 
 # ==============================================================================
-# 2. RÉCUPÉRATION xG (BZZOIRO) & COTES MARCHÉ (THE ODDS API)
+# 2. DIXON-COLES CALIBRÉ & LISSAGE BAYÉSIEN ANTI-HALLUCINATION
 # ==============================================================================
 
-def fetch_bzzoiro_matches(date_iso: str, api_key: str | None = None) -> list[dict[str, Any]]:
-    """
-    Récupère les matchs éligibles du jour sur toutes les compétitions depuis Bzzoiro.
-    Format date_iso : 'YYYY-MM-DD'
-    """
-    headers = {}
-    key = api_key or os.getenv("BZZOIRO_API_KEY", "")
-    if key:
-        headers["Authorization"] = f"Token {key}"
+def estimate_lambdas_from_odds(
+    home_odd: float,
+    away_odd: float,
+    draw_odd: float | None = None,
+    over_25_odd: float | None = None,
+    under_25_odd: float | None = None,
+    neutral_venue: bool = False,
+) -> tuple[float, float]:
+    odds_list = [o for o in (home_odd, draw_odd, away_odd) if o and o > 1.01]
+    if len(odds_list) == 3:
+        inv_sum = sum(1.0 / o for o in odds_list)
+        p_h = (1.0 / home_odd) / inv_sum
+        p_a = (1.0 / away_odd) / inv_sum
+    else:
+        inv_h = 1.0 / max(1.05, home_odd)
+        inv_a = 1.0 / max(1.05, away_odd)
+        p_h = 0.74 * (inv_h / (inv_h + inv_a))
+        p_a = 0.74 * (inv_a / (inv_h + inv_a))
 
-    try:
-        resp = requests.get(
-            BZZOIRO_EVENTS_URL,
-            params={"date": date_iso},
-            headers=headers,
-            timeout=12,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        raw_events = payload.get("results", payload) if isinstance(payload, dict) else payload
+    expected_total_goals = 2.65
+    if over_25_odd and under_25_odd and over_25_odd > 1.01 and under_25_odd > 1.01:
+        inv_ou = (1.0 / over_25_odd) + (1.0 / under_25_odd)
+        p_over25 = (1.0 / over_25_odd) / inv_ou
+        expected_total_goals = max(1.85, min(3.45, 0.85 + 3.45 * p_over25))
 
-        matches: list[dict[str, Any]] = []
-        for ev in raw_events:
-            home = ev.get("home_team") or ev.get("home", {}).get("name", "")
-            away = ev.get("away_team") or ev.get("away", {}).get("name", "")
-            league_obj = ev.get("league") if isinstance(ev.get("league"), dict) else {}
-            league = ev.get("league_name") or league_obj.get("name", "Football")
-            country = ev.get("country") or league_obj.get("country", "")
+    share_h = max(0.18, min(0.82, p_h / max(0.05, p_h + p_a)))
+    if not neutral_venue:
+        share_h = min(0.84, share_h * 1.03)
+    share_a = 1.0 - share_h
 
-            if not (home and away) or not is_eligible_competition(league):
-                continue
+    lam_h = round(max(0.25, expected_total_goals * share_h), 2)
+    lam_a = round(max(0.20, expected_total_goals * share_a), 2)
+    return lam_h, lam_a
 
-            home_xg = float(ev.get("home_xg") or ev.get("xg_home") or 1.25)
-            away_xg = float(ev.get("away_xg") or ev.get("xg_away") or 1.05)
-
-            matches.append(
-                {
-                    "bzzoiro_id": ev.get("id"),
-                    "home_team": home,
-                    "away_team": away,
-                    "league": league,
-                    "country": country,
-                    "kickoff": ev.get("start_time") or ev.get("date", date_iso),
-                    "home_xg": home_xg,
-                    "away_xg": away_xg,
-                }
-            )
-        return matches
-    except Exception as exc:
-        logger.error("Erreur récupération Bzzoiro (%s): %s", date_iso, exc)
-        return []
-
-
-def fetch_market_odds(sport_key: str, api_key: str | None = None) -> list[dict[str, Any]]:
-    """Récupère les cotes h2h (1X2) et totals (Over/Under) via The Odds API."""
-    if not sport_key:
-        return []
-    key = api_key or os.getenv("ODDS_API_KEY", "")
-    if not key:
-        return []
-
-    try:
-        url = f"{ODDS_API_BASE}/{sport_key}/odds/"
-        params = {
-            "apiKey": key,
-            "regions": "eu",
-            "markets": "h2h,totals",
-            "oddsFormat": "decimal",
-        }
-        resp = requests.get(url, params=params, timeout=12)
-        if resp.status_code == 404:
-            return []
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as exc:
-        logger.warning("Erreur The Odds API (%s): %s", sport_key, exc)
-        return []
-
-
-def extract_odds_for_match(
-    home_team: str,
-    away_team: str,
-    odds_events: list[dict[str, Any]],
-) -> dict[str, tuple[float, list[float]]]:
-    """
-    Extrait les cotes moyennes par marché pour un match donné :
-    retourne {market_key: (target_odd, all_market_odds)}.
-    """
-    extracted: dict[str, tuple[float, list[float]]] = {}
-    for ev in odds_events:
-        ev_home = ev.get("home_team", "")
-        ev_away = ev.get("away_team", "")
-        if not (_teams_match(home_team, ev_home) and _teams_match(away_team, ev_away)):
-            continue
-
-        h2h_1, h2h_x, h2h_2 = [], [], []
-        ou_15_over, ou_15_under = [], []
-        ou_25_over, ou_25_under = [], []
-
-        for bk in ev.get("bookmakers", []):
-            for mkt in bk.get("markets", []):
-                mkey = mkt.get("key")
-                outcomes = mkt.get("outcomes", [])
-                if mkey == "h2h":
-                    for o in outcomes:
-                        name = o.get("name", "")
-                        price = float(o.get("price", 0))
-                        if price <= 1.0:
-                            continue
-                        if name == ev_home:
-                            h2h_1.append(price)
-                        elif name == ev_away:
-                            h2h_2.append(price)
-                        elif name.lower() == "draw":
-                            h2h_x.append(price)
-                elif mkey == "totals":
-                    for o in outcomes:
-                        point = float(o.get("point", 0))
-                        price = float(o.get("price", 0))
-                        side = o.get("name", "").lower()
-                        if price <= 1.0:
-                            continue
-                        if point == 1.5:
-                            if side == "over":
-                                ou_15_over.append(price)
-                            elif side == "under":
-                                ou_15_under.append(price)
-                        elif point == 2.5:
-                            if side == "over":
-                                ou_25_over.append(price)
-                            elif side == "under":
-                                ou_25_under.append(price)
-
-        if h2h_1 and h2h_x and h2h_2:
-            avg_1 = round(sum(h2h_1) / len(h2h_1), 2)
-            avg_x = round(sum(h2h_x) / len(h2h_x), 2)
-            avg_2 = round(sum(h2h_2) / len(h2h_2), 2)
-            all_1x2 = [avg_1, avg_x, avg_2]
-            extracted["1"] = (avg_1, all_1x2)
-            extracted["X"] = (avg_x, all_1x2)
-            extracted["2"] = (avg_2, all_1x2)
-
-        if ou_15_over and ou_15_under:
-            avg_o15 = round(sum(ou_15_over) / len(ou_15_over), 2)
-            avg_u15 = round(sum(ou_15_under) / len(ou_15_under), 2)
-            extracted["OVER_1.5"] = (avg_o15, [avg_o15, avg_u15])
-
-        if ou_25_over and ou_25_under:
-            avg_o25 = round(sum(ou_25_over) / len(ou_25_over), 2)
-            avg_u25 = round(sum(ou_25_under) / len(ou_25_under), 2)
-            extracted["OVER_2.5"] = (avg_o25, [avg_o25, avg_u25])
-            extracted["UNDER_2.5"] = (avg_u25, [avg_o25, avg_u25])
-        break
-
-    return extracted
-
-
-# ==============================================================================
-# 3. MODÈLE DIXON-COLES CALIBRÉ & BOUCLIER ANTI-RISQUE
-# ==============================================================================
 
 def dixon_coles_probabilities(
     home_xg: float,
@@ -474,23 +351,17 @@ def dixon_coles_probabilities(
     rho: float = -0.11,
     max_goals: int = 8,
 ) -> dict[str, float]:
-    """
-    Calcule les probabilités 1X2, Over/Under 1.5 et Over/Under 2.5 via Dixon-Coles.
-    Neutralise automatiquement l'avantage domicile (gamma = 1.00) sur terrain neutre.
-    """
-    home_adv = 1.00 if neutral_venue else 1.12
+    home_adv = 1.00 if neutral_venue else 1.08
     lam = max(0.20, home_xg * home_adv)
     mu = max(0.20, away_xg)
 
-    prob_1, prob_x, prob_2 = 0.0, 0.0, 0.0
-    prob_over_15, prob_under_15 = 0.0, 0.0
-    prob_under_25, prob_over_25 = 0.0, 0.0
+    prob_1 = prob_x = prob_2 = 0.0
+    prob_o15 = prob_u15 = prob_o25 = prob_u25 = prob_o35 = prob_btts = 0.0
 
     for h in range(max_goals + 1):
         p_h = (math.exp(-lam) * (lam ** h)) / math.factorial(h)
         for a in range(max_goals + 1):
             p_a = (math.exp(-mu) * (mu ** a)) / math.factorial(a)
-
             if h == 0 and a == 0:
                 tau = 1.0 - (lam * mu * rho)
             elif h == 1 and a == 0:
@@ -502,308 +373,100 @@ def dixon_coles_probabilities(
             else:
                 tau = 1.0
 
-            p_score = max(0.0, p_h * p_a * tau)
-            total_goals = h + a
-
+            p_sc = max(0.0, p_h * p_a * tau)
+            tot = h + a
             if h > a:
-                prob_1 += p_score
+                prob_1 += p_sc
             elif h == a:
-                prob_x += p_score
+                prob_x += p_sc
             else:
-                prob_2 += p_score
+                prob_2 += p_sc
 
-            if total_goals >= 2:
-                prob_over_15 += p_score
+            if tot >= 2:
+                prob_o15 += p_sc
             else:
-                prob_under_15 += p_score
-
-            if total_goals <= 2:
-                prob_under_25 += p_score
+                prob_u15 += p_sc
+            if tot >= 3:
+                prob_o25 += p_sc
             else:
-                prob_over_25 += p_score
+                prob_u25 += p_sc
+            if tot >= 4:
+                prob_o35 += p_sc
+            if h >= 1 and a >= 1:
+                prob_btts += p_sc
 
-    total = prob_1 + prob_x + prob_2
+    norm = max(1e-9, prob_1 + prob_x + prob_2)
+    p1, px, p2 = prob_1 / norm, prob_x / norm, prob_2 / norm
     return {
-        "1": prob_1 / total,
-        "X": prob_x / total,
-        "2": prob_2 / total,
-        "OVER_1.5": prob_over_15 / total,
-        "UNDER_1.5": prob_under_15 / total,
-        "UNDER_2.5": prob_under_25 / total,
-        "OVER_2.5": prob_over_25 / total,
+        "p_home": round(p1, 4),
+        "p_draw": round(px, 4),
+        "p_away": round(p2, 4),
+        "double_chance_1X": round(min(0.96, p1 + px), 4),
+        "double_chance_X2": round(min(0.96, p2 + px), 4),
+        "double_chance_12": round(min(0.96, p1 + p2), 4),
+        "over_1.5": round(prob_o15 / norm, 4),
+        "under_1.5": round(prob_u15 / norm, 4),
+        "over_2.5": round(prob_o25 / norm, 4),
+        "under_2.5": round(prob_u25 / norm, 4),
+        "over_3.5": round(prob_o35 / norm, 4),
+        "btts_yes": round(prob_btts / norm, 4),
+        "btts_no": round(max(0.02, 1.0 - (prob_btts / norm)), 4),
     }
 
 
-def evaluate_selection_tiered(
-    match: dict[str, Any],
-    espn_ctx: dict[str, Any],
+def calibrate_prob_with_market(
+    raw_model_prob: float,
+    target_odd: float,
+    opposing_odds: list[float] | None = None,
+    model_weight: float = 0.35,
+) -> tuple[float, float, float]:
+    if target_odd <= 1.01 or raw_model_prob <= 0:
+        return 0.0, 0.0, 0.0
+
+    if opposing_odds and all(o > 1.01 for o in opposing_odds):
+        overround = sum(1.0 / o for o in opposing_odds)
+        true_market_prob = (1.0 / target_odd) / overround
+    else:
+        true_market_prob = min(0.92, (1.0 / target_odd) * 0.945)
+
+    calibrated = (model_weight * raw_model_prob) + ((1.0 - model_weight) * true_market_prob)
+    calibrated = max(0.05, min(0.90, calibrated))
+    ev = calibrated * target_odd
+    return calibrated, true_market_prob, ev
+
+
+def passes_anti_trap_checks(
     market_key: str,
     target_odd: float,
-    all_market_odds: list[float],
-) -> dict[str, Any] | None:
-    """
-    Filtre anti-risque multi-compétitions avec lissage bayésien (30% Dixon-Coles / 70% marché)
-    et classement par niveau de confiance ('VIP_VALUE' ou 'SAFE_BACKUP').
-    """
-    if not all_market_odds or target_odd <= 1.01:
-        return None
-
-    total_xg = match["home_xg"] + match["away_xg"]
-
-    # 1. Plage de cotes & conditions structurelles par marché
-    if market_key == "OVER_1.5":
-        if not (1.28 <= target_odd <= 1.50):
-            return None
-        if total_xg < 2.75 or match["home_xg"] < 0.85 or match["away_xg"] < 0.85:
-            return None
+    calibrated_prob: float,
+    true_market_prob: float,
+    total_xg: float,
+    espn_ctx: dict[str, Any] | None = None,
+    home_team: str = "",
+    away_team: str = "",
+) -> tuple[bool, str]:
+    if market_key in ("over_1.5", "double_chance_1X", "double_chance_X2"):
+        if not (1.25 <= target_odd <= 1.60):
+            return False, f"cote hors plage sécurité ({target_odd})"
     else:
-        if not (1.35 <= target_odd <= 1.90):
-            return None
-
-    # 2. Filtre blessures ciblé sur l'équipe jouée (max 3 absents)
-    if market_key in ("1", "2"):
-        target_team = match["home_team"] if market_key == "1" else match["away_team"]
-        team_injuries = [
-            inj for inj in espn_ctx.get("injuries", []) if _teams_match(target_team, inj)
-        ]
-        if len(team_injuries) >= 4:
-            return None
-
-    # 3. Verrou anti-faux Under 2.5 (bloque les matchs ouverts ou équipes dos au mur > 24e)
-    if market_key == "UNDER_2.5":
-        if total_xg > 2.55:
-            return None
-        home_rank = int(espn_ctx["home_rank"]) if str(espn_ctx.get("home_rank")).isdigit() else 10
-        away_rank = int(espn_ctx["away_rank"]) if str(espn_ctx.get("away_rank")).isdigit() else 10
-        if home_rank > 24 or away_rank > 24:
-            return None
-
-    # 4. Probabilité Dixon-Coles corrigée terrain neutre
-    dc_probs = dixon_coles_probabilities(
-        home_xg=match["home_xg"],
-        away_xg=match["away_xg"],
-        neutral_venue=espn_ctx.get("neutral_venue", False),
-    )
-    if market_key not in dc_probs:
-        return None
-    raw_model_prob = dc_probs[market_key]
-
-    # 5. De-vigging + Lissage bayésien (30% modèle / 70% marché)
-    overround = sum(1.0 / o for o in all_market_odds if o > 1.0)
-    if overround <= 0:
-        return None
-    true_market_prob = (1.0 / target_odd) / overround
-    calibrated_prob = (0.30 * raw_model_prob) + (0.70 * true_market_prob)
+        if not (1.30 <= target_odd <= 1.95):
+            return False, f"cote hors plage pro ({target_odd})"
 
     edge = calibrated_prob - true_market_prob
     ev = calibrated_prob * target_odd
+    if edge > 0.10 or ev > 1.16 or ev < 0.96:
+        return False, f"edge/EV hors bornes (edge={edge:+.2f}, EV={ev:.2f})"
 
-    # 6. Plafonds de sécurité : rejette tout edge > 11% ou EV irréaliste (> 1.18)
-    if edge > 0.11 or ev > 1.18 or ev < 0.95:
-        return None
+    if market_key == "under_2.5":
+        if total_xg > 2.50:
+            return False, f"faux Under 2.5 (xG total={total_xg:.2f} > 2.50)"
+        if target_odd > 1.92:
+            return False, f"faux Under 2.5 (cote marché trop haute={target_odd})"
 
-    tier = "VIP_VALUE" if ev >= 1.02 else "SAFE_BACKUP"
-    family = "GOALS" if ("OVER" in market_key or "UNDER" in market_key) else "RESULT"
+    if espn_ctx and market_key in ("victoire_home", "victoire_away"):
+        target_team = home_team if market_key == "victoire_home" else away_team
+        team_inj = [inj for inj in espn_ctx.get("injuries", []) if teams_match_strict(target_team, inj)]
+        if len(team_inj) >= 4:
+            return False, f"trop d'absents ({len(team_inj)} blessés)"
 
-    ranks_label = (
-        f"{espn_ctx['home_rank']}e vs {espn_ctx['away_rank']}e"
-        if str(espn_ctx.get("home_rank")).isdigit() and str(espn_ctx.get("away_rank")).isdigit()
-        else "Coupe / Phase directe"
-    )
-
-    return {
-        "match_name": f"{match['home_team']} vs {match['away_team']}",
-        "home_team": match["home_team"],
-        "away_team": match["away_team"],
-        "league": match.get("league", "Football"),
-        "kickoff": match.get("kickoff", ""),
-        "market": market_key,
-        "family": family,
-        "odd": round(target_odd, 2),
-        "calibrated_prob": round(calibrated_prob * 100, 1),
-        "market_prob": round(true_market_prob * 100, 1),
-        "ev": round(ev, 2),
-        "tier": tier,
-        "home_xg": round(match["home_xg"], 2),
-        "away_xg": round(match["away_xg"], 2),
-        "venue": f"{espn_ctx['venue_name']} ({espn_ctx['venue_city']})",
-        "neutral_venue": espn_ctx.get("neutral_venue", False),
-        "ranks": ranks_label,
-        "injuries": espn_ctx.get("injuries", []),
-    }
-
-
-def build_daily_odds3_combo(valid_picks: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """
-    Assemble le combiné quotidien ODDS +3 (cote 2.55 à 3.40) sur toutes les compétitions :
-    - Priorité 1 : Duo Haute Confiance (2 sélections)
-    - Priorité 2 : Trio Sécurité (3 sélections incluant au max 1 pari BUTS)
-    """
-    unique_by_match: dict[str, dict[str, Any]] = {}
-    for p in sorted(
-        valid_picks,
-        key=lambda x: (x["tier"] == "VIP_VALUE", x["calibrated_prob"]),
-        reverse=True,
-    ):
-        if p["match_name"] not in unique_by_match:
-            unique_by_match[p["match_name"]] = p
-
-    pool = list(unique_by_match.values())
-
-    # Tentative 1 : Duo (2 sélections)
-    for p1, p2 in combinations(pool, 2):
-        if sum(1 for x in (p1, p2) if x["family"] == "GOALS") > 1:
-            continue
-        combo_odd = round(p1["odd"] * p2["odd"], 2)
-        if 2.55 <= combo_odd <= 3.35:
-            combo_prob = round((p1["calibrated_prob"] / 100) * (p2["calibrated_prob"] / 100) * 100, 1)
-            return {
-                "legs": [p1, p2],
-                "combo_odd": combo_odd,
-                "combo_prob": combo_prob,
-                "combo_ev": round((combo_prob / 100) * combo_odd, 2),
-                "mode": "DUO HAUTE CONFIANCE",
-            }
-
-    # Tentative 2 : Trio Sécurité (3 sélections)
-    for p1, p2, p3 in combinations(pool, 3):
-        if sum(1 for x in (p1, p2, p3) if x["family"] == "GOALS") > 1:
-            continue
-        combo_odd = round(p1["odd"] * p2["odd"] * p3["odd"], 2)
-        if 2.60 <= combo_odd <= 3.40:
-            combo_prob = round(
-                (p1["calibrated_prob"] / 100)
-                * (p2["calibrated_prob"] / 100)
-                * (p3["calibrated_prob"] / 100)
-                * 100,
-                1,
-            )
-            return {
-                "legs": [p1, p2, p3],
-                "combo_odd": combo_odd,
-                "combo_prob": combo_prob,
-                "combo_ev": round((combo_prob / 100) * combo_odd, 2),
-                "mode": "TRIO SÉCURITÉ",
-            }
-
-    return None
-
-
-# ==============================================================================
-# 4. ANALYSE IA GEMINI VERROUILLÉE SUR LE MARCHÉ & FORMATAGE TELEGRAM
-# ==============================================================================
-
-MARKET_LABELS: dict[str, str] = {
-    "1": "Victoire Domicile (1)",
-    "X": "Match Nul (X)",
-    "2": "Victoire Extérieur (2)",
-    "OVER_1.5": "Plus de 1.5 buts",
-    "UNDER_1.5": "Moins de 1.5 buts",
-    "OVER_2.5": "Plus de 2.5 buts",
-    "UNDER_2.5": "Moins de 2.5 buts",
-}
-
-
-def generate_gemini_analysis(pick: dict[str, Any], api_key: str | None = None) -> str:
-    """
-    Génère un commentaire analytique court (3 phrases max) strictement aligné
-    sur le marché retenu, le stade réel et le classement vérifié sur ESPN.
-    """
-    market_rules = {
-        "1": f"Justifie uniquement l'avantage de {pick['home_team']} (efficacité offensive, xG, dynamique).",
-        "2": f"Justifie uniquement la capacité de {pick['away_team']} à s'imposer à l'extérieur.",
-        "OVER_1.5": "Justifie uniquement un match avec au moins 2 buts attendus (xG cumulés élevés et double menace offensive).",
-        "OVER_2.5": "Justifie uniquement un match ouvert avec des occasions franches des deux côtés.",
-        "UNDER_2.5": "Justifie uniquement un match tactique fermé à faible score. INTERDICTION d'évoquer un festival offensif.",
-    }
-
-    prompt = f"""
-Tu es l'analyste quantitatif du canal VIP VOLATILITY INDEX. Rédige une analyse percutante de 3 phrases maximum en français.
-
-RÈGLES ABSOLUES :
-1. Utilise UNIQUEMENT les faits ci-dessous. N'invente jamais un classement ou un stade.
-2. {market_rules.get(pick['market'], 'Justifie strictement le pari sélectionné.')}
-3. Si Terrain neutre = True, précise explicitement que la rencontre est délocalisée à {pick['venue']} sans avantage du public.
-
-DONNÉES VÉRIFIÉES :
-- Match : {pick['match_name']} ({pick['league']})
-- Contexte / Classement : {pick['ranks']}
-- Stade : {pick['venue']} | Terrain neutre : {pick['neutral_venue']}
-- Pari : {MARKET_LABELS.get(pick['market'], pick['market'])} @ {pick['odd']}
-- Probabilité calibrée : {pick['calibrated_prob']}% (Marché : {pick['market_prob']}%)
-- xG Bzzoiro : {pick['home_team']} {pick['home_xg']} vs {pick['away_team']} {pick['away_xg']}
-""".strip()
-
-    key = api_key or os.getenv("GEMINI_API_KEY", "")
-    if key:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}"
-            body = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 220},
-            }
-            res = requests.post(url, json=body, timeout=15)
-            if res.ok:
-                candidates = res.json().get("candidates", [])
-                if candidates:
-                    text = candidates[0]["content"]["parts"][0]["text"].strip()
-                    if text:
-                        return text
-        except Exception as exc:
-            logger.warning("Fallback commentaire local (Gemini indisponible): %s", exc)
-
-    neutral_note = f" (match délocalisé à {pick['venue']})" if pick.get("neutral_venue") else ""
-    return (
-        f"Les indicateurs Bzzoiro ({pick['home_xg']} vs {pick['away_xg']} xG) et le contexte sportif ({pick['ranks']}) "
-        f"valident l'option {MARKET_LABELS.get(pick['market'], pick['market'])}{neutral_note}. "
-        f"Avec une probabilité calibrée de {pick['calibrated_prob']}% face à une cote de {pick['odd']}, "
-        f"la sélection présente une valeur statistique maîtrisée (EV {pick['ev']})."
-    )
-
-
-def format_telegram_vip_ticket(combo: dict[str, Any], date_label: str) -> str:
-    """Formate le message VIP Telegram VOLATILITY INDEX prêt à publier."""
-    legs = combo["legs"]
-    lines = [
-        "━━━━━━━━━━━━━━━━━━━━━━━",
-        "     ⚡ VOLATILITY INDEX ⚡",
-        "━━━━━━━━━━━━━━━━━━━━━━━",
-        "Analyse IA • VIP",
-        f"📅 {date_label}",
-        "🟢 Mode : MULTI-COMPÉTITIONS CALIBRÉ",
-        "",
-        "🛡️ ODDS +3 AUTH",
-        f"Sélection Pro VIP • {combo['mode']} • {len(legs)} sélections",
-        "",
-        "┏━━━━━━━━━━━━━━━┓",
-        f"┃ 🎫 Cote : {combo['combo_odd']}",
-        f"┃ 📈 Réussite est. : {combo['combo_prob']}%",
-        f"┃ 💎 EV : {combo['combo_ev']}",
-        "┗━━━━━━━━━━━━━━━┛",
-        "",
-    ]
-
-    for idx, leg in enumerate(legs, start=1):
-        dots = "🟢🟢🟢" if leg["calibrated_prob"] >= 68 else "🟢🟢⚪"
-        label = MARKET_LABELS.get(leg["market"], leg["market"])
-        if leg["market"] == "1":
-            label = f"Victoire {leg['home_team']} (1)"
-        elif leg["market"] == "2":
-            label = f"Victoire {leg['away_team']} (2)"
-
-        commentary = leg.get("commentary") or generate_gemini_analysis(leg)
-        lines.extend(
-            [
-                f"┌─ #{idx} {leg['match_name']}",
-                f"│ 📅 {leg.get('kickoff', date_label)} • {leg['league']}",
-                f"│ 🎯 {label}",
-                f"│ 📊 Confiance : {leg['calibrated_prob']}% {dots}",
-                f"│ 💰 Cote : {leg['odd']}",
-                f"│ 🧠 {commentary}",
-                "└─────────────",
-                "",
-            ]
-        )
-
-    lines.append("⚠️ Analyse statistique calibrée (ESPN + Bzzoiro). Gestion de bankroll recommandée (1-3% par ticket).")
-    return "\n".join(lines)
+    return True, "ok"
