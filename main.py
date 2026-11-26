@@ -28,8 +28,15 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
 
 # --- IMPORTS ---
-try: from gemini_predictor import predict_match_probas
-except: predict_match_probas = None
+try:
+    from gemini_predictor import predict_match_probas
+except Exception:
+    predict_match_probas = None
+
+try:
+    from gemini_predictor import explain_selected_pick_with_gemini
+except Exception:
+    explain_selected_pick_with_gemini = None
 
 try: from bzzoiro_data import enrich_match_with_bzzoiro
 except: enrich_match_with_bzzoiro = None
@@ -92,15 +99,15 @@ WEIGHT_ALGO    = float(os.getenv("WEIGHT_ALGO",   "0.35"))
 WEIGHT_GEMINI  = float(os.getenv("WEIGHT_GEMINI", "0.35"))
 WEIGHT_BZZOIRO = float(os.getenv("WEIGHT_BZZOIRO","0.30"))
 
-# ✅ CALIBRAGE PRO GLOBAL — ZÉRO EV NÉGATIVE SUR TOUTES LES CATÉGORIES
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.01"))
-MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "1.00"))
-MIN_REAL_COUPON_EV = float(os.getenv("MIN_REAL_COUPON_EV", "1.02"))
+# ✅ CALIBRAGE PRO GLOBAL — PLAGE OFFICIELLE 2.00 À 3.50 (BATTRE LA MARGE BOOKMAKER)
+MIN_EDGE = float(os.getenv("MIN_EDGE", "-0.03"))
+MIN_COUPON_EV = float(os.getenv("MIN_COUPON_EV", "0.96"))
+MIN_REAL_COUPON_EV = float(os.getenv("MIN_REAL_COUPON_EV", "0.97"))
 
-# ✅ CALIBRAGE MOTEUR DU 22 NOVEMBRE (PYRAMIDE SÉCURISÉE >= 71%, EV >= 1.00)
-AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "68.0"))
+# ✅ CALIBRAGE MOTEUR VIP (3 MATCHS VARIÉS ENTRE 2.00 ET 3.50)
+AUTH_PROBA_MIN = float(os.getenv("AUTH_PROBA_MIN", "62.0"))
 AUTH_PROBA_MAX = float(os.getenv("AUTH_PROBA_MAX", "88.0"))
-AUTH_MIN_COMBINED_PROB = 0.31
+AUTH_MIN_COMBINED_PROB = 0.26
 
 DOUBLE_SCAN_POOL_SIZE       = int(os.getenv("DOUBLE_SCAN_POOL_SIZE", "12"))
 DOUBLE_SCAN_STABILITY_DELTA = float(os.getenv("DOUBLE_SCAN_STABILITY_DELTA", "0.16"))
@@ -116,16 +123,18 @@ DRAW_MIN_SCORE = 70
 DRAW_MAX_ECART = 0.20
 DRAW_MIN_PROB = 0.30
 
-ODDS3_AUTH_MIN_COTE = 1.85
-ODDS3_AUTH_MAX_COTE = 2.35
-ODDS3_HYB_MIN_COTE = 3.20
-ODDS3_HYB_MAX_COTE = 5.50
+ODDS3_AUTH_MIN_COTE = 2.00
+ODDS3_AUTH_MAX_COTE = 3.50
+ODDS3_HYB_MIN_COTE = 3.55
+ODDS3_HYB_MAX_COTE = 6.00
 ODDS3_MIN_COTE_LEG = 1.15
 
 MATCH_START_BUFFER_MINUTES = 10
 RESERVE_KEYWORDS = ["jong", " fc b", " ii", " u21", " u19", " castilla", " reserves", " b team"]
 
 PRO_TRAP_PHRASES = [
+    "match piège",
+    "risque élevé",
     "effectif remanié",
     "équipe bis",
     "équipe b",
@@ -460,7 +469,7 @@ def has_pro_red_flags(analysis_text: str, league_name: str = "") -> Tuple[bool, 
             return True, phrase
     return False, ""
 
-def clean_analysis_text(text: str, max_len: int = 520) -> str:
+def clean_analysis_text(text: str, max_len: int = 560) -> str:
     if not text:
         return ""
     text = re.sub(r"\s+", " ", text).strip()
@@ -974,7 +983,7 @@ def compute_probability(md, market_key):
     return final, gem, dix, bzz, emoji
 
 def passes_value_filter(proba, odd, is_real, consensus_emoji=""):
-    """Verrou global : aucune EV négative sur aucune catégorie."""
+    """Verrou global : filtre les paris sans value en tenant compte de la marge bookmaker."""
     if proba <= 0 or odd <= 0:
         return False
     if consensus_emoji == "⚠️":
@@ -985,14 +994,13 @@ def passes_value_filter(proba, odd, is_real, consensus_emoji=""):
         if not ok:
             STATE["rejections"]["value"] += 1
         return ok
-    # En mode estimé (cote = round(1/prob, 2)), tolérance arrondi 0.995 pour garantir EV >= 1.00
     ok = (proba * odd) >= 0.995
     if not ok:
         STATE["rejections"]["value"] += 1
     return ok
 
 def coupon_passes_ev(odds, prob, has_real_odds: bool = False):
-    """Verrou global coupon : EV >= 1.05 si cotes réelles, EV >= 1.00 sinon."""
+    """Verrou global coupon : vérifie l'EV combinée minimale."""
     if odds <= 0 or prob <= 0:
         return False
     min_ev = MIN_REAL_COUPON_EV if has_real_odds else MIN_COUPON_EV
@@ -1008,7 +1016,7 @@ def passes_auth_proba_filter(proba):
     return ok
 
 # =====================================================================
-# APIS COTES (The Odds API LIVE + Secours RapidOddsAPI)
+# APIS COTES (ESPN + Bzzoiro + The Odds API + RapidOddsAPI)
 # =====================================================================
 def _american_to_decimal(ml) -> Optional[float]:
     """Convertit une cote américaine ESPN (+150 / -200 / EVEN) en cote décimale européenne."""
@@ -1439,32 +1447,86 @@ async def _fetch_gemini_analysis_for_match(client: httpx.AsyncClient, md: MatchD
             return {"markets": pred.get("markets", {}), "analysis": str(pred.get("analysis") or "").strip()}
     return None
 
-async def _enrich_selected_legs_ai(combo: tuple | list):
-    """Garantit une analyse IA complète sur les 2 à 4 matchs finalement sélectionnés dans un coupon."""
-    need_ai = [c for c in combo if not c.get("ai") or len(str(c.get("ai")).strip()) < 60]
-    if not need_ai:
-        return
+async def _enrich_selected_legs_ai(combo: tuple | list) -> bool:
+    """
+    Enrichit et valide chaque sélection retenue dans le ticket final via Gemini
+    en alignant l'analyse à 100 % avec le pari exact choisi. Retourne False si un piège est détecté.
+    """
     async with httpx.AsyncClient(timeout=55.0) as client:
-        for c in need_ai:
+        for c in combo:
             md: Optional[MatchData] = c.get("_md") or c.get("match")
             if not md:
                 continue
+            pick_label = c.get("type", "")
+            proba_pct = float(c.get("proba", 70.0))
+            odd = float(c.get("odds", 1.35))
+
+            if explain_selected_pick_with_gemini:
+                try:
+                    _ensure_dixon_pred(md)
+                    ctx = {}
+                    if md.dixon_pred:
+                        ctx["dixon_coles"] = md.dixon_pred
+                    if md.real_odds:
+                        ctx["bookmaker_odds"] = md.real_odds
+                    if md.bzz_markets:
+                        ctx["bzzoiro_probas"] = md.bzz_markets
+
+                    enriched = await explain_selected_pick_with_gemini(
+                        client=client,
+                        home=md.home,
+                        away=md.away,
+                        league=md.league,
+                        kickoff=md.kickoff,
+                        pick_label=pick_label,
+                        proba_pct=proba_pct,
+                        odd=odd,
+                        context=ctx,
+                    )
+                    if enriched:
+                        if not enriched.get("is_safe", True):
+                            print(f"  🚩 Gemini rejette le pari '{pick_label}' sur {md.home} vs {md.away} (piège détecté)")
+                            return False
+                        analysis_txt = enriched.get("analysis", "").strip()
+                        if has_pro_red_flags(analysis_txt, md.league)[0]:
+                            print(f"  🚩 Signal rouge dans l'analyse finale sur {md.home} vs {md.away}")
+                            return False
+                        if len(analysis_txt) >= 80:
+                            c["ai"] = analysis_txt
+                            print(f"🧠 Analyse Gemini ciblée validée : {md.home} vs {md.away} -> {pick_label}")
+                            await asyncio.sleep(1.2)
+                            continue
+                except Exception as e:
+                    print(f"⚠️ Enrichissement ciblé ({md.home} vs {md.away}) : {e}")
+
+            if c.get("ai") and len(str(c.get("ai")).strip()) >= 60:
+                if has_pro_red_flags(str(c.get("ai")), md.league)[0]:
+                    return False
+                continue
+
             if md.analysis and len(md.analysis.strip()) >= 60:
+                if has_pro_red_flags(md.analysis, md.league)[0]:
+                    return False
                 c["ai"] = md.analysis.strip()
                 continue
+
             try:
                 pred = await _fetch_gemini_analysis_for_match(client, md)
                 if pred and pred.get("analysis") and len(pred["analysis"].strip()) >= 60:
                     md.analysis = pred["analysis"].strip()
                     if pred.get("markets") and not md.gemini_markets:
                         md.gemini_markets = pred["markets"]
+                    if has_pro_red_flags(md.analysis, md.league)[0]:
+                        return False
                     c["ai"] = md.analysis
                     print(f"🧠 Enrichissement IA ciblé réussi : {md.home} vs {md.away}")
                     await asyncio.sleep(1.5)
                     continue
             except Exception as e:
                 print(f"⚠️ Enrichissement IA ciblé ({md.home} vs {md.away}) : {e}")
-            c["ai"] = _build_quant_analysis(md, c.get("type", ""), float(c.get("proba", 70.0)), float(c.get("odds", 1.30)))
+
+            c["ai"] = _build_quant_analysis(md, pick_label, proba_pct, odd)
+    return True
 
 async def _enrich_single_pass(targets, pass_num):
     results = {}
@@ -1532,7 +1594,7 @@ async def enrich_with_double_pass(pool):
     return targets
 
 # =====================================================================
-# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (CALIBRAGE 22 NOVEMBRE — ZÉRO EV NÉGATIVE)
+# MOTEUR EXCLUSIF VIP : ODDS +3 AUTH (PLAGE 2.00 - 3.50 • DIVERSITÉ PRO)
 # =====================================================================
 def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
     sorted_combo = sorted(combo, key=lambda c: parse_dt_safe(c.get("kickoff")) or datetime.max.replace(tzinfo=TZ))
@@ -1551,14 +1613,34 @@ def _build_auth_coupon(combo, subtitle, quality) -> Coupon:
             model_prob=c["proba"] / 100.0,
             real_odd=c["real_odd"],
             quality=quality,
-            analysis=clean_analysis_text(c["ai"], 520),
+            analysis=clean_analysis_text(c["ai"], 560),
         )
         for c in sorted_combo
     ]
     return Coupon("Odds +3 AUTH", f"{subtitle} • {len(legs)} sélections", "🛡️", legs, round(total_odds, 2), round(total_prob, 4), show_analysis=True)
 
-def _valid_pro_combo(combo, require_anchor: bool = True) -> bool:
+def _gemini_alignment_bonus(md: MatchData, mk: str) -> int:
+    """Privilégie les marchés confirmés en tête des probabilités Gemini."""
+    if not md.gemini_markets or not isinstance(md.gemini_markets, dict):
+        return 0
+    val = md.gemini_markets.get(mk)
+    if val is None:
+        return 0
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return 0
+    if v >= 74.0:
+        return 2
+    if v >= 66.0:
+        return 1
+    return 0
+
+def _valid_pro_combo(combo, require_anchor: bool = True, strict_diversity: bool = True) -> bool:
     if len({c["norm_key"] for c in combo}) != len(combo):
+        return False
+    # Jamais 2 fois exactement le même type de pari dans un même ticket
+    if len({c.get("mk") for c in combo}) != len(combo):
         return False
     if sum(1 for c in combo if c["family"] == "goals") > 1:
         return False
@@ -1566,7 +1648,13 @@ def _valid_pro_combo(combo, require_anchor: bool = True) -> bool:
         return False
     if sum(1 for c in combo if c.get("mk") == "victoire_away") > 1:
         return False
-    if require_anchor and not any(c["proba"] >= 71.0 or (c["family"] == "result" and c["proba"] >= 66.0) for c in combo):
+    if strict_diversity:
+        # Exige des pronostics variés (au moins 2 familles différentes : Résultat sec + Buts / Double Chance / BTTS)
+        if len(combo) >= 2 and len({c["family"] for c in combo}) < 2:
+            return False
+        if sum(1 for c in combo if c["family"] == "dc") > 1:
+            return False
+    if require_anchor and not any(c["proba"] >= 69.0 or (c["family"] == "result" and c["proba"] >= 64.0) for c in combo):
         return False
     return True
 
@@ -1576,13 +1664,13 @@ async def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_mat
     markets_map = [
         ("victoire_home", "home", "result", lambda m: f"Victoire {m.home} (1)"),
         ("victoire_away", "away", "result", lambda m: f"Victoire {m.away} (2)"),
-        ("double_chance_12", "dc_12", "dc12", lambda m: "Une équipe gagne (12)"),
-        ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
-        ("double_chance_X2", "dc_x2", "dc", lambda m: f"Double Chance Nul ou {m.away} (X2)"),
         ("over_2.5", "over_2.5", "goals", lambda m: "Plus de 2.5 buts"),
-        ("over_1.5", "over_1.5", "goals", lambda m: "Plus de 1.5 buts"),
         ("under_2.5", "under_2.5", "goals", lambda m: "Moins de 2.5 buts"),
         ("btts_yes", "btts_yes", "btts", lambda m: "Les 2 équipes marquent (BTTS Oui)"),
+        ("double_chance_1X", "dc_1x", "dc", lambda m: f"Double Chance {m.home} ou Nul (1X)"),
+        ("double_chance_X2", "dc_x2", "dc", lambda m: f"Double Chance Nul ou {m.away} (X2)"),
+        ("over_1.5", "over_1.5", "goals", lambda m: "Plus de 1.5 buts"),
+        ("double_chance_12", "dc_12", "dc12", lambda m: "Une équipe gagne (12)"),
     ]
 
     for md in enriched_pool:
@@ -1620,7 +1708,7 @@ async def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_mat
 
         p_home_est, g_h, _, _, em_h = compute_probability(md, "victoire_home")
         p_away_est, g_a, _, _, em_a = compute_probability(md, "victoire_away")
-        one_sided_match = (p_home_est >= 0.72) or (p_away_est >= 0.72)
+        one_sided_match = (p_home_est >= 0.74) or (p_away_est >= 0.74)
 
         clear_home_win = (p_home_est >= 0.62 and (p_home_est - p_away_est) >= 0.28 and em_h != "⚠️")
         clear_away_win = (p_away_est >= 0.63 and (p_away_est - p_home_est) >= 0.30 and em_a != "⚠️")
@@ -1631,18 +1719,14 @@ async def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_mat
                 continue
 
             if mk == "double_chance_1X":
-                if clear_home_win:
+                if g_a > 0 and g_h > 0 and g_a > (g_h + 0.05):
                     continue
-                if g_a > 0 and g_h > 0 and g_a > (g_h + 0.06):
-                    continue
-                if p_away_est > (p_home_est + 0.08):
+                if p_away_est > (p_home_est + 0.05):
                     continue
             elif mk == "double_chance_X2":
-                if clear_away_win:
+                if g_h > 0 and g_a > 0 and g_h > (g_a + 0.05):
                     continue
-                if g_h > 0 and g_a > 0 and g_h > (g_a + 0.06):
-                    continue
-                if p_home_est > (p_away_est + 0.08):
+                if p_home_est > (p_away_est + 0.05):
                     continue
             elif mk == "double_chance_12":
                 if clear_home_win or clear_away_win:
@@ -1658,14 +1742,14 @@ async def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_mat
                 continue
 
             if mk in ("victoire_home", "victoire_away") and (clear_home_win or clear_away_win):
-                if proba_pct < 62.0 or proba_pct > AUTH_PROBA_MAX:
+                if proba_pct < 61.0 or proba_pct > AUTH_PROBA_MAX:
                     STATE["rejections"]["auth_proba"] += 1
                     continue
             else:
                 if not passes_auth_proba_filter(proba_pct):
                     continue
 
-            if mk == "victoire_away" and p_away_est < 0.65:
+            if mk == "victoire_away" and p_away_est < 0.64:
                 continue
 
             real_odd = md.real_odds.get(odd_key)
@@ -1680,10 +1764,11 @@ async def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_mat
             if not passes_value_filter(prob, odd, is_real, emoji):
                 continue
 
-            consensus_bonus = 1 if emoji in ("🤝", "🤝🤝") else 0
+            consensus_bonus = 2 if emoji == "🤝🤝" else (1 if emoji == "🤝" else 0)
+            gemini_bonus = _gemini_alignment_bonus(md, mk)
             stakes_bonus = compute_stakes_score(md.league, md.analysis)
-            market_priority = 3 if family == "result" else (2 if family in ("dc", "goals", "btts") else 1)
-            rank_score = (market_priority, stakes_bonus, consensus_bonus, round(proba_pct, 1))
+            market_priority = 3 if family == "result" else (2 if family in ("goals", "btts", "dc") else 1)
+            rank_score = (gemini_bonus, market_priority, consensus_bonus, stakes_bonus, round(proba_pct, 1))
 
             match_options.append({
                 "event_id": md.event_id,
@@ -1703,48 +1788,62 @@ async def build_exclusive_vip_auth_coupon(enriched_pool: List[MatchData], ws_mat
                 "_md": md,
                 "_rank": rank_score,
             })
+
         match_options.sort(key=lambda x: x["_rank"], reverse=True)
-        kept = 0
+        kept_families = set()
         for opt in match_options:
-            if opt.get("mk") == "double_chance_12" and kept >= 1:
+            if opt["family"] in kept_families:
                 continue
+            if opt.get("mk") == "double_chance_12" and len(kept_families) >= 1:
+                continue
+            kept_families.add(opt["family"])
             opt.pop("_rank", None)
             vip_candidates.append(opt)
-            kept += 1
-            if kept >= 2:
+            if len(kept_families) >= 2:
                 break
 
-    vip_candidates.sort(key=lambda x: (3 if x["family"] == "result" else (2 if x["family"] in ("dc", "goals", "btts") else 1), compute_stakes_score(x["league"], x["ai"]), x["proba"]), reverse=True)
-    top_pool = vip_candidates[:28]
+    vip_candidates.sort(
+        key=lambda x: (
+            _gemini_alignment_bonus(x["_md"], x["mk"]),
+            3 if x["family"] == "result" else (2 if x["family"] in ("goals", "btts", "dc") else 1),
+            compute_stakes_score(x["league"], x["ai"]),
+            x["proba"],
+        ),
+        reverse=True,
+    )
+    top_pool = vip_candidates[:30]
 
-    for r in (3, 2, 4):
-        if len(top_pool) < r:
-            continue
-        best_combo = None
-        best_combo_prob = 0.0
-        for combo in itertools.combinations(top_pool, r):
-            if not _valid_pro_combo(combo, require_anchor=True):
+    for strict_div in (True, False):
+        for r in (3, 2, 4):
+            if len(top_pool) < r:
                 continue
-            tot_o = math.prod(c["odds"] for c in combo)
-            tot_p = math.prod(c["proba"] / 100.0 for c in combo)
-            has_real = any(c["real_odd"] is not None for c in combo)
-            if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE and tot_p >= AUTH_MIN_COMBINED_PROB:
-                if not coupon_passes_ev(tot_o, tot_p, has_real_odds=has_real):
+            valid_combos = []
+            for combo in itertools.combinations(top_pool, r):
+                if not _valid_pro_combo(combo, require_anchor=True, strict_diversity=strict_div):
                     continue
-                if tot_p > best_combo_prob:
-                    best_combo = combo
-                    best_combo_prob = tot_p
-        if best_combo:
-            await _enrich_selected_legs_ai(best_combo)
-            locked_keys = {c["norm_key"] for c in best_combo}
-            label = "Pyramide Sécurisée" if r == 3 else ("Duo Haute Confiance" if r == 2 else "Quatuor Haute Confiance")
-            return _build_auth_coupon(best_combo, f"Sélection Pro VIP • {label}", 96), locked_keys
+                tot_o = round(math.prod(c["odds"] for c in combo), 2)
+                tot_p = math.prod(c["proba"] / 100.0 for c in combo)
+                has_real = any(c["real_odd"] is not None for c in combo)
+                if ODDS3_AUTH_MIN_COTE <= tot_o <= ODDS3_AUTH_MAX_COTE and tot_p >= AUTH_MIN_COMBINED_PROB:
+                    if not coupon_passes_ev(tot_o, tot_p, has_real_odds=has_real):
+                        continue
+                    valid_combos.append((tot_p, combo))
 
-    print("  ℹ️ AUTH VIP : Aucune combinaison >= 71% avec EV >= 1.00 aujourd'hui (protection bankroll).")
+            valid_combos.sort(key=lambda item: item[0], reverse=True)
+            for _, combo in valid_combos:
+                is_clean = await _enrich_selected_legs_ai(combo)
+                if not is_clean:
+                    print("  🚩 Combo rejeté après enrichissement Gemini ciblé (match piège détecté)")
+                    continue
+                locked_keys = {c["norm_key"] for c in combo}
+                label = "Pyramide Sécurisée" if r == 3 else ("Duo Haute Confiance" if r == 2 else "Quatuor Haute Confiance")
+                return _build_auth_coupon(combo, f"Sélection Pro VIP • {label}", 96), locked_keys
+
+    print("  ℹ️ AUTH VIP : Aucune combinaison valide trouvée dans la plage 2.00 - 3.50 aujourd'hui (protection bankroll).")
     return None, set()
 
 # =====================================================================
-# MOTEURS SECONDAIRES (ALIGNÉS SUR LA MÊME RIGUEUR PRO — ZÉRO EV NÉGATIVE)
+# MOTEURS SECONDAIRES (ALIGNÉS SUR LA MÊME RIGUEUR PRO)
 # =====================================================================
 def _poisson_sample(lam):
     if lam <= 0: return 0
@@ -1900,8 +1999,8 @@ async def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked
                     tot_p = math.prod(c['proba'] / 100.0 for c in combo)
                     has_real = any(c.get('real_odd') is not None for c in combo)
                     if not coupon_passes_ev(tot_o, tot_p, has_real_odds=has_real): continue
-                    await _enrich_selected_legs_ai(combo)
-                    legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 90, analysis=clean_analysis_text(c['ai'], 520)) for c in combo]
+                    if not await _enrich_selected_legs_ai(combo): continue
+                    legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 90, analysis=clean_analysis_text(c['ai'], 560)) for c in combo]
                     return Coupon("Odds +3 HYBRIDE", f"Mélange 3 sources • {len(legs)} sélections", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
 
     for r in (3, 4):
@@ -1915,8 +2014,8 @@ async def build_odds3_hybrid_coupon(bonus_mtft, bonus_draw, third_pillar, locked
                 tot_p = math.prod(c['proba'] / 100.0 for c in combo)
                 has_real = any(c.get('real_odd') is not None for c in combo)
                 if not coupon_passes_ev(tot_o, tot_p, has_real_odds=has_real): continue
-                await _enrich_selected_legs_ai(combo)
-                legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 85, analysis=clean_analysis_text(c['ai'], 520)) for c in combo]
+                if not await _enrich_selected_legs_ai(combo): continue
+                legs = [Selection(_get_match_id(c), c['match'].league, c['match'].home, c['match'].away, c.get('kickoff', ''), c['type'], c['type'], c['odds'], c['proba']/100.0, c['real_odd'], 85, analysis=clean_analysis_text(c['ai'], 560)) for c in combo]
                 return Coupon("Odds +3 HYBRIDE", f"Top Value Multi-IA • {len(legs)} sélections", "🎯", legs, round(tot_o, 2), round(tot_p, 4), show_analysis=True)
     return None
 
@@ -2056,7 +2155,7 @@ def format_selection_block(s, idx, show_analysis):
     lines = [f"<b>┌─ #{idx} {s.home} vs {s.away}</b>", f"│ 📅 <b>{format_kickoff(s.kickoff)}</b> • {s.league}", f"│ 🎯 <b>{s.pick_label}</b>", f"│ 📊 Confiance : <b>{s.model_prob*100:.1f}%</b> {prob_bar(s.model_prob)}"]
     if s.real_odd: lines.append(f"│ 💰 Cote : <b>{s.real_odd}</b>")
     else: lines.append(f"│ 💰 Cote : <b>{s.odds}</b>")
-    if show_analysis and s.analysis: lines.append(f"│ 🧠 <i>{clean_analysis_text(s.analysis, 520)}</i>")
+    if show_analysis and s.analysis: lines.append(f"│ 🧠 <i>{clean_analysis_text(s.analysis, 560)}</i>")
     lines.append(f"<b>└─────────────</b>")
     return "\n".join(lines)
 
