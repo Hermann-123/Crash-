@@ -1,343 +1,222 @@
+"""
+Prédicteur Gemini Pro — Analyse quantitative + contextuelle (méthodologie pronostiqueur 20+ ans).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
 import os
 import re
-import json
-import logging
-import requests
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
-logger = logging.getLogger("VOLATILITY_GEMINI")
+import httpx
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-# Tentaive d'import du SDK officiel google-genai (avec fallback REST automatique)
-try:
-    from google import genai
-    from google.genai import types
-    HAS_GENAI_SDK = True
-except ImportError:
-    HAS_GENAI_SDK = False
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
-def _extract_json_block(text: str) -> Dict[str, Any]:
-    """Extrait proprement un objet JSON depuis une réponse texte ou Markdown."""
-    if not text:
-        return {}
-    cleaned = text.strip()
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
-    if match:
-        cleaned = match.group(1)
-    else:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            cleaned = cleaned[start : end + 1]
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        logger.warning("Impossible de parser le JSON Gemini : %s", cleaned[:200])
-        return {}
+def format_context(context: Optional[dict], kickoff: str = "") -> str:
+    if not context or not isinstance(context, dict):
+        return f"\nCoup d'envoi : {kickoff}" if kickoff else ""
+
+    parts = []
+    if kickoff:
+        parts.append(f"Coup d'envoi : {kickoff}")
+
+    # 1. Historique confrontations directes (Bzzoiro H2H)
+    h2h = context.get("h2h")
+    if isinstance(h2h, dict) and h2h.get("total_matches"):
+        total = h2h.get("total_matches", 0)
+        hw = h2h.get("home_wins", 0)
+        d = h2h.get("draws", 0)
+        aw = h2h.get("away_wins", 0)
+        parts.append(f"Historique H2H ({total} matchs) : {hw}V dom / {d}N / {aw}V ext")
+
+    # 2. Base statistique Dixon-Coles (Poisson)
+    dixon = context.get("dixon_coles")
+    if isinstance(dixon, dict) and dixon:
+        ph = dixon.get("p_home")
+        pd = dixon.get("p_draw")
+        pa = dixon.get("p_away")
+        o25 = dixon.get("over_2.5")
+        btts = dixon.get("btts_yes")
+        lh = dixon.get("lambda_home")
+        la = dixon.get("lambda_away")
+        stat_bits = []
+        if ph is not None and pd is not None and pa is not None:
+            stat_bits.append(f"1={float(ph)*100:.1f}% / X={float(pd)*100:.1f}% / 2={float(pa)*100:.1f}%")
+        if lh is not None and la is not None:
+            stat_bits.append(f"Buts attendus (xG) : {float(lh):.2f} - {float(la):.2f}")
+        if o25 is not None:
+            stat_bits.append(f"Over 2.5={float(o25)*100:.1f}%")
+        if btts is not None:
+            stat_bits.append(f"BTTS={float(btts)*100:.1f}%")
+        if stat_bits:
+            parts.append("Modèle statistique Dixon-Coles : " + " | ".join(stat_bits))
+
+    # 3. Forme / classement éventuels fournis par Bzzoiro
+    for key, label in (("home_form", "Forme domicile"), ("away_form", "Forme extérieur"), ("summary", "Données terrain")):
+        val = context.get(key)
+        if val:
+            parts.append(f"{label} : {val}")
+
+    return ("\nCONTEXTE STATISTIQUE DISPONIBLE :\n- " + "\n- ".join(parts)) if parts else ""
 
 
-def _call_gemini(
-    prompt: str,
-    use_search: bool = True,
-    temperature: float = 0.35,
-    max_tokens: int = 900,
-) -> str:
-    """Appelle Gemini avec Google Search Grounding (SDK puis fallback REST)."""
-    if not GEMINI_API_KEY:
-        logger.error("Clé GEMINI_API_KEY manquante dans les variables d'environnement.")
-        return ""
+def build_prompt(home: str, away: str, league: str, ctx_block: str) -> str:
+    return f"""Tu es un pronostiqueur sportif professionnel avec plus de 20 ans d'expérience dans les paris football et la gestion de bankroll VIP.
+Analyse ce match avec une rigueur absolue : {home} (Domicile) vs {away} (Extérieur) — Compétition : {league}.
+{ctx_block}
 
-    # 1. Via le SDK google-genai
-    if HAS_GENAI_SDK:
+MÉTHODOLOGIE D'ANALYSE PRO (OBLIGATOIRE) :
+1. RAPPORT DE FORCE RÉEL : Compare le niveau des effectifs, la solidité à domicile de {home} vs le rendement à l'extérieur de {away}, et les données statistiques fournies ci-dessus.
+2. FILTRE ANTI-PIÈGE : Identifie tout facteur de risque majeur (rotation d'effectif avant/après coupe d'Europe, match de coupe nationale déséquilibré, blessures clés, équipe sans enjeu ou en crise). Si un risque existe, passe "trap_warning" à true.
+3. CALIBRATION RÉALISTE DES PROBABILITÉS : Ne gonfle jamais artificiellement un favori. En football réel, même un grand favori dépasse rarement 75-82% de victoire sèche. Utilise la Double Chance (1X ou X2) si un favori joue à l'extérieur ou face à un bloc bas.
+4. COHÉRENCE TOTALE : Le marché ayant la plus forte probabilité dans le JSON DOIT correspondre exactement à la conclusion de ton texte "analysis".
+
+Retourne UNIQUEMENT ce JSON valide :
+{{
+  "markets": {{
+    "victoire_home": 0,
+    "match_nul": 0,
+    "victoire_away": 0,
+    "double_chance_1X": 0,
+    "double_chance_X2": 0,
+    "double_chance_12": 0,
+    "over_2.5": 0,
+    "under_2.5": 0,
+    "over_1.5": 0,
+    "under_1.5": 0,
+    "over_3.5": 0,
+    "under_3.5": 0,
+    "btts_yes": 0,
+    "btts_no": 0
+  }},
+  "risk_level": "LOW",
+  "trap_warning": false,
+  "analysis": "Analyse d'expert en 3 phrases courtes et percutantes : rapport de force, dynamique/enjeu, et justification du pari le plus sûr.",
+  "advices": [
+    {{"text": "Recommandation principale de pro", "confidence": 0}}
+  ]
+}}
+
+RÈGLES MATHÉMATIQUES STRICTES :
+- Probabilités entières entre 2 et 96.
+- victoire_home + match_nul + victoire_away = 100.
+- over_1.5 + under_1.5 = 100 | over_2.5 + under_2.5 = 100 | over_3.5 + under_3.5 = 100.
+- btts_yes + btts_no = 100.
+- risk_level : "LOW" (match lisible et sûr), "MEDIUM" (incertitude modérée), ou "HIGH" (match piège / imprévisible)."""
+
+
+def _sanitize_prediction(parsed: dict) -> Optional[dict]:
+    """Vérifie et normalise mathématiquement les probabilités retournées par Gemini."""
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("markets"), dict):
+        return None
+
+    raw_m = parsed["markets"]
+    clean_m = {}
+    for k, v in raw_m.items():
         try:
-            client = genai.Client(api_key=GEMINI_API_KEY)
-            config_kwargs: Dict[str, Any] = {
-                "temperature": temperature,
-                "max_output_tokens": max_tokens,
-            }
-            if use_search:
-                config_kwargs["tools"] = [{"google_search": {}}]
+            f = float(v)
+            if 0 < f <= 1:
+                f *= 100.0
+            clean_m[k] = round(min(97.0, max(1.0, f)), 1)
+        except (ValueError, TypeError):
+            continue
 
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(**config_kwargs),
-            )
-            if response and response.text:
-                return response.text.strip()
-        except Exception as e:
-            logger.warning("Fallback REST activé suite à erreur SDK Gemini : %s", e)
+    # Normalisation stricte 1X2 = 100%
+    if all(k in clean_m for k in ("victoire_home", "match_nul", "victoire_away")):
+        s = clean_m["victoire_home"] + clean_m["match_nul"] + clean_m["victoire_away"]
+        if s > 0:
+            vh = round((clean_m["victoire_home"] / s) * 100.0, 1)
+            mn = round((clean_m["match_nul"] / s) * 100.0, 1)
+            va = round(max(1.0, 100.0 - vh - mn), 1)
+            clean_m["victoire_home"] = vh
+            clean_m["match_nul"] = mn
+            clean_m["victoire_away"] = va
+            clean_m["double_chance_1X"] = round(min(97.0, vh + mn), 1)
+            clean_m["double_chance_X2"] = round(min(97.0, mn + va), 1)
+            clean_m["double_chance_12"] = round(min(97.0, vh + va), 1)
 
-    # 2. Fallback direct via API REST v1beta
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    payload: Dict[str, Any] = {
+    # Normalisation des paires complémentaires (Over/Under, BTTS)
+    for k1, k2 in (("over_1.5", "under_1.5"), ("over_2.5", "under_2.5"), ("over_3.5", "under_3.5"), ("btts_yes", "btts_no")):
+        if k1 in clean_m and k2 in clean_m:
+            s = clean_m[k1] + clean_m[k2]
+            if s > 0:
+                v1 = round((clean_m[k1] / s) * 100.0, 1)
+                clean_m[k1] = v1
+                clean_m[k2] = round(max(1.0, 100.0 - v1), 1)
+
+    analysis = str(parsed.get("analysis") or "").strip()
+    risk_level = str(parsed.get("risk_level") or "MEDIUM").upper().strip()
+    trap_warning = bool(parsed.get("trap_warning", False))
+
+    # Signal explicite dans l'analyse pour le filtre anti-piège de main.py
+    if (trap_warning or risk_level == "HIGH") and "match piège" not in analysis.lower():
+        analysis = f"{analysis} (Match piège / risque élevé détecté).".strip()
+
+    parsed["markets"] = clean_m
+    parsed["analysis"] = analysis
+    parsed["risk_level"] = risk_level
+    parsed["trap_warning"] = trap_warning
+    return parsed
+
+
+async def call_gemini(client: httpx.AsyncClient, model: str, prompt: str) -> Optional[dict]:
+    url = f"{GEMINI_BASE_URL}/{model}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens,
+            "temperature": 0.15,
+            "maxOutputTokens": 1200,
+            "responseMimeType": "application/json",
         },
     }
-    if use_search:
-        payload["tools"] = [{"google_search": {}}]
 
-    try:
-        resp = requests.post(url, json=payload, timeout=25)
-        if resp.status_code != 200 and use_search:
-            # Réessai sans outil de recherche si le modèle/compte restreint le grounding
-            payload.pop("tools", None)
-            resp = requests.post(url, json=payload, timeout=25)
-        resp.raise_for_status()
-        data = resp.json()
-        candidates = data.get("candidates", [])
-        if candidates:
-            parts = candidates[0].get("content", {}).get("parts", [])
-            return "".join(p.get("text", "") for p in parts).strip()
-    except Exception as e:
-        logger.error("Erreur REST Gemini : %s", e)
+    for attempt in range(2):
+        try:
+            r = await client.post(url, json=payload, timeout=45.0)
+            if r.status_code in (503, 429):
+                wait = 2 * (attempt + 1)
+                print(f"  ⏳ Gemini {model} {r.status_code}, retry {attempt+1}/2...")
+                await asyncio.sleep(wait)
+                continue
+            if r.status_code >= 400:
+                print(f"  ⚠️ Gemini {model} HTTP {r.status_code}")
+                return None
 
-    return ""
+            data = r.json()
+            try:
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError, TypeError):
+                return None
 
+            m = re.search(r"\{[\s\S]*\}", text)
+            if not m:
+                return None
+            try:
+                parsed = json.loads(m.group())
+            except json.JSONDecodeError:
+                return None
 
-def bayesian_smooth_probas(
-    model_probas: Dict[str, float],
-    odds: Dict[str, float],
-    market_weight: float = 0.35,
-) -> Dict[str, float]:
-    """
-    Recalibre les probabilités IA / Dixon-Coles avec les probabilités implicites
-    du marché (dé-vigées) pour éviter les surestimations d'EV.
-    """
-    smoothed = dict(model_probas)
-
-    # Normalisation 1X2 si les 3 cotes sont présentes
-    o1, ox, o2 = odds.get("1", 0), odds.get("X", 0), odds.get("2", 0)
-    if o1 > 1.0 and ox > 1.0 and o2 > 1.0:
-        inv_sum = (1.0 / o1) + (1.0 / ox) + (1.0 / o2)
-        imp_1 = (1.0 / o1) / inv_sum
-        imp_x = (1.0 / ox) / inv_sum
-        imp_2 = (1.0 / o2) / inv_sum
-
-        w_m = max(0.0, min(0.7, market_weight))
-        w_s = 1.0 - w_m
-
-        p1 = w_s * model_probas.get("home_win", imp_1) + w_m * imp_1
-        px = w_s * model_probas.get("draw", imp_x) + w_m * imp_x
-        p2 = w_s * model_probas.get("away_win", imp_2) + w_m * imp_2
-        total_1x2 = p1 + px + p2
-        if total_1x2 > 0:
-            smoothed["home_win"] = round(p1 / total_1x2, 4)
-            smoothed["draw"] = round(px / total_1x2, 4)
-            smoothed["away_win"] = round(p2 / total_1x2, 4)
-
-    # Normalisation Over / Under 2.5
-    ou_over, ou_under = odds.get("over_25", 0), odds.get("under_25", 0)
-    if ou_over > 1.0 and ou_under > 1.0:
-        inv_ou = (1.0 / ou_over) + (1.0 / ou_under)
-        imp_over = (1.0 / ou_over) / inv_ou
-        imp_under = (1.0 / ou_under) / inv_ou
-
-        w_m = max(0.0, min(0.7, market_weight))
-        w_s = 1.0 - w_m
-
-        po = w_s * model_probas.get("over_25", imp_over) + w_m * imp_over
-        pu = w_s * model_probas.get("under_25", imp_under) + w_m * imp_under
-        tot_ou = po + pu
-        if tot_ou > 0:
-            smoothed["over_25"] = round(po / tot_ou, 4)
-            smoothed["under_25"] = round(pu / tot_ou, 4)
-
-    return smoothed
+            return _sanitize_prediction(parsed)
+        except Exception as e:
+            print(f"  ⚠️ Gemini {model} crash: {repr(e)}")
+            await asyncio.sleep(1.5)
+    return None
 
 
-def predict_match_probas(
-    match_data: Optional[Dict[str, Any]] = None,
-    *,
-    home_team: str = "",
-    away_team: str = "",
-    league: str = "",
-    match_date: str = "",
-    odds: Optional[Dict[str, float]] = None,
-    dc_probas: Optional[Dict[str, float]] = None,
-    stats_context: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    """
-    Évalue un match via Gemini + Google Search et retourne les probabilités calibrées,
-    le statut anti-piège (is_trap) et les facteurs clés.
-    Compatible avec un appel par dictionnaire (match_data) ou par arguments nommés.
-    """
-    data = dict(match_data or {})
-    home = home_team or data.get("home_team") or data.get("home", "")
-    away = away_team or data.get("away_team") or data.get("away", "")
-    comp = league or data.get("league") or data.get("competition", "Football")
-    date_str = match_date or data.get("match_date") or data.get("commence_time", "")
-    match_odds = odds or data.get("odds", {})
-    base_dc = dc_probas or data.get("dc_probas") or data.get("probas", {})
-    extra_stats = stats_context or data.get("stats_context") or data.get("stats", {})
+async def predict_match_probas(client, home, away, league, kickoff, context=None):
+    if not GEMINI_API_KEY:
+        return None
+    ctx_block = format_context(context, kickoff=str(kickoff or ""))
+    prompt = build_prompt(home, away, league, ctx_block)
 
-    # Probabilités par défaut issues de Dixon-Coles si disponibles
-    default_probas = {
-        "home_win": float(base_dc.get("home_win", 0.40)),
-        "draw": float(base_dc.get("draw", 0.28)),
-        "away_win": float(base_dc.get("away_win", 0.32)),
-        "over_25": float(base_dc.get("over_25", 0.50)),
-        "under_25": float(base_dc.get("under_25", 0.50)),
-        "btts_yes": float(base_dc.get("btts_yes", 0.50)),
-        "btts_no": float(base_dc.get("btts_no", 0.50)),
-    }
-
-    prompt = f"""Tu es un analyste quantitatif football pour le moteur VOLATILITY INDEX.
-Effectue une recherche web rapide sur l'actualité récente de ce match :
-- Match : {home} vs {away}
-- Compétition : {comp}
-- Date : {date_str}
-- Cotes bookmakers : {json.dumps(match_odds, ensure_ascii=False)}
-- Modèle statistique initial (Dixon-Coles / xG) : {json.dumps(default_probas, ensure_ascii=False)}
-- Contexte statistique : {json.dumps(extra_stats, ensure_ascii=False)}
-
-Vérifie impérativement :
-1. Blessures majeures, suspensions ou rotation d'effectif annoncée.
-2. Enjeu réel du match (qualification déjà acquise, derby, match couperet, fatigue européenne).
-3. Détection de "match piège" (is_trap = true si rotation massive, équipe déjà qualifiée/éliminée sans motivation, météo extrême ou incohérence majeure entre stats et news).
-
-Réponds UNIQUEMENT avec un objet JSON valide suivant exactement ce schéma :
-{{
-  "home_win": 0.00,
-  "draw": 0.00,
-  "away_win": 0.00,
-  "over_25": 0.00,
-  "under_25": 0.00,
-  "btts_yes": 0.00,
-  "btts_no": 0.00,
-  "is_trap": false,
-  "trap_reason": "",
-  "confidence": 75.0,
-  "key_facts": ["fait 1", "fait 2"]
-}}"""
-
-    raw_text = _call_gemini(prompt, use_search=True, temperature=0.2, max_tokens=700)
-    parsed = _extract_json_block(raw_text)
-
-    if not parsed:
-        smoothed = bayesian_smooth_probas(default_probas, match_odds)
-        return {
-            **smoothed,
-            "is_trap": False,
-            "trap_reason": "",
-            "confidence": round(max(smoothed.get("home_win", 0.5), smoothed.get("away_win", 0.5), smoothed.get("under_25", 0.5), smoothed.get("over_25", 0.5)) * 100, 1),
-            "key_facts": [],
-        }
-
-    raw_probas = {
-        "home_win": float(parsed.get("home_win", default_probas["home_win"])),
-        "draw": float(parsed.get("draw", default_probas["draw"])),
-        "away_win": float(parsed.get("away_win", default_probas["away_win"])),
-        "over_25": float(parsed.get("over_25", default_probas["over_25"])),
-        "under_25": float(parsed.get("under_25", default_probas["under_25"])),
-        "btts_yes": float(parsed.get("btts_yes", default_probas["btts_yes"])),
-        "btts_no": float(parsed.get("btts_no", default_probas["btts_no"])),
-    }
-
-    # Lissage bayésien avec les cotes du marché
-    calibrated = bayesian_smooth_probas(raw_probas, match_odds, market_weight=0.35)
-
-    return {
-        **calibrated,
-        "is_trap": bool(parsed.get("is_trap", False)),
-        "trap_reason": str(parsed.get("trap_reason", "")).strip(),
-        "confidence": float(parsed.get("confidence", 70.0)),
-        "key_facts": parsed.get("key_facts", []),
-    }
-
-
-def explain_selected_pick_with_gemini(
-    match_data: Optional[Dict[str, Any]] = None,
-    *,
-    home_team: str = "",
-    away_team: str = "",
-    league: str = "",
-    selection: str = "",
-    market: str = "",
-    odd: float = 0.0,
-    probability: float = 0.0,
-    stats_context: Optional[Dict[str, Any]] = None,
-    pick_index: int = 1,
-    **kwargs: Any,
-) -> str:
-    """
-    Génère une analyse fluide en 4 temps (style Café Foot) strictement verrouillée
-    sur le marché sélectionné (1X2, Under/Over, BTTS, Double Chance) et sans intro répétitive.
-    """
-    data = dict(match_data or {})
-    home = home_team or data.get("home_team") or data.get("home", "Équipe Domicile")
-    away = away_team or data.get("away_team") or data.get("away", "Équipe Extérieur")
-    comp = league or data.get("league") or data.get("competition", "")
-    chosen_pick = selection or market or data.get("selection") or data.get("market", "")
-    chosen_odd = odd or float(data.get("odd", 0.0))
-    chosen_prob = probability or float(data.get("probability", data.get("confidence", 0.0)))
-    if chosen_prob <= 1.0 and chosen_prob > 0:
-        chosen_prob = round(chosen_prob * 100, 1)
-    context = stats_context or data.get("stats_context") or data.get("stats", {})
-
-    opening_styles = {
-        1: "Commence directement par la dynamique du match ou l'enjeu sportif du soir.",
-        2: "Commence directement par un chiffre clé (xG, série défensive/offensive ou écart statistique).",
-        3: "Commence directement par le rapport de force tactique entre les deux équipes.",
-    }
-    style_directive = opening_styles.get(pick_index, opening_styles[2])
-
-    prompt = f"""Rédige une analyse courte et percutante en français (3 à 4 phrases maximum, 65 à 95 mots) pour un ticket VIP Telegram.
-
-DONNÉES EXACTES DU PARI RETENU :
-- Rencontre : {home} vs {away} ({comp})
-- PARI SÉLECTIONNÉ : {chosen_pick}
-- Cote : {chosen_odd} | Probabilité modèle calibrée : {chosen_prob}%
-- Données statistiques (xG, Dixon-Coles, H2H, forme) : {json.dumps(context, ensure_ascii=False)}
-
-RÈGLES IMPÉRATIVES :
-1. VERROUILLAGE MARCHÉ : Ton argumentaire doit justifier EXCLUSIVEMENT le pari "{chosen_pick}".
-   - Si le pari est "Moins de 2.5 buts" (Under), parle de maîtrise défensive, faible volume d'occasions (xG), gestion du tempo ou bloc bas — JAMAIS d'une pluie de buts ni d'une défense qui va exploser.
-   - Si le pari est "Plus de 2.5 buts" (Over), parle de projection offensive, déséquilibres et xG élevés.
-   - Si le pari est une victoire (1 ou 2) ou Double Chance, justifie la supériorité ou la solidité de l'équipe visée.
-2. INTERDICTION ABSOLUE d'utiliser "Salut les pronos", "Bonjour", "Voici l'analyse" ou toute formule d'introduction générique.
-3. {style_directive}
-4. Structure fluide en un seul paragraphe : constat fort -> appui statistique (xG / Dixon-Coles) -> contexte/enjeu -> brève nuance de vigilance.
-5. Pas de puces, pas de titres, pas d'emojis dans le paragraphe."""
-
-    explanation = _call_gemini(prompt, use_search=True, temperature=0.4, max_tokens=300)
-
-    if explanation:
-        # Nettoyage de sécurité si le modèle glisse malgré tout une salutation
-        explanation = re.sub(
-            r"^(Salut les pronos\s*[!,.:-]*\s*|Bonjour\s*[!,.:-]*\s*)",
-            "",
-            explanation,
-            flags=re.IGNORECASE,
-        ).strip()
-        return explanation
-
-    # Fallback déterministe cohérent avec le marché si l'API est indisponible
-    pick_lower = chosen_pick.lower()
-    if "moins" in pick_lower or "under" in pick_lower:
-        return (
-            f"Le profil statistique de ce {home} - {away} pointe vers une rencontre fermée et tactique, "
-            f"avec une probabilité estimée à {chosen_prob}% pour le {chosen_pick}. "
-            f"Les projections xG et le modèle Dixon-Coles confirment un rythme maîtrisé où les deux blocs limitent les espaces dans l'axe. "
-            f"Seul un but très précoce sur coup de pied arrêté pourrait forcer l'équipe menée à se découvrir."
-        )
-    if "plus" in pick_lower or "over" in pick_lower:
-        return (
-            f"Les indicateurs offensifs convergent vers un duel ouvert entre {home} et {away}, "
-            f"validant le scénario {chosen_pick} à {chosen_prob}% de réussite estimée. "
-            f"La production d'xG des deux formations laisse entrevoir des transitions rapides et plusieurs situations franches. "
-            f"La vigilance portera uniquement sur l'efficacité dans le dernier geste en première période."
-        )
-    return (
-        f"Dans ce duel de {comp}, les métriques avancées placent {chosen_pick} en position de force "
-        f"avec une probabilité calibrée de {chosen_prob}%. "
-        f"L'écart de niveau mesuré par Dixon-Coles et la dynamique récente justifient la valeur prise à {chosen_odd}, "
-        f"sous réserve d'une gestion sérieuse des temps faibles."
-    )
+    for i, model in enumerate(GEMINI_MODELS):
+        result = await call_gemini(client, model, prompt)
+        if result is not None:
+            return result
+        if i < len(GEMINI_MODELS) - 1:
+            print(f"  🔄 Bascule vers {GEMINI_MODELS[i+1]}")
+    return None
